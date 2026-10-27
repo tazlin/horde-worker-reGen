@@ -420,6 +420,8 @@ class WorkloadEvidence(BaseModel):
     """Seconds the check spent applying its settings before work was offered, including a reused config."""
     sampling_seconds: float | None = None
     """Sum of the image jobs' reported sampling seconds, or None when no job reported one."""
+    clearance_wait_seconds: float | None = None
+    """The longest time an image job's child blocked on the clearance lease, or None when no job waited."""
     device_peak_mb: int | None = None
     ram_peak_mb: int | None = None
     recoveries: int = 0
@@ -460,6 +462,8 @@ class WorkloadEvidence(BaseModel):
     model_reference_rates: dict[str, ReferenceSamplingRate] = Field(default_factory=dict)
     """The single-lane rate each model's check rate was compared with, and where it came from."""
     combined_validation: bool = False
+    notes: list[str] = Field(default_factory=list)
+    """What the controller changed about the case before running it, such as a joint reduced to fit the card."""
     attempted: bool = False
     reason_code: str = ""
     jobs_completed: int = 0

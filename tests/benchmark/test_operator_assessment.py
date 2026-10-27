@@ -54,6 +54,7 @@ from horde_worker_regen.process_management.models.feature_readiness import (
     GatedFeature,
 )
 from horde_worker_regen.process_management.resources.run_metrics import JobMetricsRecord, StatsJobCompletedEvent
+from horde_worker_regen.process_management.scheduling.clearance_lease import CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS
 from horde_worker_regen.process_management.scheduling.workload_flow import WorkloadKind
 
 
@@ -363,6 +364,73 @@ async def test_result_explains_missing_measurements_or_process_replacement(
     assert all(detail in result.reason for detail in expected_details)
     if metrics.get("device_index") == 1:
         assert "execution card was not reported" not in result.reason
+
+
+@pytest.mark.parametrize(
+    ("lease_wait_seconds", "lease_timed_out", "expected_status", "expected_code"),
+    [
+        (CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS, False, EvidenceStatus.UNKNOWN, "clearance_timeout"),
+        (5.0, True, EvidenceStatus.UNKNOWN, "clearance_timeout"),
+        (5.0, False, EvidenceStatus.MEASURED_SUCCESS, "measured"),
+        (0.0, False, EvidenceStatus.MEASURED_SUCCESS, "measured"),
+    ],
+)
+async def test_jobs_sampled_only_after_the_clearance_timeout_do_not_confirm_settings(
+    tmp_path: Path,
+    lease_wait_seconds: float,
+    lease_timed_out: bool,
+    expected_status: EvidenceStatus,
+    expected_code: str,
+) -> None:
+    """A job that waited out the clearance lease, or sampled without a grant, was never priced.
+
+    Every job is dispatched long before its first step, as a cold model load does, so only the lease wait the
+    child measured decides the grade.
+    """
+
+    class LeaseWaitWorker(HttpTestWorker):
+        def _record(
+            self, case: AssessmentCase, job_index: int, identifier: str, model_name: str, sampling_start: float
+        ) -> JobMetricsRecord:
+            record = super()._record(case, job_index, identifier, model_name, sampling_start)
+            window = record.sampling_window or SamplingWindow(first_step=sampling_start, last_step=sampling_start + 1)
+            return record.model_copy(
+                update={
+                    "stage_timestamps": {
+                        **record.stage_timestamps,
+                        "INFERENCE_IN_PROGRESS": time.time() - 2 * CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS,
+                    },
+                    "sampling_window": window.model_copy(
+                        update={"lease_wait_seconds": lease_wait_seconds, "lease_timed_out": lease_timed_out}
+                    ),
+                    "width": case.profile.width,
+                    "height": case.profile.height,
+                    "batch_count": case.profile.batch,
+                }
+            )
+
+    controller = OperatorAssessment(
+        catalog_options=CatalogOptions(tiers=[BenchTier.SD15]),
+        out_dir=tmp_path,
+        models={BenchTier.SD15: "Deliberate"},
+    )
+    async with LocalHorde() as service:
+        worker = LeaseWaitWorker(service, tmp_path / "worker", {})
+        await worker.start()
+        try:
+            case = AssessmentCase(
+                Capability(tier=BenchTier.SD15, kind=CapabilityKind.BASELINE),
+                OperatingProfile(device_index=0, tier=BenchTier.SD15, model_name="Deliberate"),
+            )
+            result = await controller._execute(service, worker, case, time.monotonic() + 5)
+        finally:
+            await worker.close()
+    assert result.status is expected_status
+    assert result.reason_code == expected_code
+    assert result.clearance_wait_seconds == (lease_wait_seconds or None)
+    if expected_status is EvidenceStatus.UNKNOWN:
+        assert "only after the clearance timeout" in result.reason
+        assert "512x512" in result.reason
 
 
 @pytest.mark.parametrize("service_card", [1, None])
@@ -955,6 +1023,73 @@ async def test_a_thrashing_lane_in_the_confirmation_is_judged_against_the_thread
         assert all(
             reference.basis is ReferenceRateBasis.SINGLE_LANE for reference in item.model_reference_rates.values()
         )
+    assert report.suggested_bridge_data.max_threads == 1
+
+
+async def test_a_joint_unconfirmed_on_its_threads_is_confirmed_again_at_one_thread(tmp_path: Path) -> None:
+    """A multi-lane joint refused for its thread count repeats at one thread, so its other limits still confirm."""
+
+    class SlowedConfirmationWorker(LaneRateWorker):
+        async def _consume(self, case: AssessmentCase) -> None:
+            self.companion_slowed = case.combined
+            await super()._consume(case)
+
+    report = await OperatorAssessment(
+        catalog_options=CatalogOptions(tiers=[BenchTier.SD15], include_features=False, include_alchemy=False),
+        out_dir=tmp_path,
+        models={BenchTier.SD15: "Deliberate", BenchTier.SDXL: "AlbedoBase XL (SDXL)"},
+        only_probe="sd15-threads-2",
+        worker_factory=SlowedConfirmationWorker,
+    ).run_async()
+    follow_up_slug = Capability(tier=BenchTier.SD15, kind=CapabilityKind.SUSTAINED, magnitude=1).slug
+    joints = {
+        item.profile.device_index: item
+        for item in report.evidence
+        if item.combined_validation and item.profile.threads == 2
+    }
+    follow_ups = {
+        item.profile.device_index: item
+        for item in report.evidence
+        if item.combined_validation and item.profile.threads == 1
+    }
+    assert joints and follow_ups.keys() == joints.keys()
+    for device, joint in joints.items():
+        assert joint.status is EvidenceStatus.UNKNOWN and joint.reason_code == "throughput_below_single_lane"
+        follow_up = follow_ups[device]
+        assert follow_up.evidence_id == f"card{device}-{follow_up_slug}-combined" != joint.evidence_id
+        assert follow_up.status is EvidenceStatus.MEASURED_SUCCESS and follow_up.reason_code == "measured"
+        assert follow_up.profile.companion_model is None and follow_up.profile.lease_slots is None
+        assert (follow_up.profile.batch, follow_up.profile.width, follow_up.profile.height) == (
+            joint.profile.batch,
+            joint.profile.width,
+            joint.profile.height,
+        )
+    suggestion = report.suggested_bridge_data
+    assert suggestion.safe_to_apply and suggestion.max_threads == 1
+    for follow_up in follow_ups.values():
+        assert suggestion.max_batch == follow_up.profile.batch
+        assert suggestion.max_power == follow_up.profile.width * follow_up.profile.height // (8 * 64 * 64)
+
+
+async def test_a_joint_that_faults_is_not_repeated_at_one_thread(tmp_path: Path) -> None:
+    """Only a thread-count verdict earns the single-thread follow-up. A faulted joint keeps its measured verdict."""
+
+    class FaultingConfirmationWorker(LaneRateWorker):
+        async def _consume(self, case: AssessmentCase) -> None:
+            self.metrics_overrides = {"faulted": True} if case.combined else {}
+            await super()._consume(case)
+
+    report = await OperatorAssessment(
+        catalog_options=CatalogOptions(tiers=[BenchTier.SD15], include_features=False, include_alchemy=False),
+        out_dir=tmp_path,
+        models={BenchTier.SD15: "Deliberate", BenchTier.SDXL: "AlbedoBase XL (SDXL)"},
+        only_probe="sd15-threads-2",
+        worker_factory=FaultingConfirmationWorker,
+    ).run_async()
+    confirmations = [item for item in report.evidence if item.combined_validation]
+    assert confirmations
+    assert all(item.profile.threads == 2 for item in confirmations)
+    assert all(item.status is EvidenceStatus.MEASURED_FAILURE for item in confirmations)
     assert not report.suggested_bridge_data.safe_to_apply
 
 
@@ -1167,8 +1302,9 @@ def test_targeted_large_thread_check_reserves_confirmation_and_follow_up() -> No
     ]
     jobs = derived_work_budget(cases, validate=True, options=CatalogOptions(tiers=[BenchTier.SD15]), targeted=True)
     # The check runs 32 jobs at one lane and 32 at sixteen threads, the overlap follow-up repeats only the
-    # sixteen-thread run, and the confirmation runs only sixteen threads.
-    assert jobs == 1 + 64 + 32 + 32
+    # sixteen-thread run, the confirmation runs only sixteen threads, and its single-thread follow-up runs one
+    # job.
+    assert jobs == 1 + 64 + 32 + 32 + 1
 
 
 def test_default_thread_reservation_stops_at_the_installed_model_count() -> None:

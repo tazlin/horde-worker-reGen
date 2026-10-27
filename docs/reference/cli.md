@@ -299,6 +299,18 @@ lease settings its thread check ranked. Its result does not depend on the wall-c
 lane-equivalent references come from the thread check's single-lane jobs of the same model and
 shape.
 
+The combined-settings confirmation is priced before it runs. The largest passed resolution and batch are
+forecast together with the worker's own sampling-VRAM estimate, one job per lane, against the card's total
+minus the arbiter's admission margin. A joint the worker could not admit is reduced along the passed rungs,
+resolution first and then batch, and the report notes each reduction. Resolution goes first because batch
+jobs are a large share of production pops while jobs near the largest resolutions are rare. Without this, a
+joint of two limits that each passed alone can price above the card, wait out the clearance timeout and
+sample unpriced.
+A joint on two or more lanes that is unconfirmed only for a thread reason (no overlap, a lane-equivalent
+throughput below one lane, or an unmeasured or noise-level wall gain) is run once more at one thread with the
+same shape, so its batch, resolution and queue size still confirm. The work limit reserves that follow-up for
+every multi-lane joint.
+
 The two runs are compared by throughput: image-job megapixelsteps divided by elapsed time from the
 earliest pop to the latest finalization. This includes time spent loading, encoding, checking safety
 and submitting results. When any job lacks either timestamp, the run uses the sampling windows'
@@ -307,7 +319,8 @@ throughput. It must exceed one and reach one plus the noise margin, the median a
 the single-lane jobs' pop-to-finalize times over their median. The report and the progress line
 state the gain and the jobs per minute of both runs for the tested shape. A gain within the margin
 is inconclusive with `wall_gain_below_noise`. A check whose jobs did not report the timestamps or
-the megapixelsteps is inconclusive with `throughput_unmeasured`.
+the megapixelsteps is inconclusive with `throughput_unmeasured`. A check with an image job that waited
+out the clearance lease, or sampled without a grant, is inconclusive with `clearance_timeout`.
 
 Confirmation also requires observed denoise overlap to reach the slot count permitted by the second
 run's lease. Lanes beyond the slots stage the next job and are reported as such. With the operator's

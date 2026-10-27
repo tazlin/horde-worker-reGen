@@ -28,6 +28,8 @@ from horde_worker_regen.benchmark.enums import BenchTier
 from horde_worker_regen.benchmark.ladder import _TIER_BASELINES, _TIER_RESOLUTIONS, BENCH_TIER_MODELS, HUGE_TIERS
 from horde_worker_regen.benchmark.scenarios import CannedAlchemyFormSpec, CannedImageJobSpec, Scenario
 from horde_worker_regen.model_download_plan import is_model_present
+from horde_worker_regen.process_management.resources.admission_identity import admission_margin_mb
+from horde_worker_regen.process_management.resources.resource_budget import predict_job_sampling_vram_mb
 
 
 def _eligible_model_records(
@@ -133,6 +135,8 @@ class AssessmentCase:
     capability: Capability
     profile: OperatingProfile
     combined: bool = False
+    notes: tuple[str, ...] = ()
+    """What the policy changed about the workload while building it, for the report."""
 
     @property
     def case_id(self) -> str:
@@ -289,8 +293,19 @@ def assessment_priority(case: AssessmentCase) -> int:
     return 2
 
 
-def combined_case(evidence: list[WorkloadEvidence], *, device: int, tier: BenchTier) -> AssessmentCase | None:
-    """Build a combined workload from successful checks, ready for an independent confirmation."""
+def combined_case(
+    evidence: list[WorkloadEvidence], *, device: int, tier: BenchTier, card_total_mb: float | None = None
+) -> AssessmentCase | None:
+    """Build a combined workload from successful checks, ready for an independent confirmation.
+
+    Args:
+        evidence: Every check run so far.
+        device: The card the confirmation runs on.
+        tier: The model family being confirmed.
+        card_total_mb: The card's total VRAM. When given, a joint the worker's own forecast cannot admit
+            is stepped down through passed rungs until it fits, and each reduction is recorded in
+            ``AssessmentCase.notes``. None leaves the joint at the largest passed limits.
+    """
     passed = [
         item
         for item in evidence
@@ -319,7 +334,7 @@ def combined_case(evidence: list[WorkloadEvidence], *, device: int, tier: BenchT
     widest = max(limits, key=lambda item: item.profile.threads).profile
     threads = widest.threads
     queue_size = max(item.profile.queue_size for item in limits)
-    return AssessmentCase(
+    case = AssessmentCase(
         Capability(tier=tier, kind=CapabilityKind.SUSTAINED),
         anchor.model_copy(
             update={
@@ -335,6 +350,75 @@ def combined_case(evidence: list[WorkloadEvidence], *, device: int, tier: BenchT
         ),
         combined=True,
     )
+    if card_total_mb is None:
+        return case
+    baselines = {item.profile.model_name: _TIER_BASELINES[item.profile.tier] for item in evidence}
+    return _fit_to_card(case, [item.profile for item in limits], baselines, card_total_mb)
+
+
+def _joint_sampling_forecast_mb(profile: OperatingProfile, baselines: Mapping[str, str]) -> float | None:
+    """Return the worker's sampling forecast for one job per lane, summed, or None when any lane is unpriced.
+
+    The lanes of a confirmation sample beside each other, so the card holds every lane's job at once.
+    """
+    lanes = AssessmentCase(
+        Capability(tier=profile.tier, kind=CapabilityKind.SUSTAINED),
+        profile.model_copy(update={"work_jobs": profile.threads}),
+    )
+    total_mb = 0.0
+    for job in lanes.scenario().expand_image_jobs():
+        forecast_mb = predict_job_sampling_vram_mb(job, baselines.get(job.model or "", _TIER_BASELINES[profile.tier]))
+        if forecast_mb is None:
+            return None
+        total_mb += forecast_mb
+    return total_mb
+
+
+def _fit_to_card(
+    case: AssessmentCase,
+    passed: list[OperatingProfile],
+    baselines: Mapping[str, str],
+    card_total_mb: float,
+) -> AssessmentCase:
+    """Step a joint workload down through passed rungs until the worker's own forecast fits the card.
+
+    Each limit passed alone, but the joint of the largest resolution and the largest batch can exceed what
+    the worker admits. The worker then holds the job for the whole lease-acquire timeout and samples it
+    unpriced, so the confirmation measures that wait rather than a workload the worker serves. The resolution
+    steps down one passed rung at a time first, because batch jobs are a large share of production pops while
+    jobs near the largest resolutions are rare. The batch steps down only once the resolution is at its
+    smallest passed rung. A forecast that is not available leaves the workload as built.
+    """
+    usable_mb = card_total_mb - admission_margin_mb(card_total_mb)
+    batches = sorted({profile.batch for profile in passed})
+    sizes = sorted({(profile.width, profile.height) for profile in passed}, key=lambda size: size[0] * size[1])
+    profile = case.profile
+    notes: list[str] = []
+    while True:
+        forecast_mb = _joint_sampling_forecast_mb(profile, baselines)
+        if forecast_mb is None or forecast_mb <= usable_mb:
+            break
+        reason = (
+            f"the worker forecasts {forecast_mb:.0f} MB against {usable_mb:.0f} MB usable "
+            f"on a {card_total_mb:.0f} MB card"
+        )
+        smaller_sizes = [size for size in sizes if size[0] * size[1] < profile.width * profile.height]
+        if smaller_sizes:
+            width, height = smaller_sizes[-1]
+            notes.append(f"Reduced the resolution {profile.width}x{profile.height} to {width}x{height}: {reason}.")
+            profile = profile.model_copy(update={"width": width, "height": height})
+            continue
+        smaller_batches = [batch for batch in batches if batch < profile.batch]
+        if smaller_batches:
+            notes.append(f"Reduced the batch {profile.batch} to {smaller_batches[-1]}: {reason}.")
+            profile = profile.model_copy(update={"batch": smaller_batches[-1]})
+            continue
+        # The operator still needs a confirmation of what passed, so the smallest passed shape runs anyway.
+        notes.append(f"Confirming the baseline shape although {reason}.")
+        break
+    if not notes:
+        return case
+    return AssessmentCase(case.capability, profile, combined=case.combined, notes=(*case.notes, *notes))
 
 
 def measured_recommendation(evidence: list[WorkloadEvidence], *, per_card: bool = False) -> SuggestedBridgeData:

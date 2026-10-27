@@ -9,9 +9,10 @@ import pytest
 from horde_model_reference.meta_consts import MODEL_REFERENCE_CATEGORY
 from horde_model_reference.model_reference_manager import ModelReferenceManager
 from horde_model_reference.model_reference_records import ImageGenerationModelRecord
-from horde_sdk.ai_horde_api.apimodels import ImageStatsModelsResponse
+from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse, ImageStatsModelsResponse
 from ruamel.yaml import YAML
 
+from horde_worker_regen.benchmark import assessment_policy
 from horde_worker_regen.benchmark.assessment_policy import (
     AssessmentCase,
     _eligible_model_records,
@@ -35,6 +36,7 @@ from horde_worker_regen.benchmark.capabilities.result import (
 )
 from horde_worker_regen.benchmark.enums import BenchTier
 from horde_worker_regen.benchmark.ladder import HUGE_TIERS
+from horde_worker_regen.process_management.resources.admission_identity import admission_margin_mb
 from horde_worker_regen.tui.benchmark_launcher import apply_suggested_to_config
 
 
@@ -387,6 +389,116 @@ def test_queue_confirmation_offers_enough_jobs_to_fill_the_queue() -> None:
     case = combined_case([baseline, queued], device=0, tier=BenchTier.SD15)
     assert case is not None and case.profile.queue_size == 2
     assert case.work_count == len(case.scenario().expand_image_jobs()) == 3
+
+
+def _tile_forecast(job: ImageGenerateJobPopResponse, baseline: str | None) -> float:
+    """Price a job at one MB per 64x64 latent tile per image, so each test can size a card exactly."""
+    return float((job.payload.width // 64) * (job.payload.height // 64) * job.payload.n_iter)
+
+
+def _sdxl_climbs() -> list[WorkloadEvidence]:
+    """Return SDXL evidence whose resolution climb reached 1984 and whose batch climb reached four, separately."""
+    baseline = _evidence(tier=BenchTier.SDXL)
+    baseline.profile.width = baseline.profile.height = 1024
+    climbs = [baseline]
+    for width in (1408, 1984):
+        rung = _evidence(tier=BenchTier.SDXL, kind=CapabilityKind.RESOLUTION)
+        rung.profile.width = rung.profile.height = width
+        climbs.append(rung)
+    for batch in (2, 4):
+        rung = _evidence(tier=BenchTier.SDXL, kind=CapabilityKind.BATCH, batch=batch)
+        rung.profile.width = rung.profile.height = 1024
+        climbs.append(rung)
+    return climbs
+
+
+# Below 10240 MB the admission margin is its 512 MB floor on every platform, so these totals are exact.
+_MARGIN_FLOOR_MB = 512
+
+
+def test_joint_confirmation_without_a_card_total_keeps_the_independent_maxima(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With no card total the joint takes the largest passed resolution and batch whatever they are forecast at."""
+    monkeypatch.setattr(assessment_policy, "predict_job_sampling_vram_mb", _tile_forecast)
+    case = combined_case(_sdxl_climbs(), device=0, tier=BenchTier.SDXL)
+    assert case is not None
+    assert (case.profile.width, case.profile.batch) == (1984, 4)
+    assert case.notes == ()
+
+
+def test_joint_confirmation_that_fits_the_card_is_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A joint whose forecast fits the usable card is confirmed as built, with nothing recorded."""
+    monkeypatch.setattr(assessment_policy, "predict_job_sampling_vram_mb", _tile_forecast)
+    case = combined_case(_sdxl_climbs(), device=0, tier=BenchTier.SDXL, card_total_mb=_MARGIN_FLOOR_MB + 3844)
+    assert case is not None
+    assert (case.profile.width, case.profile.batch) == (1984, 4)
+    assert case.notes == ()
+
+
+def test_joint_confirmation_over_the_card_gives_back_resolution_first(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A joint forecast above the card steps the resolution down a passed rung before touching the batch."""
+    monkeypatch.setattr(assessment_policy, "predict_job_sampling_vram_mb", _tile_forecast)
+    # At batch four 1984x1984 forecasts 3844 MB and 1408x1408 forecasts 1936 MB.
+    case = combined_case(_sdxl_climbs(), device=0, tier=BenchTier.SDXL, card_total_mb=_MARGIN_FLOOR_MB + 3000)
+    assert case is not None
+    assert (case.profile.width, case.profile.height, case.profile.batch) == (1408, 1408, 4)
+    assert len(case.notes) == 1 and "1984x1984 to 1408x1408" in case.notes[0]
+
+
+def test_joint_confirmation_too_large_at_the_smallest_resolution_steps_the_batch_down(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Once the resolution is at its smallest passed rung the batch steps down one passed rung at a time."""
+    monkeypatch.setattr(assessment_policy, "predict_job_sampling_vram_mb", _tile_forecast)
+    # 1024x1024 at batch four forecasts 1024 MB and at batch two 512 MB.
+    case = combined_case(_sdxl_climbs(), device=0, tier=BenchTier.SDXL, card_total_mb=_MARGIN_FLOOR_MB + 700)
+    assert case is not None
+    assert (case.profile.width, case.profile.height, case.profile.batch) == (1024, 1024, 2)
+    assert [note.split(":")[0] for note in case.notes] == [
+        "Reduced the resolution 1984x1984 to 1408x1408",
+        "Reduced the resolution 1408x1408 to 1024x1024",
+        "Reduced the batch 4 to 2",
+    ]
+
+
+def test_joint_confirmation_that_never_fits_confirms_the_baseline_shape(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When even the baseline shape is forecast over the card the confirmation still runs it, and says so."""
+    monkeypatch.setattr(assessment_policy, "predict_job_sampling_vram_mb", _tile_forecast)
+    case = combined_case(_sdxl_climbs(), device=0, tier=BenchTier.SDXL, card_total_mb=_MARGIN_FLOOR_MB + 100)
+    assert case is not None and case.combined
+    assert (case.profile.width, case.profile.height, case.profile.batch) == (1024, 1024, 1)
+    assert "baseline shape" in case.notes[-1]
+
+
+def test_joint_confirmation_prices_every_lane_together(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Lanes sample beside each other, so the joint is priced as the sum of each lane's job."""
+    monkeypatch.setattr(assessment_policy, "predict_job_sampling_vram_mb", _tile_forecast)
+    baseline = _evidence(tier=BenchTier.SDXL)
+    baseline.profile.width = baseline.profile.height = 1024
+    batch = _evidence(tier=BenchTier.SDXL, kind=CapabilityKind.BATCH, batch=2)
+    batch.profile.width = batch.profile.height = 1024
+    threads = _evidence(tier=BenchTier.SDXL, kind=CapabilityKind.THREADS, threads=2)
+    threads.profile.width = threads.profile.height = 1024
+    threads.profile.companion_model = "other-model"
+    # One lane at batch two forecasts 512 MB and fits alone; two lanes forecast 1024 MB and do not.
+    case = combined_case(
+        [baseline, batch, threads], device=0, tier=BenchTier.SDXL, card_total_mb=_MARGIN_FLOOR_MB + 800
+    )
+    assert case is not None
+    assert (case.profile.threads, case.profile.batch) == (2, 1)
+    assert case.profile.companion_model == "other-model"
+
+
+def test_worker_forecast_keeps_the_sdxl_batch_on_a_16_gb_card() -> None:
+    """Priced with the worker's own forecast, the SDXL joint on a 16 GB card keeps batch four at 1024x1024."""
+    card_total_mb = 16375.0
+    case = combined_case(_sdxl_climbs(), device=0, tier=BenchTier.SDXL, card_total_mb=card_total_mb)
+    assert case is not None and case.notes
+    # Batch four forecasts above the usable room at 1408x1408 and inside it at 1024x1024.
+    assert (case.profile.width, case.profile.height, case.profile.batch) == (1024, 1024, 4)
+    usable_mb = card_total_mb - admission_margin_mb(card_total_mb)
+    lane_jobs = AssessmentCase(case.capability, case.profile.model_copy(update={"work_jobs": 1})).scenario()
+    forecast = assessment_policy.predict_job_sampling_vram_mb(lane_jobs.expand_image_jobs()[0], "stable_diffusion_xl")
+    assert forecast is not None and forecast <= usable_mb
 
 
 @pytest.mark.parametrize("per_card", [False, True])

@@ -349,6 +349,8 @@ def _render_assessment(report: CapabilityReport) -> str:
         if item.reason_code == "not_applicable":
             status = "Not applicable"
         detail = item.reason.replace("|", "/").replace("\n", " ")
+        if item.notes:
+            detail = " ".join(item.notes) + " " + detail
         scope = (
             f"shared worker (image card {profile.device_index})"
             if profile.alchemy_forms

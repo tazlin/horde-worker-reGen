@@ -11,7 +11,7 @@ import time
 import uuid
 from collections.abc import Callable, Mapping
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from statistics import median
 from typing import IO, Protocol
@@ -80,6 +80,7 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
 )
 from horde_worker_regen.process_management.models.feature_readiness import GatedFeature
 from horde_worker_regen.process_management.resources.run_metrics import JobMetricsRecord
+from horde_worker_regen.process_management.scheduling.clearance_lease import CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS
 from horde_worker_regen.process_management.scheduling.workload_flow import WorkloadKind
 
 
@@ -97,6 +98,17 @@ class AssessmentWorker(Protocol):
 
     def alive(self) -> bool:
         """Whether the worker can still make progress."""
+
+
+def _card_total_mb(service: LocalHorde, device: int) -> float | None:
+    """Return the card's total VRAM from the worker's snapshot, or None before the worker has reported it."""
+    snapshot = service.snapshot
+    if snapshot is None:
+        return None
+    for card in snapshot.per_card:
+        if card.device_index == device and card.total_vram_mb is not None:
+            return float(card.total_vram_mb)
+    return None
 
 
 def _probe_storage(worker: AssessmentWorker) -> dict[str, bool | None]:
@@ -130,8 +142,56 @@ even when total job throughput improved."""
 SINGLE_LANE_WALL_GAIN = 1.0
 """The reference throughput ratio for comparing multiple lanes with one lane."""
 
+THREAD_COUNT_REASON_CODES = frozenset(
+    {"sampling_not_overlapped", "throughput_below_single_lane", "throughput_unmeasured", "wall_gain_below_noise"}
+)
+"""The reason codes of a check whose thread count was not confirmed while its other limits ran cleanly."""
+
 _FINALIZED_STAGE = "FINALIZED"
 """The ``stage_timestamps`` key the parent stamps when a job's record is finalized after submit."""
+
+
+@dataclass(frozen=True)
+class ClearanceWait:
+    """The time one image job's child blocked on the clearance lease, as the child measured it."""
+
+    seconds: float
+    timed_out: bool
+    record: JobMetricsRecord
+
+    @property
+    def reached_timeout(self) -> bool:
+        """Whether the job sampled without a grant or waited at least the lease-acquire timeout.
+
+        A child held that long samples unpriced, so the job's completion does not show that the card can serve
+        the settings.
+        """
+        return self.timed_out or self.seconds >= CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS
+
+
+def clearance_waits(records: list[JobMetricsRecord]) -> list[ClearanceWait]:
+    """Return the clearance wait of each image job whose child blocked on the lease or went without a grant."""
+    waits: list[ClearanceWait] = []
+    for record in records:
+        window = record.sampling_window
+        if record.workload is not WorkloadKind.IMAGE_GENERATION or window is None:
+            continue
+        if window.lease_wait_seconds <= 0 and not window.lease_timed_out:
+            continue
+        waits.append(ClearanceWait(seconds=window.lease_wait_seconds, timed_out=window.lease_timed_out, record=record))
+    return waits
+
+
+def describe_clearance_timeout(wait: ClearanceWait) -> str:
+    """Return the reason a check whose job sampled only after the clearance timeout is not confirmed."""
+    record = wait.record
+    size = f"{record.width}x{record.height}" if record.width is not None and record.height is not None else None
+    shape = ", ".join(part for part in (record.model_name, size, f"batch {record.batch_count}") if part is not None)
+    return (
+        f"The worker could not price a job ({shape}) and sampled it only after the clearance timeout. "
+        f"It waited {wait.seconds:.0f} s for the clearance lease, against a "
+        f"{CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS:.0f} s timeout. The settings were not confirmed"
+    )
 
 
 @dataclass(frozen=True)
@@ -439,6 +499,42 @@ def model_loading_summaries(records: list[JobMetricsRecord]) -> list[ModelLoadin
     return list(models.values())
 
 
+def _single_lane_joint_jobs(queue_size: int) -> int:
+    """Return the jobs a one-lane joint offers, enough to fill its queue once when the queue is deeper than one."""
+    return queue_size + 1 if queue_size > 1 else 1
+
+
+def _single_thread_follow_up(case: AssessmentCase) -> AssessmentCase:
+    """Return a multi-lane joint workload at one thread, so its batch, resolution and queue size can confirm alone.
+
+    The capability magnitude carries the thread count, so the follow-up's evidence id differs from the joint's
+    and the report keeps both.
+    """
+    return replace(
+        case,
+        capability=case.capability.model_copy(update={"magnitude": 1}),
+        profile=case.profile.model_copy(
+            update={
+                "threads": 1,
+                "lease_slots": None,
+                "companion_model": None,
+                "work_jobs": _single_lane_joint_jobs(case.profile.queue_size),
+            }
+        ),
+        notes=(
+            *case.notes,
+            f"Repeats the combined settings at one thread because the run at {case.profile.threads} threads "
+            "did not confirm them.",
+        ),
+    )
+
+
+def _confirmation_work_count(case: AssessmentCase) -> int:
+    """Return the jobs a combined confirmation may offer, counting a multi-lane joint's single-thread follow-up."""
+    follow_up = _single_thread_follow_up(case).check_work_count if case.profile.threads > 1 else 0
+    return case.check_work_count + follow_up
+
+
 def derived_work_budget(
     cases: list[AssessmentCase],
     *,
@@ -450,7 +546,8 @@ def derived_work_budget(
     """Reserve representative work, two capacity checks per axis and one follow-up for overlap.
 
     A concurrency check offers two jobs per thread at one lane and again at its thread count, and its overlap
-    follow-up repeats only the second run. The combined confirmation runs only its thread count.
+    follow-up repeats only the second run. The combined confirmation runs only its thread count, and a multi-lane
+    joint keeps room to repeat at one thread.
     """
     anchors = [case for case in cases if case.capability.kind is CapabilityKind.BASELINE]
     total = sum(case.profile.threads * 2 * 2 if case.profile.threads > 1 else case.work_count for case in cases)
@@ -476,6 +573,7 @@ def derived_work_budget(
         )
         if queue_size > 1:
             confirmation_jobs = max(confirmation_jobs, threads + queue_size)
+        multi_lane = threads > 1
         if not targeted:
             for kind in (CapabilityKind.BATCH, CapabilityKind.THREADS, CapabilityKind.RESOLUTION):
                 if kind in options.excluded_kinds:
@@ -494,10 +592,11 @@ def derived_work_budget(
                         jobs = magnitude * 2
                         total += jobs * 3
                         confirmation_jobs = max(confirmation_jobs, jobs)
+                        multi_lane = True
                     else:
                         total += 1
         if validate:
-            total += confirmation_jobs
+            total += confirmation_jobs + (_single_lane_joint_jobs(queue_size) if multi_lane else 0)
     # Explicit thread probes still need their optional follow-up and two jobs per thread.
     if targeted:
         total += sum(case.profile.threads * 2 for case in cases if case.profile.threads > 1)
@@ -1346,9 +1445,14 @@ class OperatorAssessment:
                 )
             self._plan(case)
             required = case.check_work_count
-            confirmations = [combined_case(evidence, device=device, tier=tier) for device, tier in anchors]
+            confirmations = [
+                combined_case(evidence, device=device, tier=tier, card_total_mb=_card_total_mb(service, device))
+                for device, tier in anchors
+            ]
             reserve = (
-                sum(item.check_work_count if item is not None else 1 for item in confirmations) if self.validate else 0
+                sum(_confirmation_work_count(item) if item is not None else 1 for item in confirmations)
+                if self.validate
+                else 0
             )
             baseline_passed = any(
                 item.capability.kind is CapabilityKind.BASELINE
@@ -1494,36 +1598,60 @@ class OperatorAssessment:
             return
         confirmations = []
         for device, tier in sorted(anchors):
-            case = combined_case(evidence, device=device, tier=tier)
+            case = combined_case(evidence, device=device, tier=tier, card_total_mb=_card_total_mb(service, device))
             if case is None:
                 continue
             if case.profile.threads > 1:
-                case = AssessmentCase(
-                    case.capability, case.profile.model_copy(update={"work_jobs": case.profile.threads * 2}), True
-                )
+                case = replace(case, profile=case.profile.model_copy(update={"work_jobs": case.profile.threads * 2}))
             confirmations.append(case)
         for confirmation_index, case in enumerate(confirmations):
-            self._plan(case)
-            required = case.check_work_count
-            if not worker.alive() or worker_unresponsive(service):
-                code, reason = (
-                    ("worker_exited", "Not tested: the worker exited")
-                    if not worker.alive()
-                    else ("worker_unresponsive", "Not tested: the worker stopped responding")
-                )
-                item = self._unknown(case, reason).model_copy(update={"reason_code": code})
-                evidence.append(item)
-                self._finish(item)
+            reserve = sum(_confirmation_work_count(pending) for pending in confirmations[confirmation_index + 1 :])
+            follow_up = _single_thread_follow_up(case) if case.profile.threads > 1 else None
+            result = await self._confirm(
+                service,
+                worker,
+                case,
+                deadline,
+                reserved_jobs=reserve + (follow_up.check_work_count if follow_up is not None else 0),
+            )
+            evidence.append(result)
+            # A joint refused only for its thread count still carries batch, resolution and queue limits that
+            # one lane can confirm. A follow-up is at one thread, so it is never followed up.
+            if (
+                follow_up is None
+                or result.status is EvidenceStatus.MEASURED_SUCCESS
+                or result.reason_code not in THREAD_COUNT_REASON_CODES
+            ):
                 continue
-            if time.monotonic() >= deadline or self.budget.jobs_offered + required > self.budget.max_jobs:
-                item = self._unknown(
-                    case, "Not tested: the remaining work or time limit does not allow confirmation"
-                ).model_copy(update={"reason_code": "confirmation_limit"})
-                evidence.append(item)
-                self._finish(item)
-                continue
-            reserve = sum(pending.check_work_count for pending in confirmations[confirmation_index + 1 :])
-            evidence.append(await self._execute(service, worker, case, deadline, reserved_jobs=reserve))
+            evidence.append(await self._confirm(service, worker, follow_up, deadline, reserved_jobs=reserve))
+
+    async def _confirm(
+        self,
+        service: LocalHorde,
+        worker: AssessmentWorker,
+        case: AssessmentCase,
+        deadline: float,
+        *,
+        reserved_jobs: int,
+    ) -> WorkloadEvidence:
+        """Run one combined confirmation, or record why the worker, time or work limit does not allow it."""
+        self._plan(case)
+        if not worker.alive() or worker_unresponsive(service):
+            code, reason = (
+                ("worker_exited", "Not tested: the worker exited")
+                if not worker.alive()
+                else ("worker_unresponsive", "Not tested: the worker stopped responding")
+            )
+            item = self._unknown(case, reason).model_copy(update={"reason_code": code})
+            self._finish(item)
+            return item
+        if time.monotonic() >= deadline or self.budget.jobs_offered + case.check_work_count > self.budget.max_jobs:
+            item = self._unknown(
+                case, "Not tested: the remaining work or time limit does not allow confirmation"
+            ).model_copy(update={"reason_code": "confirmation_limit"})
+            self._finish(item)
+            return item
+        return await self._execute(service, worker, case, deadline, reserved_jobs=reserved_jobs)
 
     def _configured_lease_slots(self) -> int | None:
         value = self._source_config.get("gpu_sampling_lease_slots")
@@ -1580,6 +1708,7 @@ class OperatorAssessment:
             reason=reason,
             scope=EvidenceScope.SHARED_WORKER if case.profile.alchemy_forms else EvidenceScope.CARD,
             combined_validation=case.combined,
+            notes=list(case.notes),
         )
 
     def _finish(self, result: WorkloadEvidence) -> None:
@@ -1885,12 +2014,11 @@ class OperatorAssessment:
             # Double the baseline steps so sampling lasts beyond pop and dispatch delays on warm lanes.
             # Covering a full model load would make these checks too long. The follow-up reuses this count.
             maximum = self._source_config.get("max_steps", 150)
-            case = AssessmentCase(
-                case.capability,
-                case.profile.model_copy(
+            case = replace(
+                case,
+                profile=case.profile.model_copy(
                     update={"steps": min(int(maximum) if isinstance(maximum, int) else 150, case.profile.steps * 2)}
                 ),
-                case.combined,
             )
         self._plan(case)
         concurrent = case.profile.threads > 1
@@ -2035,6 +2163,15 @@ class OperatorAssessment:
             # The thread-count run is not offered after a faulted or unfinished single-lane run, and a check that
             # did not run it says nothing about overlap or throughput.
             checked = complete and bool(check_ids)
+            lease_waits = clearance_waits(image_records)
+            longest_lease_wait = max(lease_waits, key=lambda wait: wait.seconds, default=None)
+            late_sampling = (
+                max(
+                    (wait for wait in lease_waits if wait.reached_timeout), key=lambda wait: wait.seconds, default=None
+                )
+                if checked
+                else None
+            )
             shortfall = (
                 self._thread_count_shortfall(
                     case.profile,
@@ -2079,6 +2216,7 @@ class OperatorAssessment:
                 and not retried
                 and retry_provenance_complete
                 and peaks
+                and late_sampling is None
                 and concurrency_confirmed
                 and shortfall is None
                 else EvidenceStatus.UNKNOWN
@@ -2126,6 +2264,8 @@ class OperatorAssessment:
                     "This run could not confirm the settings."
                 )
                 if complete and not retry_provenance_complete
+                else describe_clearance_timeout(late_sampling)
+                if late_sampling is not None
                 else (
                     f"Jobs finished, but at most {concurrency} of {expected_concurrency} sampling threads overlapped. "
                     "Concurrent sampling was not confirmed"
@@ -2170,6 +2310,7 @@ class OperatorAssessment:
                 elapsed_seconds=time.monotonic() - started,
                 configure_seconds=configure_seconds,
                 sampling_seconds=self._sampling_seconds_total(ids),
+                clearance_wait_seconds=longest_lease_wait.seconds if longest_lease_wait is not None else None,
                 recoveries=recovered,
                 inference_failures=inference_failures,
                 resource_failures=resource_failures,
@@ -2192,9 +2333,12 @@ class OperatorAssessment:
                 device_peak_mb=max(peaks) if peaks else None,
                 ram_peak_mb=max(ram) if ram else None,
                 combined_validation=case.combined,
+                notes=list(case.notes),
                 attempted=True,
                 reason_code="unavailable"
                 if unavailable_forms
+                else "clearance_timeout"
+                if late_sampling is not None
                 else "sampling_not_overlapped"
                 if checked and not concurrency_confirmed
                 else shortfall[0]
