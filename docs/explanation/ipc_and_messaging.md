@@ -100,6 +100,18 @@ same id, the aggregator retains them as separate stage records
 correlation; the monolithic inference emission covers an entire job in one process and
 stays untagged (`stage is None`).
 
+Image inference also attaches an optional `SamplingWindow` to that metrics message. The child stamps
+its first and last reported sampling steps on the host's shared monotonic clock. The aggregator
+retains that window and the sampling card on the finalized `JobMetricsRecord`, including the SAMPLE
+stage of a disaggregated job. The operator assessment uses overlapping windows to establish actual
+sampling concurrency; configured limits, loading and decode overlap cannot establish it. Older records
+without the optional window remain readable and provide no concurrency proof.
+
+At finalization the parent also exports the tracker's `inference_attempts` (failed attempts, not total
+dispatches), `resource_failures`, `degraded_retry_used` and `host_commit_refusals`. These values survive
+successful retries, so an eventual success does not erase the recovery it required. Older records
+and non-image workloads leave these fields null. The ordinary retry policy is unchanged.
+
 When the operator opts into the RAM component cache (`component_cache_budget_mb`),
 each GPU child attaches a `held_components` list to its periodic memory report: one
 `HeldComponentSnapshot` (`kind`, `identity`, `approx_ram_mb`) per resident cache entry.

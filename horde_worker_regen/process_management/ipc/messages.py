@@ -552,6 +552,17 @@ class PipelineStageTag(StrEnum):
     """Final images decoded from the sampled latent by the VAE lane."""
 
 
+class SamplingWindow(BaseModel):
+    """Child-stamped first/last sampling progress on the host's shared monotonic clock.
+
+    This interval excludes loading and decode. It proves observed overlap conservatively: work before
+    the first reported step and after the last reported step is deliberately omitted.
+    """
+
+    first_step: float
+    last_step: float
+
+
 class HordeJobMetricsMessage(HordeProcessMessage):
     """Per-job performance metrics, sent by a child right after a job (or alchemy form) finishes.
 
@@ -569,6 +580,7 @@ class HordeJobMetricsMessage(HordeProcessMessage):
     or otherwise unstaged emission. Additive over IPC: an older consumer that lacks the field ignores it."""
     phase_metrics: JobPhaseMetrics
     """The per-job metrics snapshot from hordelib."""
+    sampling_window: SamplingWindow | None = None
 
 
 class HordeDownloadMetricsMessage(HordeProcessMessage):

@@ -37,6 +37,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeProcessState,
     HordeProcessStateChangeMessage,
     PipelineStageTag,
+    SamplingWindow,
     UnsupportedControlMessageError,
 )
 from horde_worker_regen.utils.private_memory import private_ram_usage_bytes
@@ -705,7 +706,9 @@ class HordeProcess(abc.ABC):
             logger.debug(f"Component restore request failed: {type(e).__name__} {e}")
             return False
 
-    def send_stage_job_metrics_message(self, job_id: str, *, stage: PipelineStageTag | None = None) -> None:
+    def send_stage_job_metrics_message(
+        self, job_id: str, *, stage: PipelineStageTag | None = None, sampling_window: SamplingWindow | None = None
+    ) -> None:
         """Drain hordelib's per-job metrics collector after a stage and forward the snapshot, stage-tagged.
 
         A disaggregated lane runs one pipeline stage of a job, so draining the collector here attributes
@@ -724,6 +727,7 @@ class HordeProcess(abc.ABC):
                     job_id=job_id,
                     stage=stage,
                     phase_metrics=get_metrics_collector().snapshot_and_reset_job(),
+                    sampling_window=sampling_window,
                 ),
             )
         except Exception as e:

@@ -17,6 +17,7 @@ from hordelib.api import ComfyUIProgress, ComfyUIProgressUnit, ProgressReport, P
 from horde_worker_regen.process_management.ipc.messages import (
     HordeHeartbeatType,
     HordeProcessHeartbeatMessage,
+    SamplingWindow,
 )
 from horde_worker_regen.process_management.workers.inference_process import HordeInferenceProcess
 from horde_worker_regen.process_management.workers.vae_lane_process import HordeVaeLaneProcess
@@ -48,10 +49,13 @@ class _SamplerHeartbeatFake:
 
     It deliberately omits the VAE-decode semaphore, the inference-slot release, and the
     ``_current_job_inference_steps_complete`` completion latch. If the emitter reached for any of that
-    machinery the attribute access would raise, so a green test proves the emitter never touches it.
+    state, attribute access would raise. This checks that sampling progress does not depend on decode or slot release.
     """
 
+    _note_sampling_step = HordeInferenceProcess._note_sampling_step
+
     def __init__(self) -> None:
+        self._sampling_window: SamplingWindow | None = None
         self._last_progress_step_seen: int | None = None
         self._nonadvancing_progress_repeats = 0
         self._last_job_inference_rate: str | None = None
@@ -87,6 +91,18 @@ def _emit_sample(fake: _SamplerHeartbeatFake, report: ProgressReport) -> None:
 
 class TestSampleStageEmitter:
     """The sample-stage emitter forwards step progress and never touches the VAE/slot handoff."""
+
+    def test_sampling_window_brackets_only_reported_sampling_steps(self) -> None:
+        """Sampling timestamps exist only after progress and advance through the terminal step."""
+        fake = _SamplerHeartbeatFake()
+        _emit_sample(fake, _progress(current_step=0, total_steps=30))
+        assert fake._sampling_window is None
+        _emit_sample(fake, _progress(current_step=1, total_steps=30))
+        assert fake._sampling_window is not None
+        first = fake._sampling_window.first_step
+        _emit_sample(fake, _progress(current_step=30, total_steps=30))
+        assert fake._sampling_window.first_step == first
+        assert fake._sampling_window.last_step >= first
 
     def test_advancing_step_emits_inference_step_with_populated_fields(self) -> None:
         """A mid-sampling step becomes an INFERENCE_STEP heartbeat carrying the step counts."""

@@ -17,6 +17,7 @@ from types import SimpleNamespace
 import pytest
 from hordelib.metrics import JobPhaseMetrics, ModelLoadEvent
 
+from horde_worker_regen.process_management.ipc.messages import SamplingWindow
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessState
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
@@ -1863,7 +1864,9 @@ class _SampleStageFake:
     def send_process_state_change_message(self, process_state: HordeProcessState, info: str = "") -> None:
         self.states.append(process_state)
 
-    def send_stage_job_metrics_message(self, job_id: str, *, stage: object) -> None:
+    def send_stage_job_metrics_message(
+        self, job_id: str, *, stage: object, sampling_window: SamplingWindow | None = None
+    ) -> None:
         return None
 
     @staticmethod

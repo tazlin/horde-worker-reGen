@@ -6180,7 +6180,8 @@ class HordeWorkerProcessManager:
 
     def _on_job_metrics(self, message: HordeJobMetricsMessage) -> None:
         """Fan a child's per-job metrics message out to the run metrics and the performance model."""
-        self._run_metrics.on_job_metrics(message)
+        process = self._process_map.get(message.process_id)
+        self._run_metrics.on_job_metrics(message, device_index=process.device_index if process is not None else None)
         self._performance_model.on_job_metrics(message)
 
     def _on_job_finalized(self, tracked: TrackedJob, completed_job_info: HordeJobInfo) -> None:

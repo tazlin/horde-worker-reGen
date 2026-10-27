@@ -309,14 +309,14 @@ class TrackedJob:
     a safety re-check). Drives the status dump's per-stage aging so a stuck stage shows a growing age."""
     inference_attempts: int = 0
     """How many inference attempts have failed for this job; bounds retry against ``max_inference_attempts``."""
+    resource_failures: int = 0
+    """How many failed inference attempts were classified as resource failures, retained through retries."""
     fault_reason: str | None = None
     """Why this job faulted, or None while it has not.
 
-    The same text the fault rides to the horde on, kept in plain form so the finalize observers can put it in
-    the job's metrics record. A faulted job carries no image and no stage marker naming its cause, so without
-    this a post-mortem can see only that the job faulted and has to reconstruct the reason from logs.
-    Cleared when a post-inference fault is withdrawn, so a job whose images were adopted after all does not
-    finalize carrying the reason it briefly held."""
+    Retain the text sent to the Horde so finalization observers can include it in the job's metrics.
+    Without this field, diagnosing a fault from the metrics requires reconstructing the cause from logs.
+    Clear it when a post-inference fault is withdrawn so an accepted result does not retain an obsolete reason."""
     fault_counted: bool = False
     """Whether this job has already been counted in the worker's faulted-job total.
 
@@ -2717,6 +2717,8 @@ class JobTracker:
         # retry (which clears the device for it) rather than a plain re-dispatch onto another
         # over-committed slot that would only kill a second process.
         resource_failure = is_resource_failure or tracked.admitted_over_budget
+        if resource_failure:
+            tracked.resource_failures += 1
 
         # A measured attempt belongs to one job/card pair. Any failed execution ends its continuation admit;
         # the arbiter's per-card one-shot prevents a replacement from repeating it on the same card. A resource

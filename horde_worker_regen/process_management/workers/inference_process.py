@@ -52,6 +52,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     PipelineStageTag,
     SamplerTruncationReport,
     SampleSliceResult,
+    SamplingWindow,
 )
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcess
 from horde_worker_regen.process_management.models.component_residency_map import holds_model
@@ -1017,6 +1018,8 @@ class HordeInferenceProcess(HordeProcess):
     _start_inference_time: float = 0.0
 
     _current_job_inference_steps_complete: bool = False
+    _sampling_window: SamplingWindow | None = None
+
     _first_step_report_sent: bool = False
     """Whether this job's first sampling step has sent its memory report.
 
@@ -1070,6 +1073,13 @@ class HordeInferenceProcess(HordeProcess):
     A dispatch that preloads its own model reads this to fault the job back for re-admission. Running the
     pipeline instead would load the checkpoint inside the job without the mapping guard, under the same host
     memory condition that refused the preload."""
+
+    def _note_sampling_step(self) -> None:
+        now = time.monotonic()
+        if self._sampling_window is None:
+            self._sampling_window = SamplingWindow(first_step=now, last_step=now)
+        else:
+            self._sampling_window.last_step = now
 
     def _send_inference_memory_report(self) -> None:
         """Send a precise boundary VRAM report at a stage transition (sampling done, VAE decode).
@@ -1132,6 +1142,9 @@ class HordeInferenceProcess(HordeProcess):
                 self._last_progress_step_seen = reported_step
 
         saturated_current_step, saturated_total_steps = reportable_step_counts(progress_report.comfyui_progress)
+
+        if reported_step is not None and reported_step > 0 and not self._current_job_inference_steps_complete:
+            self._note_sampling_step()
 
         if self._current_job_inference_steps_complete:
             if not self._vae_lock_was_acquired:
@@ -1235,6 +1248,8 @@ class HordeInferenceProcess(HordeProcess):
 
         comfyui_progress = progress_report.comfyui_progress
         reported_step = comfyui_progress.current_step if comfyui_progress is not None else None
+        if reported_step is not None and reported_step > 0:
+            self._note_sampling_step()
         if reported_step is not None:
             if reported_step == self._last_progress_step_seen:
                 self._nonadvancing_progress_repeats += 1
@@ -1289,6 +1304,7 @@ class HordeInferenceProcess(HordeProcess):
                     job_id=job_id,
                     is_alchemy=is_alchemy,
                     phase_metrics=get_metrics_collector().snapshot_and_reset_job(),
+                    sampling_window=self._sampling_window,
                 ),
             )
         except Exception as e:
@@ -1356,6 +1372,7 @@ class HordeInferenceProcess(HordeProcess):
         logger.info("Acquired inference semaphore.")
         self._is_busy = True
         self._current_job_inference_steps_complete = False
+        self._sampling_window = None
         self._first_step_report_sent = False
         self._inference_slot_released = False
         self._vae_lock_was_acquired = False
@@ -1524,6 +1541,7 @@ class HordeInferenceProcess(HordeProcess):
         self._retained_weights_evicted = False
 
         for job_slice in message.slices:
+            self._sampling_window = None
             # Reset the step-tracking state per slice so every slice in a batch emits its own step
             # progress from step one (the first step of a slice always differs from the prior slice's
             # final step, so the non-advancing watchdog counter also starts clean).
@@ -1570,7 +1588,9 @@ class HordeInferenceProcess(HordeProcess):
                 )
             # Drained per slice (success or fault) so the slice that triggered a UNet load owns the
             # load events; same-model siblings in the batch then correctly report none.
-            self.send_stage_job_metrics_message(str(job_slice.job_id), stage=PipelineStageTag.SAMPLE)
+            self.send_stage_job_metrics_message(
+                str(job_slice.job_id), stage=PipelineStageTag.SAMPLE, sampling_window=self._sampling_window
+            )
 
         self.process_message_queue.put(
             HordeSampleResultMessage(

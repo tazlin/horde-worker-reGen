@@ -71,6 +71,8 @@ async def test_resource_failure_earns_one_degraded_retry(job_tracker: JobTracker
     first = await job_tracker.handle_job_fault(faulted_job=job, is_resource_failure=True)  # pyrefly: ignore
     assert first is InferenceFailureResolution.RETRY_DEGRADED
     assert job_tracker.is_degraded_dispatch_pending(job) is True  # type: ignore[arg-type]
+    tracked = job_tracker.get_tracked_job(job.id_)  # type: ignore[union-attr]
+    assert tracked is not None and tracked.inference_attempts == tracked.resource_failures == 1
 
     # The scheduler consumes the degraded flag when it dispatches the isolated retry.
     job_tracker.clear_degraded_dispatch(job)  # type: ignore[arg-type]
@@ -81,6 +83,8 @@ async def test_resource_failure_earns_one_degraded_retry(job_tracker: JobTracker
     # The one degraded retry has been spent, so a further resource failure takes the ordinary retry.
     assert second is InferenceFailureResolution.RETRY
     assert job_tracker.is_degraded_dispatch_pending(job) is False  # type: ignore[arg-type]
+    assert tracked.inference_attempts == tracked.resource_failures == 2
+    assert tracked.degraded_retry_used
 
 
 async def test_disaggregated_structural_fault_latches_job_monolithic_on_requeue(job_tracker: JobTracker) -> None:

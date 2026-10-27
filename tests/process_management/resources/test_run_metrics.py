@@ -8,12 +8,13 @@ from pathlib import Path
 from horde_sdk.ai_horde_api import GENERATION_STATE
 from horde_sdk.ai_horde_api.apimodels import LorasPayloadEntry
 from hordelib.metrics import DownloadEvent, JobPhaseMetrics, ModelLoadEvent, SamplingStats
-from pytest import MonkeyPatch
+from pytest import MonkeyPatch, mark
 
 from horde_worker_regen.process_management.ipc.messages import (
     HordeDownloadMetricsMessage,
     HordeJobMetricsMessage,
     PipelineStageTag,
+    SamplingWindow,
 )
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
     RECENT_EVENTS_IN_SNAPSHOT,
@@ -75,6 +76,10 @@ def _finalize_job(
     post_processing_depth_at_dispatch: int | None = None,
     served_whole_card: bool | None = None,
     serving_process_age_seconds: float | None = None,
+    inference_attempts: int = 0,
+    resource_failures: int = 0,
+    degraded_retry_used: bool = False,
+    host_commit_refusals: int = 0,
 ) -> str:
     """Finalize a synthetic tracked job and return its job id string."""
     job = dummy_job_factory("Deliberate")
@@ -108,6 +113,10 @@ def _finalize_job(
         post_processing_depth_at_dispatch=post_processing_depth_at_dispatch,
         served_whole_card=served_whole_card,
         serving_process_age_seconds=serving_process_age_seconds,
+        inference_attempts=inference_attempts,
+        resource_failures=resource_failures,
+        degraded_retry_used=degraded_retry_used,
+        host_commit_refusals=host_commit_refusals,
     )
     job_info = HordeJobInfo(
         sdk_api_job_info=job,
@@ -120,6 +129,33 @@ def _finalize_job(
 
 class TestJobCorrelation:
     """Correlation of child-reported phase metrics with finalized jobs."""
+
+    def test_success_retains_prior_failed_and_degraded_attempts(self) -> None:
+        """An eventual success must export its original resource/retry history into the stats event."""
+        metrics = WorkerRunMetrics()
+        _finalize_job(
+            metrics, inference_attempts=1, resource_failures=1, degraded_retry_used=True, host_commit_refusals=2
+        )
+        record = metrics.snapshot().jobs[0]
+        assert not record.faulted
+        loaded = JobMetricsRecord.model_validate_json(record.model_dump_json())
+        assert loaded.inference_attempts == loaded.resource_failures == 1
+        assert loaded.degraded_retry_used and loaded.host_commit_refusals == 2
+
+    @mark.parametrize("stage", [None, PipelineStageTag.SAMPLE])
+    def test_sampling_window_and_card_survive_finalization(self, stage: PipelineStageTag | None) -> None:
+        """Both monolithic and disaggregated samples retain the child's interval on the terminal record."""
+        metrics = WorkerRunMetrics()
+        job = dummy_job_factory("Deliberate")
+        assert job.id_ is not None
+        window = SamplingWindow(first_step=10, last_step=12)
+        message = _job_metrics_message(str(job.id_)).model_copy(update={"stage": stage, "sampling_window": window})
+        metrics.on_job_metrics(message, device_index=2)
+        tracked = TrackedJob(job_id=job.id_, sdk_api_job_info=job, stage=JobStage.PENDING_SUBMIT)
+        metrics.on_job_finalized(tracked, HordeJobInfo(sdk_api_job_info=job, state=GENERATION_STATE.ok, time_popped=0))
+        record = metrics.snapshot().jobs[0]
+        assert record.device_index == 2 and record.sampling_window == window
+        assert not metrics._sampling_by_job
 
     def test_image_job_metrics_correlated_at_finalize(self) -> None:
         """A child report keyed by str(generation id) must end up on the finalized record."""

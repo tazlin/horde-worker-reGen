@@ -27,6 +27,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeDownloadMetricsMessage,
     HordeJobMetricsMessage,
     PipelineStageTag,
+    SamplingWindow,
 )
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
     RECENT_EVENTS_IN_SNAPSHOT,
@@ -206,6 +207,9 @@ class JobMetricsRecord(BaseModel):
     """The full metrics picture of one finished unit of work (an image job, an alchemy form, a text job)."""
 
     job_id: str
+    device_index: int | None = None
+    """Card that sampled this job, retained from the child's metrics report."""
+    sampling_window: SamplingWindow | None = None
     workload: WorkloadKind = WorkloadKind.IMAGE_GENERATION
     """Which flow produced this record.
 
@@ -213,12 +217,17 @@ class JobMetricsRecord(BaseModel):
     three workloads and a boolean can only partition two. Image-shaped fields (steps, resolution,
     megapixelsteps, sampler) stay at their defaults on a record from another workload."""
     faulted: bool = False
+    inference_attempts: int | None = None
+    """Failed image-inference attempts before finalization; None on old records or non-image workloads."""
+    resource_failures: int | None = None
+    degraded_retry_used: bool | None = None
+    host_commit_refusals: int | None = None
     fault_reason: str | None = None
     """Why the job faulted, as reported by the stage that faulted it, or None when it did not fault.
 
-    A faulted record otherwise names no cause, so reading a fault out of the stats stream meant correlating
-    it against the parent log by timestamp. Free-form text (an exception's type and message for a stage
-    failure, a sentence for a worker-side decision), so treat it as a diagnostic, not a key to group by."""
+    Retain the cause so a reader can diagnose the fault without correlating the record with the parent log.
+    The text may be an exception type and message or a worker-side explanation. Use it for diagnostics;
+    the free-form wording is unsuitable as a grouping key."""
     time_popped: float | None = None
     stage_timestamps: dict[str, float] = {}
     """Epoch time of first entry into each ``JobStage`` (plus ``FINALIZED``)."""
@@ -790,6 +799,8 @@ class WorkerRunMetrics:
         self._stage_metrics: list[JobMetricsRecord] = []
         self._downloads: list[DownloadEvent] = []
         self._phase_metrics_by_job: dict[str, JobPhaseMetrics] = {}
+        self._device_by_job: dict[str, int] = {}
+        self._sampling_by_job: dict[str, SamplingWindow] = {}
         self._vram_high_water_per_process: dict[int, int] = {}
         self._ram_high_water_per_process: dict[int, int] = {}
         self._crash_events: list[ProcessCrashRecord] = []
@@ -832,6 +843,8 @@ class WorkerRunMetrics:
         self._stage_metrics.clear()
         self._downloads.clear()
         self._phase_metrics_by_job.clear()
+        self._device_by_job.clear()
+        self._sampling_by_job.clear()
         self._vram_high_water_per_process.clear()
         self._ram_high_water_per_process.clear()
         self._crash_events.clear()
@@ -929,9 +942,13 @@ class WorkerRunMetrics:
         if times and times[0] < cutoff:
             self._churn_event_times[kind] = [t for t in times if t >= cutoff]
 
-    def on_job_metrics(self, message: HordeJobMetricsMessage) -> None:
+    def on_job_metrics(self, message: HordeJobMetricsMessage, *, device_index: int | None = None) -> None:
         """Handle a per-job metrics message from a child process."""
         metrics = message.phase_metrics
+        if message.sampling_window is not None and message.stage in (None, PipelineStageTag.SAMPLE):
+            self._sampling_by_job[message.job_id] = message.sampling_window
+        if device_index is not None and message.stage in (None, PipelineStageTag.SAMPLE):
+            self._device_by_job[message.job_id] = device_index
 
         if metrics.vram_used_high_water_mb is not None:
             current = self._vram_high_water_per_process.get(message.process_id, 0)
@@ -1034,7 +1051,13 @@ class WorkerRunMetrics:
         faulted = completed_job_info.state == GENERATION_STATE.faulted
         record = JobMetricsRecord(
             job_id=job_id,
+            device_index=self._device_by_job.pop(job_id, None),
+            sampling_window=self._sampling_by_job.pop(job_id, None),
             faulted=faulted,
+            inference_attempts=tracked.inference_attempts,
+            resource_failures=tracked.resource_failures,
+            degraded_retry_used=tracked.degraded_retry_used,
+            host_commit_refusals=tracked.host_commit_refusals,
             fault_reason=tracked.fault_reason if faulted else None,
             time_popped=time_popped,
             stage_timestamps=stage_timestamps,
@@ -1103,6 +1126,7 @@ class WorkerRunMetrics:
             job_e2e_histogram.record(e2e_seconds)
         record = JobMetricsRecord(
             job_id=form_id,
+            device_index=self._device_by_job.pop(form_id, None),
             workload=WorkloadKind.ALCHEMY,
             faulted=faulted,
             e2e_seconds=e2e_seconds,
