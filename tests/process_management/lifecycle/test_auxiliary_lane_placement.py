@@ -13,6 +13,7 @@ from contextlib import contextmanager
 from unittest.mock import Mock
 
 import pytest
+from horde_sdk.generation_parameters.alchemy.consts import KNOWN_MISC_POST_PROCESSORS
 from loguru import logger
 
 from horde_worker_regen.process_management.config.worker_state import WorkerState
@@ -25,6 +26,7 @@ from horde_worker_regen.process_management.lifecycle.process_lifecycle import (
     ProcessLifecycleManager,
 )
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
+from horde_worker_regen.process_management.scheduling.workload_flow import AlchemyFormDemand
 from horde_worker_regen.process_management.worker_entry_points import ProcessEntryPoints
 from tests.process_management.conftest import (
     device_wide_reading_provider,
@@ -88,8 +90,8 @@ def _make_placement_plm(
     """Build a lifecycle manager with both auxiliary lanes enabled over ``device_indices``.
 
     ``free_mb_by_device`` of None models a host that has reported no per-card free VRAM yet (the provider
-    answers None for every card), which is what drives the fallback to the static placement rule. The
-    extended-ControlNet opt-in is set so the utilities lane is wanted without a job in hand.
+    answers None for every card), which is what drives the fallback to the static placement rule. A waiting
+    background-strip alchemy form is reported so the utilities lane is wanted without an image job in hand.
     """
     bridge_data = Mock()
     bridge_data.image_models_to_load = ["stable_diffusion"]
@@ -138,7 +140,7 @@ def _make_placement_plm(
         utilities_adapters.append(adapter)
         return adapter
 
-    return ProcessLifecycleManager(
+    plm = ProcessLifecycleManager(
         ctx=fake_ctx,  # type: ignore[arg-type]
         process_map=ProcessMap({}),
         horde_model_map=Mock(),
@@ -160,6 +162,9 @@ def _make_placement_plm(
         entry_points=ProcessEntryPoints(utilities_adapter_factory=_utilities_factory),
         device_reading_provider=device_wide_reading_provider(_free_mb, lambda _device_index: 24576.0),
     )
+    lane_form_waiting = AlchemyFormDemand(waiting=(KNOWN_MISC_POST_PROCESSORS.strip_background.value,))
+    plm.set_utilities_alchemy_form_demand_provider(lambda: lane_form_waiting)
+    return plm
 
 
 @pytest.fixture(autouse=True)

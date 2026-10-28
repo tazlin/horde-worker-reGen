@@ -163,6 +163,12 @@ against is the head's **card**, not the worker: each card has its own process po
 semaphore and its own copy of `max_threads`, so the worker-wide ceiling is the sum over driven cards
 (`worker_wide_concurrency_ceiling`).
 
+Two kinds of queued job are skipped by the walk because they cannot sample yet: a job whose LoRAs or textual
+inversions are still being placed on disk, and an extended-ControlNet job held while the image-utilities lane
+comes up to serve its control type (`job_awaits_utilities_lane`, see
+[Extended ControlNet](image_utilities_lane.md#extended-controlnet)). Neither holds a lane, so the job behind
+takes the slot, and a terminal gate in `_dispatch_withheld_by` keeps either from being seated by any path.
+
 Where a job's model is resident on more than one card, the copy it is routed to is a free lane on a card
 running fewer jobs than its cap, then the card with the fewest busy lanes (`_pick_best_resident_process`). A
 lane loading or holding a freshly loaded model is busy without running a job, so busy lanes alone tie a card
@@ -321,7 +327,7 @@ VRAM holds), [safety placement](../horde_worker_regen/process_management/schedul
 (reuse credits and the stale-slot cycle clock), [head admission](../horde_worker_regen/process_management/scheduling/ledgers/head_admission.md)
 (the head's starvation, RAM-defer and barrier clocks, the last preload admission) and
 [dispatch holds](../horde_worker_regen/process_management/scheduling/ledgers/dispatch_holds.md) (per-job residency
-holds and their counters). The whole-card residency machine lives in
+and utilities-lane holds and their counters). The whole-card residency machine lives in
 [`governance/whole_card.py`][horde_worker_regen.process_management.scheduling.governance.whole_card]. A
 decision reads the view; the act site updates the ledger.
 

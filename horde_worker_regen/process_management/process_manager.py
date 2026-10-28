@@ -100,6 +100,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     AlchemyFormSpec,
     HordeAnnotationResultMessage,
     HordeAnnotatorAvailabilityMessage,
+    HordeDownloadAvailabilityMessage,
     HordeImageResult,
     HordeInferenceResultMessage,
     HordeProcessState,
@@ -1687,6 +1688,10 @@ class HordeWorkerProcessManager:
         # id, learned from the lane's availability snapshots. The pre-annotation scan keys on the union of
         # these; an entry is pruned when its process leaves the map so a dead lane never appears servable.
         self._annotator_servable_types: dict[int, frozenset[str]] = {}
+        # Whether each extended control type's annotator weights are on disk, probed once per type and cleared when
+        # the download process reports a change in ControlNet or post-processor presence.
+        self._extended_annotator_presence: dict[str, bool] = {}
+        self._last_feature_presence: tuple[object, ...] | None = None
         # The single-owner verified reclaim ladder: when the governor calls a card SATURATED it issues one
         # pressure-relief rung per tick (newest idle model -> idle allocator caches -> older idle models ->
         # lane pauses -> safety off GPU), then verifies the realized NVML device-free gain against the rung's
@@ -1763,7 +1768,7 @@ class HordeWorkerProcessManager:
             on_download_metrics=self._run_metrics.on_download_metrics,
         )
         self._message_dispatcher.set_event_sink(self._run_metrics.record_event)
-        self._message_dispatcher.set_download_availability_handler(self._download_coordinator.on_download_availability)
+        self._message_dispatcher.set_download_availability_handler(self._on_download_availability)
         self._message_dispatcher.set_aux_prefetch_result_handler(self._aux_prefetch_coordinator.on_prefetch_result)
         self._message_dispatcher.set_model_load_failure_handler(self._on_model_load_failure)
         self._message_dispatcher.set_inference_lane_outcome_handler(
@@ -1963,6 +1968,10 @@ class HordeWorkerProcessManager:
         # Between stages a disaggregated job leaves every inference slot idle by design, so the deadlock
         # detector must not read that as a wedge.
         self._message_dispatcher.set_disagg_hold_provider(self._disaggregation_orchestrator.held_job_ids)
+        # A job held for the image-utilities lane takes no slot until the lane serves its control type.
+        self._message_dispatcher.set_utilities_lane_hold_provider(
+            self._inference_scheduler.utilities_lane_held_job_ids
+        )
         # Crash-path inference failures resolve in the tracker without touching the orchestrator; releasing the
         # job's held pipeline state there keeps the retry single-flight (no parallel held-state re-dispatch)
         # and purges the registration on a terminal fault (no zombie sampling of a job the tracker dropped).
@@ -4752,8 +4761,10 @@ class HordeWorkerProcessManager:
             # completed window, regardless of whether new work is pending. No-op unless the lease is enabled.
             self._advance_clearance()
 
-            # Reissue any queued extended-controlnet job the worker never offered (hostile or stale-race
-            # input) before it can reach annotation or in-graph preprocessing.
+            # Hold a queued extended-controlnet job while the image-utilities lane comes up to serve its control
+            # type, and reissue one the worker cannot serve (hostile or stale-race input) before it can reach
+            # annotation or in-graph preprocessing. Runs before the annotation pass and the scheduling cycle, so a
+            # released job is parked for annotation and a held one is skipped by selection in the same tick.
             self._fault_unready_extended_controlnet_jobs()
 
             # Fault any pending job whose ad-hoc LoRA/TI prefetch never resolved by its deadline, so a job is
@@ -4901,26 +4912,66 @@ class HordeWorkerProcessManager:
         return frozenset(servable)
 
     def _extended_controlnet_ready(self) -> bool:
-        """Return whether every extended controlnet annotator is servable right now (torch-free, fail-closed).
+        """Return whether every extended controlnet type can be served now or once the lane is up (fail-closed).
 
         Re-evaluated on each pop so the offer can flip from withheld to offered once the annotators land,
-        with no restart. With the image-utilities lane enabled, readiness is the live lane servable set
-        covering the whole extended control-type surface; otherwise (in-graph annotation) it is the extended
-        annotator weight files being present on disk, resolved through horde_model_reference's on-disk layout
-        (the same authority the lane's child environment is pointed at). A resolution failure fails closed.
+        with no restart. With the image-utilities lane enabled, the offer stands while the live servable set
+        covers the whole extended control-type surface, or while the lane is up, coming up or down by policy
+        (:meth:`ProcessLifecycleManager.utilities_lane_will_serve`) and the extended annotator weights are on disk.
+        An extended job is the lane's demand, so a lane that is down starts when one arrives, and dispatch holds
+        the job until the lane serves its type. A crashed lane, a paused one or one whose start was refused
+        withdraws the offer. With the lane disabled (in-graph annotation), readiness is the weights on disk.
         """
         if self.bridge_data.enable_image_utilities is True:
-            return self._servable_control_types() >= EXTENDED_CONTROL_TYPES
-        try:
-            from horde_model_reference.on_disk_layout import (
-                annotators_present_for_control_types,
-                resolve_weights_root,
-            )
+            if self._servable_control_types() >= EXTENDED_CONTROL_TYPES:
+                return True
+            if not self._process_lifecycle.utilities_lane_will_serve():
+                return False
+        return self._extended_annotators_on_disk(EXTENDED_CONTROL_TYPES)
 
-            return annotators_present_for_control_types(sorted(EXTENDED_CONTROL_TYPES), resolve_weights_root())
-        except Exception as e:  # noqa: BLE001 - readiness is best-effort; a resolution failure must fail closed.
-            logger.debug(f"Extended controlnet readiness probe failed: {type(e).__name__}: {e}")
-            return False
+    def _extended_annotators_on_disk(self, control_types: Iterable[str]) -> bool:
+        """Return whether the annotator weights for ``control_types`` are on disk (torch-free, fail-closed).
+
+        Resolved through horde_model_reference's on-disk layout, the same authority the lane's child environment
+        is pointed at. Each type is probed once and its answer kept until the download process reports a change in
+        presence (:meth:`_on_download_availability`), since the pop offer and every held job read this each tick.
+        A resolution failure returns False and caches nothing, so the next read probes again.
+        """
+        wanted = tuple(control_types)
+        unprobed = [control_type for control_type in wanted if control_type not in self._extended_annotator_presence]
+        if unprobed:
+            try:
+                from horde_model_reference.on_disk_layout import (
+                    annotators_present_for_control_types,
+                    resolve_weights_root,
+                )
+
+                root = resolve_weights_root()
+                for control_type in unprobed:
+                    self._extended_annotator_presence[control_type] = annotators_present_for_control_types(
+                        [control_type],
+                        root,
+                    )
+            except Exception as e:  # noqa: BLE001 - readiness is best-effort; a resolution failure must fail closed.
+                logger.debug(f"Extended controlnet readiness probe failed: {type(e).__name__}: {e}")
+                return False
+        return all(self._extended_annotator_presence[control_type] for control_type in wanted)
+
+    def _on_download_availability(self, message: HordeDownloadAvailabilityMessage) -> None:
+        """Record the download process's availability report and clear the annotator cache when presence changes.
+
+        The download process recomputes ControlNet and post-processor presence after its disk scan and after each
+        download, so a change in those fields is the point at which an annotator may have landed on disk.
+        """
+        presence = (
+            message.controlnet_present,
+            message.sdxl_controlnet_present,
+            None if message.post_processors_present is None else frozenset(message.post_processors_present),
+        )
+        if presence != self._last_feature_presence:
+            self._last_feature_presence = presence
+            self._extended_annotator_presence.clear()
+        self._download_coordinator.on_download_availability(message)
 
     def _staged_checkpoint_models(self) -> frozenset[str]:
         """Return the checkpoints staged in RAM on live, healthy inference processes eligible to sample.
@@ -5139,34 +5190,71 @@ class HordeWorkerProcessManager:
             )
 
     def _fault_unready_extended_controlnet_jobs(self) -> None:
-        """Reissue any queued extended-controlnet job the worker is not currently offering (hostile input).
+        """Hold or reissue each queued extended-controlnet job the worker cannot serve right now.
 
-        The extended offer is fail-closed and dynamic: the worker only advertises the extended control types
-        once its annotators are servable and the operator opted in. A queued extended-type job while that
-        offer is withheld is therefore hostile or a stale race, so it is faulted non-retryably (the horde
-        reissues it to a capable worker) rather than being let through to annotation or in-graph
-        preprocessing, where a missing annotator would fault it far later (or produce a garbage map). The
-        readiness probe is paid only when an extended-type job is actually queued (normally never).
+        A job whose control type the image-utilities lane serves, or that already carries its derived control
+        map, passes to pre-annotation or inference. A job that wants pre-annotation of a type the lane cannot serve
+        yet is held at dispatch while the lane is up or coming up
+        (:meth:`ProcessLifecycleManager.utilities_lane_will_serve`) and the type's annotator weights are on disk.
+        The job is the lane's demand, so a lane that is down starts on the next tick, and the hold lasts until the
+        lane reports the type servable or the job's deadline runs out
+        (:meth:`InferenceScheduler.reconcile_utilities_lane_holds`). Every other queued extended job is hostile
+        input or a stale race against a withdrawn offer (:meth:`_extended_controlnet_ready`). It is faulted
+        non-retryably, so the horde reissues it to a capable worker before it reaches in-graph preprocessing, where
+        a missing annotator would fault it far later or produce a garbage map. The probes run only while an
+        extended-type job is queued.
         """
-        extended_jobs = [
-            job
+        extended_jobs: list[tuple[ImageGenerateJobPopResponse, str]] = [
+            (job, control_type)
             for job in list(self._job_tracker.jobs_pending_inference)
             if job not in self._job_tracker.jobs_in_progress
             and (control_type := _control_type_name(job.payload.control_type)) is not None
             and control_type in EXTENDED_CONTROL_TYPES
         ]
-        if not extended_jobs:
+        held: list[tuple[ImageGenerateJobPopResponse, str]] = []
+        unready: list[ImageGenerateJobPopResponse] = []
+        if extended_jobs and self.bridge_data.extended_controlnet is not True:
+            unready = [job for job, _control_type in extended_jobs]
+        elif extended_jobs and self.bridge_data.enable_image_utilities is not True:
+            if not self._extended_controlnet_ready():
+                unready = [job for job, _control_type in extended_jobs]
+        elif extended_jobs:
+            servable = self._servable_control_types()
+            # A live lane that has reported its servable set has finished saying what it can annotate, so a type
+            # missing from that set is not held for. The pruning in _servable_control_types leaves only live lanes.
+            lane_reported = bool(self._annotator_servable_types)
+            lane_will_serve = self._process_lifecycle.utilities_lane_will_serve()
+            for job, control_type in extended_jobs:
+                tracked = self._job_tracker.get_tracked_job(job.id_) if job.id_ is not None else None
+                if control_type in servable or (tracked is not None and tracked.premade_control_map_bytes is not None):
+                    continue
+                if not job_wants_pre_annotation(job):
+                    # A job that brings its own control map needs no annotator, only the offer it was popped under.
+                    if not self._extended_controlnet_ready():
+                        unready.append(job)
+                    continue
+                if (
+                    lane_will_serve
+                    and not lane_reported
+                    and tracked is not None
+                    and not tracked.annotation_attempted
+                    and self._extended_annotators_on_disk((control_type,))
+                ):
+                    held.append((job, control_type))
+                else:
+                    unready.append(job)
+        # Called every tick, so a hold whose job left the queue by any path is released.
+        unready.extend(self._inference_scheduler.reconcile_utilities_lane_holds(held))
+        if not unready:
             return
-        if self.bridge_data.extended_controlnet is True and self._extended_controlnet_ready():
-            return
-        for job in extended_jobs:
+        for job in unready:
             self._job_tracker.handle_job_fault_now(
                 job,
                 retryable=False,
                 fault_reason="extended_controlnet_not_offered",
             )
         logger.warning(
-            f"Faulted {len(extended_jobs)} queued extended-controlnet job(s) for reissue: the worker is not "
+            f"Faulted {len(unready)} queued extended-controlnet job(s) for reissue: the worker is not "
             "currently offering the extended control types.",
         )
 

@@ -9,7 +9,9 @@ from horde_worker_regen.process_management.scheduling.dispatch_affinity import (
     AffinitySkipState,
     affinity_budget_seconds,
     affinity_skip_allowed,
+    head_aged_past_anti_starvation,
     record_affinity_skip,
+    utilities_lane_hold_expired,
 )
 
 
@@ -109,3 +111,70 @@ class TestRecordAffinitySkip:
             now += 1.0
         assert state.skip_count == _AFFINITY_MAX_SKIPS
         assert not affinity_skip_allowed(state, "head-1", now=now, budget_seconds=45.0, max_skips=_AFFINITY_MAX_SKIPS)
+
+
+class TestUtilitiesLaneHoldClock:
+    """A lane hold lasts until the ttl less expected sampling and the skip budget, or the share without a figure."""
+
+    def test_the_clock_covers_a_bring_up_the_share_would_not(self) -> None:
+        """Past the anti-starvation share, a job whose ttl still covers its sampling and tail stays held."""
+        # ttl 300: the share ends at 90 s; the clock ends at 300 - 30 sampling - 45 skip budget = 225 s.
+        assert head_aged_past_anti_starvation(now=120.0, popped_at=0.0, ttl=300.0, fallback_ttl=None)
+        assert affinity_budget_seconds(300.0) == 45.0
+        assert not utilities_lane_hold_expired(
+            now=120.0,
+            popped_at=0.0,
+            ttl=300.0,
+            recent_job_ttl=300.0,
+            expected_sampling_seconds=30.0,
+        )
+        assert utilities_lane_hold_expired(
+            now=226.0,
+            popped_at=0.0,
+            ttl=300.0,
+            recent_job_ttl=300.0,
+            expected_sampling_seconds=30.0,
+        )
+
+    def test_the_clock_expires_when_the_ttl_cannot_cover_sampling_and_the_tail(self) -> None:
+        """A short ttl less a long sampling time does not leave room to wait for the lane."""
+        # ttl 100: 100 - 60 sampling - 20 skip budget = 20 s.
+        assert affinity_budget_seconds(100.0) == 20.0
+        assert utilities_lane_hold_expired(
+            now=25.0,
+            popped_at=0.0,
+            ttl=100.0,
+            recent_job_ttl=100.0,
+            expected_sampling_seconds=60.0,
+        )
+
+    def test_without_a_sampling_figure_the_share_bounds_the_hold(self) -> None:
+        """No expected sampling figure means the hold ends at the anti-starvation share of the ttl."""
+        hold = {"popped_at": 0.0, "ttl": 300.0, "recent_job_ttl": 300.0, "expected_sampling_seconds": None}
+        assert not utilities_lane_hold_expired(now=80.0, **hold)  # type: ignore[arg-type]
+        assert utilities_lane_hold_expired(now=91.0, **hold)  # type: ignore[arg-type]
+
+    def test_no_ttl_reads_the_fallback_and_no_pop_time_expires(self) -> None:
+        """A job with no ttl and none seen is measured against the default ttl, and an unknown pop time expires."""
+        # Default ttl 150 with no figure: the share ends at 45 s.
+        assert not utilities_lane_hold_expired(
+            now=40.0,
+            popped_at=0.0,
+            ttl=None,
+            recent_job_ttl=None,
+            expected_sampling_seconds=None,
+        )
+        assert utilities_lane_hold_expired(
+            now=46.0,
+            popped_at=0.0,
+            ttl=None,
+            recent_job_ttl=None,
+            expected_sampling_seconds=None,
+        )
+        assert utilities_lane_hold_expired(
+            now=0.0,
+            popped_at=None,
+            ttl=300.0,
+            recent_job_ttl=None,
+            expected_sampling_seconds=30.0,
+        )

@@ -26,14 +26,14 @@ _LANE_PROCESS_ID = 4
 def _plm_with_lane(
     constructed: list[_FakeAdapter] | None = None,
     *,
-    warm: bool = True,
+    demand: bool = True,
 ) -> ProcessLifecycleManager:
     """A lifecycle manager with a live utilities lane in the map and a fake adapter factory for restarts."""
     lane = make_mock_process_info(_LANE_PROCESS_ID, model_name=None, process_type=HordeProcessType.UTILITIES)
     return _make_utilities_plm(
         constructed=constructed if constructed is not None else [],
         process_map=ProcessMap({_LANE_PROCESS_ID: lane}),
-        warm=warm,
+        demand=demand,
     )
 
 
@@ -98,7 +98,7 @@ def test_pause_is_a_noop_without_a_live_lane_or_with_the_lane_disabled() -> None
 def test_restore_without_demand_clears_the_pause_and_leaves_the_lane_down() -> None:
     """The holder's restore discharges the pause, and with no job needing the lane it does not start one."""
     constructed: list[_FakeAdapter] = []
-    plm = _plm_with_lane(constructed, warm=False)
+    plm = _plm_with_lane(constructed, demand=False)
     _paused_with_lane_gone(plm)
 
     with _captured_messages() as messages:
@@ -112,7 +112,7 @@ def test_restore_without_demand_clears_the_pause_and_leaves_the_lane_down() -> N
 def test_restore_with_demand_starts_the_lane() -> None:
     """With a job needing the lane the restore starts it, as the ladder's restore always did."""
     constructed: list[_FakeAdapter] = []
-    plm = _plm_with_lane(constructed, warm=True)
+    plm = _plm_with_lane(constructed, demand=True)
     _paused_with_lane_gone(plm)
 
     with _captured_messages() as messages:

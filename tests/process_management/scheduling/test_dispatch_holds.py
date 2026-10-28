@@ -172,3 +172,21 @@ class TestPostProcessingTurn:
         ledger.clear_pp_turn()
         assert ledger.pp_turn is None
         assert ledger.pp_yield_expired(floor_seconds=5.0) is False
+
+
+class TestUtilitiesLaneHolds:
+    """A lane hold is stamped once per job and released with its held seconds when the job is no longer waiting."""
+
+    def test_hold_counts_once_and_release_reports_the_held_seconds(self) -> None:
+        """Re-holding a held job is not a new hold, and a job left out of ``keep`` is released."""
+        ledger, clock = _ledger()
+        assert ledger.note_utilities_lane_hold("a") is True
+        assert ledger.note_utilities_lane_hold("b") is True
+        clock.now += 4.0
+        assert ledger.note_utilities_lane_hold("a") is False
+        assert ledger.utilities_lane_hold_count == 2
+
+        assert ledger.release_utilities_lane_holds(keep={"b"}) == [("a", 4.0)]
+        assert set(ledger.utilities_lane_holds) == {"b"}
+        assert ledger.release_utilities_lane_holds(keep=()) == [("b", 4.0)]
+        assert ledger.utilities_lane_holds == {}

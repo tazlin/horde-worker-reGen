@@ -86,6 +86,14 @@ class AffinitySkipState:
     skip_count: int = 0
 
 
+def fallback_ttl_seconds(recent_job_ttl: float | None) -> float:
+    """Return the ttl a hold assumes for a job the horde gave none.
+
+    The most recent horde-supplied ttl, or the default the skip budget is sized on when the worker has seen none.
+    """
+    return recent_job_ttl if recent_job_ttl is not None else _DEFAULT_AFFINITY_TTL_SECONDS
+
+
 def affinity_budget_seconds(recent_job_ttl: float | None) -> float:
     """Return the wall-clock seconds a displaced head may be bypassed, derived from the job ttl.
 
@@ -100,9 +108,54 @@ def affinity_budget_seconds(recent_job_ttl: float | None) -> float:
     Returns:
         The budget in seconds, clamped to ``[_AFFINITY_BUDGET_MIN_SECONDS, _AFFINITY_BUDGET_MAX_SECONDS]``.
     """
-    ttl = recent_job_ttl if recent_job_ttl is not None else _DEFAULT_AFFINITY_TTL_SECONDS
+    ttl = fallback_ttl_seconds(recent_job_ttl)
     budget = _AFFINITY_BUDGET_FRACTION * ttl
     return max(_AFFINITY_BUDGET_MIN_SECONDS, min(budget, _AFFINITY_BUDGET_MAX_SECONDS))
+
+
+def utilities_lane_hold_expired(
+    *,
+    now: float,
+    popped_at: float | None,
+    ttl: float | None,
+    recent_job_ttl: float | None,
+    expected_sampling_seconds: float | None,
+) -> bool:
+    """Whether a job held for the image-utilities lane has run out of time to wait for it.
+
+    The hold may last until the job's ttl from pop, less its expected sampling seconds, less the skip budget
+    (:func:`affinity_budget_seconds`). This is longer than the anti-starvation share. That share exists to step a
+    stuck head aside so its own preload can run, and a held job has not been offered a lane yet, so there is
+    nothing to step aside from. What the job still needs once the lane serves its type is its sampling and the
+    tail after it.
+
+    The skip budget stands in for that tail (staging, decode, safety and submit). It is the module's existing
+    allowance for a head's own work after a wait, sized from the ttl and clamped, and no measured
+    finished-to-submit figure is available to the scheduler.
+
+    With no expected sampling figure (a signature with neither a calibrated median nor a benchmark seed), the
+    hold ends at the anti-starvation share (:func:`head_aged_past_anti_starvation`). Without a figure the time
+    left after the wait is unknown, and the share is the bound the module already applies to a head whose
+    remaining work it cannot price.
+
+    A job with no ttl is measured against :func:`fallback_ttl_seconds`. A job with no pop time is reported
+    expired, so every hold has a bound. The caller faults an expired hold with the reason it uses for any
+    extended-ControlNet job the worker cannot serve.
+
+    Args:
+        now: The current wall-clock time.
+        popped_at: When the job was popped, or None when unknown.
+        ttl: The job's horde-supplied ttl in seconds, or None.
+        recent_job_ttl: The most recent horde-supplied ttl the worker saw, or None.
+        expected_sampling_seconds: The performance model's expected sampling seconds for the job, or None.
+    """
+    if popped_at is None:
+        return True
+    effective_ttl = ttl if ttl is not None else fallback_ttl_seconds(recent_job_ttl)
+    if expected_sampling_seconds is None:
+        return head_aged_past_anti_starvation(now=now, popped_at=popped_at, ttl=effective_ttl, fallback_ttl=None)
+    deadline = popped_at + effective_ttl - expected_sampling_seconds - affinity_budget_seconds(recent_job_ttl)
+    return now > deadline
 
 
 def affinity_skip_allowed(

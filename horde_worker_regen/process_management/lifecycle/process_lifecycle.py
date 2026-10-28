@@ -2326,7 +2326,6 @@ class ProcessLifecycleManager:
 
     def utilities_lane_demand_inputs(self) -> UtilitiesLaneDemandInputs:
         """Assemble what :func:`utilities_lane_demand` reads from the tracker, the live config and alchemy."""
-        bridge_data = self._runtime_config.bridge_data
         tracker = self._job_tracker
         strip_only_jobs = 0
         pre_annotation_candidates = 0
@@ -2349,9 +2348,6 @@ class ProcessLifecycleManager:
                 and self._utilities_interpreter_available()
             ),
             shutting_down=self._state.shutting_down,
-            extended_controlnet_opted_in=(
-                bridge_data.extended_controlnet is True and bridge_data.allow_controlnet is True
-            ),
             alchemy=self._utilities_alchemy_form_demand_provider(),
             jobs_pending_strip=len(tracker.jobs_pending_strip),
             strip_only_jobs_before_strip=strip_only_jobs,
@@ -2362,6 +2358,30 @@ class ProcessLifecycleManager:
     def utilities_lane_demand(self) -> UtilitiesLaneDemandReason | None:
         """Return why the image-utilities lane should be up now, or None when nothing needs it."""
         return utilities_lane_demand(self.utilities_lane_demand_inputs())
+
+    def utilities_lane_will_serve(self) -> bool:
+        """Return whether the image-utilities lane is up, coming up, or down by policy and startable on demand.
+
+        A job that needs the lane may wait for it in any of these states, since the demand driver starts a lane
+        that is down by policy on the tick after the job arrives. Down by policy means enabled, provisioned, not
+        paused by a reclaim or residency owner, no start deferred for VRAM, no crash replacement under way and no
+        demand start that failed outright. A crashed lane or one whose start was refused is not waited for.
+        """
+        if not self.utilities_process_enabled() or not self.process_type_wanted(HordeProcessType.UTILITIES):
+            return False
+        if self._state.shutting_down or self._utilities_gpu_paused:
+            return False
+        if self._utilities_processes_should_be_replaced:
+            # An operator recycle ends in a fresh start through the demand gate. A crash replacement is not waited for.
+            return self._utilities_replacement_intentional
+        lanes = [info for info in self._process_map.values() if info.process_type is HordeProcessType.UTILITIES]
+        if lanes:
+            return any(info.is_process_alive() and not info.end_intended for info in lanes)
+        if self._pending_gpu_start_key(HordeProcessType.UTILITIES, None) in self._pending_gpu_starts:
+            return False
+        if self._utilities_demand_start_attempted:
+            return False
+        return self._utilities_interpreter_available()
 
     def start_utilities_processes(self) -> bool:
         """Start the dedicated image-utilities lane, if enabled, not already running, and needed.

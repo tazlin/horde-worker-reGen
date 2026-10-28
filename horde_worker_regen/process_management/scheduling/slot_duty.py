@@ -81,6 +81,10 @@ class SlotDutyBucket(StrEnum):
     """The selected job's auxiliary models (LoRAs, textual inversions) were still being placed on disk, so it
     held no lane and could not sample. Selection already skips such a job; this is the terminal backstop that
     keeps one from seizing a lane by any path."""
+    UTILITIES_LANE_BRING_UP = "utilities_lane_bring_up"
+    """The head is an extended-ControlNet job whose control type the image-utilities lane cannot serve yet while
+    the lane starts or primes its annotators. It has no in-graph path, so it holds no lane and cannot sample until
+    the lane reports the type servable. Selection skips it, so a sibling is dispatched meanwhile."""
     UNEXPLAINED = "unexplained"
     """No gate claimed the empty slot: the scheduler-stall-shaped case worth reporting."""
 

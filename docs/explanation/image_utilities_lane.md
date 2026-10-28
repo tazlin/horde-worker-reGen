@@ -104,17 +104,16 @@ up and why. Its rules, first match wins:
 
 1. A lane that is disabled, not wanted by the configured workloads or not provisioned, or a worker shutting
    down, is never wanted.
-2. Warm requirement. The extended-ControlNet opt-in (`extended_controlnet` with `allow_controlnet`) keeps the
-   lane up from boot, since extended ControlNet jobs have no in-graph path and arrive with no lead. So does an
-   alchemist that would offer a form `capability_for_alchemy_form` routes to the lane (`strip_background`,
-   `annotation`), since that offer needs a live lane.
+2. Warm requirement. An alchemist that would offer a form `capability_for_alchemy_form` routes to the lane
+   (`strip_background`, `annotation`) keeps the lane up, since that offer needs a live lane. The
+   extended-ControlNet opt-in does not keep it up (see [Extended ControlNet](#extended-controlnet)).
 3. A job in `PENDING_STRIP`.
 4. A job pending or in inference whose post-processing is background removal alone. Its queue wait and
    generation cover a lane start. A job that also asks for an upscaler or face fixer counts from rule 3 only,
    once its post-processing chain has left the post-processing lane, so the chain does not find a lane started
    for it and stop it again.
 5. A ControlNet job that wants pre-annotation and has not been offered to the lane, or a job in
-   `PENDING_ANNOTATION`.
+   `PENDING_ANNOTATION`. An extended-ControlNet job with a source image counts here like any other.
 6. A lane-bound alchemy form pending dispatch or in flight.
 
 Every start goes through `ProcessLifecycleManager.start_utilities_processes`, which refuses without demand: the
@@ -140,6 +139,47 @@ claims it, held for the stranded-lane debounce) is restored by the driver once a
 A lane that is down because nothing needs it is not a failure. Recovery, the hung-process watchdog and the
 crash reaper act on processes in the map only, the strip and annotation stages wait or fall through as they do
 while the lane restarts, and the dashboard's process table lists the lane only while it runs.
+
+### Extended ControlNet
+
+Extended ControlNet types have no in-graph preprocessor, so an extended job can only run once the lane has
+derived its control map. The lane is not kept up for them. `ProcessLifecycleManager.utilities_lane_will_serve`
+says whether a job may wait for the lane. It is true while the lane runs or starts, and while the lane is down
+by policy (enabled, provisioned, not paused by a reclaim or residency owner, no start deferred for VRAM, no crash
+replacement under way, no demand start that failed outright). A crashed, paused or refused lane is not waited
+for.
+
+The worker offers extended ControlNet at pop (`_extended_controlnet_ready`) while the live servable set covers
+every extended type, or while the lane will serve and the extended annotator weights are on disk. A popped
+extended job is lane demand under rule 5, so the driver starts a lane that is down on the next tick.
+
+Each control-loop tick, before the annotation pass and the scheduling cycle,
+`_fault_unready_extended_controlnet_jobs` sorts the queued extended jobs:
+
+- A job whose type is in the live servable set, or that already carries its derived map, passes on to
+  pre-annotation or inference.
+- A job that wants pre-annotation of a type the lane cannot serve yet is held while the lane will serve, no live
+  lane has reported its servable set yet, and the type's weights are on disk. `InferenceScheduler.reconcile_utilities_lane_holds` records the hold in the
+  `DispatchHoldLedger`, logs `Holding extended-ControlNet job <id> for the image-utilities lane, which cannot
+  serve control type <type> yet.` and records an `INFERENCE_DISPATCH` decision (`withhold`,
+  `awaiting_utilities_lane`) once per hold, resolved when the hold is released. Selection skips a held job, as it
+  skips an aux-unprepared one, so the jobs behind it dispatch, and an empty slot behind a held head is
+  attributed to the `utilities_lane_bring_up` duty bucket. The deadlock detector exempts held jobs.
+- A held job past `dispatch_affinity.utilities_lane_hold_expired`, and every other extended job the worker
+  cannot serve, is faulted non-retryably with `extended_controlnet_not_offered` so the horde reissues it. The
+  hold lasts until the job's ttl from pop, less its expected sampling seconds from the performance model, less
+  the skip budget (`affinity_budget_seconds`), which stands in for the tail after sampling. This is longer than
+  the anti-starvation share, since a held job has not been offered a lane and there is no head to step aside.
+  With no sampling figure the hold ends at the anti-starvation share. A job with no ttl is measured against
+  `dispatch_affinity.fallback_ttl_seconds`, the most recent ttl the worker saw or the skip budget's default. A live lane that has reported a set without the job's
+  type is not waited for.
+
+The weights check (`_extended_annotators_on_disk`) probes each extended type once and keeps the answer until the
+download process reports a change in ControlNet or post-processor presence, so the pop offer and the per-tick
+hold check read a cached answer.
+
+The hold is released on the tick the lane reports the job's type servable, and the annotation pass parks the job
+for its map in the same tick.
 
 ## Liveness and recovery
 
@@ -285,7 +325,8 @@ Beyond that static provisioning gate the two features diverge at runtime:
   gate.
 
 `allow_extended_controlnet` carries a further, server-side gate on top of the operator opt-in
-(`extended_controlnet` in `bridgeData`) and live annotator readiness. The `allow_extended_controlnet` pop
+(`extended_controlnet` in `bridgeData`) and annotator readiness (see
+[Extended ControlNet](#extended-controlnet)). The `allow_extended_controlnet` pop
 field only exists on the AI Horde server from the release that ships extended ControlNet, and a server
 that does not recognise the field rejects the whole pop. So the worker advertises it only once the
 server-capability probe (see [`server_capabilities`][horde_worker_regen.server_capabilities]) confirms the

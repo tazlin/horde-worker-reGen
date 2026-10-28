@@ -2,8 +2,9 @@
 
 The lane's parent-side adapter is injected as a fake through the ``ProcessEntryPoints`` seam, so these
 tests exercise the ``ProcessLifecycleManager`` start / defer / end / replace machinery without launching a
-real cross-venv subprocess. The lane starts only when a job needs it, so the shared builder sets the
-extended-ControlNet opt-in, the warm requirement that keeps a lane up from boot, unless a row asks for none.
+real cross-venv subprocess. The lane starts only when a job needs it, so the shared builder registers a
+background-strip alchemy form as waiting, which wants the lane with no image job in hand, unless a row asks for no
+demand.
 """
 
 from __future__ import annotations
@@ -13,13 +14,18 @@ import time
 from collections.abc import Callable
 from unittest.mock import Mock
 
+from horde_sdk.generation_parameters.alchemy.consts import KNOWN_MISC_POST_PROCESSORS
+
 from horde_worker_regen.process_management.config.worker_state import WorkerState
 from horde_worker_regen.process_management.ipc.messages import HordeProcessState
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType, WorkerCapability
 from horde_worker_regen.process_management.lifecycle.process_lifecycle import PauseOwner, ProcessLifecycleManager
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
-from horde_worker_regen.process_management.scheduling.workload_flow import UtilitiesLaneDemandReason
+from horde_worker_regen.process_management.scheduling.workload_flow import (
+    AlchemyFormDemand,
+    UtilitiesLaneDemandReason,
+)
 from horde_worker_regen.process_management.worker_entry_points import ProcessEntryPoints
 from tests.process_management.conftest import (
     device_wide_reading_provider,
@@ -78,11 +84,12 @@ def _make_utilities_plm(
     device_free_mb_provider: Callable[[int], float | None] | None = None,
     device_total_vram_mb_provider: Callable[[int], float | None] | None = None,
     process_map: ProcessMap | None = None,
-    warm: bool = True,
+    demand: bool = True,
 ) -> ProcessLifecycleManager:
     """Build a lifecycle manager with the utilities lane enabled and a fake adapter factory injected.
 
-    ``warm`` sets the extended-ControlNet opt-in, which keeps the lane wanted with no job in hand.
+    ``demand`` registers a waiting background-strip alchemy form, which wants the lane with no image job in hand.
+    Extended ControlNet is opted in throughout, as it is by default, and does not by itself want the lane.
     """
     bridge_data = Mock()
     bridge_data.image_models_to_load = ["stable_diffusion"]
@@ -91,8 +98,8 @@ def _make_utilities_plm(
     bridge_data.post_processing_lane_enabled = False
     bridge_data.safety_on_gpu = False
     bridge_data.enable_image_utilities = True
-    bridge_data.extended_controlnet = warm
-    bridge_data.allow_controlnet = warm
+    bridge_data.extended_controlnet = True
+    bridge_data.allow_controlnet = True
     bridge_data.process_timeout = 120
     bridge_data.inference_step_timeout = 60
     bridge_data.inference_first_step_timeout = 120
@@ -118,7 +125,7 @@ def _make_utilities_plm(
         constructed.append(adapter)
         return adapter
 
-    return ProcessLifecycleManager(
+    plm = ProcessLifecycleManager(
         ctx=multiprocessing.get_context("spawn"),  # type: ignore[arg-type]
         process_map=process_map if process_map is not None else ProcessMap({}),
         horde_model_map=Mock(),
@@ -140,6 +147,17 @@ def _make_utilities_plm(
             else device_wide_reading_provider(device_free_mb_provider, device_total_vram_mb_provider)
         ),
     )
+    _set_lane_form_waiting(plm, waiting=demand)
+    return plm
+
+
+_STRIP_FORM = KNOWN_MISC_POST_PROCESSORS.strip_background.value
+
+
+def _set_lane_form_waiting(plm: ProcessLifecycleManager, *, waiting: bool) -> None:
+    """Report one background-strip alchemy form waiting for the lane, or none."""
+    demand = AlchemyFormDemand(waiting=(_STRIP_FORM,)) if waiting else AlchemyFormDemand()
+    plm.set_utilities_alchemy_form_demand_provider(lambda: demand)
 
 
 def test_utilities_lane_disabled_is_a_noop() -> None:
@@ -281,7 +299,7 @@ async def _queue_strip_only_job(plm: ProcessLifecycleManager) -> None:
 async def test_start_refuses_without_demand_and_starts_with_it() -> None:
     """Every start path goes through the demand check, so a lane nothing needs is not started."""
     constructed: list[_FakeAdapter] = []
-    plm = _make_utilities_plm(constructed=constructed, warm=False)
+    plm = _make_utilities_plm(constructed=constructed, demand=False)
 
     assert plm.utilities_lane_demand() is None
     assert plm.start_utilities_processes() is False
@@ -305,7 +323,7 @@ def test_deferred_start_is_dropped_once_its_demand_lapses() -> None:
     assert plm.start_utilities_processes() is False
     assert plm.has_pending_gpu_starts() is True
 
-    plm._runtime_config.bridge_data.extended_controlnet = False
+    _set_lane_form_waiting(plm, waiting=False)
     free_holder["mb"] = 24000.0
     assert plm.drain_pending_gpu_starts() == 0
     assert plm.has_pending_gpu_starts() is False
@@ -315,7 +333,7 @@ def test_deferred_start_is_dropped_once_its_demand_lapses() -> None:
 async def test_driver_starts_once_per_demand_episode() -> None:
     """The per-tick driver starts the lane on the first tick with demand and not again while it runs."""
     constructed: list[_FakeAdapter] = []
-    plm = _make_utilities_plm(constructed=constructed, warm=False)
+    plm = _make_utilities_plm(constructed=constructed, demand=False)
 
     idle = plm.reconcile_utilities_demand(pause_stranded=False)
     assert idle.started_for is None
@@ -338,7 +356,7 @@ async def test_driver_does_not_start_beside_a_replacement_or_a_deferred_start() 
         constructed=constructed,
         device_free_mb_provider=lambda _index: free_holder["mb"],
         device_total_vram_mb_provider=lambda _index: 24576.0,
-        warm=False,
+        demand=False,
     )
     await _queue_strip_only_job(plm)
 
@@ -361,7 +379,7 @@ async def test_driver_does_not_start_beside_a_replacement_or_a_deferred_start() 
 async def test_driver_restores_a_stranded_ladder_pause_only_with_demand() -> None:
     """A ladder pause no owner can restore is lifted by the driver once a job needs the lane."""
     constructed: list[_FakeAdapter] = []
-    plm = _make_utilities_plm(constructed=constructed, warm=True)
+    plm = _make_utilities_plm(constructed=constructed, demand=True)
     assert plm.start_utilities_processes() is True
     assert plm.pause_utilities_off_gpu(owner=PauseOwner.RECLAIM_LADDER) is True
     for _ in range(4):
@@ -372,13 +390,13 @@ async def test_driver_restores_a_stranded_ladder_pause_only_with_demand() -> Non
     assert plm.reconcile_utilities_demand(pause_stranded=False).started_for is None
     assert plm.is_utilities_gpu_paused is True
 
-    plm._runtime_config.bridge_data.extended_controlnet = False
+    _set_lane_form_waiting(plm, waiting=False)
     assert plm.reconcile_utilities_demand(pause_stranded=True).started_for is None
     assert plm.is_utilities_gpu_paused is True, "a stranded pause with nothing to serve is left alone"
 
-    plm._runtime_config.bridge_data.extended_controlnet = True
+    _set_lane_form_waiting(plm, waiting=True)
     restored = plm.reconcile_utilities_demand(pause_stranded=True)
-    assert restored.started_for is UtilitiesLaneDemandReason.EXTENDED_CONTROLNET_WARM
+    assert restored.started_for is UtilitiesLaneDemandReason.ALCHEMY_FORM_WAITING
     assert plm.is_utilities_gpu_paused is False
     assert len(constructed) == 2
 
@@ -391,7 +409,7 @@ def test_crash_replacement_without_demand_leaves_the_lane_down_and_counts_the_re
     utilities = plm._process_map.get_capable_processes(WorkerCapability.IMAGE_UTILITIES)[0]
     recoveries_before = plm._num_process_recoveries
 
-    plm._runtime_config.bridge_data.extended_controlnet = False
+    _set_lane_form_waiting(plm, waiting=False)
     constructed[0].handle.alive = False
     assert plm._reap_if_crashed(utilities) is True
     for _ in range(4):
@@ -401,3 +419,60 @@ def test_crash_replacement_without_demand_leaves_the_lane_down_and_counts_the_re
     assert len(constructed) == 1
     assert plm.utilities_processes_should_be_replaced is False
     assert plm._num_process_recoveries == recoveries_before + 1
+
+
+async def test_an_extended_controlnet_job_is_demand_and_the_opt_in_alone_is_not() -> None:
+    """With extended ControlNet opted in the lane is not wanted until an extended job with a source image arrives."""
+    from tests.process_management.test_image_utilities_annotation import _make_controlnet_job
+
+    constructed: list[_FakeAdapter] = []
+    plm = _make_utilities_plm(constructed=constructed, demand=False)
+    assert plm.utilities_lane_demand() is None
+
+    job = _make_controlnet_job(control_type="lineart")
+    await plm._job_tracker.record_popped_job(job, time_popped=time.time())
+
+    assert plm.utilities_lane_demand() is UtilitiesLaneDemandReason.CONTROLNET_ANNOTATION
+
+
+def test_a_lane_down_by_policy_or_running_will_serve() -> None:
+    """A job may wait for a lane that is down by policy, starting or running."""
+    constructed: list[_FakeAdapter] = []
+    plm = _make_utilities_plm(constructed=constructed, demand=False)
+    assert plm.utilities_lane_will_serve() is True, "down by policy, startable on demand"
+
+    _set_lane_form_waiting(plm, waiting=True)
+    assert plm.start_utilities_processes() is True
+    assert plm.utilities_lane_will_serve() is True, "running"
+
+
+def test_a_crashed_paused_or_refused_lane_will_not_serve() -> None:
+    """A lane that crashed, was paused by an owner or had its start refused for VRAM is not waited for."""
+    constructed: list[_FakeAdapter] = []
+    free_holder = {"mb": 24000.0}
+    plm = _make_utilities_plm(
+        constructed=constructed,
+        device_free_mb_provider=lambda _index: free_holder["mb"],
+        device_total_vram_mb_provider=lambda _index: 24576.0,
+    )
+    assert plm.start_utilities_processes() is True
+    utilities = plm._process_map.get_capable_processes(WorkerCapability.IMAGE_UTILITIES)[0]
+    constructed[0].handle.alive = False
+    assert plm.utilities_lane_will_serve() is False, "crashed"
+    assert plm._reap_if_crashed(utilities) is True
+    assert plm.utilities_lane_will_serve() is False, "crash replacement under way"
+    for _ in range(4):
+        plm._replace_all_utilities_process()
+    assert plm.utilities_lane_will_serve() is True, "replaced"
+
+    assert plm.pause_utilities_off_gpu(owner=PauseOwner.RECLAIM_LADDER) is True
+    assert plm.utilities_lane_will_serve() is False, "paused"
+    for _ in range(4):
+        plm._replace_all_utilities_process()
+    assert plm.utilities_lane_will_serve() is False, "paused and down"
+
+    plm._utilities_gpu_paused = False
+    free_holder["mb"] = 100.0
+    assert plm.start_utilities_processes() is False
+    assert plm.has_pending_gpu_starts() is True
+    assert plm.utilities_lane_will_serve() is False, "start refused for VRAM"

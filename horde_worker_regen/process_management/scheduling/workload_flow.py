@@ -190,8 +190,6 @@ def job_wants_pre_annotation(job: ImageGenerateJobPopResponse) -> bool:
 class UtilitiesLaneDemandReason(enum.StrEnum):
     """Why the image-utilities lane should be up: the first rule of :func:`utilities_lane_demand` that holds."""
 
-    EXTENDED_CONTROLNET_WARM = "extended_controlnet_warm"
-    """The operator opted into extended ControlNet, whose jobs have no in-graph path and arrive with no lead."""
     ALCHEMY_FORM_WARM = "alchemy_form_warm"
     """The alchemist offers a form that runs on the lane, and the offer needs a live lane."""
     PENDING_STRIP = "pending_strip"
@@ -199,7 +197,8 @@ class UtilitiesLaneDemandReason(enum.StrEnum):
     STRIP_ONLY_JOB = "strip_only_job"
     """A queued or sampling job will need its strip once inference ends, with no post-processing chain first."""
     CONTROLNET_ANNOTATION = "controlnet_annotation"
-    """A ControlNet job wants its control map derived on the lane, or is parked for it."""
+    """A ControlNet job wants its control map derived on the lane, or is parked for it. An extended-ControlNet job
+    counts here like any other, and dispatch holds it until the lane can serve its control type."""
     ALCHEMY_FORM_WAITING = "alchemy_form_waiting"
     """An alchemy form that runs on the lane is pending dispatch or in flight."""
 
@@ -221,8 +220,6 @@ class UtilitiesLaneDemandInputs:
     lane_available: bool
     """The lane is enabled, wanted by the configured workloads and provisioned."""
     shutting_down: bool
-    extended_controlnet_opted_in: bool
-    """The operator opted into extended ControlNet on a worker that allows ControlNet."""
     alchemy: AlchemyFormDemand
     jobs_pending_strip: int
     """Jobs in ``PENDING_STRIP``."""
@@ -243,20 +240,18 @@ def utilities_lane_demand(inputs: UtilitiesLaneDemandInputs) -> UtilitiesLaneDem
     The rules, first match wins:
 
     1. A disabled, unwanted or unprovisioned lane, or a worker shutting down, is never wanted.
-    2. Warm requirement: the extended-ControlNet opt-in, or an offerable alchemy form that routes to the lane.
-       Extended ControlNet jobs have no in-graph fallback and arrive with no lead, and an alchemy offer of a
-       lane form needs a live lane.
+    2. Warm requirement: an offerable alchemy form that routes to the lane, since an alchemy offer of a lane
+       form needs a live lane.
     3. A job in ``PENDING_STRIP``.
     4. A job pending or in inference whose post-processing is background removal alone. Its lead (queue wait
        plus generation) covers a lane start. A job with an upscaler or face fixer counts from rule 3 only, so
        its own post-processing chain does not find a lane started for it and stop it again.
-    5. A ControlNet pre-annotation candidate, or a job in ``PENDING_ANNOTATION``.
+    5. A ControlNet pre-annotation candidate, or a job in ``PENDING_ANNOTATION``. Extended-ControlNet jobs
+       count here, so the lane starts at their pop and dispatch holds them until it can serve their type.
     6. A lane-bound alchemy form pending or in flight.
     """
     if not inputs.lane_available or inputs.shutting_down:
         return None
-    if inputs.extended_controlnet_opted_in:
-        return UtilitiesLaneDemandReason.EXTENDED_CONTROLNET_WARM
     if any(routes_to_utilities_lane(form) for form in inputs.alchemy.offerable):
         return UtilitiesLaneDemandReason.ALCHEMY_FORM_WARM
     if inputs.jobs_pending_strip > 0:

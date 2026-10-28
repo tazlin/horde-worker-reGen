@@ -211,6 +211,7 @@ from horde_worker_regen.process_management.scheduling.dispatch_affinity import (
     affinity_skip_disclosure,
     head_aged_past_anti_starvation,
     record_affinity_skip,
+    utilities_lane_hold_expired,
 )
 from horde_worker_regen.process_management.scheduling.governance import (
     AdmissionDecision,
@@ -4527,6 +4528,12 @@ class InferenceScheduler:
         cycle and every rung would look effective. Such figures belong to the formatted line instead
         (:meth:`_log_dispatch_stall_if_needed`), which prints them alongside the parked-seconds count.
         """
+        if self.job_awaits_utilities_lane(head):
+            # Whatever its residency, the head cannot sample before the lane serves its control type.
+            return SlotDutyBucket.UTILITIES_LANE_BRING_UP, (
+                "it is an extended-ControlNet job whose control type the image-utilities lane cannot serve yet, "
+                "and the lane is coming up to serve it"
+            )
         process = self.resident_process_for_job(head)
         # Mirror dispatch's retention affinity: where a busy slot holds the head's model on the device and a
         # second copy does not fit beside it, that slot is the head's destination, so the wait is named as the
@@ -10080,6 +10087,7 @@ class InferenceScheduler:
                 for j in pending
                 if j not in self._job_tracker.jobs_in_progress
                 and not self._job_tracker.job_requires_aux_preparation(j)
+                and not self.job_awaits_utilities_lane(j)
             ),
             None,
         )
@@ -10106,6 +10114,7 @@ class InferenceScheduler:
                 for job in self._job_tracker.jobs_pending_inference
                 if job not in self._job_tracker.jobs_in_progress
                 and not self._job_tracker.job_requires_aux_preparation(job)
+                and not self.job_awaits_utilities_lane(job)
             ),
             None,
         )
@@ -10195,8 +10204,12 @@ class InferenceScheduler:
             if job is head_job or job.model is None or job.model == head_job.model:
                 rejections.append(f"{job.model}: head/same-model")
                 continue
-            if job in in_progress or self._job_tracker.job_requires_aux_preparation(job):
-                rejections.append(f"{job.model}: in-progress/aux-gated")
+            if (
+                job in in_progress
+                or self._job_tracker.job_requires_aux_preparation(job)
+                or self.job_awaits_utilities_lane(job)
+            ):
+                rejections.append(f"{job.model}: in-progress/aux-gated/lane-held")
                 continue
             # A degraded retry must run isolated (see the diversity path), so it is never a bypass target.
             if self._job_tracker.is_degraded_dispatch_pending(job):
@@ -10253,6 +10266,7 @@ class InferenceScheduler:
                 for job in pending
                 if job not in self._job_tracker.jobs_in_progress
                 and not self._job_tracker.job_requires_aux_preparation(job)
+                and not self.job_awaits_utilities_lane(job)
             ),
             None,
         )
@@ -11246,6 +11260,10 @@ class InferenceScheduler:
             # pop-time prefetch pipeline clears its preparation gate. Skipping it here lets a fitting sibling
             # become the dispatch head and be GPU-fed while the gated job waits, so no lane idles behind it.
             if self._job_tracker.job_requires_aux_preparation(job):
+                continue
+            # A job held for the image-utilities lane is skipped for the same reason. It cannot sample until the
+            # lane serves its control type, and the jobs behind it should not idle meanwhile.
+            if self.job_awaits_utilities_lane(job):
                 continue
             if next_job is None:
                 next_job = job
@@ -13305,6 +13323,74 @@ class InferenceScheduler:
         if job.id_ is not None:
             self._dispatch_holds.note_pp_defer(str(job.id_), deferred=deferred)
 
+    def reconcile_utilities_lane_holds(
+        self,
+        waiting: Iterable[tuple[ImageGenerateJobPopResponse, str]],
+    ) -> list[ImageGenerateJobPopResponse]:
+        """Hold each extended-ControlNet job waiting for the image-utilities lane while its deadline allows.
+
+        ``waiting`` pairs each job with its control type. The caller has judged that the lane is up or coming up
+        and cannot serve that type yet. A held job is skipped by selection, so the jobs behind it dispatch, and it
+        names the empty slot ``UTILITIES_LANE_BRING_UP``. The wait is bounded by
+        ``dispatch_affinity.utilities_lane_hold_expired``: the job's ttl from pop, less its expected sampling seconds
+        from the performance model, less the skip budget, or the anti-starvation share when no sampling figure
+        exists. A job past that bound is returned for the caller to fault rather than held. Every hold for a job
+        not in ``waiting`` is released.
+
+        Args:
+            waiting: The jobs to hold, each with the control type the lane cannot serve yet.
+
+        Returns:
+            The jobs whose deadline cannot cover the wait.
+        """
+        expired: list[ImageGenerateJobPopResponse] = []
+        held_ids: set[str] = set()
+        for job, control_type in waiting:
+            if job.id_ is None:
+                continue
+            tracked = self._job_tracker.get_tracked_job(job.id_)
+            if utilities_lane_hold_expired(
+                now=self._clock(),
+                popped_at=tracked.time_popped if tracked is not None else None,
+                ttl=float(job.ttl) if job.ttl is not None else None,
+                recent_job_ttl=self._state.recent_job_ttl,
+                expected_sampling_seconds=(
+                    None
+                    if job.model is None
+                    else self._expected_sampling_seconds(job, self._model_metadata.get_baseline(job.model))
+                ),
+            ):
+                expired.append(job)
+                continue
+            job_id = str(job.id_)
+            held_ids.add(job_id)
+            if not self._dispatch_holds.note_utilities_lane_hold(job_id):
+                continue
+            # Log contract: analysis/log_signatures.py (extended_controlnet_lane_hold).
+            logger.info(
+                f"Holding extended-ControlNet job {job_id[:8]} for the image-utilities lane, which cannot serve "
+                f"control type {control_type} yet.",
+            )
+            if self._decision_sink is not None:
+                self._decision_sink(
+                    decision_kind=DecisionKind.INFERENCE_DISPATCH,
+                    subject=job_id,
+                    verdict=DecisionVerdict.WITHHOLD,
+                    reason="awaiting_utilities_lane",
+                    inputs={"model": str(job.model), "control_type": control_type},
+                )
+        for job_id, _held_seconds in self._dispatch_holds.release_utilities_lane_holds(held_ids):
+            self._resolve_dispatch_decision(job_id, reason="utilities_lane_hold_released")
+        return expired
+
+    def job_awaits_utilities_lane(self, job: ImageGenerateJobPopResponse) -> bool:
+        """Whether ``job`` is held for the image-utilities lane to serve its control type."""
+        return job.id_ is not None and str(job.id_) in self._dispatch_holds.utilities_lane_holds
+
+    def utilities_lane_held_job_ids(self) -> set[str]:
+        """The ids of the jobs held for the image-utilities lane, for the deadlock detector's exemption."""
+        return set(self._dispatch_holds.utilities_lane_holds)
+
     def _resolve_dispatch_decision(self, job_id: str, *, reason: str) -> None:
         """Close any open dispatch-hold decision for ``job_id`` with a final resolving record.
 
@@ -13877,6 +13963,13 @@ class InferenceScheduler:
             return withheld(
                 SlotDutyBucket.AUX_PREPARATION,
                 "its auxiliary models are still being placed on disk, so it holds no lane and cannot sample",
+            )
+
+        if next_job_and_process.line_skip is None and self.job_awaits_utilities_lane(next_job):
+            # Selection already skips a lane-held job. This terminal gate keeps one from seizing a lane by any path.
+            return withheld(
+                SlotDutyBucket.UTILITIES_LANE_BRING_UP,
+                "the image-utilities lane cannot serve its control type yet and is coming up to serve it",
             )
 
         if self._job_tracker.is_degraded_dispatch_pending(next_job) and self._jobs_in_progress_in_dispatch_scope(

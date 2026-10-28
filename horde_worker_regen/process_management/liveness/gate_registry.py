@@ -1030,6 +1030,26 @@ GATE_REGISTRY: tuple[GateEntry, ...] = (
         observable_at=_DISPATCH_STALL_OBSERVABLE,
     ),
     GateEntry(
+        key="utilities_lane_bring_up",
+        surface=GateSurface.DISPATCH_STALL,
+        kind=GateKind.HOLD,
+        subsystem="process_management.process_manager",
+        engaged_by=(
+            "an extended-ControlNet job's control type is not in the image-utilities lane's servable set while "
+            "the lane starts or primes for it, so the job holds no lane and cannot sample"
+        ),
+        released_by="the lane reporting the job's control type servable, after which the job is pre-annotated",
+        bound_seconds=None,
+        bound_source="dispatch_affinity.utilities_lane_hold_expired",
+        backstop=(
+            "the job's ttl less its expected sampling and the skip budget, a live lane reporting a set without "
+            "the type, and the lane crashing, being paused or having its start refused, "
+            "each of which faults the job for reissue. Selection skips the job meanwhile, so a sibling is "
+            "dispatched instead of idling the lane"
+        ),
+        observable_at=_DISPATCH_STALL_OBSERVABLE,
+    ),
+    GateEntry(
         key="safety_backlog_exclusion",
         surface=GateSurface.DISPATCH_STALL,
         kind=GateKind.HOLD,

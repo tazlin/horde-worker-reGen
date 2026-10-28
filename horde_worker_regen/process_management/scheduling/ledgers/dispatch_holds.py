@@ -4,9 +4,10 @@ A dispatch-time residency hold parks an already-resident head while idle sibling
 materialisation fits before it commits; the job keeps its queue position and is never faulted. A
 post-processing defer hold parks a head whose sampling peak would collide with an in-flight post-processing
 chain. A clearance hold withholds the clearance grant from a staged, primed child whose diffusion weights would
-over-commit the card at the clearance moment. Each is bookkeeping the gate already needs; keeping it in one place
-lets the stall classifier, the recovery supervisor and the liveness watchdog read the gate's own truthful state
-instead of re-deriving it.
+over-commit the card at the clearance moment. A utilities-lane hold keeps an extended-ControlNet job out of
+selection while the image-utilities lane comes up to serve its control type. Each is bookkeeping the gate already
+needs; keeping it in one place lets the stall classifier, the recovery supervisor and the liveness watchdog read
+the gate's own truthful state instead of re-deriving it.
 
 Alongside them it owns the current cycle's dispatch declines: which gate withheld each job the dispatch pass
 selected, so the pass can route around a withheld job instead of re-asking the gate, and the stall explainer
@@ -150,6 +151,11 @@ class DispatchHoldLedger:
         the liveness grace it already consumed."""
         self.clearance_granted_ids: set[str] = set()
         """In-progress job ids the clearance gate has granted their load-and-sample window."""
+        self.utilities_lane_holds: dict[str, float] = {}
+        """Extended-ControlNet jobs held for the image-utilities lane to serve their control type, keyed by job id,
+        with when each hold began. Selection skips a held job, so it does not stall the jobs behind it."""
+        self.utilities_lane_hold_count = 0
+        """Distinct utilities-lane holds this session."""
         self.cycle_declines: dict[str, DispatchDecline] = {}
         """The jobs a dispatch gate withheld during the scheduling cycle now running, keyed by job id. Scoped
         to the cycle and discarded at its start, so it states what this pass decided and never a stale verdict
@@ -238,6 +244,25 @@ class DispatchHoldLedger:
         """Whether ``job_id``'s hold has stood at least ``bound_seconds``."""
         held = self.held_seconds(job_id)
         return held is not None and held >= bound_seconds
+
+    # ---- utilities-lane holds
+
+    def note_utilities_lane_hold(self, job_id: str) -> bool:
+        """Hold ``job_id`` for the image-utilities lane and return whether this is the job's first hold."""
+        if job_id in self.utilities_lane_holds:
+            return False
+        self.utilities_lane_holds[job_id] = self._clock()
+        self.utilities_lane_hold_count += 1
+        return True
+
+    def release_utilities_lane_holds(self, keep: Iterable[str]) -> list[tuple[str, float]]:
+        """Release every utilities-lane hold not in ``keep`` and return each released job id with its held seconds."""
+        kept = set(keep)
+        released: list[tuple[str, float]] = []
+        for job_id in [job_id for job_id in self.utilities_lane_holds if job_id not in kept]:
+            held_since = self.utilities_lane_holds.pop(job_id)
+            released.append((job_id, max(0.0, self._clock() - held_since)))
+        return released
 
     # ---- post-processing defer holds
 

@@ -220,6 +220,11 @@ def _no_disagg_holds() -> set[str]:
     return set()
 
 
+def _no_utilities_lane_holds() -> set[str]:
+    """Default utilities-lane hold provider: report no jobs held for the image-utilities lane."""
+    return set()
+
+
 @dataclass(frozen=True)
 class DeadlockSnapshot:
     """Represents the currently observed scheduler deadlock state."""
@@ -275,6 +280,7 @@ class MessageDispatcher:
     _on_unload_vram: Callable[[HordeProcessInfo], Awaitable[None]]
     _aux_hold_provider: Callable[[], set[GenerationID]]
     _disagg_hold_provider: Callable[[], set[str]]
+    _utilities_lane_hold_provider: Callable[[], set[str]]
     _on_alchemy_result: Callable[[HordeAlchemyResultMessage], None] | None = None
     _on_annotation_result: Callable[[HordeAnnotationResultMessage], None] | None = None
     """Invoked when the image-utilities lane reports a ControlNet annotation result (map bytes or a fault)."""
@@ -429,6 +435,7 @@ class MessageDispatcher:
         self._state = state
         self._aux_hold_provider = aux_hold_provider if aux_hold_provider is not None else _no_aux_holds
         self._disagg_hold_provider = _no_disagg_holds
+        self._utilities_lane_hold_provider = _no_utilities_lane_holds
         self._safety_verdicts_known_lost: set[GenerationID] = set()
         """Jobs whose safety verdict was dropped because its producing launch was retired.
 
@@ -541,6 +548,16 @@ class MessageDispatcher:
         idle by design, so "work outstanding plus every process idle" is the pipeline advancing, not a wedge.
         """
         self._disagg_hold_provider = provider
+
+    def set_utilities_lane_hold_provider(self, provider: Callable[[], set[str]]) -> None:
+        """Register the source of job ids held for the image-utilities lane to serve their control type.
+
+        Deadlock detection excludes these jobs from both deadlock conditions. A held job takes no inference slot
+        until the lane comes up, so a queue holding only such jobs leaves every process idle by design. The hold
+        is bounded by the job's anti-starvation deadline and by the lane's own state, so a lane that never comes
+        up stops shielding the queue once the job is faulted.
+        """
+        self._utilities_lane_hold_provider = provider
 
     def set_metrics_handlers(
         self,
@@ -2600,9 +2617,10 @@ class MessageDispatcher:
         # the pipeline, so it stops shielding the queue.
         aux_held = self._aux_hold_provider()
         disagg_held = self._disagg_hold_provider()
+        lane_held = self._utilities_lane_hold_provider()
 
         def _deadlock_exempt(job: ImageGenerateJobPopResponse) -> bool:
-            return job.id_ in aux_held or str(job.id_) in disagg_held
+            return job.id_ in aux_held or str(job.id_) in disagg_held or str(job.id_) in lane_held
 
         unheld_pending = tuple(job for job in self._job_tracker.jobs_pending_inference if not _deadlock_exempt(job))
         unheld_in_progress = tuple(job for job in self._job_tracker.jobs_in_progress if not _deadlock_exempt(job))

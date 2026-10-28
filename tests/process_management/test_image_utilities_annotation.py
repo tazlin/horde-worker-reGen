@@ -19,6 +19,7 @@ import time
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
+from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
@@ -33,6 +34,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeAnnotationResultMessage,
     HordeAnnotatorAvailabilityMessage,
     HordeControlFlag,
+    HordeDownloadAvailabilityMessage,
     HordeImageResult,
     HordeInferenceControlMessage,
     HordeInferenceResultMessage,
@@ -52,6 +54,11 @@ from horde_worker_regen.process_management.lifecycle.process_map import ProcessM
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.process_manager import HordeWorkerProcessManager
 from horde_worker_regen.process_management.resources.run_metrics import DecisionKind, DecisionVerdict
+from horde_worker_regen.process_management.scheduling.dispatch_affinity import (
+    ANTI_STARVATION_TTL_FRACTION,
+    fallback_ttl_seconds,
+)
+from horde_worker_regen.process_management.scheduling.slot_duty import SlotDutyBucket
 from horde_worker_regen.process_management.worker_entry_points import ProcessEntryPoints
 from tests.process_management.conftest import (
     make_job_pop_response,
@@ -81,12 +88,14 @@ def _make_controlnet_job(
     control_type: str = "canny",
     return_control_map: bool = False,
     image_is_control: bool = False,
+    ttl: int | None = None,
 ) -> ImageGenerateJobPopResponse:
     """Build a real controlnet generation pop response carrying an inline (base64) source image."""
     job_id = str(uuid.uuid4())
     data = {
         "id": job_id,
         "ids": [job_id],
+        "ttl": ttl,
         "model": "stable_diffusion",
         "source_image": _SOURCE_IMAGE_B64,
         "source_processing": "img2img",
@@ -296,12 +305,13 @@ class TestUnservableControlType:
 class TestExtendedControlnetHostileInput:
     """An extended-controlnet job that arrives while the worker withholds extended is faulted for reissue."""
 
-    async def test_unoffered_extended_job_is_faulted(self) -> None:
-        """A queued extended-type job while extended is not fully servable is reissued, never annotated."""
+    async def test_unoffered_extended_job_is_faulted(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A queued extended-type job the lane cannot serve, with no annotator weights on disk, is reissued."""
         pm = make_testable_process_manager(enable_image_utilities=True, extended_controlnet=True)
         util = _add_utilities_process(pm)
-        # Only a classic type is servable, so the extended surface is not fully ready; extended stays withheld.
+        # Only a classic type is servable and the extended weights are absent, so the lane never will serve it.
         _mark_servable(pm, ["canny"])
+        monkeypatch.setattr(pm, "_extended_annotators_on_disk", lambda _types: False)
         job = _make_controlnet_job(control_type="lineart")
         assert job.id_ is not None
         await pm._job_tracker.record_popped_job(job, time_popped=time.time())
@@ -1195,3 +1205,317 @@ class TestUtilitiesLaneOnDemandEnsemble:
         started = [reason for verdict, reason in decisions if verdict is DecisionVerdict.ADMIT]
         assert started == ["strip_only_job", "strip_only_job"]
         assert (DecisionVerdict.WITHHOLD, "no_demand") in decisions
+
+
+class _ExtendedLaneRig:
+    """A manager with the lane enabled, extended ControlNet opted in and a fake lane adapter, driven tick by tick.
+
+    A tick runs the control loop's lane steps in their loop order: the extended-ControlNet pass, the annotation
+    pass, the lane's replacement machine and the demand driver.
+    """
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, *, device_free_mb: float = 24000.0) -> None:
+        self.pm = make_testable_process_manager(
+            enable_image_utilities=True,
+            extended_controlnet=True,
+            device_free_mb=device_free_mb,
+        )
+        self.constructed: list[_FakeAdapter] = []
+        self.faults: list[str | None] = []
+        self.dispatch_decisions: list[tuple[str, DecisionVerdict, str]] = []
+        lifecycle = self.pm._process_lifecycle
+
+        def _factory(*_args: object, **_kwargs: object) -> _FakeAdapter:
+            adapter = _FakeAdapter()
+            self.constructed.append(adapter)
+            return adapter
+
+        lifecycle._entry_points = ProcessEntryPoints(utilities_adapter_factory=_factory)  # type: ignore[arg-type]
+        lifecycle._ctx.Pipe.return_value = (Mock(), Mock())
+        self.pm._download_coordinator.inference_processes_started = True
+        # The annotator weights for every extended type are on disk, so a lane that comes up can serve them.
+        monkeypatch.setattr(self.pm, "_extended_annotators_on_disk", lambda _types: True)
+
+        fault_now = self.pm._job_tracker.handle_job_fault_now
+
+        def _spy_fault(*args: object, **kwargs: object) -> object:
+            self.faults.append(kwargs.get("fault_reason"))  # type: ignore[arg-type]
+            return fault_now(*args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(self.pm._job_tracker, "handle_job_fault_now", _spy_fault)
+
+        sink = self.pm._inference_scheduler._decision_sink
+        assert sink is not None
+
+        def _spy_decision(**kwargs: object) -> object:
+            if kwargs["decision_kind"] is DecisionKind.INFERENCE_DISPATCH:
+                self.dispatch_decisions.append(
+                    (str(kwargs["subject"]), kwargs["verdict"], str(kwargs["reason"])),  # type: ignore[arg-type]
+                )
+            return sink(**kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(self.pm._inference_scheduler, "_decision_sink", _spy_decision)
+
+    def lane(self) -> HordeProcessInfo | None:
+        lanes = [info for info in self.pm._process_map.values() if info.process_type is HordeProcessType.UTILITIES]
+        return lanes[0] if lanes else None
+
+    def tick(self) -> None:
+        self.pm._fault_unready_extended_controlnet_jobs()
+        self.pm._advance_pending_annotations()
+        self.pm._process_lifecycle._replace_all_utilities_process()
+        self.pm._reconcile_utilities_demand()
+
+    def report_servable(self, control_types: list[str]) -> None:
+        lane = self.lane()
+        assert lane is not None
+        self.pm._on_annotator_availability(
+            HordeAnnotatorAvailabilityMessage(
+                process_id=lane.process_id,
+                process_launch_identifier=0,
+                info="availability",
+                servable_control_types=control_types,
+            ),
+        )
+
+
+class TestExtendedControlnetWaitsForTheLane:
+    """An extended-ControlNet job popped with the lane down starts it and waits for its control type."""
+
+    async def test_a_job_popped_with_the_lane_down_is_held_until_its_type_is_servable(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The job starts the lane, is held until the lane reports its set, then goes to annotation."""
+        rig = _ExtendedLaneRig(monkeypatch)
+        for _ in range(3):
+            rig.tick()
+        assert rig.constructed == [], "extended ControlNet alone does not keep the lane up"
+
+        job = _make_controlnet_job(control_type="lineart", ttl=600)
+        assert job.id_ is not None
+        await rig.pm._job_tracker.record_popped_job(job, time_popped=time.time())
+
+        rig.tick()
+        assert job in rig.pm._job_tracker.jobs_pending_inference, "the job waits for the lane"
+        assert len(rig.constructed) == 1, "the pending job starts the lane"
+        lane = rig.lane()
+        assert lane is not None
+        assert rig.pm._inference_scheduler.job_awaits_utilities_lane(job)
+
+        lane.last_process_state = HordeProcessState.WAITING_FOR_JOB
+        # The held job takes no slot by design, so the deadlock detector does not read the idle processes as a wedge.
+        rig.pm._state.last_job_pop_time = time.time() - 60
+        idle_id = max(rig.pm._process_map) + 1
+        rig.pm._process_map[idle_id] = make_mock_process_info(
+            idle_id,
+            model_name="stable_diffusion",
+            state=HordeProcessState.WAITING_FOR_JOB,
+        )
+        for _ in range(3):
+            rig.pm.detect_deadlock()
+        snapshot = rig.pm._message_dispatcher.get_deadlock_snapshot()
+        assert snapshot.in_queue_deadlock is False
+        assert snapshot.in_deadlock is False
+        for _ in range(3):
+            rig.tick()
+        assert rig.pm._job_tracker.get_stage(job.id_) == JobStage.PENDING_INFERENCE
+        assert rig.pm._inference_scheduler.job_awaits_utilities_lane(job)
+        assert not _sent(lane).called
+
+        rig.report_servable(["canny", "lineart"])
+        rig.tick()
+        assert not rig.pm._inference_scheduler.job_awaits_utilities_lane(job)
+        assert rig.pm._job_tracker.get_stage(job.id_) == JobStage.PENDING_ANNOTATION
+        sent = _sent(lane).call_args.args[0]
+        assert isinstance(sent, HordeStartAnnotationControlMessage)
+        assert sent.control_type == "lineart"
+        assert rig.faults == []
+        holds = [record for record in rig.dispatch_decisions if record[1] is DecisionVerdict.WITHHOLD]
+        assert holds == [(str(job.id_), DecisionVerdict.WITHHOLD, "awaiting_utilities_lane")], "recorded once"
+
+    async def test_a_lane_start_refused_for_vram_faults_the_job(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A lane whose start is deferred for VRAM is not coming up, so the job is reissued as before."""
+        rig = _ExtendedLaneRig(monkeypatch, device_free_mb=100.0)
+        job = _make_controlnet_job(control_type="lineart", ttl=600)
+        assert job.id_ is not None
+        await rig.pm._job_tracker.record_popped_job(job, time_popped=time.time())
+
+        for _ in range(2):
+            rig.tick()
+
+        assert rig.constructed == []
+        assert rig.pm._process_lifecycle.has_pending_gpu_starts()
+        assert job not in rig.pm._job_tracker.jobs_pending_inference
+        assert rig.faults == ["extended_controlnet_not_offered"]
+        assert not rig.pm._inference_scheduler.job_awaits_utilities_lane(job)
+
+    async def test_a_job_whose_deadline_cannot_cover_the_bring_up_is_faulted(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A job already past the anti-starvation share of its ttl is reissued rather than held."""
+        rig = _ExtendedLaneRig(monkeypatch)
+        job = _make_controlnet_job(control_type="lineart", ttl=100)
+        assert job.id_ is not None
+        await rig.pm._job_tracker.record_popped_job(job, time_popped=time.time() - 40.0)
+
+        rig.tick()
+
+        assert job not in rig.pm._job_tracker.jobs_pending_inference
+        assert rig.faults == ["extended_controlnet_not_offered"]
+        assert not rig.pm._inference_scheduler.job_awaits_utilities_lane(job)
+
+    async def test_a_live_lane_whose_reported_set_lacks_the_type_faults_the_job(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Once a live lane reports its servable set, a type missing from it is not waited for."""
+        rig = _ExtendedLaneRig(monkeypatch)
+        job = _make_controlnet_job(control_type="lineart", ttl=600)
+        assert job.id_ is not None
+        await rig.pm._job_tracker.record_popped_job(job, time_popped=time.time())
+        rig.tick()
+        assert rig.pm._inference_scheduler.job_awaits_utilities_lane(job)
+        lane = rig.lane()
+        assert lane is not None
+        lane.last_process_state = HordeProcessState.WAITING_FOR_JOB
+
+        rig.report_servable(["canny"])
+        rig.tick()
+
+        assert job not in rig.pm._job_tracker.jobs_pending_inference
+        assert rig.faults == ["extended_controlnet_not_offered"]
+        assert not rig.pm._inference_scheduler.job_awaits_utilities_lane(job)
+
+    @pytest.mark.parametrize(
+        ("age_seconds", "held"),
+        [(10.0, True), (50.0, False)],
+        ids=["inside-the-fallback-share", "past-the-fallback-share"],
+    )
+    async def test_a_job_with_no_ttl_is_bounded_by_the_fallback_ttl(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        age_seconds: float,
+        held: bool,
+    ) -> None:
+        """With no ttl on the job and none seen, the hold reads the skip budget's default ttl."""
+        rig = _ExtendedLaneRig(monkeypatch)
+        assert rig.pm._state.recent_job_ttl is None
+        # The two ages sit either side of the fallback's anti-starvation share.
+        assert 10.0 < ANTI_STARVATION_TTL_FRACTION * fallback_ttl_seconds(None) < 50.0
+        job = _make_controlnet_job(control_type="lineart")
+        assert job.id_ is not None and job.ttl is None
+        await rig.pm._job_tracker.record_popped_job(job, time_popped=time.time() - age_seconds)
+
+        rig.tick()
+
+        assert rig.pm._inference_scheduler.job_awaits_utilities_lane(job) is held
+        assert (job in rig.pm._job_tracker.jobs_pending_inference) is held
+        assert rig.faults == ([] if held else ["extended_controlnet_not_offered"])
+
+    def test_the_annotator_probe_runs_once_per_type_until_presence_changes(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A second read is served from the cache, and a changed presence report clears it."""
+        pm = make_testable_process_manager(enable_image_utilities=True, extended_controlnet=True)
+        probed: list[list[str]] = []
+
+        def _probe(control_types: list[str], _root: object) -> bool:
+            probed.append(list(control_types))
+            return True
+
+        monkeypatch.setattr("horde_model_reference.on_disk_layout.annotators_present_for_control_types", _probe)
+        monkeypatch.setattr("horde_model_reference.on_disk_layout.resolve_weights_root", lambda: Path("unused"))
+
+        assert pm._extended_annotators_on_disk(["lineart", "mlsd"]) is True
+        assert sorted(probed) == [["lineart"], ["mlsd"]]
+        assert pm._extended_annotators_on_disk(["lineart"]) is True
+        assert pm._extended_annotators_on_disk(["mlsd", "lineart"]) is True
+        assert len(probed) == 2, "a second read does not touch the filesystem"
+
+        def _report(controlnet_present: bool | None) -> None:
+            pm._on_download_availability(
+                HordeDownloadAvailabilityMessage(
+                    process_id=99,
+                    process_launch_identifier=0,
+                    info="test",
+                    available_model_names=[],
+                    controlnet_present=controlnet_present,
+                ),
+            )
+
+        _report(False)
+        assert pm._extended_annotators_on_disk(["lineart"]) is True
+        assert len(probed) == 3, "the first presence report clears the cache"
+        _report(False)
+        assert pm._extended_annotators_on_disk(["lineart"]) is True
+        assert len(probed) == 3, "an unchanged report keeps it"
+        _report(True)
+        assert pm._extended_annotators_on_disk(["lineart"]) is True
+        assert len(probed) == 4, "a changed report clears it"
+
+    @pytest.mark.parametrize(
+        ("expected_sampling_seconds", "held"),
+        [(30.0, True), (250.0, False), (None, False)],
+        ids=["figure-leaves-room", "figure-leaves-no-room", "no-figure-reads-the-share"],
+    )
+    async def test_the_hold_reads_the_performance_models_sampling_figure(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        expected_sampling_seconds: float | None,
+        held: bool,
+    ) -> None:
+        """Past the anti-starvation share, a job stays held only while its ttl covers its expected sampling."""
+        scheduler = _make_inference_scheduler(job_tracker=JobTracker())
+        job = _make_controlnet_job(control_type="lineart", ttl=300)
+        # 120 s after pop is past the share (90 s) and inside 300 - 30 - 45 = 225 s.
+        await scheduler._job_tracker.record_popped_job(job, time_popped=time.time() - 120.0)
+        performance_model = Mock()
+        performance_model.expected_sampling_seconds.return_value = expected_sampling_seconds
+        monkeypatch.setattr(scheduler, "_performance_model", performance_model)
+        monkeypatch.setattr(scheduler._model_metadata, "get_baseline", lambda _model: "stable_diffusion_1")
+
+        expired = scheduler.reconcile_utilities_lane_holds([(job, "lineart")])
+
+        assert performance_model.expected_sampling_seconds.called
+        assert scheduler.job_awaits_utilities_lane(job) is held
+        assert expired == ([] if held else [job])
+
+    async def test_a_held_head_is_stepped_past_and_names_the_lane_hold(self) -> None:
+        """Selection skips a lane-held head for the job behind it, and the empty slot names the hold."""
+        process_info = make_mock_process_info(
+            0, model_name="stable_diffusion", state=HordeProcessState.PRELOADED_MODEL
+        )
+        horde_model_map = HordeModelMap(root={})
+        horde_model_map.update_entry(
+            horde_model_name="stable_diffusion",
+            load_state=ModelLoadState.LOADED_IN_RAM,
+            process_id=0,
+        )
+        job_tracker = JobTracker()
+        held = _make_controlnet_job(control_type="lineart", ttl=600)
+        behind = make_job_pop_response("stable_diffusion")
+        await job_tracker.record_popped_job(held, time_popped=time.time())
+        await job_tracker.record_popped_job(behind, time_popped=time.time())
+        scheduler = _make_inference_scheduler(
+            process_map=ProcessMap({0: process_info}),
+            horde_model_map=horde_model_map,
+            job_tracker=job_tracker,
+        )
+
+        assert scheduler.reconcile_utilities_lane_holds([(held, "lineart")]) == []
+
+        selection = await scheduler.get_next_job_and_process(information_only=True)
+        assert selection is not None
+        assert selection.next_job is behind
+        bucket, text = scheduler._classify_dispatch_stall(held, {})
+        assert bucket is SlotDutyBucket.UTILITIES_LANE_BRING_UP
+        assert "image-utilities lane" in text
+
+        assert scheduler.reconcile_utilities_lane_holds([]) == []
+        assert not scheduler.job_awaits_utilities_lane(held)
+        selection = await scheduler.get_next_job_and_process(information_only=True)
+        assert selection is not None
+        assert selection.next_job is held

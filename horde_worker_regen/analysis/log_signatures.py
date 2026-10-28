@@ -1683,6 +1683,17 @@ _SIGNATURE_LIST: list[LogSignature] = [
         dry_run_reason=_RECLAIM_HOLD_NOT_EXERCISED,
     ),
     _signature(
+        "extended_controlnet_lane_hold",
+        r"Holding extended-ControlNet job (?P<job_id>\S+) for the image-utilities lane, which cannot serve control "
+        r"type (?P<control_type>\S+) yet\.",
+        emitter="process_management.scheduling.inference_scheduler:InferenceScheduler.reconcile_utilities_lane_holds",
+        sample=(
+            "Holding extended-ControlNet job 6cf4693b for the image-utilities lane, which cannot serve control "
+            "type lineart yet."
+        ),
+        dry_run_reason=_UTILITIES_LANE_NOT_WANTED,
+    ),
+    _signature(
         "inference_result_lost",
         r"Process (?P<process>\d+) returned to idle while job (?P<job_id>\S+) was still in progress; its inference "
         r"result was lost\.",

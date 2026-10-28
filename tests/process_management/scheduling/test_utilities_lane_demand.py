@@ -7,13 +7,16 @@ import dataclasses
 import pytest
 from horde_sdk.generation_parameters.alchemy.consts import KNOWN_ALCHEMY_FORMS, KNOWN_MISC_POST_PROCESSORS
 
+from horde_worker_regen.consts import EXTENDED_CONTROL_TYPES
 from horde_worker_regen.process_management.scheduling.workload_flow import (
     AlchemyFormDemand,
     UtilitiesLaneDemandInputs,
     UtilitiesLaneDemandReason,
+    job_wants_pre_annotation,
     post_processing_is_strip_only,
     utilities_lane_demand,
 )
+from tests.process_management.test_image_utilities_annotation import _make_controlnet_job
 
 _STRIP = KNOWN_MISC_POST_PROCESSORS.strip_background.value
 _ANNOTATION = KNOWN_ALCHEMY_FORMS.annotation.value
@@ -23,7 +26,6 @@ _UPSCALER = "RealESRGAN_x4plus"
 _IDLE = UtilitiesLaneDemandInputs(
     lane_available=True,
     shutting_down=False,
-    extended_controlnet_opted_in=False,
     alchemy=AlchemyFormDemand(),
     jobs_pending_strip=0,
     strip_only_jobs_before_strip=0,
@@ -47,7 +49,7 @@ def test_an_enabled_lane_with_nothing_to_serve_is_not_wanted() -> None:
     [
         _with(lane_available=False, jobs_pending_strip=1),
         _with(shutting_down=True, jobs_pending_strip=1),
-        _with(lane_available=False, extended_controlnet_opted_in=True),
+        _with(lane_available=False, alchemy=AlchemyFormDemand(offerable=frozenset({_STRIP}))),
         _with(shutting_down=True, alchemy=AlchemyFormDemand(offerable=frozenset({_STRIP}))),
     ],
     ids=["unavailable-with-a-strip", "shutting-down-with-a-strip", "unavailable-warm", "shutting-down-warm"],
@@ -57,11 +59,19 @@ def test_a_disabled_lane_or_a_shutdown_wins_over_every_demand(inputs: UtilitiesL
     assert utilities_lane_demand(inputs) is None
 
 
-def test_the_extended_controlnet_opt_in_keeps_the_lane_warm() -> None:
-    """Extended ControlNet jobs have no in-graph path, so the opt-in wants the lane with no job in hand."""
-    assert utilities_lane_demand(_with(extended_controlnet_opted_in=True)) is (
-        UtilitiesLaneDemandReason.EXTENDED_CONTROLNET_WARM
-    )
+def test_extended_controlnet_has_no_warm_rule() -> None:
+    """The predicate reads no extended-ControlNet opt-in, so the opt-in alone does not keep the lane up."""
+    assert "extended_controlnet_opted_in" not in {
+        field.name for field in dataclasses.fields(UtilitiesLaneDemandInputs)
+    }
+    assert all("extended" not in reason.value for reason in UtilitiesLaneDemandReason)
+
+
+@pytest.mark.parametrize("control_type", sorted(EXTENDED_CONTROL_TYPES))
+def test_a_pending_extended_controlnet_job_is_demand(control_type: str) -> None:
+    """An extended job with a source image wants pre-annotation, which is the ControlNet annotation rule."""
+    assert job_wants_pre_annotation(_make_controlnet_job(control_type=control_type))
+    assert utilities_lane_demand(_with(pre_annotation_candidates=1)) is UtilitiesLaneDemandReason.CONTROLNET_ANNOTATION
 
 
 @pytest.mark.parametrize("form", [_STRIP, _ANNOTATION], ids=["strip_background", "annotation"])
@@ -131,7 +141,6 @@ def test_forms_waiting_for_other_lanes_are_not_demand() -> None:
 def test_the_first_rule_that_holds_names_the_reason() -> None:
     """With every rule holding, the reason follows the documented order."""
     every_rule = _with(
-        extended_controlnet_opted_in=True,
         alchemy=AlchemyFormDemand(offerable=frozenset({_STRIP}), waiting=(_STRIP,)),
         jobs_pending_strip=1,
         strip_only_jobs_before_strip=1,
@@ -139,7 +148,6 @@ def test_the_first_rule_that_holds_names_the_reason() -> None:
         jobs_pending_annotation=1,
     )
     expected_order = [
-        (UtilitiesLaneDemandReason.EXTENDED_CONTROLNET_WARM, {"extended_controlnet_opted_in": False}),
         (UtilitiesLaneDemandReason.ALCHEMY_FORM_WARM, {"alchemy": AlchemyFormDemand(waiting=(_STRIP,))}),
         (UtilitiesLaneDemandReason.PENDING_STRIP, {"jobs_pending_strip": 0}),
         (UtilitiesLaneDemandReason.STRIP_ONLY_JOB, {"strip_only_jobs_before_strip": 0}),
