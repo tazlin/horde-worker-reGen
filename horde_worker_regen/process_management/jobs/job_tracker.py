@@ -362,7 +362,7 @@ class TrackedJob:
     aux_resolve_requeued: bool = False
     """Whether an inference child has returned this job because its auxiliary files did not resolve.
 
-    Such a requeue spends no inference attempt. The prefetch coordinator bounds the job's later auxiliary holds
+    Such a requeue does not spend an inference attempt. The prefetch coordinator bounds the job's later auxiliary holds
     from its pop instead, so a file the download process keeps reporting present while the child cannot read it
     does not cycle the job forever."""
     needs_degraded_dispatch: bool = False
@@ -453,7 +453,7 @@ class TrackedJob:
     """Epoch time this queued strip reached the head of the strip queue, or None while it is not there.
 
     The head is the first queued strip with no dispatched strip ahead of it. The queue-wait budget is measured
-    from here, because a strip behind a running pass is waiting on the lane's time and not its own. The parent
+    from here, because a strip behind a running pass is waiting for the lane to finish that pass. The parent
     stamps it on the first tick the job is at the head and clears it on dispatch, on requeue after a lost lane,
     and whenever a strip ahead takes the head back."""
     strip_dispatch_attempts: int = 0
@@ -491,14 +491,14 @@ class TrackedJob:
 
     With :attr:`time_popped` this measures the wall time a job spent blocked on its auxiliary files being
     placed on disk, which is the part of its queue wait attributable to LoRA/TI fetching rather than to
-    scheduling. A job whose files were already on disk stamps this when the download process's presence answer
+    scheduling. A job whose files were already on disk stamps this when the download process's presence result
     arrives, so its wait reads as that round trip rather than as unknown."""
     aux_present_lora_keys: set[str] = field(default_factory=set)
     """The LoRAs the download process reported present for this job, keyed like the LoRA skip verdicts.
 
-    The download process applies the eviction pins a request carries before it answers, and the pins cover every
+    The download process applies the eviction pins a request carries before it responds, and the pins cover every
     tracked job that still needs its files, so a LoRA reported present for this job stays on disk while the job
-    is tracked. The set belongs to this job alone. Another job referencing the same LoRA asks the download
+    is tracked. The set belongs to this job alone. Another job referencing the same LoRA requests it from the download
     process itself, because the file may have been evicted once this job's pin lapsed. Cleared by
     :meth:`JobTracker.invalidate_job_aux_preparation` when an inference child fails to resolve one of the files.
     """
@@ -664,8 +664,8 @@ class JobTracker:
         # like the fault streaks (device_index, None on a single-GPU host); monotonic across the session.
         self._card_inference_results: dict[int | None, int] = {}
 
-        # The tracker keeps no worker-wide belief about which LoRAs or TIs are on disk. The download process
-        # owns the files and every evictor, so presence is its answer, recorded per job on the tracked job
+        # The tracker does not keep a worker-wide record of which LoRAs or TIs are on disk. The download process
+        # holds the files and runs every evictor, so presence is its report, recorded per job on the tracked job
         # (TrackedJob.aux_present_lora_keys and aux_present_ti_keys).
 
         # LoRA/TI files a job references whose ad-hoc download was ruled out. A skipped file is not on disk, but
@@ -844,7 +844,7 @@ class JobTracker:
         """Record a post-processing fault for the feature-level circuit breaker when it is a VRAM over-commit.
 
         Every site that faults a job's post-processing or background strip reports here with its cause, so the
-        classification has one owner. Only :attr:`PostProcessingFaultCause.VRAM_OVERCOMMIT` is counted,
+        classification is made in one place. Only :attr:`PostProcessingFaultCause.VRAM_OVERCOMMIT` is counted,
         because the breaker's clear condition is a VRAM probe and nothing else the breaker can do helps the
         other causes. Feature-level, so no per-model streak is kept.
 
@@ -2227,7 +2227,7 @@ class JobTracker:
         """Record the download process's report that one auxiliary file (LoRA or TI) is present for one job.
 
         The report is kept on the tracked job only (see :attr:`TrackedJob.aux_present_lora_keys`), so a later
-        job referencing the same file asks the download process again. A job no longer tracked is ignored.
+        job referencing the same file requests it from the download process again. A job no longer tracked is ignored.
         """
         tracked = self._tracked_by_id(job_id)
         if tracked is None:
@@ -2287,7 +2287,7 @@ class JobTracker:
         """Withdraw a job's aux-prepared state after its files failed to resolve in the inference child.
 
         The job's presence reports from the download process are forgotten along with the prepared flag, so the
-        prefetch reconcile sweep asks the download process about every auxiliary file the job references again,
+        prefetch reconcile sweep queries the download process about every auxiliary file the job references again,
         as a fresh pop does. Returns True when a tracked job's prepared flag was actually withdrawn.
         """
         tracked = self._tracked_for(job)
@@ -2617,7 +2617,7 @@ class JobTracker:
         A refusal is a capacity result. The job returns to ``PENDING_INFERENCE`` without spending an inference
         attempt or a degraded retry. A refused preload reports its load FAILED and a refused run unloads its model,
         and either report clears the lane's record of the model. Unless another lane holds the model, the job then
-        waits for a preload that the host admission passes. The count has no clock, so a host whose reading admits
+        waits for a preload that the host admission passes. The count is not timed, so a host whose reading admits
         the same refused mapping again spends the budget at that rate. The refusal
         after :data:`MAX_HOST_COMMIT_REQUEUES` requeues faults the job for the horde to reissue. That fault reaches
         the terminal-fault observer because the horde counts it as a dropped job, and it never feeds the
@@ -2687,8 +2687,8 @@ class JobTracker:
     async def requeue_for_aux_resolve(self, faulted_job: ImageGenerateJobPopResponse) -> InferenceFailureResolution:
         """Return a job whose inference child could not resolve its auxiliary files to ``PENDING_INFERENCE``.
 
-        The child checks the files before any load or sampling, so no inference ran. The requeue spends no
-        inference attempt and no degraded retry, so a later generation failure still has the job's whole retry
+        The child checks the files before any load or sampling, so no inference ran. The requeue does not spend an
+        inference attempt or a degraded retry, so a later generation failure still has the job's whole retry
         budget. The job's prepared state and its presence reports are withdrawn, which gates it out of dispatch
         until the prefetch coordinator re-requests its files. That coordinator bounds the cycle with the deadline
         it measures from the job's pop.
@@ -2711,12 +2711,12 @@ class JobTracker:
             logger.warning(f"Job {faulted_job.id_} already in completed_jobs")
             return InferenceFailureResolution.FAULTED
 
-        # Released before deciding, as the ordinary fault path does, so a requeue cannot race the orchestrator's
-        # re-dispatch of held disaggregation state and a terminal fault leaves none behind.
+        # Released before the outcome is chosen, as on the ordinary fault path, so a requeue cannot race the
+        # orchestrator's re-dispatch of held disaggregation state and a terminal fault does not leave any behind.
         if faulted_job.id_ is not None and self._inference_failure_release_observer is not None:
             self._inference_failure_release_observer(faulted_job.id_)
 
-        # The child returned the job before loading anything, so the attempt says nothing about the card's ceiling.
+        # The child returned the job before loading anything, so the attempt is not evidence about the card's ceiling.
         if tracked.measured_attempt:
             tracked.measured_attempt = False
             tracked.measured_attempt_device_index = None
@@ -2733,7 +2733,8 @@ class JobTracker:
         tracked.job_info.fault_job()
         self._record_fault_diagnostics(tracked, is_resource_failure=False, fault_reason=reason)
         if self._set_stage(tracked, JobStage.PENDING_SUBMIT):
-            # Counted here for the reason the ordinary terminal path gives: no later step counts a fault decided now.
+            # Counted here, as on the ordinary terminal path, because a later step does not count a fault
+            # that is settled now.
             self._total_num_completed_jobs += 1
             self._count_job_faulted(tracked)
         if self._terminal_fault_observer is not None:

@@ -1,4 +1,4 @@
-"""The only_models_on_disk filter prices presence against the merged canonical-plus-beta reference."""
+"""The only_models_on_disk filter checks presence against the merged canonical-plus-beta reference."""
 
 from __future__ import annotations
 

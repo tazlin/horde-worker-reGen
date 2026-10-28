@@ -269,9 +269,9 @@ class _OrderRecordingLoraManager(_FakeLoraManager):
 
 
 def test_present_entry_is_answered_without_fetch_after_its_pin_is_applied(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A present LoRA answers success with no fetch, and the request's pin protects it before the probe reads it.
+    """A present LoRA is reported as a success with no fetch, and the pin is applied before the presence probe.
 
-    The parent keeps no belief of its own about which files are on disk and sends every entry of a popped job. The
+    The parent does not track which files are on disk and sends every entry of a popped job. The
     success it receives for a present file is only sound while the file stays on disk until the job dispatches,
     which the pin applied in the same request guarantees.
     """
@@ -356,7 +356,7 @@ def test_disk_full_refusal_reports_the_disk_full_outcome(monkeypatch: pytest.Mon
     """A fetch hordelib skipped for a full cache volume reports the disk-full kind.
 
     hordelib returns the skip as a typed ``AdhocDownloadSkipReason``, distinct from its terminal rejection reasons.
-    The outcome stays retryable and carries no rejection reason.
+    The outcome stays retryable and does not carry a rejection reason.
     """
     lora = _FakeLoraManager(present=set(), fetch_succeeds=False, reject_reason=AdhocDownloadSkipReason.DISK_FULL)
     process = _make_process(monkeypatch, lora=lora, ti=None)

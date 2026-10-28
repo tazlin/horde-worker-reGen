@@ -1,4 +1,4 @@
-"""The rules that decide whether the image-utilities lane should be up, one row per rule and one for their order."""
+"""The rules for whether the image-utilities lane should be up, one row per rule and one for their order."""
 
 from __future__ import annotations
 
@@ -32,7 +32,7 @@ _IDLE = UtilitiesLaneDemandInputs(
     pre_annotation_candidates=0,
     jobs_pending_annotation=0,
 )
-"""An enabled lane with nothing to serve."""
+"""An enabled, idle lane."""
 
 
 def _with(**changes: object) -> UtilitiesLaneDemandInputs:
@@ -65,7 +65,7 @@ def test_a_disabled_lane_or_a_shutdown_wins_over_every_demand(inputs: UtilitiesL
 
 
 def test_extended_controlnet_has_no_warm_rule() -> None:
-    """The predicate reads no extended-ControlNet opt-in, so the opt-in alone does not keep the lane up."""
+    """The predicate does not read the extended-ControlNet opt-in, so the opt-in alone does not keep the lane up."""
     assert "extended_controlnet_opted_in" not in {
         field.name for field in dataclasses.fields(UtilitiesLaneDemandInputs)
     }
@@ -74,13 +74,13 @@ def test_extended_controlnet_has_no_warm_rule() -> None:
 
 @pytest.mark.parametrize("control_type", sorted(EXTENDED_CONTROL_TYPES))
 def test_a_pending_extended_controlnet_job_is_demand(control_type: str) -> None:
-    """An extended job with a source image wants pre-annotation, which is the ControlNet annotation rule."""
+    """An extended job with a source image needs pre-annotation, which is the ControlNet annotation rule."""
     assert job_wants_pre_annotation(_make_controlnet_job(control_type=control_type))
     assert utilities_lane_demand(_with(pre_annotation_candidates=1)) is UtilitiesLaneDemandReason.CONTROLNET_ANNOTATION
 
 
 def test_an_alchemy_offer_does_not_keep_the_lane_warm() -> None:
-    """The alchemy offer stands while the lane is down by policy, so the predicate reads no offered forms."""
+    """The alchemy offer stands while the lane is down by policy, so the predicate does not read offered forms."""
     assert "offerable" not in {field.name for field in dataclasses.fields(AlchemyFormDemand)}
     assert all("warm" not in reason.value for reason in UtilitiesLaneDemandReason)
 
@@ -125,7 +125,7 @@ def test_only_a_job_whose_post_processing_is_the_strip_alone_counts_before_its_s
     ids=["pre-annotation-candidate", "pending-annotation"],
 )
 def test_controlnet_annotation_is_demand(inputs: UtilitiesLaneDemandInputs) -> None:
-    """A pre-annotation candidate and a parked job both want the lane."""
+    """A pre-annotation candidate and a parked job both need the lane."""
     assert utilities_lane_demand(inputs) is UtilitiesLaneDemandReason.CONTROLNET_ANNOTATION
 
 
@@ -137,7 +137,7 @@ def test_a_lane_form_pending_or_in_flight_is_demand(form: str) -> None:
 
 
 def test_forms_waiting_for_other_lanes_are_not_demand() -> None:
-    """Forms routed to the CLIP stack or the post-processing lane do not want this one."""
+    """Forms routed to the CLIP stack or the post-processing lane do not need this one."""
     inputs = _with(alchemy=AlchemyFormDemand(waiting=(_CAPTION, _UPSCALER)))
     assert utilities_lane_demand(inputs) is None
 

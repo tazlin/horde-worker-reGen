@@ -295,7 +295,7 @@ def expand_offered_forms(
     only strand. Offer and dispatch read the same routing, so the worker cannot advertise work it would then
     send nowhere. The image-utilities lane runs only while work needs it, so its flag reads "the lane serves or
     will serve once a popped form starts it" (:meth:`AlchemyCoordinator._utilities_lane_healthy`). The three
-    flags default True for config-only callers that cannot see runtime process state; the pop path passes the
+    flags default True for config-only callers that cannot read runtime process state. The pop path passes the
     live readings.
 
     ``strip_background`` additionally needs its lane provisioned at all (:func:`strip_background_available`),
@@ -638,7 +638,7 @@ class AlchemyCoordinator:
         :func:`~horde_worker_regen.process_management.scheduling.workload_flow.utilities_lane_demand`.
         ``annotation_set_unlearned`` holds when :func:`expand_offered_forms` would offer annotation with every
         lane up and every control type servable, and the annotation provider reports that no lane has reported a
-        servable set this session. The offer cannot name control types until the lane runs once.
+        servable set this session. The offer cannot list control types until the lane runs once.
         """
         waiting = tuple(spec.form for spec in self._pending_forms) + tuple(
             spec.form for spec in self._in_flight.values()

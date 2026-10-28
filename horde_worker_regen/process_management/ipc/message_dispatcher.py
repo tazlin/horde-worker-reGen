@@ -221,7 +221,7 @@ def _no_disagg_holds() -> set[str]:
 
 
 def _no_utilities_lane_holds() -> set[str]:
-    """Default utilities-lane hold provider: report no jobs held for the image-utilities lane."""
+    """Default utilities-lane hold provider: report that no jobs are held for the image-utilities lane."""
     return set()
 
 
@@ -552,8 +552,8 @@ class MessageDispatcher:
     def set_utilities_lane_hold_provider(self, provider: Callable[[], set[str]]) -> None:
         """Register the source of job ids held for the image-utilities lane to serve their control type.
 
-        Deadlock detection excludes these jobs from both deadlock conditions. A held job takes no inference slot
-        until the lane comes up, so a queue holding only such jobs leaves every process idle by design. The hold
+        Deadlock detection excludes these jobs from both deadlock conditions. A held job does not take an inference
+        slot until the lane comes up, so a queue holding only such jobs leaves every process idle by design. The hold
         is bounded by the job's anti-starvation deadline and by the lane's own state, so a lane that never comes
         up stops shielding the queue once the job is faulted.
         """
@@ -1826,7 +1826,7 @@ class MessageDispatcher:
             if message.info == HOST_COMMIT_FAILED_INFO:
                 # The host refused the checkpoint mapping: a memory condition at map time. With the lane record
                 # gone, the next load of the model goes through the preload gate's host admission. The model is
-                # not implicated and the slot stays up, so nothing is counted against either.
+                # not implicated and the slot stays up, so neither is counted against.
                 logger.warning(
                     f"Process {message.process_id} could not map {message.horde_model_name} because the host refused "
                     "to commit the checkpoint mapping. The load will be re-admitted against host memory.",
@@ -2251,9 +2251,9 @@ class MessageDispatcher:
         # The download process reported those files present for this job under its eviction pins, so a miss
         # means a file was evicted between that report and the child's read, or the ad-hoc reference lost the
         # file's record. Neither is a CivitAI download failure, so the fault does not arm the LoRA-download
-        # backoff. The child checks before any load, so no inference ran and the requeue charges no inference
-        # attempt, no degraded retry and no lane streak. The tracker withdraws the job's prepared state and its
-        # presence reports, and the prefetch reconcile sweep then asks the download process about every file the
+        # backoff. The child checks before any load, so no inference ran and the requeue does not charge an inference
+        # attempt, a degraded retry or a lane streak. The tracker withdraws the job's prepared state and its
+        # presence reports, and the prefetch reconcile sweep then queries the download process about every file the
         # job references again, within the deadline the coordinator measures from the job's pop.
         if message.info == AUX_RESOLVE_FAILED_INFO:
             resolution = await self._job_tracker.requeue_for_aux_resolve(message.sdk_api_job_info)
@@ -2276,7 +2276,7 @@ class MessageDispatcher:
         # A CUDA context fault is a verdict on the process, which is replaced for it. Its "out of memory" wording
         # must not earn the degraded retry or count against the model and the card the way an allocator OOM does.
         resource_failure = is_resource_failure(message.info) and not message.cuda_context_fault
-        # Faults the worker already attributes elsewhere stay out of the lane streak: a disaggregated stage fault is
+        # Faults the worker already attributes elsewhere stay out of the lane streak. A disaggregated stage fault is
         # about the pipeline's shape, and a measured attempt's failure is the card's ceiling. Read before the
         # tracker resolves the fault, which ends the measured attempt.
         counts_against_lane = not is_disaggregated_completion and not self._job_tracker.is_measured_attempt(

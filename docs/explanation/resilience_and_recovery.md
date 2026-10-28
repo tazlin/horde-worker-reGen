@@ -98,7 +98,7 @@ without spending an inference attempt or its degraded retry. A refused preload
 reports its load FAILED and a refused run unloads its model, and either report
 clears the lane's record of the model. Unless another lane holds the model, the
 job then waits for a preload that the host admission passes. The requeue budget
-is a count with no clock. A requeue counts nothing against
+is a plain count with no clock. A requeue does not count against
 the fault-rate breaker, the resource-fault throttle, the model's over-budget
 streak or the lane-fault streak. Each requeue logs a WARNING naming the job, the
 model and the requeue count against `MAX_HOST_COMMIT_REQUEUES` (3).

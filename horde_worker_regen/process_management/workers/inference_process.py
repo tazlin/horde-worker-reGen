@@ -761,8 +761,8 @@ class HordeInferenceProcess(HordeProcess):
         mistake a download for a hung sampler. A file listed in ``skipped_aux`` was terminally rejected from
         ad-hoc download (invalid, too large, or NSFW on an SFW-only worker) and is tolerated as intentionally
         absent: the generator skips it and records a fault-metadata entry. Any other missing file returns
-        ``False`` and the caller faults the job retryably, and the parent's prefetch reconcile sweep asks the
-        download process for the file again.
+        ``False`` and the caller faults the job retryably, and the parent's prefetch reconcile sweep requests the
+        file from the download process again.
 
         Args:
             job_info (ImageGenerateJobPopResponse): The job whose auxiliary references are checked.
@@ -882,8 +882,8 @@ class HordeInferenceProcess(HordeProcess):
                 horde_model_name=self._active_model_name,
                 horde_model_state=ModelLoadState.ON_DISK,
             )
-            # The parent has now been told the previous model is gone, so the child's record says the same. A
-            # load that fails below leaves no active model, and a later START_INFERENCE mismatch reports that.
+            # The parent has now been notified that the previous model is gone, so the child's record matches. A
+            # load that fails below does not leave an active model, and a later START_INFERENCE mismatch reports that.
             self._active_model_name = None
             self._active_model_load_state = None
             self._active_model_diffusion_model_only = False
@@ -2019,7 +2019,7 @@ class HordeInferenceProcess(HordeProcess):
                 # the job became dispatchable, so here the child only confirms them read-only (no network). An
                 # unresolved file means an eviction between that report and this read, or a reference record the
                 # ad-hoc cache lost. The job is faulted retryably and the child goes idle with the model
-                # resident, and the parent's prefetch reconcile sweep asks the download process again.
+                # resident, and the parent's prefetch reconcile sweep queries the download process again.
                 if not self._resolve_aux_models(message.sdk_api_job_info, message.skipped_aux_models):
                     self._fault_job_for_unresolved_aux(message.sdk_api_job_info)
                     return

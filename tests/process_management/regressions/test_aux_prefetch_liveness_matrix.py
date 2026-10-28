@@ -108,7 +108,7 @@ class _PrefetchScript:
     """How a job's auxiliary prefetch resolves, from the perspective of the scripted download process.
 
     Attributes:
-        on_disk: The files are already on disk at pop, so the download process answers the pop's request at
+        on_disk: The files are already on disk at pop, so the download process responds to the pop's request at
             once with a success and the job is prepared in the pop cycle (its completion cycle is zero).
         resolve_cycle: The scheduling cycle at which a success (or failure) outcome is delivered for a job
             whose files were not cached at pop. Ignored when ``on_disk`` is set or when the job is left to its
@@ -204,8 +204,8 @@ class _AuxLivenessWorld:
     async def pop(self, job: ImageGenerateJobPopResponse, *, script: _PrefetchScript) -> None:
         """Record a popped job and drive its pop-time prefetch exactly as the control loop would.
 
-        For an ``on_disk`` script the scripted download process answers the pop's request at once with a success
-        for every referenced file, as the real one answers an entry already present, so the job is prepared at pop.
+        For an ``on_disk`` script the scripted download process responds to the pop's request at once with a success
+        for every referenced file, as the real one does for an entry already present, so the job is prepared at pop.
         """
         assert job.id_ is not None
         await track_popped_job_async(self._job_tracker, job)

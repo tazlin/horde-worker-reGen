@@ -1692,7 +1692,7 @@ class HordeWorkerProcessManager:
         # The servable set the lane reported on its last run, kept after the lane leaves the map so the alchemy
         # annotation offer can stand while the lane is down by policy. None until a lane reports this session, and
         # dropped back to None by a crash replacement or a disabled lane. The replacement count is the lifecycle's
-        # unintended-replacement count when the set was noted.
+        # unintended-replacement count when the set was recorded.
         self._kept_servable_control_types: frozenset[str] | None = None
         self._kept_servable_replacement_count = 0
         # Whether each extended control type's annotator weights are on disk, probed once per type and cleared when
@@ -1975,7 +1975,7 @@ class HordeWorkerProcessManager:
         # Between stages a disaggregated job leaves every inference slot idle by design, so the deadlock
         # detector must not read that as a wedge.
         self._message_dispatcher.set_disagg_hold_provider(self._disaggregation_orchestrator.held_job_ids)
-        # A job held for the image-utilities lane takes no slot until the lane serves its control type.
+        # A job held for the image-utilities lane does not take a slot until the lane serves its control type.
         self._message_dispatcher.set_utilities_lane_hold_provider(
             self._inference_scheduler.utilities_lane_held_job_ids
         )
@@ -2401,7 +2401,7 @@ class HordeWorkerProcessManager:
     def _init_model_reference(self) -> None:
         """Fetch the stable diffusion model reference, retrying on failure, and publish the beta records.
 
-        The parent owns the pending (beta) read. It drops any inherited file-backed beta directory before its
+        The pending (beta) read happens in the parent. It drops any inherited file-backed beta directory before its
         first read so its provider is the network one, then writes the pending records for the children it
         spawns later and points them at the files.
         """
@@ -2427,7 +2427,7 @@ class HordeWorkerProcessManager:
         self._record_pending_publish(share_pending_records_with_children(ModelReferenceManager.get_instance()))
 
     def _record_pending_publish(self, complete: bool) -> None:  # noqa: FBT001 - one outcome flag
-        """Keep the outcome of a beta-record publish, which arms the retry in the reference tick when incomplete."""
+        """Store the outcome of a beta-record publish, which arms the retry in the reference tick when incomplete."""
         self._pending_publish_incomplete = not complete
         self._last_pending_publish = time.time()
 
@@ -4924,10 +4924,10 @@ class HordeWorkerProcessManager:
         return frozenset(servable)
 
     def _kept_servable_set(self) -> frozenset[str] | None:
-        """Return the servable set kept from the lane's last run, or None when none is known.
+        """Return the servable set kept from the lane's last run, or None when none is kept.
 
         The set is dropped when the lane is disabled or was replaced after a crash or a hang since the set was
-        noted, so a lane that comes back after either reports its set afresh before annotation is offered from it.
+        recorded, so a lane that comes back after either reports its set afresh before annotation is offered from it.
         """
         lifecycle = self._process_lifecycle
         lane_lost = (
@@ -4939,9 +4939,9 @@ class HordeWorkerProcessManager:
         return self._kept_servable_control_types
 
     def _alchemy_annotation_types(self) -> frozenset[str] | None:
-        """Return the control types the alchemy annotation offer may carry now, or None when none is known.
+        """Return the control types the alchemy annotation offer may carry now, or None when no set is available.
 
-        A live lane that has reported answers with its set. Without one, the set kept from the lane's last run
+        A live lane that has reported supplies its set. Without one, the set kept from the lane's last run
         stands while the lane will serve (:meth:`ProcessLifecycleManager.utilities_lane_will_serve`), since a
         popped annotation form starts the lane and waits for it. A lane that will not serve gives an empty set.
         None means no lane has reported a set since the session began or the kept set was dropped, which the
@@ -4988,9 +4988,9 @@ class HordeWorkerProcessManager:
         """Return whether the annotator weights for ``control_types`` are on disk (torch-free, fail-closed).
 
         Resolved through horde_model_reference's on-disk layout, the same authority the lane's child environment
-        is pointed at. Each type is probed once and its answer kept until the download process reports a change in
+        is pointed at. Each type is probed once and its result cached until the download process reports a change in
         presence (:meth:`_on_download_availability`), since the pop offer and every held job read this each tick.
-        A resolution failure returns False and caches nothing, so the next read probes again.
+        A resolution failure returns False and does not cache a result, so the next read probes again.
         """
         wanted = tuple(control_types)
         unprobed = [control_type for control_type in wanted if control_type not in self._extended_annotator_presence]
@@ -5250,7 +5250,7 @@ class HordeWorkerProcessManager:
         """Hold or reissue each queued extended-controlnet job the worker cannot serve right now.
 
         A job whose control type the image-utilities lane serves, or that already carries its derived control
-        map, passes to pre-annotation or inference. A job that wants pre-annotation of a type the lane cannot serve
+        map, passes to pre-annotation or inference. A job that needs pre-annotation of a type the lane cannot serve
         yet is held at dispatch while the lane is up or coming up
         (:meth:`ProcessLifecycleManager.utilities_lane_will_serve`) and the type's annotator weights are on disk.
         The job is the lane's demand, so a lane that is down starts on the next tick, and the hold lasts until the
@@ -5277,7 +5277,7 @@ class HordeWorkerProcessManager:
                 unready = [job for job, _control_type in extended_jobs]
         elif extended_jobs:
             servable = self._servable_control_types()
-            # A live lane that has reported its servable set has finished saying what it can annotate, so a type
+            # A live lane that has reported its servable set has listed everything it can annotate, so a type
             # missing from that set is not held for. The pruning in _servable_control_types leaves only live lanes.
             lane_reported = bool(self._annotator_servable_types)
             lane_will_serve = self._process_lifecycle.utilities_lane_will_serve()
@@ -5286,7 +5286,8 @@ class HordeWorkerProcessManager:
                 if control_type in servable or (tracked is not None and tracked.premade_control_map_bytes is not None):
                     continue
                 if not job_wants_pre_annotation(job):
-                    # A job that brings its own control map needs no annotator, only the offer it was popped under.
+                    # A job that brings its own control map does not need an annotator, only the offer it was popped
+                    # under.
                     if not self._extended_controlnet_ready():
                         unready.append(job)
                     continue
@@ -5451,7 +5452,7 @@ class HordeWorkerProcessManager:
     dispatched strip ahead of it), and the head gets this same budget to be handed a lane. Time spent behind a
     running pass is bounded by :meth:`_strip_stage_cap_seconds` instead. A dead or unresponsive lane is caught
     sooner by the orphan reconcile. On expiry the job is a no-image fault (reissued), because background
-    removal has no in-graph fallback. The post-processing lane also faults a job whose requested
+    removal does not have an in-graph fallback. The post-processing lane also faults a job whose requested
     post-processing could not run."""
 
     _MAX_STRIP_DISPATCH_ATTEMPTS = 2
@@ -5466,7 +5467,7 @@ class HordeWorkerProcessManager:
 
         One execution budget for each job the worker admits to intake at once, plus the job's own pass. A
         queue deeper than the worker's intake is not one its lane can work through in time, and a job held
-        past it has outlived any wait the worker could have promised when it popped the job. The intake budget
+        past it has waited longer than the worker could have planned for when it popped the job. The intake budget
         is the job popper's, per card and summed across cards, so the cap follows ``queue_size`` and
         ``max_threads`` and does not encode one machine. A queued strip is faulted once a fresh pass could
         no longer finish inside the cap, so a strip dispatched before then always gets its full execution
@@ -5626,12 +5627,12 @@ class HordeWorkerProcessManager:
     async def _age_out_pending_strips(self) -> None:
         """Fault (no images) any strip job that has outlived its execution budget, its head wait or the stage cap.
 
-        A dispatched strip is judged on how long it has been running on its lane. A queued strip at the head
-        of the queue (no dispatched strip ahead of it) is judged on how long it has waited there for a lane,
-        against one execution budget. A queued strip behind a running pass has no clock of its own, since
+        A dispatched strip is timed by how long it has been running on its lane. A queued strip at the head
+        of the queue (no dispatched strip ahead of it) is timed by how long it has waited there for a lane,
+        against one execution budget. A queued strip behind a running pass does not have a clock of its own, since
         the lane serves strips one at a time and that wait is the lane's time. Every queued strip is also
-        faulted once its time in the stage leaves no room for a pass inside :meth:`_strip_stage_cap_seconds`.
-        Runs after the tick's dispatch, so a strip handed a lane this tick is judged as dispatched.
+        faulted once its time in the stage no longer leaves room for a pass inside :meth:`_strip_stage_cap_seconds`.
+        Runs after the tick's dispatch, so a strip handed a lane this tick is timed as dispatched.
         """
         now = time.time()
         execution_budget = self._PENDING_STRIP_TIMEOUT_SECONDS
@@ -5739,7 +5740,7 @@ class HordeWorkerProcessManager:
         re-download runs off the event loop in a daemon thread (writing fresh JSON to disk); once it
         finishes, the next tick broadcasts a reload so every subprocess re-reads the files.
 
-        A successful refresh also drops the merged canonical-plus-beta view, so the next parent read sees
+        A successful refresh also drops the merged canonical-plus-beta view, so the next parent read reads
         the current pending queue, and republishes the pending records before the broadcast, so the reloading
         subprocesses read the same beta set from the parent's files. ``stable_diffusion_reference`` keeps the
         set it was built with. Between refreshes, an incomplete publish is retried by
@@ -5796,7 +5797,7 @@ class HordeWorkerProcessManager:
                 complete = share_pending_records_with_children(manager)
                 self._record_pending_publish(complete)
                 if complete:
-                    logger.info("Published the beta records on retry; broadcasting reload to subprocesses")
+                    logger.info("Published the beta records on retry. Broadcasting reload to subprocesses")
                     self._pending_reference_reload_broadcast = True
             finally:
                 self._reference_refresh_in_progress = False

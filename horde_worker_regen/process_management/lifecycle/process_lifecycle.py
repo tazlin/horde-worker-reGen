@@ -106,12 +106,12 @@ class PauseOwner(enum.StrEnum):
 
 @dataclass(frozen=True)
 class UtilitiesDemandReconcile:
-    """What one pass of :meth:`ProcessLifecycleManager.reconcile_utilities_demand` found."""
+    """What one pass of :meth:`ProcessLifecycleManager.reconcile_utilities_demand` returned."""
 
     started_for: UtilitiesLaneDemandReason | None = None
-    """The demand a lane start this pass answered, None when the pass started nothing."""
+    """The demand behind a lane start this pass, None when the pass started nothing."""
     held_down: bool = False
-    """The lane is enabled and down because nothing needs it."""
+    """The lane is enabled and down because no job needs it."""
 
 
 def _pause_owner_phrase(owner: PauseOwner) -> str:
@@ -900,9 +900,9 @@ class ProcessLifecycleManager:
         self._utilities_gpu_pause_count = 0
         self._utilities_gpu_restore_count = 0
         # The alchemy flow's part of the lane's demand. The alchemy coordinator is built after this manager and
-        # registers it. Until then no alchemy form counts.
+        # registers it. Until then, alchemy forms are not counted.
         self._utilities_alchemy_form_demand_provider: Callable[[], AlchemyFormDemand] = AlchemyFormDemand
-        # Set when the demand driver asks for a lane start, cleared once a lane is in the map or the demand
+        # Set when the demand driver requests a lane start, cleared once a lane is in the map or the demand
         # lapses, so a start that fails outright is tried once per demand episode and not on every tick.
         self._utilities_demand_start_attempted = False
         # Set when a restore leaves the lane down for want of demand, cleared when a lane starts, so the line
@@ -2320,8 +2320,8 @@ class ProcessLifecycleManager:
     def set_utilities_alchemy_form_demand_provider(self, provider: Callable[[], AlchemyFormDemand]) -> None:
         """Register the alchemy flow's part of the image-utilities lane's demand.
 
-        The alchemy coordinator's :meth:`AlchemyCoordinator.utilities_form_demand`. Until registered no alchemy
-        form counts toward the demand.
+        The alchemy coordinator's :meth:`AlchemyCoordinator.utilities_form_demand`. Until it is registered, alchemy
+        forms do not count toward the demand.
         """
         self._utilities_alchemy_form_demand_provider = provider
 
@@ -2357,7 +2357,7 @@ class ProcessLifecycleManager:
         )
 
     def utilities_lane_demand(self) -> UtilitiesLaneDemandReason | None:
-        """Return why the image-utilities lane should be up now, or None when nothing needs it."""
+        """Return why the image-utilities lane should be up now, or None when no job needs it."""
         return utilities_lane_demand(self.utilities_lane_demand_inputs())
 
     def utilities_lane_will_serve(self) -> bool:
@@ -2388,8 +2388,8 @@ class ProcessLifecycleManager:
         """Start the dedicated image-utilities lane, if enabled, not already running, and needed.
 
         Every start of the lane comes through here (the boot bring-up, a deferred retry, the replacement's final
-        start, the reclaim ladder's restore and the demand driver), so the demand check below decides for all of
-        them whether a lane comes up.
+        start, the reclaim ladder's restore and the demand driver), so the demand check below is the single gate on
+        whether a lane comes up.
         """
         # While a starved head holds the lane off the card this per-tick start hook must not resurrect it;
         # the owner's restore clears the pause and starts the lane directly.
@@ -2408,7 +2408,7 @@ class ProcessLifecycleManager:
             )
             return False
 
-        # A lane with nothing to serve holds a CUDA context and spends tens of seconds of CPU priming its
+        # An idle lane holds a CUDA context and spends tens of seconds of CPU priming its
         # annotators, and the reclaim ladder then stops it again for the next post-processing chain.
         if self.utilities_lane_demand() is None:
             return False
@@ -2499,7 +2499,7 @@ class ProcessLifecycleManager:
         """Return how many times this session the image-utilities lane was replaced after a crash or a hang.
 
         A ladder pause and an operator recycle mark their replacement intentional and are not counted. A reader
-        compares the count against the value it noted earlier to tell whether the lane crashed since then.
+        compares the count against the value it recorded earlier to check whether the lane crashed since then.
         """
         return self._utilities_unintended_replacements
 
@@ -2548,7 +2548,7 @@ class ProcessLifecycleManager:
         return self._utilities_processes_should_be_replaced
 
     def reconcile_utilities_demand(self, *, pause_stranded: bool) -> UtilitiesDemandReconcile:
-        """Start the image-utilities lane when a job needs it and nothing else is bringing it up.
+        """Start the image-utilities lane when a job needs it and no other path is bringing it up.
 
         Run once per control-loop tick. The lane starts with demand, no lane in the map, no pause, no replacement
         under way and no deferred start pending, so the lane comes up on the tick after a job arrives that only
@@ -2556,15 +2556,15 @@ class ProcessLifecycleManager:
         the demand lapses and returns.
 
         A reclaim-ladder pause that no saturation episode, post-processing borrow or recovery remedy still claims
-        (``pause_stranded``, judged by the caller, which holds those owners) has no restore path left, and the
-        pause check in :meth:`start_utilities_processes` refuses every start behind it. With demand present it is
-        restored here.
+        (``pause_stranded``, computed by the caller, which holds those owners) does not have a restore path left,
+        and the pause check in :meth:`start_utilities_processes` refuses every start behind it. With demand present
+        it is restored here.
 
         Args:
             pause_stranded: Whether the lane's current pause has outlived every owner that could restore it.
 
         Returns:
-            The demand a start answered this pass, and whether the lane is held down for want of demand.
+            The demand a start served this pass, and whether the lane is held down for want of demand.
         """
         if self._automatic_replacement_is_parked():
             return UtilitiesDemandReconcile()

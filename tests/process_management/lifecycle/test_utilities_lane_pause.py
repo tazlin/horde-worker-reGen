@@ -68,7 +68,7 @@ def test_pause_arms_the_replacement_and_holds_the_start_hook() -> None:
 
 
 def test_only_the_pausing_owner_restores() -> None:
-    """A foreign owner cannot lift another's hold; the holder's restore clears it and, with demand, starts the lane."""
+    """A foreign owner cannot lift another's hold. The holder's restore clears it and, with demand, starts the lane."""
     plm = _plm_with_lane()
     assert plm.pause_utilities_off_gpu(owner=PauseOwner.RECLAIM_LADDER) is True
 

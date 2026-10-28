@@ -409,7 +409,7 @@ class TestDispatchConditionStamps:
         assert tracked.aux_models_prepared_at is None
 
     async def test_presence_report_prepares_only_the_job_it_names(self, job_tracker: JobTracker) -> None:
-        """A download-process presence report is kept for the job it answered, never as a worker-wide belief.
+        """A download-process presence report is kept for the job it was reported for, not as a worker-wide record.
 
         A second job for the same LoRA stays unprepared until its own report arrives, because the file may have
         been evicted once the first job's pin lapsed. Withdrawing the first job's preparation drops its report.
@@ -430,7 +430,7 @@ class TestDispatchConditionStamps:
         assert job_tracker.mark_job_aux_prepared_if_ready(first.id_) is False
 
     async def test_skip_verdict_counts_as_ready_without_a_presence_report(self, job_tracker: JobTracker) -> None:
-        """A LoRA under a live skip verdict needs no presence report for its job to become ready."""
+        """A LoRA under a live skip verdict does not need a presence report for its job to become ready."""
         job = await track_popped_job_async(
             job_tracker,
             make_job_pop_response(loras=[LorasPayloadEntry(name="rejected_ref", is_version=False)]),

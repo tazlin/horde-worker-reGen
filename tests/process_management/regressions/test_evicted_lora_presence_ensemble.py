@@ -1,11 +1,11 @@
-"""A job for a LoRA the download process evicted waits for the download process's answer before it dispatches.
+"""A job for a LoRA the download process evicted waits for the download process's response before it dispatches.
 
-The download process is the one owner of whether a LoRA or textual inversion is on disk: it holds the files, runs
-every evictor (the free-disk floor guard and the ad-hoc budget evictor) and answers a request for a file already
-present with an immediate success, after applying the eviction pins that request carries. The parent keeps no
-belief of its own. A LoRA an earlier job downloaded can be evicted before a later job for it is popped, and the
-eviction is not reported to the parent, so the later job's request names the LoRA again and the job stays gated
-until the answer arrives.
+Only the download process checks whether a LoRA or textual inversion is on disk. It holds the files, runs
+every evictor (the free-disk floor guard and the ad-hoc budget evictor) and reports a request for a file already
+present as an immediate success, after applying the eviction pins that request carries. The parent does not
+track presence itself. A LoRA an earlier job downloaded can be evicted before a later job for it is popped, and the
+eviction is not reported to the parent, so the later job's request lists the LoRA again and the job stays gated
+until the response arrives.
 
 The row runs the manager's own wiring: the prefetch coordinator sends through the process lifecycle to the download
 process's pipe, the result comes back through the message dispatcher, and dispatch runs the real scheduler.
@@ -45,9 +45,9 @@ _LORA = "evictable-style"
 class _FakeDownloadProcess:
     """The download process's presence rule over a scripted disk, read from the pipe the parent writes to.
 
-    A requested entry already on disk is answered with an immediate success and no fetch. An absent entry is
-    fetched (recorded in ``fetched``) and then answered with a success. ``evict`` removes a file as the floor
-    guard does, sending nothing to the parent.
+    A requested entry already on disk is reported as an immediate success with no fetch. An absent entry is
+    fetched (recorded in ``fetched``) and then reported as a success. ``evict`` removes a file as the floor
+    guard does, without notifying the parent.
     """
 
     def __init__(self, process_info: HordeProcessInfo) -> None:
@@ -67,11 +67,11 @@ class _FakeDownloadProcess:
         ]
 
     def evict(self, name: str) -> None:
-        """Remove a file from disk without telling the parent."""
+        """Remove a file from disk without notifying the parent."""
         self.on_disk.discard(name)
 
     def answer_new_requests(self) -> HordeAuxPrefetchResultMessage | None:
-        """Answer every request not yet answered, or return None when there is none."""
+        """Respond to every request not yet responded to, or return None when there is none."""
         pending = self.requests()[self._answered :]
         self._answered += len(pending)
         outcomes: list[AuxPrefetchOutcome] = []
@@ -116,9 +116,9 @@ async def _pop(manager: HordeWorkerProcessManager, job: ImageGenerateJobPopRespo
 
 
 async def _deliver(manager: HordeWorkerProcessManager, download: _FakeDownloadProcess) -> None:
-    """Route the download process's answer through the manager's message dispatcher."""
+    """Route the download process's response through the manager's message dispatcher."""
     result = download.answer_new_requests()
-    assert result is not None, "the parent sent no request to answer"
+    assert result is not None, "the parent did not send a request to respond to"
     await manager._message_dispatcher._dispatch_buffered_message(result)
 
 
@@ -142,7 +142,7 @@ def _sent_start_inference(lane: HordeProcessInfo) -> bool:
 
 
 async def test_job_for_an_evicted_lora_dispatches_only_after_the_download_process_answers() -> None:
-    """The second job for an evicted LoRA is held until the download process re-fetches and answers it."""
+    """The second job for an evicted LoRA is held until the download process re-fetches and responds."""
     manager = make_testable_process_manager(
         stable_diffusion_reference={_MODEL: make_mock_model_reference_record(_MODEL)},
         max_threads=1,

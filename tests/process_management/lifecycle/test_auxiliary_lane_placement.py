@@ -90,7 +90,7 @@ def _make_placement_plm(
     """Build a lifecycle manager with both auxiliary lanes enabled over ``device_indices``.
 
     ``free_mb_by_device`` of None models a host that has reported no per-card free VRAM yet (the provider
-    answers None for every card), which is what drives the fallback to the static placement rule. A waiting
+    returns None for every card), which is what drives the fallback to the static placement rule. A waiting
     background-strip alchemy form is reported so the utilities lane is wanted without an image job in hand.
     """
     bridge_data = Mock()

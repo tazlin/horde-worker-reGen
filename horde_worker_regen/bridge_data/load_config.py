@@ -454,7 +454,7 @@ class BridgeDataLoader:
                 "large models (e.g. Flux, Stable Cascade) are not loaded.",
             )
 
-        # The SDK resolver only sees the canonical reference, which never includes a PRIMARY's pending-queue
+        # The SDK resolver only reads the canonical reference, which never includes a PRIMARY's pending-queue
         # (beta) models. The merged view keeps opted-in beta models through the meta-instruction expansion
         # below, the known-models filter and the on-disk filter.
         beta_records = beta_aware_image_records(horde_model_reference_manager, bounded=bounded_beta_read)
@@ -542,8 +542,8 @@ class BridgeDataLoader:
 
         if bridge_data.only_models_on_disk:
             offered_custom_models = set(bridge_data.image_models_to_load).intersection(custom_model_names)
-            # Custom names are judged by startup validation, so the on-disk pass sees only reference models
-            # and its drop line names only models it decided on.
+            # Startup validation checks custom names, so the on-disk pass handles only reference models
+            # and its drop line lists only the models it dropped.
             bridge_data.image_models_to_load = BridgeDataLoader._filter_to_models_on_disk(
                 [name for name in bridge_data.image_models_to_load if name not in custom_model_names],
                 horde_model_reference_manager,

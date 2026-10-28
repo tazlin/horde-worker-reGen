@@ -172,7 +172,7 @@ async def test_present_entry_is_requested_and_its_immediate_success_prepares_the
     assert len(sender.calls) == 1
     assert [entry.name for entry in sender.calls[0][0]] == ["on-disk-style"]
     assert tracker.are_job_aux_models_prepared(job) is False
-    # The download process answers an entry already present with a success, sent without a fetch.
+    # The download process reports an entry already present as a success, sent without a fetch.
     coordinator.on_prefetch_result(_ok_message(job, "on-disk-style"))
     assert tracker.are_job_aux_models_prepared(job) is True
     assert job.id_ not in coordinator.job_ids_with_live_deadlines()
@@ -217,7 +217,7 @@ async def test_skipped_and_cooling_references_are_not_requested() -> None:
 async def test_reference_reported_present_for_the_job_is_not_asked_again_after_a_cooldown() -> None:
     """A re-request for a job leaves out a reference already reported present for that job.
 
-    The report stays true while the job is tracked, because the pins that protect the file cover the job. Asking
+    The report stays true while the job is tracked, because the pins that protect the file cover the job. Requesting
     again would arm a fresh in-flight deadline that hides the job from the reconcile sweep, so the cooling
     reference would never be re-requested.
     """
@@ -260,11 +260,11 @@ async def test_reference_reported_present_for_the_job_is_not_asked_again_after_a
 
 
 async def test_lora_reported_downloaded_earlier_is_requested_again_for_a_later_job() -> None:
-    """A later job for a LoRA an earlier job downloaded asks the download process again before it dispatches.
+    """A later job for a LoRA an earlier job downloaded queries the download process again before it dispatches.
 
     The download process evicts ad-hoc LoRAs (the free-disk floor guard and the over-budget evictor) and does not
-    report an eviction to the parent. Only the download process can say whether the file is still on disk, so the
-    second job's request names the LoRA and the job stays gated until the answer arrives.
+    report an eviction to the parent. Only the download process can report whether the file is still on disk, so the
+    second job's request lists the LoRA and the job stays gated until the response arrives.
     """
     tracker = JobTracker()
     first = _job(loras=[_lora("evictable")])
@@ -274,7 +274,7 @@ async def test_lora_reported_downloaded_earlier_is_requested_again_for_a_later_j
     coordinator.on_prefetch_result(_ok_message(first, "evictable"))
     assert tracker.are_job_aux_models_prepared(first) is True
     # The first job leaves the tracker, its pin lapses, and the download process evicts the file. The eviction
-    # sends nothing to the parent.
+    # is not sent to the parent.
     tracker.handle_job_fault_now(first, retryable=False, fault_reason="finished")
 
     second = _job(loras=[_lora("evictable")])
@@ -1180,14 +1180,14 @@ class TestBackoffStrikeAccounting:
     async def test_disk_full_refusals_never_arm_the_backoff(self) -> None:
         """Five references refused for a full volume inside one window serve their jobs without arming a strike.
 
-        A full volume is a local condition the disk guard owns. Each job dispatches without the refused file,
-        spends no inference attempt, and LoRA pops are not withheld by the download backoff.
+        A full volume is a local condition handled by the disk guard. Each job dispatches without the refused file,
+        does not spend an inference attempt, and LoRA pops are not withheld by the download backoff.
         """
         tracker = JobTracker()
         jobs = [_job(loras=[_lora(f"{100 + index}", is_version=True)]) for index in range(5)]
         for job in jobs:
             await track_popped_job_async(tracker, job)
-        # Anchored to real time, since the tracker judges a skip verdict's expiry against the wall clock.
+        # Anchored to real time, since the tracker compares a skip verdict's expiry against the wall clock.
         real_clock = _Clock()
         real_clock.now = time.time()
         coordinator, _sender, state, clock = _make(tracker, clock=real_clock)

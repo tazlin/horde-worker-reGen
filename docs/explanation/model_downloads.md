@@ -138,16 +138,16 @@ fetched at most once even when several jobs share it, and the request carries an
 eviction-pin set (every auxiliary file any tracked job still references) so a file one
 pending job needs is not evicted before that job dispatches.
 
-The download process is the one owner of whether a LoRA or textual inversion is on
+The download process is the only place that checks whether a LoRA or textual inversion is on
 disk. It holds the files and runs every evictor (the free-disk floor guard and
 hordelib's ad-hoc budget and room evictors), and none of them reports an eviction to
-the parent. The parent therefore keeps no presence belief of its own. A popped job's
-request names every reference except one under a skip verdict or a re-fetch cooldown,
+the parent. The parent therefore does not track presence itself. A popped job's
+request lists every reference except one under a skip verdict or a re-fetch cooldown,
 including files an earlier job downloaded, since the file may have been evicted after
 that job's pin lapsed. The download process applies the request's pins first and then
-answers an entry already on disk with an immediate success, without a CivitAI
-round-trip. A success is recorded for the jobs it names only, so a later job for the
-same file asks again. A report stays true for its job while the job is tracked,
+reports an entry already on disk as an immediate success, without a CivitAI
+round-trip. A success is recorded for the jobs it lists only, so a later job for the
+same file sends a new request. A report stays true for its job while the job is tracked,
 because the pins cover the job, so a re-request for the same job leaves out a file
 already reported present for it.
 
@@ -178,7 +178,7 @@ manager's own pin-aware eviction so a file another pending job still references 
 evicted to make room.
 
 The download process reports a per-file outcome back to the parent. A success is
-recorded against each job it names and, once every LoRA and textual inversion a pending
+recorded against each job it covers and, once every LoRA and textual inversion a pending
 job needs is reported present for it (or skipped), clears that job's dispatch gate. Failure handling is kind-agnostic
 across LoRAs and textual inversions. A terminal *rejection* (a file the fetch API
 permanently refuses: a LoRA that is invalid, too large, NSFW on an SFW-only worker, or
@@ -213,12 +213,12 @@ reasons, and the download process reports the outcome as `AuxPrefetchFailureKind
 condition, so the coordinator does not arm or advance the download backoff for it. The
 waiting jobs dispatch without the file, the reference stays skipped for a minute, and no
 inference attempt is spent. The LoRA offer under a full volume belongs to the disk guard
-alone: `ProcessManager._evaluate_lora_disk_exhaustion` sets `lora_disk_exhausted`, and the
+alone. `ProcessManager._evaluate_lora_disk_exhaustion` sets `lora_disk_exhausted`, and the
 popper withholds `allow_lora` while it holds.
 
 Each auxiliary class holds its own escalating download backoff. A strike starts a window of
 60 s that doubles per strike up to 1800 s, and the ladder resets after 15 minutes without a
-strike. A strike is taken at most once per open window: a reference that fails while the
+strike. A strike is taken at most once per open window. A reference that fails while the
 window is open leaves the ladder where it is, so a burst of references failing together is
 one incident. The ladder advances only when a failure follows the window's expiry. The LoRA backoff also
 gates pop-time LoRA advertising, because the pop request carries an `allow_lora`
@@ -271,13 +271,13 @@ from cache. In the same
 periodic step a reconcile sweep re-requests any pending auxiliary-bearing job that has no
 request in flight (a retryable-failure requeue, a lost result message, or a download-process
 restart that dropped its in-flight map) and marks a job prepared outright when every file
-was already reported present for it: this is the liveness that heals. The tracker's retry
+was already reported present for it. This is the liveness that heals. The tracker's retry
 policy bounds the total attempts, so a permanently failing job still faults rather than
 looping. Should an inference child later fail to resolve a prefetched file (an eviction
 between the download process's report and the child's read, or a reference record the
-ad-hoc cache lost), it returns the job before loading anything. The requeue spends no
-inference attempt and no degraded retry, and it withdraws the job's prepared state and its
-presence reports, so the reconcile sweep asks the download process again instead of the
+ad-hoc cache lost), it returns the job before loading anything. The requeue does not spend an
+inference attempt or a degraded retry, and it withdraws the job's prepared state and its
+presence reports, so the reconcile sweep requests the file from the download process again instead of the
 scheduler re-dispatching the job into the same failure. Because the requeue is free, the
 coordinator measures that job's prefetch budget from its pop rather than from each
 re-request. Once the budget is spent the job is served with the references skipped, so a

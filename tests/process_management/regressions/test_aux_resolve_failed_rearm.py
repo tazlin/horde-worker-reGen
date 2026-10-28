@@ -130,7 +130,7 @@ class TestResolveFaultWithdrawsPreparation:
     async def test_resolve_fault_spends_no_attempt_and_forgets_the_presence_report(self) -> None:
         """A one-attempt budget still requeues the job, and its contradicted presence report is withdrawn.
 
-        No inference ran, so the requeue charges no inference attempt and is no degraded retry. A later job
+        No inference ran, so the requeue does not charge an inference attempt and is not a degraded retry. A later job
         referencing the same file goes through a fresh prefetch, whose presence probe in the download process
         re-verifies the disk.
         """
@@ -162,8 +162,8 @@ class TestResolveFaultWithdrawsPreparation:
         """A job the child keeps returning is served without the file once its budget from the pop runs out.
 
         The download process can keep reporting a file present that the child cannot resolve, and each requeue
-        spends no attempt. The coordinator measures such a job's prefetch budget from its pop, so a re-request past
-        that budget sends nothing and dispatches the job with the reference skipped.
+        does not spend an attempt. The coordinator measures such a job's prefetch budget from its pop, so past that
+        budget the job is dispatched with the reference skipped and no request is sent.
         """
         tracker = JobTracker()
         tracker.set_retry_policy(1)

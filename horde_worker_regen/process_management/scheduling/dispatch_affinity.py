@@ -89,7 +89,7 @@ class AffinitySkipState:
 def fallback_ttl_seconds(recent_job_ttl: float | None) -> float:
     """Return the ttl a hold assumes for a job the horde gave none.
 
-    The most recent horde-supplied ttl, or the default the skip budget is sized on when the worker has seen none.
+    The most recent horde-supplied ttl, or the default the skip budget is sized on when the worker has received none.
     """
     return recent_job_ttl if recent_job_ttl is not None else _DEFAULT_AFFINITY_TTL_SECONDS
 
@@ -125,8 +125,8 @@ def utilities_lane_hold_expired(
 
     The hold may last until the job's ttl from pop, less its expected sampling seconds, less the skip budget
     (:func:`affinity_budget_seconds`). This is longer than the anti-starvation share. That share exists to step a
-    stuck head aside so its own preload can run, and a held job has not been offered a lane yet, so there is
-    nothing to step aside from. What the job still needs once the lane serves its type is its sampling and the
+    stuck head aside so its own preload can run, and a held job has not been offered a lane yet, so it does not
+    need to step aside. What the job still needs once the lane serves its type is its sampling and the
     tail after it.
 
     The skip budget stands in for that tail (staging, decode, safety and submit). It is the module's existing
@@ -146,7 +146,7 @@ def utilities_lane_hold_expired(
         now: The current wall-clock time.
         popped_at: When the job was popped, or None when unknown.
         ttl: The job's horde-supplied ttl in seconds, or None.
-        recent_job_ttl: The most recent horde-supplied ttl the worker saw, or None.
+        recent_job_ttl: The most recent horde-supplied ttl the worker received, or None.
         expected_sampling_seconds: The performance model's expected sampling seconds for the job, or None.
     """
     if popped_at is None:
