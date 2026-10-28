@@ -71,6 +71,11 @@ queue cannot be reached, the view falls back to the canonical reference alone. T
 once and reads it again after each periodic reference refresh, but the scheduler's model reference keeps
 the set it started with until the worker restarts.
 
+Only the main worker process reads the beta queue from the network. It writes the beta records it holds to
+a `pending` folder beside the model reference files, at startup and after each successful refresh, and
+the inference and other worker processes load their beta models from those files through
+`HORDELIB_BETA_MODELS_DIR`. When a refresh cannot read the beta queue, the previous files stay in place.
+
 When the config load drops a configured model, the log names it. A name the reference does not know and
 a model whose files are missing under `only_models_on_disk` each get an INFO line listing the dropped
 names.

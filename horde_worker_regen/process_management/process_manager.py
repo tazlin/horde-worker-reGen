@@ -61,7 +61,13 @@ from loguru import logger
 
 from horde_worker_regen.alchemy_forms import DEFAULT_ALCHEMY_FORMS
 from horde_worker_regen.app_state import AppStateStore, WorkerRunRecord, default_app_state_dir
-from horde_worker_regen.bridge_data.beta_source import beta_aware_image_records, invalidate_merged_records
+from horde_worker_regen.bridge_data.beta_source import (
+    BETA_MODELS_DIR_ENV_VAR,
+    beta_aware_image_records,
+    invalidate_merged_records,
+    pending_publish_retry_seconds,
+    share_pending_records_with_children,
+)
 from horde_worker_regen.bridge_data.data_model import ModelPoolConfig, reGenBridgeData
 from horde_worker_regen.bridge_data.disagg_model_selection import compute_vae_cluster_sizes
 from horde_worker_regen.bridge_data.gpu_config import resolve_all_effective_gpu_configs
@@ -1361,6 +1367,10 @@ class HordeWorkerProcessManager:
         self._last_reference_refresh = time.time()
         self._reference_refresh_in_progress = False
         self._pending_reference_reload_broadcast = False
+        # A publish of the beta records that left a category unwritten is retried on the pending provider's
+        # cache cadence, so children are not left on empty beta categories until the next full refresh.
+        self._pending_publish_incomplete = False
+        self._last_pending_publish = 0.0
         logger.debug(f"Models to load: {bridge_data.image_models_to_load}")
         logger.debug(f"Custom Models to load: {bridge_data.custom_models}")
 
@@ -2378,7 +2388,13 @@ class HordeWorkerProcessManager:
         return card_runtimes, mp_primitives
 
     def _init_model_reference(self) -> None:
-        """Fetch the stable diffusion model reference, retrying on failure."""
+        """Fetch the stable diffusion model reference, retrying on failure, and publish the beta records.
+
+        The parent owns the pending (beta) read. It drops any inherited file-backed beta directory before its
+        first read so its provider is the network one, then writes the pending records for the children it
+        spawns later and points them at the files.
+        """
+        os.environ.pop(BETA_MODELS_DIR_ENV_VAR, None)
         while self.stable_diffusion_reference is None:
             try:
                 horde_model_reference_manager = ModelReferenceManager.get_instance()
@@ -2397,6 +2413,12 @@ class HordeWorkerProcessManager:
             except Exception as e:
                 logger.error(e)
                 time.sleep(5)
+        self._record_pending_publish(share_pending_records_with_children(ModelReferenceManager.get_instance()))
+
+    def _record_pending_publish(self, complete: bool) -> None:  # noqa: FBT001 - one outcome flag
+        """Keep the outcome of a beta-record publish, which arms the retry in the reference tick when incomplete."""
+        self._pending_publish_incomplete = not complete
+        self._last_pending_publish = time.time()
 
     def _apply_self_maintenance_throttle(self) -> None:
         """Lapse an elapsed pop pause, then let each fault backstop arm one.
@@ -5533,7 +5555,10 @@ class HordeWorkerProcessManager:
         finishes, the next tick broadcasts a reload so every subprocess re-reads the files.
 
         A successful refresh also drops the merged canonical-plus-beta view, so the next parent read sees
-        the current pending queue. ``stable_diffusion_reference`` keeps the set it was built with.
+        the current pending queue, and republishes the pending records before the broadcast, so the reloading
+        subprocesses read the same beta set from the parent's files. ``stable_diffusion_reference`` keeps the
+        set it was built with. Between refreshes, an incomplete publish is retried by
+        :meth:`_maybe_retry_pending_publish`.
         """
         if self._pending_reference_reload_broadcast:
             self._pending_reference_reload_broadcast = False
@@ -5541,10 +5566,11 @@ class HordeWorkerProcessManager:
 
         if self._reference_refresh_in_progress:
             return
-        if (time.time() - self._last_reference_refresh) < self._REFERENCE_REFRESH_INTERVAL_SECONDS:
-            return
         manager = self.horde_model_reference_manager
         if manager is None:
+            return
+        if (time.time() - self._last_reference_refresh) < self._REFERENCE_REFRESH_INTERVAL_SECONDS:
+            self._maybe_retry_pending_publish(manager)
             return
 
         self._last_reference_refresh = time.time()
@@ -5554,6 +5580,7 @@ class HordeWorkerProcessManager:
             try:
                 manager.get_all_model_references_or_none(overwrite_existing=True)
                 invalidate_merged_records()
+                self._record_pending_publish(share_pending_records_with_children(manager))
                 logger.info("Refreshed model reference from source; broadcasting reload to subprocesses")
                 self._pending_reference_reload_broadcast = True
             except Exception as e:  # noqa: BLE001 - a refresh failure must not crash the worker
@@ -5562,6 +5589,34 @@ class HordeWorkerProcessManager:
                 self._reference_refresh_in_progress = False
 
         threading.Thread(target=_refresh, name="reference-refresh", daemon=True).start()
+
+    def _maybe_retry_pending_publish(self, manager: ModelReferenceManager) -> None:
+        """Republish the beta records off the event loop while the last publish left a category unwritten.
+
+        The retry runs no more often than the registered pending provider's cache TTL, since the provider does
+        not refetch sooner than that. With no provider registered, beta is unconfigured and only the full
+        refresh tries again. A retry that completes sets the reload broadcast so the children re-read the files.
+        """
+        if not self._pending_publish_incomplete:
+            return
+        retry_seconds = pending_publish_retry_seconds(manager)
+        if retry_seconds is None or (time.time() - self._last_pending_publish) < retry_seconds:
+            return
+
+        self._last_pending_publish = time.time()
+        self._reference_refresh_in_progress = True
+
+        def _retry() -> None:
+            try:
+                complete = share_pending_records_with_children(manager)
+                self._record_pending_publish(complete)
+                if complete:
+                    logger.info("Published the beta records on retry; broadcasting reload to subprocesses")
+                    self._pending_reference_reload_broadcast = True
+            finally:
+                self._reference_refresh_in_progress = False
+
+        threading.Thread(target=_retry, name="pending-publish-retry", daemon=True).start()
 
     def _on_model_load_failure(self, process_id: int, model_name: str) -> None:
         """Handle a child's report that it failed to load ``model_name`` (the poison-model path).

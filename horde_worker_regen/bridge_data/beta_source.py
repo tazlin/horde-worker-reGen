@@ -11,6 +11,10 @@ the inference children, which resolve the same two sources in the same order.
 - :func:`beta_aware_image_records` returns the image-generation records as a typed mapping.
 - :func:`invalidate_merged_records` drops the per-process cache. The parent's periodic reference refresh
   calls it.
+- :func:`share_pending_records_with_children` writes the pending records the parent holds to
+  :func:`pending_records_directory` and points the processes the parent spawns at them, so the children
+  never fetch the pending queue over the network. :func:`publish_pending_records` writes the files, and
+  :func:`pending_publish_retry_seconds` paces the parent's retry of a publish that left a category unwritten.
 
 ``hordelib.beta_models`` owns the opt-in (which categories are in beta, how the pending provider is built,
 and the source order). It is torch-free and imported lazily, so a process that never reads the view does
@@ -20,8 +24,13 @@ network.
 
 from __future__ import annotations
 
+import contextlib
+import json
+import os
+import tempfile
 import threading
 from dataclasses import dataclass
+from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING
 
@@ -39,6 +48,16 @@ BOUNDED_PENDING_TIMEOUT_SECONDS = 5.0
 
 BOUNDED_PENDING_RETRY_MAX_ATTEMPTS = 1
 """Attempts of the pending provider a bounded read registers."""
+
+BETA_MODELS_DIR_ENV_VAR = "HORDELIB_BETA_MODELS_DIR"
+"""The variable ``hordelib.beta_models`` reads to serve pending records from files instead of the PRIMARY.
+
+hordelib owns the name. It is spelled here because horde-engine releases without the file-backed provider do not
+define it, and on those releases the variable is inert.
+"""
+
+PENDING_RECORDS_DIR_NAME = "pending"
+"""The folder under the model reference base path that holds the published pending records."""
 
 
 @dataclass(frozen=True)
@@ -156,6 +175,98 @@ def beta_aware_image_records(
     return {name: record for name, record in merged.records.items() if isinstance(record, ImageGenerationModelRecord)}
 
 
+def pending_records_directory() -> Path:
+    """Return the folder the parent publishes pending records to, under the model reference base path."""
+    from horde_model_reference import horde_model_reference_paths
+
+    return horde_model_reference_paths.base_path / PENDING_RECORDS_DIR_NAME
+
+
+def publish_pending_records(
+    manager: ModelReferenceManager,
+    directory: Path,
+) -> frozenset[MODEL_REFERENCE_CATEGORY]:
+    """Write each opted-in category's pending records to ``{directory}/{category}.json``.
+
+    The records are the pending half of :func:`merged_category_records`, so they come through the provider
+    that read registered on ``manager``. Each file maps model name to ``model_dump(mode="json")``, the shape
+    ``StaticModelProvider.from_raw`` reads, and is replaced atomically. A category whose pending read failed
+    open keeps its previous file, so a PRIMARY outage does not empty the children's beta records.
+
+    Args:
+        manager: The reference manager whose pending provider is read.
+        directory: The folder to write the files into. It is created when missing.
+
+    Returns:
+        The categories whose file was written.
+    """
+    written: set[MODEL_REFERENCE_CATEGORY] = set()
+    for category in sorted(_opted_in_categories(), key=lambda opted: opted.value):
+        view = merged_category_records(manager, category)
+        if not view.pending_read_ok:
+            logger.warning(f"Kept the previous beta {category.value} file because the pending queue was not read.")
+            continue
+        pending = {name: view.records[name].model_dump(mode="json") for name in sorted(view.beta_names)}
+        _write_json_atomically(directory / f"{category.value}.json", pending)
+        written.add(category)
+    return frozenset(written)
+
+
+def share_pending_records_with_children(manager: ModelReferenceManager) -> bool:
+    """Publish the pending records and set :data:`BETA_MODELS_DIR_ENV_VAR` for the processes spawned after this.
+
+    Spawned processes inherit the environment, so their pending provider serves these files and makes no
+    network request. The calling process keeps the provider it already registered. A failed write is logged,
+    and the children read whatever files the last successful write left. The variable is set whatever the
+    outcome.
+
+    Args:
+        manager: The reference manager whose pending provider is read.
+
+    Returns:
+        True when every opted-in category's file was written, including when no category is opted in.
+    """
+    directory = pending_records_directory()
+    complete = False
+    try:
+        complete = publish_pending_records(manager, directory) == _opted_in_categories()
+    except Exception as publish_error:  # noqa: BLE001 - beta only adds to the canonical view
+        logger.warning(
+            f"Could not publish the beta records for subprocesses: {type(publish_error).__name__}: {publish_error}"
+        )
+    os.environ[BETA_MODELS_DIR_ENV_VAR] = str(directory)
+    return complete
+
+
+def pending_publish_retry_seconds(manager: ModelReferenceManager) -> float | None:
+    """Return the registered pending provider's cache TTL, the shortest useful wait before a publish is retried.
+
+    Returns:
+        The TTL in seconds, or None when no pending provider is registered or it states no TTL.
+    """
+    from horde_model_reference import PENDING_SOURCE_ID
+
+    provider = manager.get_provider(PENDING_SOURCE_ID)
+    if provider is None:
+        return None
+    ttl_seconds = provider.cache_ttl_seconds()
+    return None if ttl_seconds is None else float(ttl_seconds)
+
+
+def _write_json_atomically(path: Path, payload: Mapping[str, object]) -> None:
+    """Write ``payload`` to ``path`` through a temporary file in the same folder and ``os.replace``."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    file_descriptor, temp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(file_descriptor, "w", encoding="utf-8") as temp_file:
+            json.dump(payload, temp_file)
+        os.replace(temp_name, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            Path(temp_name).unlink()
+        raise
+
+
 def _opted_in_categories() -> frozenset[MODEL_REFERENCE_CATEGORY]:
     """Return the categories the environment opted into beta, empty when hordelib cannot be imported."""
     try:
@@ -198,15 +309,18 @@ def _read_pending_first(
     *,
     bounded: bool,
 ) -> MergedCategoryRecords | None:
-    """Register the pending provider once and query ``category`` pending-first, or None when beta is unconfigured.
+    """Register the pending provider once and query ``category`` pending-first, or None without a pending half.
 
     ``hordelib.beta_models.build_pending_provider`` returns None, and logs why, when the PRIMARY URL or the
-    API key is missing.
+    API key is missing. The network provider reports a failed fetch as None instead of raising, and the
+    manager's query reads that the same as an empty queue, so the provider is asked first and a None makes
+    the read fail open. The query that follows is served from the provider's cache.
     """
     from horde_model_reference import PENDING_SOURCE_ID
     from hordelib.beta_models import beta_source_for, build_pending_provider
 
-    if manager.get_provider(PENDING_SOURCE_ID) is None:
+    provider = manager.get_provider(PENDING_SOURCE_ID)
+    if provider is None:
         provider = (
             build_pending_provider(
                 timeout_seconds=BOUNDED_PENDING_TIMEOUT_SECONDS,
@@ -221,6 +335,8 @@ def _read_pending_first(
 
     source = beta_source_for(category, manager)
     if isinstance(source, str):
+        return None
+    if provider.fetch_category(category) is None:
         return None
 
     records: dict[str, GenericModelRecord] = {}

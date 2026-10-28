@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import os
 from collections.abc import Iterator, Mapping
 from pathlib import Path
 
@@ -15,12 +17,16 @@ from horde_model_reference.model_reference_records import (
     ImageGenerationModelRecord,
 )
 
+import horde_worker_regen.bridge_data.beta_source as beta_source
 from horde_worker_regen.bridge_data.beta_source import (
+    BETA_MODELS_DIR_ENV_VAR,
     BOUNDED_PENDING_RETRY_MAX_ATTEMPTS,
     BOUNDED_PENDING_TIMEOUT_SECONDS,
     beta_aware_image_records,
     invalidate_merged_records,
     merged_category_records,
+    publish_pending_records,
+    share_pending_records_with_children,
 )
 
 BETA_CATEGORIES_ENV_VAR = "HORDELIB_BETA_MODEL_CATEGORIES"
@@ -391,3 +397,83 @@ def test_categories_come_from_the_environment_opt_in_only(monkeypatch: pytest.Mo
     assert set(merged.records) == {"Canonical-Only", "Shared"}
     assert merged.beta_names == frozenset()
     assert manager.queries == 0
+
+
+_ESRGAN = MODEL_REFERENCE_CATEGORY.esrgan
+
+
+def _read_published(directory: Path, category: MODEL_REFERENCE_CATEGORY) -> dict[str, dict[str, object]]:
+    return json.loads((directory / f"{category.value}.json").read_text(encoding="utf-8"))
+
+
+def test_publish_writes_the_pending_records_of_each_opted_in_category(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Each opted-in category gets a file of its pending records alone, in the shape ``from_raw`` reads."""
+    pending_shared = image_record("Shared", file_name="new")
+    serve_pending(
+        monkeypatch,
+        {_IMAGE: {"Shared": pending_shared, "Beta-Only": image_record("Beta-Only")}, _ESRGAN: {}},
+        categories="image_generation,esrgan",
+    )
+
+    written = publish_pending_records(_canonical_manager(), tmp_path)  # type: ignore[arg-type]
+
+    assert written == frozenset({_IMAGE, _ESRGAN})
+    image_file = _read_published(tmp_path, _IMAGE)
+    assert set(image_file) == {"Shared", "Beta-Only"}
+    assert _read_published(tmp_path, _ESRGAN) == {}
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["esrgan.json", "image_generation.json"]
+    served = StaticModelProvider.from_raw(PENDING_SOURCE_ID, {_IMAGE: image_file}).fetch_category(_IMAGE)
+    assert served is not None
+    assert served["Shared"] == pending_shared
+
+
+def test_publish_replaces_the_file_atomically(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A write that fails before the replace leaves the previous file and no temporary file."""
+    serve_pending(monkeypatch, {_IMAGE: {"Beta-Only": image_record("Beta-Only")}})
+    previous = tmp_path / "image_generation.json"
+    previous.write_text('{"Previous": {}}', encoding="utf-8")
+
+    def _interrupted(_source: object, _destination: object) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(beta_source.os, "replace", _interrupted)
+    with pytest.raises(OSError, match="disk full"):
+        publish_pending_records(_canonical_manager(), tmp_path)  # type: ignore[arg-type]
+
+    assert previous.read_text(encoding="utf-8") == '{"Previous": {}}'
+    assert [path.name for path in tmp_path.iterdir()] == ["image_generation.json"]
+
+
+def test_publish_keeps_the_previous_file_when_the_pending_read_fails_open(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A provider that reports a failed fetch as None fails the read open, and the published file stays."""
+    serve_pending(monkeypatch, {_ESRGAN: {}})
+    previous = tmp_path / "image_generation.json"
+    previous.write_text('{"Previous": {}}', encoding="utf-8")
+    manager = _canonical_manager()
+
+    written = publish_pending_records(manager, tmp_path)  # type: ignore[arg-type]
+
+    assert written == frozenset()
+    assert not merged_category_records(manager, _IMAGE).pending_read_ok  # type: ignore[arg-type]
+    assert previous.read_text(encoding="utf-8") == '{"Previous": {}}'
+
+
+def test_share_publishes_and_sets_the_directory_for_spawned_processes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The children inherit the directory the records were written to."""
+    serve_pending(monkeypatch, {_IMAGE: {"Beta-Only": image_record("Beta-Only")}})
+    monkeypatch.setenv(BETA_MODELS_DIR_ENV_VAR, "unrelated")
+    monkeypatch.setattr(beta_source, "pending_records_directory", lambda: tmp_path)
+
+    share_pending_records_with_children(_canonical_manager())  # type: ignore[arg-type]
+
+    assert os.environ[BETA_MODELS_DIR_ENV_VAR] == str(tmp_path)
+    assert set(_read_published(tmp_path, _IMAGE)) == {"Beta-Only"}

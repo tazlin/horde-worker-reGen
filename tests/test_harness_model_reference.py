@@ -104,7 +104,14 @@ def test_pending_only_model_keeps_its_real_baseline_when_beta_is_opted_in(monkey
         description="a pending-queue record",
     )
     monkeypatch.setenv("HORDELIB_BETA_MODEL_CATEGORIES", "image_generation")
-    monkeypatch.setattr(beta_models, "build_pending_provider", lambda **_kwargs: object())
+
+    class _PendingProviderStub:
+        """The owner reads the pending category through the built provider once before it queries."""
+
+        def fetch_category(self, _category: object) -> dict[str, ImageGenerationModelRecord]:
+            return {pending_model: pending_record}
+
+    monkeypatch.setattr(beta_models, "build_pending_provider", lambda **_kwargs: _PendingProviderStub())
 
     reference = build_harness_model_reference(
         [make_canned_job(pending_model)],
