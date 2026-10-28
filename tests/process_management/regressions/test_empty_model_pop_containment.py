@@ -9,28 +9,36 @@ empty string until it is quarantined as if it were a model. Every link is tested
 from __future__ import annotations
 
 import queue
+from typing import Any
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 from horde_sdk import RequestErrorResponse
+from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 from horde_sdk.ai_horde_api.consts import GENERATION_STATE
 from loguru import logger
 
 from horde_worker_regen.process_management.ipc.messages import (
+    HOST_COMMIT_FAILED_INFO,
     HordeControlFlag,
     HordeControlMessage,
+    HordeModelStateChangeMessage,
     HordeProcessState,
+    HordeProcessStateChangeMessage,
     ModelLoadState,
 )
 from horde_worker_regen.process_management.jobs.job_popper import JobPopper
 from horde_worker_regen.process_management.jobs.job_tracker import JobFaultOrigin, JobStage, JobTracker
+from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.lifecycle.process_lifecycle import ModelIncidentKind
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.workers.inference_process import HordeInferenceProcess
 from tests.process_management.conftest import (
     make_job_pop_response,
     make_mock_bridge_data,
+    make_mock_process_info,
     make_testable_process_manager,
+    track_popped_job_async,
 )
 from tests.process_management.jobs.test_job_popping import (
     _make_popper,
@@ -429,3 +437,117 @@ class TestBudgetDependentFlagDisclosure:
         )
 
         assert [line for line in emitted if "inert while enable_vram_budget is false" in line] == []
+
+
+def _deliver_messages(process_manager: object, messages: list[object]) -> None:
+    """Queue child messages for the dispatcher's normal drain, in arrival order."""
+    dispatcher = process_manager._message_dispatcher  # type: ignore[attr-defined]
+    dispatcher._process_message_queue.empty.side_effect = [False] * len(messages) + [True]
+    dispatcher._process_message_queue.get.side_effect = messages
+
+
+class TestRefusedLoadReturnsToHostAdmission:
+    """A load the host refused leaves the job pending behind the preload gate's host admission.
+
+    The lane's LOADING report records the model on the lane, and dispatch reads that record as the model being
+    held there. A FAILED report that left the record standing sent the requeued job straight back to the lane as a
+    resident dispatch, where the child loaded the checkpoint itself with no host admission.
+    """
+
+    _MODEL = "AlbedoBase XL (SDXL)"
+    _LANE = 1
+
+    @staticmethod
+    def _lane_report(
+        lane: HordeProcessInfo,
+        process_state: HordeProcessState,
+        model_state: ModelLoadState,
+        model: str,
+        info: str,
+    ) -> HordeModelStateChangeMessage:
+        return HordeModelStateChangeMessage(
+            process_id=lane.process_id,
+            process_launch_identifier=lane.process_launch_identifier,
+            info=info,
+            process_state=process_state,
+            horde_model_name=model,
+            horde_model_state=model_state,
+        )
+
+    @staticmethod
+    def _sent_flags(lane: HordeProcessInfo) -> list[HordeControlFlag]:
+        return [
+            call.args[0].control_flag
+            for call in lane.pipe_connection.send.call_args_list  # pyrefly: ignore
+            if isinstance(call.args[0], HordeControlMessage)
+        ]
+
+    async def test_a_host_refused_preload_is_judged_by_host_admission_before_any_dispatch(self) -> None:
+        """After LOADING then a host-commit FAILED, the next pass re-judges the load and sends no START_INFERENCE."""
+        pm = make_testable_process_manager(
+            enable_vram_budget=True,
+            vram_reserve_mb=2000,
+            ram_reserve_mb=4096,
+            image_models_to_load=[self._MODEL],
+        )
+        lane = make_mock_process_info(self._LANE, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
+        pm._process_map[self._LANE] = lane
+        scheduler = pm._inference_scheduler
+        job = make_job_pop_response(model=self._MODEL)
+        await track_popped_job_async(pm._job_tracker, job)
+
+        verdicts: list[str | None] = []
+        host_has_room = True
+        real_verdict = scheduler._apply_ram_verdict
+
+        def verdict_spy(
+            verdict_job: ImageGenerateJobPopResponse,
+            available_process: HordeProcessInfo,
+            **kwargs: Any,  # noqa: ANN401
+        ) -> bool:
+            verdicts.append(verdict_job.model)
+            if host_has_room:
+                return real_verdict(verdict_job, available_process, **kwargs)
+            # The host is scripted without room for the reload, so the admission defers it.
+            return False
+
+        scheduler._apply_ram_verdict = verdict_spy  # pyrefly: ignore
+
+        assert scheduler.preload_models() is True
+        assert verdicts == [self._MODEL]
+        assert self._sent_flags(lane) == [HordeControlFlag.PRELOAD_MODEL]
+
+        _deliver_messages(
+            pm,
+            [
+                self._lane_report(
+                    lane, HordeProcessState.PRELOADING_MODEL, ModelLoadState.LOADING, self._MODEL, "loading"
+                ),
+                self._lane_report(
+                    lane,
+                    HordeProcessState.PRELOADING_FAILED,
+                    ModelLoadState.FAILED,
+                    self._MODEL,
+                    HOST_COMMIT_FAILED_INFO,
+                ),
+                HordeProcessStateChangeMessage(
+                    process_id=lane.process_id,
+                    process_launch_identifier=lane.process_launch_identifier,
+                    info="Waiting for job",
+                    process_state=HordeProcessState.WAITING_FOR_JOB,
+                ),
+            ],
+        )
+        await pm._message_dispatcher.receive_and_handle_process_messages()
+
+        verdicts.clear()
+        lane.pipe_connection.send.reset_mock()  # pyrefly: ignore
+        host_has_room = False
+
+        await scheduler.run_scheduling_cycle(pm.stable_diffusion_reference or {})
+
+        assert job.id_ is not None
+        assert pm._job_tracker.get_stage(job.id_) is JobStage.PENDING_INFERENCE
+        assert job not in pm._job_tracker.jobs_in_progress
+        assert HordeControlFlag.START_INFERENCE not in self._sent_flags(lane)
+        assert verdicts == [self._MODEL]

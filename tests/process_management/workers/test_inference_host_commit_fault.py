@@ -229,3 +229,48 @@ def test_a_failed_run_unloads_and_goes_idle_without_reloading() -> None:
     ]
     assert model_states[-1] == ModelLoadState.ON_DISK
     assert _reported_process_states(child)[-1] == HordeProcessState.WAITING_FOR_JOB
+
+
+def test_a_refused_preload_leaves_no_active_model() -> None:
+    """A preload refused after the previous model was reported unloaded leaves the child naming no model."""
+    other_model = "AlbedoBase XL (SDXL)"
+    queue = _RecordingQueue()
+    child = _child_whose_dispatch_preload_raises(queue, HostCommitError("commit refused"))
+    child._active_model_name = "Deliberate"
+    child._active_model_load_state = ModelLoadState.LOADED_IN_RAM
+
+    child.preload_model(
+        horde_model_name=_MODEL,
+        will_load_loras=False,
+        seamless_tiling_enabled=False,
+        job_info=make_job_pop_response(model=_MODEL),
+    )
+
+    assert child._active_model_name is None
+    assert child._active_model_load_state is None
+    model_states = [
+        (call.kwargs["horde_model_name"], call.kwargs["horde_model_state"])
+        for call in child.on_horde_model_state_change.call_args_list  # type: ignore[attr-defined]
+    ]
+    assert model_states == [
+        ("Deliberate", ModelLoadState.ON_DISK),
+        (_MODEL, ModelLoadState.LOADING),
+        (_MODEL, ModelLoadState.FAILED),
+    ]
+
+    child._receive_and_handle_control_message(
+        HordeInferenceControlMessage(
+            control_flag=HordeControlFlag.START_INFERENCE,
+            horde_model_name=other_model,
+            sdk_api_job_info=make_job_pop_response(model=other_model),
+        ),
+    )
+
+    failed_reports = [
+        call.kwargs.get("info")
+        for call in child.send_process_state_change_message.call_args_list  # type: ignore[attr-defined]
+        if call.kwargs.get("process_state") == HordeProcessState.INFERENCE_FAILED
+    ]
+    assert len(failed_reports) == 1
+    assert failed_reports[0] is not None
+    assert failed_reports[0].endswith("currently active model is None")

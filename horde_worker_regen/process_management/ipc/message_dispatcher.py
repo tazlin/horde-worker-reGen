@@ -1797,12 +1797,15 @@ class MessageDispatcher:
             # The model could not be loaded. Do not record it as resident anywhere: clear any LOADING entry
             # this process held for it (left by the PRELOADING_MODEL message moments earlier) so the model is
             # not pinned to a slot that never actually loaded it, then hand the failure to the manager so it
-            # can track repeated failures and quarantine the model.
+            # can track repeated failures and quarantine the model. The lane record the LOADING report set is
+            # dropped with the map entry, since dispatch and the preload gate read that record as the model
+            # being held there.
             self._horde_model_map.expire_entry(message.horde_model_name)
+            self._process_map.on_model_load_failed(message.process_id, message.horde_model_name)
             if message.info == HOST_COMMIT_FAILED_INFO:
-                # The host refused the checkpoint mapping: a memory condition at map time, which the RAM
-                # admission re-judges on the next pass. The model is not implicated and the slot stays up, so
-                # nothing is counted against either.
+                # The host refused the checkpoint mapping: a memory condition at map time. With the lane record
+                # gone, the next load of the model goes through the preload gate's host admission. The model is
+                # not implicated and the slot stays up, so nothing is counted against either.
                 logger.warning(
                     f"Process {message.process_id} could not map {message.horde_model_name} because the host refused "
                     "to commit the checkpoint mapping. The load will be re-admitted against host memory.",

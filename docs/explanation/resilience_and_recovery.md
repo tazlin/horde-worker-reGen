@@ -94,8 +94,11 @@ through the parent's preload admission.
 The refusal is a capacity result, so the parent resolves it through
 [`JobTracker.handle_host_commit_refusal`][horde_worker_regen.process_management.jobs.job_tracker.JobTracker.handle_host_commit_refusal]
 and never through `handle_job_fault`. The job returns to `PENDING_INFERENCE`
-without spending an inference attempt or its degraded retry, and the RAM
-admission re-judges it before the next dispatch. A requeue counts nothing against
+without spending an inference attempt or its degraded retry. A refused preload
+reports its load FAILED and a refused run unloads its model, and either report
+clears the lane's record of the model. Unless another lane holds the model, the
+job then waits for a preload that the host admission passes. The requeue budget
+is a count with no clock. A requeue counts nothing against
 the fault-rate breaker, the resource-fault throttle, the model's over-budget
 streak or the lane-fault streak. Each requeue logs a WARNING naming the job, the
 model and the requeue count against `MAX_HOST_COMMIT_REQUEUES` (3).

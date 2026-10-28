@@ -21,6 +21,7 @@ from horde_worker_regen.process_management.config.worker_state import WorkerStat
 from horde_worker_regen.process_management.ipc.action_ledger import ActionLedger
 from horde_worker_regen.process_management.ipc.message_dispatcher import MessageDispatcher
 from horde_worker_regen.process_management.ipc.messages import (
+    HOST_COMMIT_FAILED_INFO,
     HordeControlFlag,
     HordeHeartbeatType,
     HordeInferenceResultMessage,
@@ -293,6 +294,10 @@ class TestReceiveAndHandleProcessMessages:
         assert seen == []
         entry = hmm.root.get("Krea2-Turbo_fp8")
         assert entry is None or not entry.horde_model_load_state.is_active()
+        # The lane record the LOADING report set goes with the map entry, so dispatch does not read the
+        # refused model as resident on this lane.
+        assert process_info.loaded_horde_model_name is None
+        assert process_map.get_process_by_horde_model_name("Krea2-Turbo_fp8") is None
 
     async def test_torch_gpu_incompatible_latches_worker_state_flag(self) -> None:
         """A TORCH_GPU_INCOMPATIBLE report latches the sticky stop-popping flag and stores its reason."""
@@ -1638,6 +1643,36 @@ class TestHostCommitRefusalRequeue:
         assert job_tracker.count_recent_resource_faults(600.0) == 0
         assert job_tracker.get_model_overbudget_fault_count(self._MODEL) == 0
         assert any(level in ("WARNING", "ERROR") and "host" in message for level, message in records)
+
+    @pytest.mark.parametrize("failure_info", [HOST_COMMIT_FAILED_INFO, "failed to load"])
+    async def test_a_failed_load_leaves_no_lane_holding_the_model(self, failure_info: str) -> None:
+        """LOADING then FAILED leaves no lane record of the model, for a host refusal and any other failure."""
+        process_info = make_mock_process_info(2, model_name=None)
+        process_info.process_launch_identifier = 4
+        process_map = ProcessMap({2: process_info})
+        dispatcher = _make_dispatcher(process_map=process_map, horde_model_map=HordeModelMap(root={}))
+        dispatcher.set_model_load_failure_handler(lambda _pid, _model: None)
+
+        for state, process_state, info in (
+            (ModelLoadState.LOADING, HordeProcessState.PRELOADING_MODEL, "loading"),
+            (ModelLoadState.FAILED, HordeProcessState.PRELOADING_FAILED, failure_info),
+        ):
+            msg = Mock(spec=HordeModelStateChangeMessage)
+            msg.process_id = 2
+            msg.process_launch_identifier = 4
+            msg.horde_model_name = self._MODEL
+            msg.horde_model_state = state
+            msg.process_state = process_state
+            msg.info = info
+            msg.time_elapsed = None
+            msg.vram_unload_refused = False
+            _enqueue(dispatcher, msg)
+            await dispatcher.receive_and_handle_process_messages()
+            if state is ModelLoadState.LOADING:
+                assert process_map.get_process_by_horde_model_name(self._MODEL) is process_info
+
+        assert process_map.get_process_by_horde_model_name(self._MODEL) is None
+        assert process_info.loaded_horde_model_baseline is None
 
 
 _FOLD_MODEL = "stable_diffusion"

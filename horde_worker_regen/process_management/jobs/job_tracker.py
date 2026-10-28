@@ -2567,7 +2567,10 @@ class JobTracker:
         """Resolve a job whose run failed because the host refused to commit a checkpoint mapping.
 
         A refusal is a capacity result. The job returns to ``PENDING_INFERENCE`` without spending an inference
-        attempt or a degraded retry, so the RAM admission re-judges it before the next dispatch. The refusal
+        attempt or a degraded retry. A refused preload reports its load FAILED and a refused run unloads its model,
+        and either report clears the lane's record of the model. Unless another lane holds the model, the job then
+        waits for a preload that the host admission passes. The count has no clock, so a host whose reading admits
+        the same refused mapping again spends the budget at that rate. The refusal
         after :data:`MAX_HOST_COMMIT_REQUEUES` requeues faults the job for the horde to reissue. That fault reaches
         the terminal-fault observer because the horde counts it as a dropped job, and it never feeds the
         resource-fault streaks, which judge whether a model fits a card.

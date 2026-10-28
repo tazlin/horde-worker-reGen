@@ -882,6 +882,11 @@ class HordeInferenceProcess(HordeProcess):
                 horde_model_name=self._active_model_name,
                 horde_model_state=ModelLoadState.ON_DISK,
             )
+            # The parent has now been told the previous model is gone, so the child's record says the same. A
+            # load that fails below leaves no active model, and a later START_INFERENCE mismatch reports that.
+            self._active_model_name = None
+            self._active_model_load_state = None
+            self._active_model_diffusion_model_only = False
 
         self.on_horde_model_state_change(
             process_state=HordeProcessState.PRELOADING_MODEL,

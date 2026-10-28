@@ -641,6 +641,29 @@ class ProcessMap(dict[int, HordeProcessInfo]):
                 self.reset_heartbeat_state(process_id)
             self[process_id].record_preload_intent(last_job_referenced)
 
+    def on_model_load_failed(self, process_id: int, horde_model_name: str) -> None:
+        """Forget the model a lane was loading, because the lane reported that load failed.
+
+        A lane record names a model only after a load report said the lane holds it or is loading it, and a
+        failed load means it holds neither. Dispatch and the preload gate read this record, so a record left
+        naming the refused model sends its jobs straight back to the lane as resident, past the host admission
+        a cold load goes through.
+
+        The child reports its previous model unloaded from RAM before it reports the new load, and that report
+        already cleared the lane's residency, so only the load's own record is dropped here. A record naming
+        another model is kept: a failure reported before any load began (a blank name) leaves the previous
+        model in place.
+
+        Args:
+            process_id (int): The ID of the process that reported the failure.
+            horde_model_name (str): The model whose load failed.
+        """
+        if self[process_id].loaded_horde_model_name != horde_model_name:
+            return
+        self[process_id].loaded_horde_model_name = None
+        self[process_id].loaded_horde_model_baseline = None
+        self[process_id].last_received_timestamp = time.time()
+
     def reconcile_reported_os_pid(self, process_id: int, reported_os_pid: int | None) -> None:
         """Adopt a child's self-reported ``os.getpid()`` as the authoritative OS pid for per-PID telemetry.
 
