@@ -30,7 +30,7 @@ from horde_worker_regen.benchmark.ladder import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Collection, Mapping, Sequence
+    from collections.abc import Mapping, Sequence
 
     from horde_model_reference.model_reference_records import GenericModelRecord
 
@@ -126,15 +126,19 @@ def model_present_on_disk(model_name: str) -> bool | None:
     JSON to disk that this then reads. An online manager here would block the subprocess on a PRIMARY-API
     round-trip whose latency it cannot bound, so the read is forced offline. Fails open (returns None) on
     any error.
+
+    The records are the merged canonical-plus-beta view read in bounded mode, so a beta model whose files
+    are present reads as present. :func:`_offline_category_reference` describes the pending read.
     """
     try:
         from horde_model_reference.meta_consts import MODEL_REFERENCE_CATEGORY
 
+        from horde_worker_regen.bridge_data.beta_source import merged_category_records
         from horde_worker_regen.model_download_plan import is_model_present
         from horde_worker_regen.reference_helper import ensure_offline_reference_manager
 
         manager = ensure_offline_reference_manager()
-        records = manager.get_all_model_references().get(MODEL_REFERENCE_CATEGORY.image_generation) or {}
+        records = merged_category_records(manager, MODEL_REFERENCE_CATEGORY.image_generation, bounded=True).records
         return is_model_present(model_name, records)
     except Exception as e:  # noqa: BLE001 - presence is best-effort; fail open
         logger.debug(f"Could not determine on-disk presence of {model_name!r}: {e}")
@@ -172,19 +176,27 @@ def _coerce_root_paths(extra_model_directories: Sequence[str | os.PathLike[str]]
 
 
 def _offline_category_reference(category: str) -> Mapping[str, GenericModelRecord] | None:
-    """Read a category's reference offline (disk-only), or None when it cannot be loaded (torch-free).
+    """Read a category's merged canonical-plus-beta reference offline, or None when it cannot be loaded.
 
     Mirrors :func:`model_present_on_disk`'s offline discipline: a short-lived benchmark subprocess must
-    never block on a PRIMARY-API fetch, so the read is forced offline. Fails open to None ("unknown"), so a
-    surface shows the feature's files as undeterminable rather than wrongly claiming them missing or present.
+    never block on a PRIMARY-API fetch, so the canonical read is forced offline. Fails open to None
+    ("unknown"), so a surface shows the feature's files as undeterminable rather than wrongly claiming them
+    missing or present.
+
+    For a category the environment opted into beta the pending (beta) records are laid over the canonical
+    ones, so a beta post-processor's files are found through its pending record. The pending queue has no
+    on-disk form, so that half is a network read. It is bounded to one short attempt and fails open to the
+    canonical records. Nothing here writes the opt-in, so a fake or dry-run run with no worker config never
+    reaches the network and gets the canonical view.
     """
     try:
         from horde_model_reference.meta_consts import MODEL_REFERENCE_CATEGORY
 
+        from horde_worker_regen.bridge_data.beta_source import merged_category_records
         from horde_worker_regen.reference_helper import ensure_offline_reference_manager
 
         manager = ensure_offline_reference_manager()
-        return manager.get_all_model_references().get(MODEL_REFERENCE_CATEGORY(category)) or {}
+        return merged_category_records(manager, MODEL_REFERENCE_CATEGORY(category), bounded=True).records
     except Exception as e:  # noqa: BLE001 - reference is best-effort; fail open to "unknown"
         logger.debug(f"Could not load the offline {category!r} reference: {e}")
         return None
@@ -193,62 +205,26 @@ def _offline_category_reference(category: str) -> Mapping[str, GenericModelRecor
 def beta_post_processor_names() -> frozenset[str]:
     """Post-processor names the PRIMARY's pending (beta) queue serves for the opted-in categories.
 
-    A beta post-processor's record exists only in the pending queue, so the canonical on-disk reference
-    does not include it however recent it is. This reads the same pending source
-    the inference children resolve them through, so what the benchmark offers matches what a child can
-    load.
+    The names come from the same merged view :func:`_offline_category_reference` reads, so what the
+    benchmark counts as beta matches what a child loads from the pending source.
 
-    **The opt-in belongs to the caller, and this never creates one.** Which categories are in beta is
-    read out of the environment and nothing here writes it, so the fetch happens only in a process that
-    already declared beta: a real worker (from its config load) or a real-mode benchmark
-    (``ensure_worker_env``, which runs before the catalog is built). A fake or dry-run run, and a CI box
-    with no worker config, therefore never reach the network here and get the canonical-only view, where
-    a beta-only form is skipped rather than offered. That is the correct degraded answer for a run that
-    boots no real children: it could not load one of those weights anyway.
-
-    Reading the categories back out of the environment rather than restating them also means an
-    operator's override (including opting out with an empty list) and any future change to the worker's
-    default posture both reach this gate unaltered.
-
-    Unlike the canonical read this is a network call, and unlike the canonical reference it is not
-    something the parent pre-writes to disk: the pending queue has no on-disk form. It is bounded by the
-    provider's own timeout and retries and fails open to an empty set, so an unreachable PRIMARY or a
-    missing key leaves the canonical picture untouched.
-
-    Returns an empty set when beta is not opted into or cannot be read; never None (absence of beta is a
-    fact, not an unknown).
-    """
-    return frozenset(_beta_records(_POST_PROCESSOR_CATEGORIES))
-
-
-def _beta_records(categories: Collection[str]) -> dict[str, GenericModelRecord]:
-    """Pending (beta) records by name, for the ``categories`` the environment opted into beta.
-
-    :func:`beta_post_processor_names` explains when this reads the network and how it fails. Returns an
-    empty mapping when no category is opted in or the read fails.
+    Returns an empty set when beta is not opted into or cannot be read. It never returns None, since the
+    absence of beta is a fact and not an unknown.
     """
     try:
         from horde_model_reference.meta_consts import MODEL_REFERENCE_CATEGORY
-        from hordelib.beta_models import beta_model_categories, build_pending_provider
 
-        opted_in = beta_model_categories() & {MODEL_REFERENCE_CATEGORY(category) for category in categories}
-        if not opted_in:
-            return {}
+        from horde_worker_regen.bridge_data.beta_source import merged_category_records
+        from horde_worker_regen.reference_helper import ensure_offline_reference_manager
 
-        # Catalog construction and the corpus preflight run in the foreground, and the beta records only add to
-        # the canonical view. One short attempt keeps an unreachable PRIMARY from stalling them for the
-        # provider's full retry budget.
-        provider = build_pending_provider(timeout_seconds=5.0, retry_max_attempts=1)
-        if provider is None:
-            return {}
-
-        records: dict[str, GenericModelRecord] = {}
-        for category in sorted(opted_in, key=lambda value: value.value):
-            records.update(provider.fetch_category(category) or {})
-        return records
+        manager = ensure_offline_reference_manager()
+        names: set[str] = set()
+        for category in _POST_PROCESSOR_CATEGORIES:
+            names |= merged_category_records(manager, MODEL_REFERENCE_CATEGORY(category), bounded=True).beta_names
+        return frozenset(names)
     except Exception as e:  # noqa: BLE001 - beta is best-effort; fail open to the canonical picture
-        logger.debug(f"Could not read the beta (pending) references for {sorted(categories)}: {e}")
-        return {}
+        logger.debug(f"Could not read the beta post-processor names: {e}")
+        return frozenset()
 
 
 def post_processor_names_in_reference() -> frozenset[str] | None:
@@ -259,9 +235,9 @@ def post_processor_names_in_reference() -> frozenset[str] | None:
     names more upscalers and face-fixers than a given reference ships, and a form with no record cannot
     load, so callers offering forms use this to keep to the intersection.
 
-    The view spans both sources a child resolves a post-processor through: the canonical on-disk reference
-    and, when the operator opted the category into beta, the PRIMARY's pending queue
-    (:func:`beta_post_processor_names`). Without that opt-in the beta half is empty and the answer is the
+    The view spans both sources a child resolves a post-processor through. Each category is read through
+    :func:`_offline_category_reference`, which lays the PRIMARY's pending queue over the canonical on-disk
+    reference when the operator opted the category into beta. Without that opt-in the answer is the
     canonical one.
 
     None means "unreadable" (every canonical category failed to load) as distinct from an empty set, so a
@@ -279,7 +255,7 @@ def post_processor_names_in_reference() -> frozenset[str] | None:
         names.update(reference)
     if not readable:
         return None
-    return frozenset(names | beta_post_processor_names())
+    return frozenset(names)
 
 
 def _feature_model_file(
@@ -435,23 +411,20 @@ def models_disk_plan(model_names: list[str]) -> DownloadPlan | None:
     offline keeps the preview bounded to local disk; the parent/TUI keeps that disk copy current. Fails
     open (returns None) so callers fall back to a cheap, presence-only path offline or in tests.
 
-    A beta model's record exists only in the PRIMARY's pending queue, which is never written to disk. When
-    image generation is opted into beta, the pending records are added on top of the canonical ones, so a
-    beta model whose files are present is reported as present. That adds one network read, bounded and
-    failing open as :func:`beta_post_processor_names` describes. A pending record replaces a canonical record
-    of the same name, which matches how the inference children resolve models.
+    A beta model's record exists only in the PRIMARY's pending queue, which is never written to disk. The
+    records are the merged canonical-plus-beta view, read as :func:`_offline_category_reference` describes,
+    so a beta model whose files are present is reported as present. A pending record replaces a canonical
+    record of the same name, which matches how the inference children resolve models.
     """
     try:
         from horde_model_reference.meta_consts import MODEL_REFERENCE_CATEGORY
 
+        from horde_worker_regen.bridge_data.beta_source import merged_category_records
         from horde_worker_regen.model_download_plan import compute_download_plan
         from horde_worker_regen.reference_helper import ensure_offline_reference_manager
 
         manager = ensure_offline_reference_manager()
-        records = {
-            **(manager.get_all_model_references().get(MODEL_REFERENCE_CATEGORY.image_generation) or {}),
-            **_beta_records((MODEL_REFERENCE_CATEGORY.image_generation.value,)),
-        }
+        records = merged_category_records(manager, MODEL_REFERENCE_CATEGORY.image_generation, bounded=True).records
         return compute_download_plan(model_names, records)
     except Exception as e:  # noqa: BLE001 - disk sizing is best-effort; fail open to the presence-only path
         logger.debug(f"Could not compute a disk plan for {model_names!r}: {e}")

@@ -1,58 +1,232 @@
-"""Shared beta (PRIMARY pending-queue) image-reference helpers for the torch-free worker contexts.
+"""The merged canonical-plus-beta model reference view for every torch-free worker context.
 
-Three torch-free contexts must agree on which image-generation models exist: the orchestrator's
-in-memory ``stable_diffusion_reference``, the config-load model filter (``load_config``), and the TUI
-picker. Beta models live only in a PRIMARY's pending queue and are merged in via ``query(source=...)``;
-they never appear in ``get_all_model_references`` (that path reads only the canonical backend/cache).
-A model one context can serve but another has never heard of is silently dropped, so the
-"register the pending provider, pick the beta source" dance is centralised here to keep them in step.
+Beta models are records in a PRIMARY's pending queue. A reader sees them only through ``query`` with the
+pending source listed first, because ``get_all_model_references`` reads the canonical source alone. The
+parent's ``stable_diffusion_reference``, the config-load filters, the TUI catalog and the benchmark planners
+all read the merged view here, so a model that one context can serve is known to every other context and to
+the inference children, which resolve the same two sources in the same order.
 
-``hordelib.beta_models`` is torch-free, so importing it from here does not violate the torch-free
-orchestrator invariant.
+- :func:`merged_category_records` returns one category's merged records and the names the pending queue
+  supplied.
+- :func:`beta_aware_image_records` returns the image-generation records as a typed mapping.
+- :func:`invalidate_merged_records` drops the per-process cache. The parent's periodic reference refresh
+  calls it.
+
+``hordelib.beta_models`` owns the opt-in (which categories are in beta, how the pending provider is built,
+and the source order). It is torch-free and imported lazily, so a process that never reads the view does
+not pay for it. Nothing here writes the opt-in, so only a process that already declared beta reaches the
+network.
 """
 
 from __future__ import annotations
 
-from horde_model_reference import SourceSelector
+import threading
+from dataclasses import dataclass
+from types import MappingProxyType
+from typing import TYPE_CHECKING
+
 from horde_model_reference.meta_consts import MODEL_REFERENCE_CATEGORY
-from horde_model_reference.model_reference_manager import ModelReferenceManager
-from horde_model_reference.model_reference_records import ImageGenerationModelRecord
+from horde_model_reference.model_reference_records import GenericModelRecord, ImageGenerationModelRecord
 from loguru import logger
 
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
-def beta_aware_image_source(manager: ModelReferenceManager) -> SourceSelector:
-    """Return the image-generation source selector, registering the beta (pending) provider if opted in.
+    from horde_model_reference.model_reference_manager import ModelReferenceManager
 
-    A beta model the inference subprocesses can load (hordelib auto-registers the pending provider from
-    ``HORDELIB_BETA_MODEL_CATEGORIES``) but the orchestrator/config-load filter have never heard of is
-    never offered, scheduled, or advertised, and a job for it would ``KeyError`` on the reference
-    lookups. Mirroring the subprocess contract here keeps the contexts in agreement. Beta is
-    best-effort: any failure degrades to the canonical source rather than blocking the caller.
+BOUNDED_PENDING_TIMEOUT_SECONDS = 5.0
+"""Per-request timeout of the pending provider a bounded read registers."""
+
+BOUNDED_PENDING_RETRY_MAX_ATTEMPTS = 1
+"""Attempts of the pending provider a bounded read registers."""
+
+
+@dataclass(frozen=True)
+class MergedCategoryRecords:
+    """Represents one category's canonical records with the pending (beta) records laid over them by name."""
+
+    records: Mapping[str, GenericModelRecord]
+    """Every record by name. A pending record replaces a canonical record of the same name."""
+    beta_names: frozenset[str] = frozenset()
+    """The names whose record came from the pending queue."""
+    pending_read_ok: bool = True
+    """False when the category is opted into beta but the pending half failed open to the canonical records."""
+
+
+class _MergedViewCache:
+    """The per-process cache of merged views, valid for one manager and one opt-in set."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.manager: object | None = None
+        self.opted_in: frozenset[MODEL_REFERENCE_CATEGORY] = frozenset()
+        self.generation = 0
+        self.views: dict[MODEL_REFERENCE_CATEGORY, MergedCategoryRecords] = {}
+
+
+_CACHE = _MergedViewCache()
+
+
+def invalidate_merged_records() -> None:
+    """Drop every cached merged view so the next read queries the sources again.
+
+    A read already in flight when this runs does not store its result.
     """
+    with _CACHE.lock:
+        _CACHE.generation += 1
+        _CACHE.manager = None
+        _CACHE.opted_in = frozenset()
+        _CACHE.views = {}
+
+
+def merged_category_records(
+    manager: ModelReferenceManager,
+    category: MODEL_REFERENCE_CATEGORY,
+    *,
+    bounded: bool = False,
+) -> MergedCategoryRecords:
+    """Return ``category``'s canonical records merged with the pending (beta) queue when the category is opted in.
+
+    The first read for a manager registers hordelib's pending provider on it. A category outside the
+    environment's opt-in, or any failure to register or read the pending source, returns the canonical
+    records alone, since beta only adds to the canonical view, and marks the result ``pending_read_ok=False``.
+
+    A non-empty result is cached per process for the manager and opt-in set it was read under, until
+    :func:`invalidate_merged_records`, with one exception. In the default mode a result whose pending half
+    failed open is not cached, so the next reader retries the pending source. The parent reads the view at
+    config load and at startup and invalidates it only on the periodic reference refresh, so a cached
+    failure would drop every beta model for most of a session. In bounded mode the failed-open result is
+    cached like any other, since bounded readers are short-lived and a stale view costs them less than a
+    repeated timeout.
+
+    Args:
+        manager: The reference manager to read and to register the pending provider on.
+        category: The model reference category to read.
+        bounded: Register a provider with a single short attempt when none is registered yet. Foreground
+            callers in short-lived processes pass this so an unreachable PRIMARY cannot stall them for the
+            provider's full retry budget. A provider already registered is reused whatever its bounds.
+
+    Returns:
+        The merged records and the names the pending queue supplied.
+
+    Raises:
+        Exception: Whatever the canonical read raises. Only the pending half fails open.
+    """
+    opted_in = _opted_in_categories()
+    with _CACHE.lock:
+        cache_matches = _CACHE.manager is manager and _CACHE.opted_in == opted_in
+        cached = _CACHE.views.get(category) if cache_matches else None
+        generation = _CACHE.generation
+    if cached is not None:
+        return cached
+
+    view = _read_merged(manager, category, opted_in=opted_in, bounded=bounded)
+    if not view.records:
+        # An empty category is a reference that has not loaded yet. Callers such as the parent's startup
+        # retry until it fills, so it must be read again rather than served from the cache.
+        return view
+    if not view.pending_read_ok and not bounded:
+        return view
+
+    with _CACHE.lock:
+        if _CACHE.generation == generation:
+            if _CACHE.manager is not manager or _CACHE.opted_in != opted_in:
+                _CACHE.manager = manager
+                _CACHE.opted_in = opted_in
+                _CACHE.views = {}
+            _CACHE.views[category] = view
+    return view
+
+
+def beta_aware_image_records(
+    manager: ModelReferenceManager,
+    *,
+    bounded: bool = False,
+) -> dict[str, ImageGenerationModelRecord]:
+    """Return the merged image-generation records by name, as :func:`merged_category_records` reads them.
+
+    Args:
+        manager: The reference manager to read.
+        bounded: As for :func:`merged_category_records`.
+
+    Returns:
+        A new mapping the caller may change freely.
+    """
+    merged = merged_category_records(manager, MODEL_REFERENCE_CATEGORY.image_generation, bounded=bounded)
+    return {name: record for name, record in merged.records.items() if isinstance(record, ImageGenerationModelRecord)}
+
+
+def _opted_in_categories() -> frozenset[MODEL_REFERENCE_CATEGORY]:
+    """Return the categories the environment opted into beta, empty when hordelib cannot be imported."""
     try:
-        from horde_model_reference import PENDING_SOURCE_ID
-        from hordelib.beta_models import beta_source_for, build_pending_provider
-
-        if manager.get_provider(PENDING_SOURCE_ID) is None:
-            provider = build_pending_provider()
-            if provider is not None:
-                manager.register_provider(provider, replace=True)
-
-        return beta_source_for(MODEL_REFERENCE_CATEGORY.image_generation, manager)
-    except Exception as e:  # noqa: BLE001 - beta is best-effort; never block the caller
-        from horde_model_reference import HORDE_SOURCE_ID
-
-        logger.warning(f"Could not enable beta models for the image reference: {type(e).__name__}: {e}")
-        return HORDE_SOURCE_ID
+        from hordelib.beta_models import beta_model_categories
+    except ImportError as import_error:
+        logger.warning(f"Beta models are unavailable because hordelib could not be imported: {import_error}")
+        return frozenset()
+    return frozenset(beta_model_categories())
 
 
-def beta_aware_image_records(manager: ModelReferenceManager) -> dict[str, ImageGenerationModelRecord]:
-    """Return the image-generation records merged with beta (pending) models when opted in.
+def _read_merged(
+    manager: ModelReferenceManager,
+    category: MODEL_REFERENCE_CATEGORY,
+    *,
+    opted_in: frozenset[MODEL_REFERENCE_CATEGORY],
+    bounded: bool,
+) -> MergedCategoryRecords:
+    """Read one category from both sources, or from the canonical source alone when beta does not apply."""
+    pending_read_ok = True
+    if category in opted_in:
+        try:
+            sourced = _read_pending_first(manager, category, bounded=bounded)
+        except Exception as pending_error:  # noqa: BLE001 - beta only adds to the canonical view
+            logger.warning(
+                f"Could not read beta {category.value} models from the pending queue, using the canonical "
+                f"reference alone: {type(pending_error).__name__}: {pending_error}",
+            )
+            sourced = None
+        if sourced is not None:
+            return sourced
+        pending_read_ok = False
 
-    ``query()`` keeps the per-category record type through the source-bearing overload (the
-    ``image_generation`` overload returns an ``ImageGenerationQuery``), so ``to_list()`` is typed as
-    ``list[ImageGenerationModelRecord]`` with no cast, unlike ``get_model_reference`` + source.
+    canonical = manager.get_all_model_references().get(category) or {}
+    return MergedCategoryRecords(records=MappingProxyType(dict(canonical)), pending_read_ok=pending_read_ok)
+
+
+def _read_pending_first(
+    manager: ModelReferenceManager,
+    category: MODEL_REFERENCE_CATEGORY,
+    *,
+    bounded: bool,
+) -> MergedCategoryRecords | None:
+    """Register the pending provider once and query ``category`` pending-first, or None when beta is unconfigured.
+
+    ``hordelib.beta_models.build_pending_provider`` returns None, and logs why, when the PRIMARY URL or the
+    API key is missing.
     """
-    source = beta_aware_image_source(manager)
-    records = manager.query(MODEL_REFERENCE_CATEGORY.image_generation, source=source).to_list()
-    return {record.name: record for record in records}
+    from horde_model_reference import PENDING_SOURCE_ID
+    from hordelib.beta_models import beta_source_for, build_pending_provider
+
+    if manager.get_provider(PENDING_SOURCE_ID) is None:
+        provider = (
+            build_pending_provider(
+                timeout_seconds=BOUNDED_PENDING_TIMEOUT_SECONDS,
+                retry_max_attempts=BOUNDED_PENDING_RETRY_MAX_ATTEMPTS,
+            )
+            if bounded
+            else build_pending_provider()
+        )
+        if provider is None:
+            return None
+        manager.register_provider(provider, replace=True)
+
+    source = beta_source_for(category, manager)
+    if isinstance(source, str):
+        return None
+
+    records: dict[str, GenericModelRecord] = {}
+    beta_names: set[str] = set()
+    for record, source_id in manager.query(category, source=source).to_list_with_source():
+        records[record.name] = record
+        if source_id == PENDING_SOURCE_ID:
+            beta_names.add(record.name)
+    return MergedCategoryRecords(records=MappingProxyType(records), beta_names=frozenset(beta_names))

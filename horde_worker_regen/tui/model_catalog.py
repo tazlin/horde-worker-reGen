@@ -21,7 +21,6 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
     from pathlib import Path
 
-    from horde_model_reference.meta_consts import MODEL_REFERENCE_CATEGORY
     from horde_model_reference.model_reference_manager import ModelReferenceManager
     from horde_model_reference.model_reference_records import GenericModelRecord
 
@@ -87,11 +86,22 @@ def _loaded_model_reference_manager() -> ModelReferenceManager:
 def load_image_models() -> list[ModelInfo]:
     """Load the image-generation model reference (blocking; call from a worker thread).
 
+    The records are the merged canonical-plus-beta view, so an opted-in beta model is listed and flagged.
+    A load is an explicit refresh, so it drops the cached view first and reads the current pending queue.
+    The read is bounded so an unreachable PRIMARY cannot hold the picker for the provider's full retry budget.
+
     Returns an alphabetical list; raises on failure so the caller can surface a clear message.
     """
+    from horde_model_reference.meta_consts import MODEL_REFERENCE_CATEGORY
+
+    from horde_worker_regen.bridge_data.beta_source import invalidate_merged_records, merged_category_records
+
     manager = _loaded_model_reference_manager()
 
-    records, beta_names = _image_records_with_beta(manager)
+    invalidate_merged_records()
+    merged = merged_category_records(manager, MODEL_REFERENCE_CATEGORY.image_generation, bounded=True)
+    records = merged.records
+    beta_names = merged.beta_names
 
     disk_by_name = _disk_info_by_name(records)
 
@@ -115,75 +125,6 @@ def load_image_models() -> list[ModelInfo]:
         for name, record in records.items()
     ]
     return sorted(models, key=lambda model: model.name.lower())
-
-
-# Mirrors hordelib.beta_models.BETA_CATEGORIES_ENV_VAR. Duplicated here as a literal so the cheap
-# "is beta even opted into?" gate below never has to import hordelib (a heavy import) just to read it.
-_BETA_CATEGORIES_ENV_VAR = "HORDELIB_BETA_MODEL_CATEGORIES"
-
-
-def _image_records_with_beta(
-    manager: ModelReferenceManager,
-) -> tuple[Mapping[str, GenericModelRecord], set[str]]:
-    """Return the image-gen records to show, plus the names that are beta (pending-queue) models.
-
-    The canonical reference (``get_all_model_references``) never includes a PRIMARY's pending-queue
-    (beta) models, so a beta model stays invisible in the picker until it is promoted into the canonical
-    data. When the operator has opted into the image-generation beta (the same env-var
-    contract the worker subprocesses use), register the pending provider and merge it via ``query`` so
-    those models surface and can be flagged. Beta is best-effort: any failure degrades to the canonical
-    catalog rather than breaking the picker.
-    """
-    from horde_model_reference.meta_consts import MODEL_REFERENCE_CATEGORY
-
-    category = MODEL_REFERENCE_CATEGORY.image_generation
-    canonical = manager.get_all_model_references().get(category) or {}
-
-    sourced = _query_beta_records(manager, category)
-    if sourced is None:
-        return canonical, set()
-
-    from horde_model_reference import PENDING_SOURCE_ID
-
-    records: dict[str, GenericModelRecord] = {}
-    beta_names: set[str] = set()
-    for record, source in sourced:
-        records[record.name] = record
-        if source == PENDING_SOURCE_ID:
-            beta_names.add(record.name)
-    return records, beta_names
-
-
-def _query_beta_records(
-    manager: ModelReferenceManager,
-    category: MODEL_REFERENCE_CATEGORY,
-) -> list[tuple[GenericModelRecord, str]] | None:
-    """Register the pending (beta) provider if opted in, and return ``(record, source)`` pairs, or None.
-
-    Returns None (falling back to canonical-only) when beta is not opted into or not fully configured
-    (missing API key / PRIMARY URL); ``hordelib.beta_models`` logs the specific reason in that case.
-    """
-    import os
-
-    if not os.environ.get(_BETA_CATEGORIES_ENV_VAR, "").strip():
-        return None
-
-    from loguru import logger
-
-    try:
-        from horde_model_reference import PENDING_SOURCE_ID
-        from hordelib.beta_models import beta_source_for, build_pending_provider
-
-        if manager.get_provider(PENDING_SOURCE_ID) is None:
-            provider = build_pending_provider()
-            if provider is None:
-                return None
-            manager.register_provider(provider, replace=True)
-
-        return manager.query(category, source=beta_source_for(category, manager)).to_list_with_source()
-    except Exception as error:  # noqa: BLE001 - beta is best-effort enrichment, never fatal to the picker
-        logger.warning(f"Could not load beta models for the picker: {type(error).__name__}: {error}")
-        return None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -285,16 +226,22 @@ def cached_image_records() -> Mapping[str, GenericModelRecord] | None:
     """Return the image-gen reference records if already loaded, else None (never forces a fetch).
 
     Lets the editor compute a disk total only when the picker has already loaded the catalog, so the
-    Config tab never triggers the model-reference network prefetch just by being opened. Resolves the
-    same beta-aware record set as the picker (``load_image_models``) and the worker subprocesses, so a
-    beta (pending-queue) model on disk is never miscounted as "to download" on the editor's footer.
+    Config tab never triggers the model-reference network prefetch just by being opened. Reads the same
+    merged canonical-plus-beta view as the picker (``load_image_models``) and the worker, so a beta
+    (pending-queue) model on disk is never miscounted as "to download" on the editor's footer.
     """
+    from horde_model_reference.meta_consts import MODEL_REFERENCE_CATEGORY
     from horde_model_reference.model_reference_manager import ModelReferenceManager
+
+    from horde_worker_regen.bridge_data.beta_source import merged_category_records
 
     if not ModelReferenceManager.has_instance():
         return None
-    records, _beta_names = _image_records_with_beta(ModelReferenceManager.get_instance())
-    return records
+    return merged_category_records(
+        ModelReferenceManager.get_instance(),
+        MODEL_REFERENCE_CATEGORY.image_generation,
+        bounded=True,
+    ).records
 
 
 def disk_summary(model_names: list[str]) -> DiskSummary | None:

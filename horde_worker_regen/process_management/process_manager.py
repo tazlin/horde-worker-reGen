@@ -61,7 +61,7 @@ from loguru import logger
 
 from horde_worker_regen.alchemy_forms import DEFAULT_ALCHEMY_FORMS
 from horde_worker_regen.app_state import AppStateStore, WorkerRunRecord, default_app_state_dir
-from horde_worker_regen.bridge_data.beta_source import beta_aware_image_records
+from horde_worker_regen.bridge_data.beta_source import beta_aware_image_records, invalidate_merged_records
 from horde_worker_regen.bridge_data.data_model import ModelPoolConfig, reGenBridgeData
 from horde_worker_regen.bridge_data.disagg_model_selection import compute_vae_cluster_sizes
 from horde_worker_regen.bridge_data.gpu_config import resolve_all_effective_gpu_configs
@@ -5475,6 +5475,9 @@ class HordeWorkerProcessManager:
         Subprocesses never download references themselves: the parent owns it. The network
         re-download runs off the event loop in a daemon thread (writing fresh JSON to disk); once it
         finishes, the next tick broadcasts a reload so every subprocess re-reads the files.
+
+        A successful refresh also drops the merged canonical-plus-beta view, so the next parent read sees
+        the current pending queue. ``stable_diffusion_reference`` keeps the set it was built with.
         """
         if self._pending_reference_reload_broadcast:
             self._pending_reference_reload_broadcast = False
@@ -5494,6 +5497,7 @@ class HordeWorkerProcessManager:
         def _refresh() -> None:
             try:
                 manager.get_all_model_references_or_none(overwrite_existing=True)
+                invalidate_merged_records()
                 logger.info("Refreshed model reference from source; broadcasting reload to subprocesses")
                 self._pending_reference_reload_broadcast = True
             except Exception as e:  # noqa: BLE001 - a refresh failure must not crash the worker

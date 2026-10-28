@@ -66,7 +66,7 @@ def _eligible_model_records(
                 "only_models_on_disk": False,
             }
         )
-        allowed = set(BridgeDataLoader._resolve_meta_instructions(bridge, manager))
+        allowed = set(BridgeDataLoader._resolve_meta_instructions(bridge, manager, bounded_beta_read=True))
         eligible = {name: record for name, record in eligible.items() if name in allowed}
     return eligible
 
@@ -93,18 +93,16 @@ def select_installed_models(
 
 
 def installed_models_for_tiers(tiers: list[BenchTier]) -> dict[BenchTier, str]:
-    """Resolve installed family representatives from offline reference metadata."""
-    from horde_model_reference.meta_consts import MODEL_REFERENCE_CATEGORY
+    """Resolve installed family representatives from offline reference metadata.
 
+    The candidates are the merged canonical-plus-beta records, read in bounded mode, so an installed beta
+    checkpoint can represent its tier.
+    """
+    from horde_worker_regen.bridge_data.beta_source import beta_aware_image_records
     from horde_worker_regen.reference_helper import ensure_offline_reference_manager
 
     manager = ensure_offline_reference_manager()
-    available = manager.get_all_model_references()
-    records = {
-        name: record
-        for name, record in (available.get(MODEL_REFERENCE_CATEGORY.image_generation) or {}).items()
-        if isinstance(record, ImageGenerationModelRecord)
-    }
+    records = beta_aware_image_records(manager, bounded=True)
     source = Path("bridgeData.yaml")
     raw = YAML(typ="safe").load(source) if source.exists() else {}
     config = raw if isinstance(raw, dict) else {}

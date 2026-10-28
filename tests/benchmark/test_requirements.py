@@ -2,7 +2,16 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator, Mapping
+from pathlib import Path
+
 import pytest
+from horde_model_reference.meta_consts import MODEL_REFERENCE_CATEGORY
+from horde_model_reference.model_reference_records import (
+    DownloadRecord,
+    GenericModelRecord,
+    GenericModelRecordConfig,
+)
 
 from horde_worker_regen.benchmark import requirements as requirements_mod
 from horde_worker_regen.benchmark.ladder import LadderOptions, RampLevel, build_default_ladder
@@ -13,6 +22,9 @@ from horde_worker_regen.benchmark.requirements import (
     requirement_skip_reason,
 )
 from horde_worker_regen.model_download_plan import DownloadPlan, ModelDiskInfo
+from tests.test_beta_source import PendingAwareManagerDouble, image_record, lay_checkpoint, serve_pending
+
+_IMAGE = MODEL_REFERENCE_CATEGORY.image_generation
 
 
 def _present(_name: str) -> bool | None:
@@ -197,32 +209,103 @@ def test_sizing_helpers_read_offline_never_network(monkeypatch: pytest.MonkeyPat
     assert offline_calls == 2
 
 
-def test_disk_plan_lays_pending_records_over_the_canonical_reference(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A beta model's record exists only in the pending queue, so the plan needs it to find the model's files."""
-    from horde_model_reference.meta_consts import MODEL_REFERENCE_CATEGORY
+@pytest.fixture
+def merged_view() -> Iterator[None]:
+    """Isolate the merged canonical-plus-beta view cache to the test."""
+    from horde_worker_regen.bridge_data.beta_source import invalidate_merged_records
 
-    import horde_worker_regen.model_download_plan as model_download_plan
+    invalidate_merged_records()
+    yield
+    invalidate_merged_records()
+
+
+def _offline_manager_with_beta(
+    monkeypatch: pytest.MonkeyPatch,
+    canonical: dict[MODEL_REFERENCE_CATEGORY, dict[str, GenericModelRecord]],
+    pending: dict[MODEL_REFERENCE_CATEGORY, dict[str, GenericModelRecord]],
+    *,
+    categories: str = "image_generation",
+) -> list[dict[str, object]]:
+    """Make the offline reference a double with ``canonical`` records and ``pending`` beta records."""
     import horde_worker_regen.reference_helper as reference_helper
 
-    canonical = {"Deliberate": "canonical-deliberate", "Shared": "canonical-shared"}
-    pending = {"Beta-Model": "pending-beta", "Shared": "pending-shared"}
+    manager = PendingAwareManagerDouble(canonical)
+    monkeypatch.setattr(reference_helper, "ensure_offline_reference_manager", lambda: manager)
+    return serve_pending(monkeypatch, pending, categories=categories)
 
-    class _FakeOfflineManager:
-        def get_all_model_references(self) -> dict:
-            return {MODEL_REFERENCE_CATEGORY.image_generation: canonical}
 
+@pytest.mark.usefixtures("merged_view")
+def test_disk_plan_lays_pending_records_over_the_canonical_reference(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A beta model's record exists only in the pending queue, so the plan needs it to find the model's files."""
+    import horde_worker_regen.model_download_plan as model_download_plan
+
+    pending_shared = image_record("Shared", file_name="pending-shared.safetensors")
+    build_calls = _offline_manager_with_beta(
+        monkeypatch,
+        {_IMAGE: {"Canonical-Model": image_record("Canonical-Model"), "Shared": image_record("Shared")}},
+        {_IMAGE: {"Beta-Model": image_record("Beta-Model"), "Shared": pending_shared}},
+    )
     seen: dict[str, object] = {}
 
-    def _capture(model_names: list[str], records: dict[str, object]) -> None:
+    def _capture(model_names: list[str], records: Mapping[str, object]) -> None:
         seen.update(records)
 
-    monkeypatch.setattr(reference_helper, "ensure_offline_reference_manager", _FakeOfflineManager)
-    monkeypatch.setattr(requirements_mod, "_beta_records", lambda categories: pending)
     monkeypatch.setattr(model_download_plan, "compute_download_plan", _capture)
 
     requirements_mod.models_disk_plan(["Beta-Model"])
 
-    assert seen == {"Deliberate": "canonical-deliberate", "Beta-Model": "pending-beta", "Shared": "pending-shared"}
+    assert set(seen) == {"Canonical-Model", "Beta-Model", "Shared"}
+    assert seen["Shared"] is pending_shared
+    assert build_calls == [{"timeout_seconds": 5.0, "retry_max_attempts": 1}]
+
+
+@pytest.mark.usefixtures("merged_view")
+def test_presence_check_sees_a_beta_model_on_disk(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A beta model whose checkpoint is on disk reads as present, and one without it as absent."""
+    monkeypatch.setenv("AIWORKER_CACHE_HOME", str(tmp_path))
+    beta_present = image_record("Beta-Present")
+    lay_checkpoint(tmp_path, beta_present)
+    _offline_manager_with_beta(
+        monkeypatch,
+        {_IMAGE: {"Canonical-Model": image_record("Canonical-Model")}},
+        {_IMAGE: {"Beta-Present": beta_present, "Beta-Absent": image_record("Beta-Absent")}},
+    )
+
+    assert requirements_mod.model_present_on_disk("Beta-Present") is True
+    assert requirements_mod.model_present_on_disk("Beta-Absent") is False
+
+
+@pytest.mark.usefixtures("merged_view")
+def test_post_processor_plan_and_names_see_a_beta_upscaler(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A beta upscaler gets a feature-plan row with its on-disk state and counts as servable and as beta."""
+    from horde_model_reference.model_reference_records import EsrganModelRecord
+    from horde_model_reference.on_disk_layout import file_paths_for
+
+    upscaler = EsrganModelRecord(
+        name="Beta-Upscaler",
+        config=GenericModelRecordConfig(
+            download=[DownloadRecord(file_name="beta-upscaler.pth", file_url="https://example.invalid/u.pth")],
+        ),
+    )
+    for target in file_paths_for(upscaler, tmp_path):
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"")
+    _offline_manager_with_beta(
+        monkeypatch,
+        {
+            MODEL_REFERENCE_CATEGORY.esrgan: {},
+            MODEL_REFERENCE_CATEGORY.gfpgan: {},
+            MODEL_REFERENCE_CATEGORY.codeformer: {},
+        },
+        {MODEL_REFERENCE_CATEGORY.esrgan: {"Beta-Upscaler": upscaler}},
+        categories="esrgan",
+    )
+
+    rows = requirements_mod.post_processor_model_files(["Beta-Upscaler"], cache_home=str(tmp_path))
+
+    assert [(row.name, row.category, row.on_disk) for row in rows] == [("Beta-Upscaler", "esrgan", True)]
+    assert requirements_mod.post_processor_names_in_reference() == frozenset({"Beta-Upscaler"})
+    assert requirements_mod.beta_post_processor_names() == frozenset({"Beta-Upscaler"})
 
 
 def _sd15_controlnet_level() -> RampLevel:

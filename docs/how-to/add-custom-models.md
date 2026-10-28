@@ -63,6 +63,18 @@ Being *available* is not the same as being *loaded*: as with any model, the work
 beta model once its `name` is in your `models_to_load` list (a literal entry, or via an "all"/"top"
 selection that now includes it).
 
+Every part of the worker that decides which models exist reads one merged view: the canonical reference
+with the beta queue laid over it, where a beta record replaces a canonical record of the same name. The
+config load (including `only_models_on_disk`, which keeps a beta model whose files are on disk), the
+scheduler's model reference, the dashboard's model picker and the benchmark all agree on it. When the beta
+queue cannot be reached, the view falls back to the canonical reference alone. The worker reads the view
+once and reads it again after each periodic reference refresh, but the scheduler's model reference keeps
+the set it started with until the worker restarts.
+
+When the config load drops a configured model, the log names it. A name the reference does not know and
+a model whose files are missing under `only_models_on_disk` each get an INFO line listing the dropped
+names.
+
 To opt out, set the environment variable `HORDELIB_BETA_MODEL_CATEGORIES=""` before launching the
 worker. An empty value disables the beta opt-in; any value you set yourself also takes precedence
 over the worker's default.

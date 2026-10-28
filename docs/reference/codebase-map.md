@@ -108,6 +108,7 @@ module paths directly.
 | `analysis/`                   | Log/session/support-bundle analysis and triage tools             |
 | `bridge_data/`                | Loading and validating `bridgeData.yaml` into `reGenBridgeData` |
 | `bridge_data/custom_models.py` | Typed custom-checkpoint definitions, dependency-derived baseline choices, startup readiness validation, and atomic hordelib registry materialization |
+| `bridge_data/beta_source.py` | The one owner of the merged canonical-plus-beta (pending-queue) reference view: per-category merge, opt-in from hordelib, bounded mode for benchmark processes, fail-open to canonical, per-process cache invalidated by the parent's reference refresh |
 | `bridge_data/disagg_model_selection.py` | Pure ranking for the `disagg_optimized N` model rule: shared-VAE cluster (via `derive_canonical_registry` over merged record/sidecar hashes) then popularity |
 | `tui/`                        | Textual dashboard, config form, worker host/launcher, and `native_dashboard.py`'s minimal semantic web overview and supervisor adapter |
 | `tui/model_catalog.py`        | The reference reads both config pickers work from: `load_image_models` for the models lists, `load_text_models` for the scribe's one model key (merged canonical plus worker-measured text records, with each one's declared file, measurement and on-disk presence) |

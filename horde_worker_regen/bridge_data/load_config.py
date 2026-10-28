@@ -378,14 +378,10 @@ class BridgeDataLoader:
         ceiling = bridge_data.ram_per_process_max_mb
         if ceiling <= 0:
             return
-        records = reference_manager.get_all_model_references().get(MODEL_REFERENCE_CATEGORY.image_generation) or {}
+        records = beta_aware_image_records(reference_manager)
         for model in bridge_data.image_models_to_load:
             record = records.get(model)
-            seed = (
-                predict_context_ram_mb(str(record.baseline), model)
-                if isinstance(record, ImageGenerationModelRecord)
-                else None
-            )
+            seed = predict_context_ram_mb(str(record.baseline), model) if record is not None else None
             if seed is None or seed <= ceiling:
                 continue
             key = (ceiling, model)
@@ -428,12 +424,16 @@ class BridgeDataLoader:
     def _resolve_meta_instructions(  # FIXME: This should be moved into the SDK
         bridge_data: reGenBridgeData,
         horde_model_reference_manager: ModelReferenceManager,
+        *,
+        bounded_beta_read: bool = False,
     ) -> list[str]:
         """Resolve the meta instructions in the bridge data. Note that this modifies the bridge data in place.
 
         Args:
             bridge_data (reGenBridgeData): The bridge data.
             horde_model_reference_manager (ModelReferenceManager): The model reference manager.
+            bounded_beta_read (bool): Read the pending (beta) queue with the bounded provider. Short-lived
+                benchmark processes pass this.
 
         Returns:
             list[str]: The image models that will be loaded.
@@ -454,11 +454,10 @@ class BridgeDataLoader:
                 "large models (e.g. Flux, Stable Cascade) are not loaded.",
             )
 
-        # The SDK resolver only sees the canonical reference (get_all_model_references never includes a
-        # PRIMARY's pending-queue / beta models), so anything beta would be silently dropped both from the
-        # meta-instruction expansion below and the known-models filter further down. Build the beta-merged
-        # records once and use them to keep opted-in beta models advertised.
-        beta_records = beta_aware_image_records(horde_model_reference_manager)
+        # The SDK resolver only sees the canonical reference, which never includes a PRIMARY's pending-queue
+        # (beta) models. The merged view keeps opted-in beta models through the meta-instruction expansion
+        # below, the known-models filter and the on-disk filter.
+        beta_records = beta_aware_image_records(horde_model_reference_manager, bounded=bounded_beta_read)
 
         # Expand the worker-local `disagg_optimized N` command before the SDK families below: it strips its
         # own literal from image_models_to_load and appends the resolved concrete names, which then flow
@@ -530,15 +529,15 @@ class BridgeDataLoader:
         known_models = set(beta_records).union(custom_model_names)
 
         total_resolved_models = len(bridge_data.image_models_to_load)
+        unknown_models = sorted(set(bridge_data.image_models_to_load) - known_models)
 
         bridge_data.image_models_to_load = list(set(bridge_data.image_models_to_load) & known_models)
 
-        used_models = len(bridge_data.image_models_to_load)
-
-        if total_resolved_models != used_models:
-            logger.debug(
-                f"Resolved {total_resolved_models} models, but only {used_models} "
-                "are available in the model reference manager.",
+        if unknown_models:
+            logger.info(
+                f"Resolved {total_resolved_models} models, but only {len(bridge_data.image_models_to_load)} "
+                f"are known to the model reference. Dropped {len(unknown_models)} unknown model(s): "
+                f"{unknown_models}",
             )
 
         if bridge_data.only_models_on_disk:
@@ -716,23 +715,22 @@ class BridgeDataLoader:
     ) -> list[str]:
         """Drop any resolved model whose files are not already present on disk (no download is queued).
 
-        Honors ``only_models_on_disk``: presence is an existence-only check against the same weights
-        roots the download planner uses, so the served set is pinned to what the operator already has.
+        Honors ``only_models_on_disk``. Presence is an existence-only check against the same weights
+        roots the download planner uses, so the served set is pinned to what the operator already has. The
+        records come from the merged canonical-plus-beta view, since a beta model's files are found through
+        its pending-queue record.
         """
-        from horde_model_reference import MODEL_REFERENCE_CATEGORY
-
         from horde_worker_regen.model_download_plan import is_model_present
 
-        references = horde_model_reference_manager.get_all_model_references()
-        image_records = references.get(MODEL_REFERENCE_CATEGORY.image_generation) or {}
+        image_records = beta_aware_image_records(horde_model_reference_manager)
 
         on_disk = [name for name in model_names if is_model_present(name, image_records)]
 
-        dropped = len(model_names) - len(on_disk)
+        dropped = sorted(set(model_names).difference(on_disk))
         if dropped:
             logger.info(
-                f"only_models_on_disk is set: dropped {dropped} model(s) not present on disk; "
-                f"keeping {len(on_disk)} already-downloaded model(s).",
+                f"only_models_on_disk is set. Dropped {len(dropped)} model(s) not present on disk and kept "
+                f"{len(on_disk)} already-downloaded model(s). Dropped: {dropped}",
             )
 
         return on_disk

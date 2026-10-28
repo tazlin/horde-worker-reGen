@@ -1380,7 +1380,7 @@ def test_storage_advice_uses_resolved_process_count_without_restricting_config(
     monkeypatch.setattr(
         BridgeDataLoader,
         "_resolve_meta_instructions",
-        staticmethod(lambda bridge, manager: bridge.image_models_to_load),
+        staticmethod(lambda bridge, manager, **_: bridge.image_models_to_load),
     )
     report = CapabilityReport(operator_assessment=True, evidence=[], machine=MachineInfo(storage=storage))
     from horde_worker_regen.benchmark.capabilities.result import WorkloadEvidence

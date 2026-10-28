@@ -8,11 +8,12 @@ resolver's canonical-only ``resolve_all_model_names``, which never includes pend
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
-from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
+from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE, MODEL_REFERENCE_CATEGORY
 
 from horde_worker_regen.bridge_data import load_config
 from horde_worker_regen.bridge_data.load_config import (
@@ -20,6 +21,7 @@ from horde_worker_regen.bridge_data.load_config import (
     _beta_models_for_meta_instructions,
     _meta_instruction_matches_record,
 )
+from tests.test_beta_source import PendingAwareManagerDouble, image_record, lay_checkpoint, serve_pending
 
 
 def _rec(
@@ -40,13 +42,14 @@ def _make_bridge(
     meta_skip_instructions: list[str] | None = None,
     image_models_to_skip: list[str] | None = None,
     load_large_models: bool = False,
+    only_models_on_disk: bool = False,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         meta_load_instructions=meta_load_instructions,
         meta_skip_instructions=meta_skip_instructions,
         image_models_to_load=image_models_to_load,
         image_models_to_skip=image_models_to_skip if image_models_to_skip is not None else [],
-        only_models_on_disk=False,
+        only_models_on_disk=only_models_on_disk,
         load_large_models=load_large_models,
         custom_models=[],
     )
@@ -114,10 +117,10 @@ def test_beta_models_for_meta_instructions_selects_by_family() -> None:
 
 def test_explicit_beta_model_survives_filter() -> None:
     """A beta model the operator listed explicitly is kept; an unknown model is dropped."""
-    bridge = _make_bridge(image_models_to_load=["Z-Image-Turbo", "Bogus-Model"])
+    bridge = _make_bridge(image_models_to_load=["Beta-Model", "Bogus-Model"])
     # beta_aware_image_records returns canonical + beta merged; here it includes the beta model.
     beta_records = {
-        "Z-Image-Turbo": _rec("Z-Image-Turbo"),
+        "Beta-Model": _rec("Beta-Model"),
         "Canonical-Model": _rec("Canonical-Model", KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1),
     }
 
@@ -127,7 +130,7 @@ def test_explicit_beta_model_survives_filter() -> None:
     ):
         result = BridgeDataLoader._resolve_meta_instructions(bridge, Mock())
 
-    assert "Z-Image-Turbo" in result
+    assert "Beta-Model" in result
     assert "Bogus-Model" not in result
 
 
@@ -135,7 +138,7 @@ def test_meta_all_instruction_includes_beta_model() -> None:
     """``load: all`` picks up an opted-in beta model the canonical SDK resolver would have missed."""
     bridge = _make_bridge(image_models_to_load=[], meta_load_instructions=["all"])
     beta_records = {
-        "Z-Image-Turbo": _rec("Z-Image-Turbo"),
+        "Beta-Model": _rec("Beta-Model"),
         "Canonical-Model": _rec("Canonical-Model", KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1),
     }
     fake_resolver = Mock()
@@ -148,7 +151,7 @@ def test_meta_all_instruction_includes_beta_model() -> None:
     ):
         result = BridgeDataLoader._resolve_meta_instructions(bridge, Mock())
 
-    assert "Z-Image-Turbo" in result
+    assert "Beta-Model" in result
     assert "Canonical-Model" in result
 
 
@@ -230,3 +233,61 @@ def test_load_large_models_passed_through_to_resolver(monkeypatch: pytest.Monkey
 
     _, kwargs = resolver.resolve_meta_instructions.call_args
     assert kwargs["load_large_models"] is False
+
+
+_BETA_ON_DISK = "Beta-On-Disk"
+_BETA_NOT_ON_DISK = "Beta-Not-On-Disk"
+_CANONICAL_ON_DISK = "Canonical-On-Disk"
+
+
+def _on_disk_manager(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> PendingAwareManagerDouble:
+    """Serve one canonical and two beta models through the merged view, with two of the three on disk."""
+    monkeypatch.setenv("AIWORKER_CACHE_HOME", str(tmp_path))
+    canonical = image_record(_CANONICAL_ON_DISK, baseline=KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1)
+    beta_on_disk = image_record(_BETA_ON_DISK)
+    lay_checkpoint(tmp_path, canonical)
+    lay_checkpoint(tmp_path, beta_on_disk)
+    serve_pending(
+        monkeypatch,
+        {
+            MODEL_REFERENCE_CATEGORY.image_generation: {
+                _BETA_ON_DISK: beta_on_disk,
+                _BETA_NOT_ON_DISK: image_record(_BETA_NOT_ON_DISK),
+            },
+        },
+    )
+    return PendingAwareManagerDouble({MODEL_REFERENCE_CATEGORY.image_generation: {_CANONICAL_ON_DISK: canonical}})
+
+
+def test_listed_beta_model_on_disk_survives_the_whole_config_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Under only_models_on_disk a listed beta model on disk passes the known-models and on-disk filters."""
+    manager = _on_disk_manager(tmp_path, monkeypatch)
+    bridge = _make_bridge(
+        image_models_to_load=[_BETA_ON_DISK, _BETA_NOT_ON_DISK, _CANONICAL_ON_DISK, "Unknown-Model"],
+        only_models_on_disk=True,
+    )
+
+    with patch.object(load_config, "_make_image_model_load_resolver", return_value=Mock()):
+        result = BridgeDataLoader._resolve_meta_instructions(bridge, manager)  # type: ignore[arg-type]
+
+    assert sorted(result) == sorted([_BETA_ON_DISK, _CANONICAL_ON_DISK])
+
+
+def test_meta_all_instruction_keeps_beta_model_on_disk(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``load: all`` under only_models_on_disk selects the beta model on disk and drops the absent one."""
+    monkeypatch.delenv("AI_HORDE_MODEL_META_LARGE_MODELS", raising=False)
+    manager = _on_disk_manager(tmp_path, monkeypatch)
+    bridge = _make_bridge(image_models_to_load=[], meta_load_instructions=["all"], only_models_on_disk=True)
+    fake_resolver = Mock()
+    fake_resolver.resolve_meta_instructions.return_value = {_CANONICAL_ON_DISK}
+
+    with (
+        patch.object(load_config, "_make_image_model_load_resolver", return_value=fake_resolver),
+        patch.object(load_config, "AIHordeAPIManualClient", Mock()),
+    ):
+        result = BridgeDataLoader._resolve_meta_instructions(bridge, manager)  # type: ignore[arg-type]
+
+    assert sorted(result) == sorted([_BETA_ON_DISK, _CANONICAL_ON_DISK])

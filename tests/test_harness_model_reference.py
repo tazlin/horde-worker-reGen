@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import pytest
-from horde_model_reference import PENDING_SOURCE_ID
+from horde_model_reference import HORDE_SOURCE_ID, PENDING_SOURCE_ID
 from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
 from horde_model_reference.model_reference_records import ImageGenerationModelRecord
 from horde_sdk.ai_horde_api.apimodels import LorasPayloadEntry
@@ -25,11 +25,15 @@ def _sdxl_record() -> ImageGenerationModelRecord:
 
 
 class _StubQuery:
-    def __init__(self, records: dict[str, ImageGenerationModelRecord]) -> None:
+    def __init__(self, records: dict[str, ImageGenerationModelRecord], source_id: str = HORDE_SOURCE_ID) -> None:
         self._records = records
+        self._source_id = source_id
 
     def to_list(self) -> list[ImageGenerationModelRecord]:
         return list(self._records.values())
+
+    def to_list_with_source(self) -> list[tuple[ImageGenerationModelRecord, str]]:
+        return [(record, self._source_id) for record in self._records.values()]
 
 
 class _StubReferenceManager:

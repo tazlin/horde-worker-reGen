@@ -38,6 +38,7 @@ from horde_worker_regen.benchmark.enums import BenchTier
 from horde_worker_regen.benchmark.ladder import HUGE_TIERS
 from horde_worker_regen.process_management.resources.admission_identity import admission_margin_mb
 from horde_worker_regen.tui.benchmark_launcher import apply_suggested_to_config
+from tests.test_beta_source import PendingAwareManagerDouble, image_record, lay_checkpoint, serve_pending
 
 
 def test_installed_checkpoint_substitution_stays_within_family(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -82,7 +83,9 @@ def test_model_selection_respects_literal_and_meta_exclusions(
     }
     manager = Mock(spec=ModelReferenceManager)
     manager.get_all_model_references.return_value = {MODEL_REFERENCE_CATEGORY.image_generation: records}
-    monkeypatch.setattr("horde_worker_regen.bridge_data.load_config.beta_aware_image_records", lambda manager: records)
+    monkeypatch.setattr(
+        "horde_worker_regen.bridge_data.load_config.beta_aware_image_records", lambda manager, **_: records
+    )
     monkeypatch.setattr(
         "horde_sdk.ai_horde_api.ai_horde_clients.AIHordeAPIManualClient.submit_request",
         lambda *args, **kwargs: ImageStatsModelsResponse(
@@ -104,6 +107,35 @@ def test_model_selection_respects_literal_and_meta_exclusions(
     assert installed_models_for_tiers([BenchTier.SD15]) == {}
 
 
+def test_installed_beta_checkpoint_represents_its_tier(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A beta checkpoint on disk is a tier candidate, read through the bounded merged view."""
+    from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
+
+    from horde_worker_regen.bridge_data.beta_source import invalidate_merged_records
+
+    invalidate_merged_records()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("AIWORKER_CACHE_HOME", str(tmp_path))
+    monkeypatch.delenv("AIWORKER_EXTRA_MODEL_DIRECTORIES", raising=False)
+    beta_sd15 = image_record("beta-sd15", baseline=KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1)
+    lay_checkpoint(tmp_path, beta_sd15)
+    manager = PendingAwareManagerDouble(
+        {
+            MODEL_REFERENCE_CATEGORY.image_generation: {
+                "canonical-sdxl": image_record("canonical-sdxl"),
+            },
+        },
+    )
+    build_calls = serve_pending(monkeypatch, {MODEL_REFERENCE_CATEGORY.image_generation: {"beta-sd15": beta_sd15}})
+    monkeypatch.setattr("horde_worker_regen.reference_helper.ensure_offline_reference_manager", lambda: manager)
+
+    try:
+        assert installed_models_for_tiers([BenchTier.SD15, BenchTier.SDXL]) == {BenchTier.SD15: "beta-sd15"}
+    finally:
+        invalidate_merged_records()
+    assert build_calls == [{"timeout_seconds": 5.0, "retry_max_attempts": 1}]
+
+
 @pytest.mark.parametrize("card_key", [0, "0"])
 def test_model_selection_ignores_exclusions_on_unselected_cards(
     monkeypatch: pytest.MonkeyPatch, card_key: int | str
@@ -116,7 +148,9 @@ def test_model_selection_ignores_exclusions_on_unselected_cards(
     }
     manager = Mock(spec=ModelReferenceManager)
     manager.get_all_model_references.return_value = {MODEL_REFERENCE_CATEGORY.image_generation: records}
-    monkeypatch.setattr("horde_worker_regen.bridge_data.load_config.beta_aware_image_records", lambda manager: records)
+    monkeypatch.setattr(
+        "horde_worker_regen.bridge_data.load_config.beta_aware_image_records", lambda manager, **_: records
+    )
     config = {
         "gpu_device_indices": [0],
         "gpu_overrides": {card_key: {"models_to_skip": ["installed-sd15"]}, 1: {"models_to_skip": ["other-model"]}},

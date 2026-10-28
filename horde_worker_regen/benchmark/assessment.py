@@ -1395,7 +1395,13 @@ class OperatorAssessment:
                 "only_models_on_disk": False,
             }
         )
-        return len(BridgeDataLoader._resolve_meta_instructions(bridge, ensure_offline_reference_manager()))
+        return len(
+            BridgeDataLoader._resolve_meta_instructions(
+                bridge,
+                ensure_offline_reference_manager(),
+                bounded_beta_read=True,
+            ),
+        )
 
     async def _run_cases(
         self,
