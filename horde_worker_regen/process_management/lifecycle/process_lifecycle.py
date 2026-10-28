@@ -47,7 +47,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeProcessState,
 )
 from horde_worker_regen.process_management.ipc.supervisor_channel import WorkerEventKind, WorkerEventSink
-from horde_worker_regen.process_management.jobs.job_tracker import JobTracker, PostProcessingFaultCause
+from horde_worker_regen.process_management.jobs.job_tracker import JobStage, JobTracker, PostProcessingFaultCause
 from horde_worker_regen.process_management.lifecycle.child_crash_capture import (
     read_last_startup_crash,
     read_startup_crash_for_launch,
@@ -73,6 +73,14 @@ from horde_worker_regen.process_management.scheduling.performance_model import (
     ResolutionBucket,
     signature_from_job,
 )
+from horde_worker_regen.process_management.scheduling.workload_flow import (
+    AlchemyFormDemand,
+    UtilitiesLaneDemandInputs,
+    UtilitiesLaneDemandReason,
+    job_wants_pre_annotation,
+    post_processing_is_strip_only,
+    utilities_lane_demand,
+)
 from horde_worker_regen.process_management.worker_entry_points import ProcessEntryPoints
 from horde_worker_regen.process_management.workers.download_process import DOWNLOAD_PROCESS_ID
 from horde_worker_regen.run_root import logs_dir
@@ -94,6 +102,16 @@ class PauseOwner(enum.StrEnum):
     """The verified reclaim ladder initiated the off-GPU placement."""
     RUNTIME_SAFETY_PLACEMENT = "runtime_safety_placement"
     """The runtime placement policy moved safety off-GPU because its context did not fit beside sampling."""
+
+
+@dataclass(frozen=True)
+class UtilitiesDemandReconcile:
+    """What one pass of :meth:`ProcessLifecycleManager.reconcile_utilities_demand` found."""
+
+    started_for: UtilitiesLaneDemandReason | None = None
+    """The demand a lane start this pass answered, None when the pass started nothing."""
+    held_down: bool = False
+    """The lane is enabled and down because nothing needs it."""
 
 
 def _pause_owner_phrase(owner: PauseOwner) -> str:
@@ -880,6 +898,15 @@ class ProcessLifecycleManager:
         self._utilities_gpu_paused_at: float | None = None
         self._utilities_gpu_pause_count = 0
         self._utilities_gpu_restore_count = 0
+        # The alchemy flow's part of the lane's demand. The alchemy coordinator is built after this manager and
+        # registers it. Until then no alchemy form counts.
+        self._utilities_alchemy_form_demand_provider: Callable[[], AlchemyFormDemand] = AlchemyFormDemand
+        # Set when the demand driver asks for a lane start, cleared once a lane is in the map or the demand
+        # lapses, so a start that fails outright is tried once per demand episode and not on every tick.
+        self._utilities_demand_start_attempted = False
+        # Set when a restore leaves the lane down for want of demand, cleared when a lane starts, so the line
+        # saying so is written once per stretch the lane stays down.
+        self._utilities_left_down_logged = False
         self._post_process_gpu_restore_count = 0
         # Marks the *next* post-processing-lane rebuild as an intentional whole-card pause/restore cycle, so
         # its completion is not counted as a crash recovery (mirrors ``_safety_replacement_intentional``).
@@ -2289,8 +2316,60 @@ class ProcessLifecycleManager:
 
         return paths.utilities_python().is_file()
 
+    def set_utilities_alchemy_form_demand_provider(self, provider: Callable[[], AlchemyFormDemand]) -> None:
+        """Register the alchemy flow's part of the image-utilities lane's demand.
+
+        The alchemy coordinator's :meth:`AlchemyCoordinator.utilities_form_demand`. Until registered no alchemy
+        form counts toward the demand.
+        """
+        self._utilities_alchemy_form_demand_provider = provider
+
+    def utilities_lane_demand_inputs(self) -> UtilitiesLaneDemandInputs:
+        """Assemble what :func:`utilities_lane_demand` reads from the tracker, the live config and alchemy."""
+        bridge_data = self._runtime_config.bridge_data
+        tracker = self._job_tracker
+        strip_only_jobs = 0
+        pre_annotation_candidates = 0
+        for job in tracker.jobs_pending_inference:
+            if post_processing_is_strip_only(job.payload.post_processing or ()):
+                strip_only_jobs += 1
+            if job.id_ is None or not job_wants_pre_annotation(job):
+                continue
+            tracked = tracker.get_tracked_job(job.id_)
+            if (
+                tracked is not None
+                and tracked.stage is JobStage.PENDING_INFERENCE
+                and not tracked.annotation_attempted
+            ):
+                pre_annotation_candidates += 1
+        return UtilitiesLaneDemandInputs(
+            lane_available=(
+                self.utilities_process_enabled()
+                and self.process_type_wanted(HordeProcessType.UTILITIES)
+                and self._utilities_interpreter_available()
+            ),
+            shutting_down=self._state.shutting_down,
+            extended_controlnet_opted_in=(
+                bridge_data.extended_controlnet is True and bridge_data.allow_controlnet is True
+            ),
+            alchemy=self._utilities_alchemy_form_demand_provider(),
+            jobs_pending_strip=len(tracker.jobs_pending_strip),
+            strip_only_jobs_before_strip=strip_only_jobs,
+            pre_annotation_candidates=pre_annotation_candidates,
+            jobs_pending_annotation=len(tracker.jobs_pending_annotation),
+        )
+
+    def utilities_lane_demand(self) -> UtilitiesLaneDemandReason | None:
+        """Return why the image-utilities lane should be up now, or None when nothing needs it."""
+        return utilities_lane_demand(self.utilities_lane_demand_inputs())
+
     def start_utilities_processes(self) -> bool:
-        """Start the dedicated image-utilities lane, if enabled and not already running."""
+        """Start the dedicated image-utilities lane, if enabled, not already running, and needed.
+
+        Every start of the lane comes through here (the boot bring-up, a deferred retry, the replacement's final
+        start, the reclaim ladder's restore and the demand driver), so the demand check below decides for all of
+        them whether a lane comes up.
+        """
         # While a starved head holds the lane off the card this per-tick start hook must not resurrect it;
         # the owner's restore clears the pause and starts the lane directly.
         if self._utilities_gpu_paused:
@@ -2306,6 +2385,11 @@ class ProcessLifecycleManager:
                 "The image-utilities lane is enabled but its virtual environment interpreter is missing; "
                 "not starting the lane. Provision the utilities venv to enable it.",
             )
+            return False
+
+        # A lane with nothing to serve holds a CUDA context and spends tens of seconds of CPU priming its
+        # annotators, and the reclaim ladder then stops it again for the next post-processing chain.
+        if self.utilities_lane_demand() is None:
             return False
 
         lane_card = self._utilities_card()
@@ -2361,6 +2445,7 @@ class ProcessLifecycleManager:
         self._book_gpu_start(self._process_map[pid])
 
         self._utilities_pinned_card = lane_card.device_index
+        self._utilities_left_down_logged = False
 
         # Log contract: analysis/log_signatures.py (utilities_lane_started).
         logger.info(f"Started image utilities process (id: {pid}, device_index: {lane_card.device_index})")
@@ -2429,6 +2514,60 @@ class ProcessLifecycleManager:
     def utilities_processes_should_be_replaced(self) -> bool:
         """Whether the dedicated image-utilities lane is flagged for replacement."""
         return self._utilities_processes_should_be_replaced
+
+    def reconcile_utilities_demand(self, *, pause_stranded: bool) -> UtilitiesDemandReconcile:
+        """Start the image-utilities lane when a job needs it and nothing else is bringing it up.
+
+        Run once per control-loop tick. The lane starts with demand, no lane in the map, no pause, no replacement
+        under way and no deferred start pending, so the lane comes up on the tick after a job arrives that only
+        the lane can serve, whichever path the job arrived by. A start that fails outright is not retried until
+        the demand lapses and returns.
+
+        A reclaim-ladder pause that no saturation episode, post-processing borrow or recovery remedy still claims
+        (``pause_stranded``, judged by the caller, which holds those owners) has no restore path left, and the
+        pause check in :meth:`start_utilities_processes` refuses every start behind it. With demand present it is
+        restored here.
+
+        Args:
+            pause_stranded: Whether the lane's current pause has outlived every owner that could restore it.
+
+        Returns:
+            The demand a start answered this pass, and whether the lane is held down for want of demand.
+        """
+        if self._automatic_replacement_is_parked():
+            return UtilitiesDemandReconcile()
+        if self._process_map.num_utilities_processes() > 0:
+            self._utilities_demand_start_attempted = False
+            return UtilitiesDemandReconcile()
+
+        inputs = self.utilities_lane_demand_inputs()
+        reason = utilities_lane_demand(inputs)
+        if reason is None:
+            self._utilities_demand_start_attempted = False
+            lane_serviceable = inputs.lane_available and not inputs.shutting_down
+            return UtilitiesDemandReconcile(held_down=lane_serviceable and not self._utilities_gpu_paused)
+
+        if self._utilities_gpu_paused:
+            if not pause_stranded or self._utilities_pause_owner is not PauseOwner.RECLAIM_LADDER:
+                return UtilitiesDemandReconcile()
+            logger.warning(
+                "Restoring a stranded image-utilities lane: the reclaim ladder stopped it, but no saturation "
+                f"episode, post-processing borrow or recovery remedy still claims it, and a job needs it ({reason}).",
+            )
+            self.restore_utilities_off_gpu(owner=PauseOwner.RECLAIM_LADDER)
+            started = self._process_map.num_utilities_processes() > 0
+            return UtilitiesDemandReconcile(started_for=reason if started else None)
+
+        if self._utilities_processes_should_be_replaced:
+            return UtilitiesDemandReconcile()
+        if self._pending_gpu_start_key(HordeProcessType.UTILITIES, None) in self._pending_gpu_starts:
+            return UtilitiesDemandReconcile()
+        if self._utilities_demand_start_attempted:
+            return UtilitiesDemandReconcile()
+        self._utilities_demand_start_attempted = True
+        if not self.start_utilities_processes():
+            return UtilitiesDemandReconcile()
+        return UtilitiesDemandReconcile(started_for=reason)
 
     def recycle_lane_process(self, process_info: HordeProcessInfo) -> bool:
         """Recycle one service lane through its end -> respawn machine to reset its host commit charge.
@@ -4198,6 +4337,11 @@ class ProcessLifecycleManager:
         return self._utilities_gpu_paused
 
     @property
+    def utilities_pause_owner(self) -> PauseOwner | None:
+        """Which initiator holds the image-utilities lane's off-GPU pause (None when it is not paused)."""
+        return self._utilities_pause_owner
+
+    @property
     def post_process_pause_owner(self) -> PauseOwner | None:
         """Which initiator holds the post-processing lane's off-GPU pause (None when it is not paused).
 
@@ -4320,11 +4464,13 @@ class ProcessLifecycleManager:
         return True
 
     def restore_utilities_off_gpu(self, *, owner: PauseOwner) -> bool:
-        """Bring the image-utilities lane back after ``owner``'s pause, starting it directly.
+        """Lift ``owner``'s pause on the image-utilities lane, starting the lane only if a job needs it.
 
-        A no-op (returns False) when the lane is not paused or ``owner`` is not the holder. The replacement
-        state machine consumed its flag while the pause suppressed its final start, so without this call the
-        lane would stay down for the rest of the session.
+        A no-op (returns False) when the lane is not paused or ``owner`` is not the holder. Otherwise the pause
+        is cleared and True is returned whether or not the lane starts, so the owner's restore obligation is
+        discharged either way. The lane starts here when :meth:`utilities_lane_demand` holds. Without demand it
+        stays down, and the per-tick :meth:`reconcile_utilities_demand` starts it when a job arrives that needs
+        it.
 
         Args:
             owner: The subsystem requesting the restore; it must match the owner that initiated the pause.
@@ -4334,6 +4480,14 @@ class ProcessLifecycleManager:
         self._utilities_gpu_paused = False
         self._utilities_pause_owner = None
         self._utilities_gpu_restore_count += 1
+        if self.utilities_lane_demand() is None:
+            if not self._utilities_left_down_logged:
+                self._utilities_left_down_logged = True
+                # Log contract: analysis/log_signatures.py (service_lane_left_down).
+                logger.info(
+                    f"{_pause_owner_phrase(owner)}: leaving the image-utilities lane down until a job needs it.",
+                )
+            return True
         logger.info(f"{_pause_owner_phrase(owner)}: restarting the image-utilities lane after releasing the card.")
         self.start_utilities_processes()
         return True

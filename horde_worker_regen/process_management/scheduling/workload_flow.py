@@ -16,7 +16,10 @@ than copying a silo.
 
 from __future__ import annotations
 
-from typing import Protocol, runtime_checkable
+import enum
+from collections.abc import Iterable
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from horde_sdk.generation_parameters.alchemy.consts import (
     is_annotation_form,
@@ -29,6 +32,9 @@ from horde_worker_regen.process_management.lifecycle.horde_process import HordeP
 
 # Re-exported from its leaf home so every existing importer of WorkloadKind from this module stays valid.
 from horde_worker_regen.process_management.scheduling.workload_kind import WorkloadKind
+
+if TYPE_CHECKING:
+    from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 
 POST_PROCESS_RESERVE_FLOW = "image_post_processing"
 """Committed-reserve ledger flow name for image jobs active on the dedicated post-processing lane."""
@@ -146,6 +152,122 @@ def capability_for_alchemy_form(form: str) -> WorkerCapability:
     if is_upscaler_form(form) or is_facefixer_form(form):
         return WorkerCapability.ALCHEMY_GRAPH
     return WorkerCapability.ALCHEMY_CLIP
+
+
+def routes_to_utilities_lane(form: str) -> bool:
+    """Return whether the given alchemy form runs on the image-utilities lane."""
+    return capability_for_alchemy_form(form) is WorkerCapability.IMAGE_UTILITIES
+
+
+def post_processing_is_strip_only(forms: Iterable[object]) -> bool:
+    """Return whether a generation job's requested post-processing is background removal and nothing else.
+
+    Such a job skips the post-processing lane and needs only the image-utilities lane after inference. The
+    split reads ``is_strip_background_form``, as the post-processing offer depth does, so the two never disagree
+    about which job the post-processing lane serves.
+    """
+    names = [str(form) for form in forms]
+    return bool(names) and all(is_strip_background_form(name) for name in names)
+
+
+def job_wants_pre_annotation(job: ImageGenerateJobPopResponse) -> bool:
+    """Return whether a ControlNet job's control map should be derived on the image-utilities lane.
+
+    True when the job requests a control type and its source is a real image (not already a control map)
+    that is present to annotate. This covers both a generation job (whose derived map is injected as its
+    premade control map) and a ``return_control_map`` job (whose derived map *is* its deliverable); the
+    result handler routes the two differently. A job with no source image (nothing to annotate) falls
+    through to hordelib's in-graph path.
+    """
+    payload = job.payload
+    if payload.control_type is None:
+        return False
+    if payload.image_is_control:
+        return False
+    return job.source_image is not None
+
+
+class UtilitiesLaneDemandReason(enum.StrEnum):
+    """Why the image-utilities lane should be up: the first rule of :func:`utilities_lane_demand` that holds."""
+
+    EXTENDED_CONTROLNET_WARM = "extended_controlnet_warm"
+    """The operator opted into extended ControlNet, whose jobs have no in-graph path and arrive with no lead."""
+    ALCHEMY_FORM_WARM = "alchemy_form_warm"
+    """The alchemist offers a form that runs on the lane, and the offer needs a live lane."""
+    PENDING_STRIP = "pending_strip"
+    """A job waits for or runs its background strip."""
+    STRIP_ONLY_JOB = "strip_only_job"
+    """A queued or sampling job will need its strip once inference ends, with no post-processing chain first."""
+    CONTROLNET_ANNOTATION = "controlnet_annotation"
+    """A ControlNet job wants its control map derived on the lane, or is parked for it."""
+    ALCHEMY_FORM_WAITING = "alchemy_form_waiting"
+    """An alchemy form that runs on the lane is pending dispatch or in flight."""
+
+
+@dataclass(frozen=True)
+class AlchemyFormDemand:
+    """The alchemy flow's part of the image-utilities lane's demand, as plain form names."""
+
+    offerable: frozenset[str] = frozenset()
+    """Every form the alchemist would offer with each lane up and every annotator servable."""
+    waiting: tuple[str, ...] = ()
+    """The forms pending dispatch or in flight, one entry per form."""
+
+
+@dataclass(frozen=True)
+class UtilitiesLaneDemandInputs:
+    """What :func:`utilities_lane_demand` reads, frozen once per evaluation."""
+
+    lane_available: bool
+    """The lane is enabled, wanted by the configured workloads and provisioned."""
+    shutting_down: bool
+    extended_controlnet_opted_in: bool
+    """The operator opted into extended ControlNet on a worker that allows ControlNet."""
+    alchemy: AlchemyFormDemand
+    jobs_pending_strip: int
+    """Jobs in ``PENDING_STRIP``."""
+    strip_only_jobs_before_strip: int
+    """Jobs pending or in inference whose post-processing is background removal alone."""
+    pre_annotation_candidates: int
+    """ControlNet jobs pending inference that want pre-annotation and have not been offered to the lane."""
+    jobs_pending_annotation: int
+    """Jobs in ``PENDING_ANNOTATION``."""
+
+
+def utilities_lane_demand(inputs: UtilitiesLaneDemandInputs) -> UtilitiesLaneDemandReason | None:
+    """Return why the image-utilities lane should be up, or None when nothing needs it.
+
+    The one owner of that question. Every lane start reads it, and so does the reclaim ladder's restore, so a
+    lane stopped to free its context stays down until work arrives that only the lane can serve.
+
+    The rules, first match wins:
+
+    1. A disabled, unwanted or unprovisioned lane, or a worker shutting down, is never wanted.
+    2. Warm requirement: the extended-ControlNet opt-in, or an offerable alchemy form that routes to the lane.
+       Extended ControlNet jobs have no in-graph fallback and arrive with no lead, and an alchemy offer of a
+       lane form needs a live lane.
+    3. A job in ``PENDING_STRIP``.
+    4. A job pending or in inference whose post-processing is background removal alone. Its lead (queue wait
+       plus generation) covers a lane start. A job with an upscaler or face fixer counts from rule 3 only, so
+       its own post-processing chain does not find a lane started for it and stop it again.
+    5. A ControlNet pre-annotation candidate, or a job in ``PENDING_ANNOTATION``.
+    6. A lane-bound alchemy form pending or in flight.
+    """
+    if not inputs.lane_available or inputs.shutting_down:
+        return None
+    if inputs.extended_controlnet_opted_in:
+        return UtilitiesLaneDemandReason.EXTENDED_CONTROLNET_WARM
+    if any(routes_to_utilities_lane(form) for form in inputs.alchemy.offerable):
+        return UtilitiesLaneDemandReason.ALCHEMY_FORM_WARM
+    if inputs.jobs_pending_strip > 0:
+        return UtilitiesLaneDemandReason.PENDING_STRIP
+    if inputs.strip_only_jobs_before_strip > 0:
+        return UtilitiesLaneDemandReason.STRIP_ONLY_JOB
+    if inputs.pre_annotation_candidates > 0 or inputs.jobs_pending_annotation > 0:
+        return UtilitiesLaneDemandReason.CONTROLNET_ANNOTATION
+    if any(routes_to_utilities_lane(form) for form in inputs.alchemy.waiting):
+        return UtilitiesLaneDemandReason.ALCHEMY_FORM_WAITING
+    return None
 
 
 @runtime_checkable

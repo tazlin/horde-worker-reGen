@@ -80,6 +80,10 @@ _SAFETY_PLACEMENT_NOT_EXERCISED = "the dry-run harness never pauses or restores 
 _UTILITIES_LANE_NOT_EXERCISED = (
     "the image-utilities lane runs an out-of-venv capability service the dry-run harness does not launch"
 )
+_UTILITIES_LANE_NOT_WANTED = (
+    "the image-utilities lane starts only for work it serves, and the dry-run contract scenario carries no "
+    "background strip, ControlNet job or lane-bound alchemy form"
+)
 _WHOLE_CARD_NOT_EXERCISED = (
     "reachable only with a whole-card-class model (e.g. Flux fp8) and a multi-process pool, which the "
     "dry-run harness's fake models never trigger"
@@ -290,6 +294,7 @@ _SIGNATURE_LIST: list[LogSignature] = [
         r"Started image utilities process \(id: (?P<process>\d+), device_index: (?P<device>\d+)\)",
         emitter="process_management.lifecycle.process_lifecycle:start_utilities_processes",
         sample="Started image utilities process (id: 2, device_index: 1)",
+        dry_run_reason=_UTILITIES_LANE_NOT_WANTED,
     ),
     _signature(
         "utilities_bringup_failed",
@@ -1667,6 +1672,14 @@ _SIGNATURE_LIST: list[LogSignature] = [
         r"the card\.",
         emitter="process_management.lifecycle.process_lifecycle:ProcessLifecycleManager.restore_post_process_off_gpu",
         sample="Reclaim ladder: restarting the post-processing lane after releasing the card.",
+        dry_run_reason=_RECLAIM_HOLD_NOT_EXERCISED,
+    ),
+    _signature(
+        "service_lane_left_down",
+        r"(?P<owner>Reclaim ladder|Whole-card residency[^:]*): leaving the (?P<lane>[\w-]+) lane down until a job "
+        r"needs it\.",
+        emitter="process_management.lifecycle.process_lifecycle:ProcessLifecycleManager.restore_utilities_off_gpu",
+        sample="Reclaim ladder: leaving the image-utilities lane down until a job needs it.",
         dry_run_reason=_RECLAIM_HOLD_NOT_EXERCISED,
     ),
     _signature(

@@ -297,7 +297,11 @@ from horde_worker_regen.process_management.scheduling.pop_governor_registry impo
 )
 from horde_worker_regen.process_management.scheduling.pop_throttler import CONSECUTIVE_FAILED_JOBS_WAIT_SECONDS
 from horde_worker_regen.process_management.scheduling.slot_duty import SlotDutyAccumulator
-from horde_worker_regen.process_management.scheduling.workload_flow import FlowCoordinator, WorkloadKind
+from horde_worker_regen.process_management.scheduling.workload_flow import (
+    FlowCoordinator,
+    WorkloadKind,
+    job_wants_pre_annotation,
+)
 from horde_worker_regen.process_management.simulation._canned_scenarios import (
     CannedAlchemySource,
     CannedJobSource,
@@ -370,6 +374,10 @@ def _control_type_name(control_type: object) -> str | None:
     return str(control_type)
 
 
+_UTILITIES_LANE_DEMAND_SUBJECT = "utilities_lane"
+"""The decision subject that records the image-utilities lane held down for want of demand and started for it."""
+
+
 def _resolve_source_image_bytes(job: ImageGenerateJobPopResponse) -> bytes | None:
     """Return the job's source image as encoded bytes for annotation, or None when unavailable.
 
@@ -387,23 +395,6 @@ def _resolve_source_image_bytes(job: ImageGenerateJobPopResponse) -> bytes | Non
         return base64_str_to_bytes(base64_value)
     except Exception:
         return None
-
-
-def job_wants_pre_annotation(job: ImageGenerateJobPopResponse) -> bool:
-    """Return whether a ControlNet job's control map should be derived on the image-utilities lane.
-
-    True when the job requests a control type and its source is a real image (not already a control map)
-    that is present to annotate. This covers both a generation job (whose derived map is injected as its
-    premade control map) and a ``return_control_map`` job (whose derived map *is* its deliverable); the
-    result handler routes the two differently. A job with no source image (nothing to annotate) falls
-    through to hordelib's in-graph path.
-    """
-    payload = job.payload
-    if payload.control_type is None:
-        return False
-    if payload.image_is_control:
-        return False
-    return job.source_image is not None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2130,6 +2121,9 @@ class HordeWorkerProcessManager:
         self._message_dispatcher.set_annotation_result_handler(self._on_annotation_result)
         self._message_dispatcher.set_annotator_availability_handler(self._on_annotator_availability)
         self._message_dispatcher.set_strip_result_handler(self._on_strip_result)
+        self._process_lifecycle.set_utilities_alchemy_form_demand_provider(
+            self._alchemy_coordinator.utilities_form_demand,
+        )
 
         self._image_coordinator = ImageGenerationCoordinator(
             state=self._state,
@@ -4080,6 +4074,51 @@ class HordeWorkerProcessManager:
             )
             scheduler.restore_post_process_lane(device_index)
 
+    def _utilities_pause_stranded(self) -> bool:
+        """Whether a reclaim-ladder pause on the image-utilities lane has outlived every owner that could restore it.
+
+        The owners are a saturation episode holding a lane pause on the lane's card (or worker-wide), a
+        post-processing borrow receipt for the lane, and a recovery remedy holding the pause. The pause must also
+        have been held for :attr:`_STRANDED_LANE_RESTORE_DEBOUNCE_SECONDS`, so a pause the ladder has just taken
+        and is about to book is not read as an orphan.
+        """
+        lifecycle = self._process_lifecycle
+        paused_at = lifecycle.utilities_paused_at
+        if paused_at is None or lifecycle.utilities_pause_owner is not PauseOwner.RECLAIM_LADDER:
+            return False
+        if (time.monotonic() - paused_at) < self._STRANDED_LANE_RESTORE_DEBOUNCE_SECONDS:
+            return False
+        if self._reclaim_ladder.episode_holds_paused_lane(lifecycle.utilities_lane_card_index()):
+            return False
+        if self._post_process_orchestrator.is_service_lane_borrowed(ActuatorCommandKind.PAUSE_UTILITIES_LANE):
+            return False
+        return not self._recovery_coordinator.holds_lane_pause(ReclaimRungKind.PAUSE_UTILITIES_LANE)
+
+    def _reconcile_utilities_demand(self) -> None:
+        """Bring the image-utilities lane up when a job needs it, and record why it started or stays down.
+
+        Waits for the boot bring-up, which starts the lanes once their models can be on disk, so the lane is never
+        started ahead of the pool it serves. The decision record opens while the lane is held down for want of
+        demand and resolves with the demand that started it.
+        """
+        if not self._download_coordinator.inference_processes_started:
+            return
+        outcome = self._process_lifecycle.reconcile_utilities_demand(pause_stranded=self._utilities_pause_stranded())
+        if outcome.started_for is not None:
+            self._run_metrics.record_decision(
+                decision_kind=DecisionKind.IMAGE_UTILITIES_ROUTING,
+                subject=_UTILITIES_LANE_DEMAND_SUBJECT,
+                verdict=DecisionVerdict.ADMIT,
+                reason=outcome.started_for.value,
+            )
+        elif outcome.held_down:
+            self._run_metrics.record_decision(
+                decision_kind=DecisionKind.IMAGE_UTILITIES_ROUTING,
+                subject=_UTILITIES_LANE_DEMAND_SUBJECT,
+                verdict=DecisionVerdict.WITHHOLD,
+                reason="no_demand",
+            )
+
     def _restore_stranded_context_reductions(self, device_index: int, *, saturated: bool) -> None:
         """Regrow an inference pool a reclaim reduction shrank once its restore owner can no longer run.
 
@@ -4760,6 +4799,7 @@ class HordeWorkerProcessManager:
             self._process_lifecycle._replace_all_component_process()
             self._process_lifecycle._replace_all_vae_lane_process()
             self._process_lifecycle._replace_all_utilities_process()
+            self._reconcile_utilities_demand()
 
             # Backstop the per-slot recovery: punt any job left in-progress with no owning live slot
             # before it can wedge the head of the queue.

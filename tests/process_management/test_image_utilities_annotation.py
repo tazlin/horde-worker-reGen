@@ -51,6 +51,8 @@ from horde_worker_regen.process_management.lifecycle.process_info import HordePr
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.process_manager import HordeWorkerProcessManager
+from horde_worker_regen.process_management.resources.run_metrics import DecisionKind, DecisionVerdict
+from horde_worker_regen.process_management.worker_entry_points import ProcessEntryPoints
 from tests.process_management.conftest import (
     make_job_pop_response,
     make_mock_bridge_data,
@@ -60,6 +62,7 @@ from tests.process_management.conftest import (
     track_popped_job_async,
 )
 from tests.process_management.ipc.test_message_dispatch import _make_dispatcher
+from tests.process_management.lifecycle.test_utilities_lifecycle import _FakeAdapter
 from tests.process_management.scheduling.test_inference_scheduling import _make_inference_scheduler
 
 _UTILITIES_PROCESS_ID = 7
@@ -1098,3 +1101,97 @@ class TestStripTailRouting:
         assert tracked.job_info is not None
         assert tracked.job_info.state == GENERATION_STATE.faulted
         assert tracked.job_info.job_image_results is None
+
+
+class TestUtilitiesLaneOnDemandEnsemble:
+    """The lane comes up for strip work, stays down once released with nothing waiting, and returns for the next."""
+
+    async def test_strip_bursts_start_the_lane_and_a_ladder_restore_without_strips_leaves_it_down(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A strip burst starts the lane once, a ladder restore with no strip waiting leaves it down.
+
+        A later strip job starts it again. Read through lane starts and the decisions recorded, never the demand
+        rule.
+        """
+        pm = make_testable_process_manager(enable_image_utilities=True)
+        lifecycle = pm._process_lifecycle
+        constructed: list[_FakeAdapter] = []
+
+        def _factory(*_args: object, **_kwargs: object) -> _FakeAdapter:
+            adapter = _FakeAdapter()
+            constructed.append(adapter)
+            return adapter
+
+        lifecycle._entry_points = ProcessEntryPoints(utilities_adapter_factory=_factory)  # type: ignore[arg-type]
+        lifecycle._ctx.Pipe.return_value = (Mock(), Mock())
+        pm._download_coordinator.inference_processes_started = True
+        decisions: list[tuple[DecisionVerdict, str]] = []
+        record_decision = pm._run_metrics.record_decision
+
+        def _spy(**kwargs: object) -> object:
+            if (
+                kwargs["decision_kind"] is DecisionKind.IMAGE_UTILITIES_ROUTING
+                and kwargs["subject"] == "utilities_lane"
+            ):
+                decisions.append((kwargs["verdict"], kwargs["reason"]))  # type: ignore[arg-type]
+            return record_decision(**kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(pm._run_metrics, "record_decision", _spy)
+
+        def _lane() -> HordeProcessInfo | None:
+            lanes = [info for info in pm._process_map.values() if info.process_type is HordeProcessType.UTILITIES]
+            return lanes[0] if lanes else None
+
+        def _tick() -> None:
+            lifecycle._replace_all_utilities_process()
+            pm._reconcile_utilities_demand()
+
+        for _ in range(3):
+            _tick()
+        assert constructed == [], "nothing needs the lane, so nothing starts it"
+
+        jobs = [make_job_pop_response(post_processing=["strip_background"]) for _ in range(3)]
+        job_infos = [await pm._job_tracker.record_popped_job(job, time_popped=time.time()) for job in jobs]
+        for _ in range(3):
+            _tick()
+        assert len(constructed) == 1, "a burst of strip jobs starts the lane once"
+        lane = _lane()
+        assert lane is not None
+        lane.last_process_state = HordeProcessState.WAITING_FOR_JOB
+
+        for job, job_info in zip(jobs, job_infos, strict=True):
+            await pm._job_tracker.mark_inference_started(job)
+            job_info.job_image_results = [HordeImageResult(image_bytes=b"raw")]
+            await pm._job_tracker.queue_for_strip(job_info, from_post_processing=False)
+        while pm._job_tracker.jobs_pending_strip:
+            await pm._advance_pending_strips()
+            for tracked in pm._job_tracker.jobs_pending_strip:
+                if tracked.strip_dispatched_at is not None:
+                    await pm._on_strip_result(_strip_result(tracked.job_id))
+                    lane.last_process_state = HordeProcessState.WAITING_FOR_JOB
+            _tick()
+        assert len(constructed) == 1
+
+        assert pm._inference_scheduler.pause_utilities_lane(None) is True
+        for _ in range(4):
+            _tick()
+        assert _lane() is None
+        with _captured_messages() as messages:
+            assert pm._inference_scheduler.restore_utilities_lane(None) is True
+            for _ in range(3):
+                _tick()
+        assert _lane() is None, "with no strip waiting the restore leaves the lane down"
+        assert len(constructed) == 1
+        assert "Reclaim ladder: leaving the image-utilities lane down until a job needs it." in messages
+
+        later = make_job_pop_response(post_processing=["strip_background"])
+        await pm._job_tracker.record_popped_job(later, time_popped=time.time())
+        _tick()
+        assert len(constructed) == 2, "a later strip job starts the lane again"
+        assert _lane() is not None
+
+        started = [reason for verdict, reason in decisions if verdict is DecisionVerdict.ADMIT]
+        assert started == ["strip_only_job", "strip_only_job"]
+        assert (DecisionVerdict.WITHHOLD, "no_demand") in decisions

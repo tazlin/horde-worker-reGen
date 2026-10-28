@@ -65,7 +65,9 @@ from horde_worker_regen.capabilities import (
 )
 from horde_worker_regen.consts import (
     AESTHETIC_FORM_NAME,
+    CLASSIC_CONTROL_TYPES,
     DESCRIBE_FORM_NAME,
+    EXTENDED_CONTROL_TYPES,
     PALETTE_FORM_NAME,
     VECTORIZE_FORM_NAME,
     WORKER_KNOWN_BETA_FACEFIXERS,
@@ -91,7 +93,11 @@ from horde_worker_regen.process_management.models.model_availability import (
     PostProcessorPresence,
 )
 from horde_worker_regen.process_management.resources.resource_budget import CommittedReserveLedger
-from horde_worker_regen.process_management.scheduling.workload_flow import WorkloadKind, capability_for_alchemy_form
+from horde_worker_regen.process_management.scheduling.workload_flow import (
+    AlchemyFormDemand,
+    WorkloadKind,
+    capability_for_alchemy_form,
+)
 from horde_worker_regen.process_management.simulation._canned_scenarios import CannedAlchemySource
 from horde_worker_regen.runtime_version import runtime_version
 from horde_worker_regen.server_capabilities import server_supports_interrogation_form
@@ -597,6 +603,31 @@ class AlchemyCoordinator:
     def num_forms_awaiting_submit(self) -> int:
         """Forms with a result, waiting for API submission."""
         return len(self._pending_submits)
+
+    def utilities_form_demand(self) -> AlchemyFormDemand:
+        """Return this flow's part of the image-utilities lane's demand, as plain form names.
+
+        ``offerable`` is what :func:`expand_offered_forms` would offer with every lane up and every control type
+        servable, so a lane-bound form the alchemist configures counts before the lane has run and reported its
+        servable set. ``waiting`` is every form pending dispatch or in flight. Which of them run on the lane is
+        decided by :func:`~horde_worker_regen.process_management.scheduling.workload_flow.utilities_lane_demand`.
+        """
+        bridge_data = self.bridge_data
+        offerable = (
+            frozenset(
+                expand_offered_forms(
+                    bridge_data,
+                    annotation_types=CLASSIC_CONTROL_TYPES | EXTENDED_CONTROL_TYPES,
+                    presence=self._post_processor_presence(),
+                ),
+            )
+            if bridge_data.alchemist is True
+            else frozenset()
+        )
+        waiting = tuple(spec.form for spec in self._pending_forms) + tuple(
+            spec.form for spec in self._in_flight.values()
+        )
+        return AlchemyFormDemand(offerable=offerable, waiting=waiting)
 
     @staticmethod
     def _decode_image_resolution(source_image_bytes: bytes) -> tuple[int, int] | None:

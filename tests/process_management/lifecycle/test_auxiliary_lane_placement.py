@@ -88,7 +88,8 @@ def _make_placement_plm(
     """Build a lifecycle manager with both auxiliary lanes enabled over ``device_indices``.
 
     ``free_mb_by_device`` of None models a host that has reported no per-card free VRAM yet (the provider
-    answers None for every card), which is what drives the fallback to the static placement rule.
+    answers None for every card), which is what drives the fallback to the static placement rule. The
+    extended-ControlNet opt-in is set so the utilities lane is wanted without a job in hand.
     """
     bridge_data = Mock()
     bridge_data.image_models_to_load = ["stable_diffusion"]
@@ -96,6 +97,8 @@ def _make_placement_plm(
     bridge_data.enable_pipeline_disaggregation = False
     bridge_data.post_processing_lane_enabled = True
     bridge_data.enable_image_utilities = True
+    bridge_data.extended_controlnet = True
+    bridge_data.allow_controlnet = True
     bridge_data.safety_on_gpu = safety_on_gpu
     bridge_data.dry_run_skip_post_processing = False
     bridge_data.dry_run_skip_safety = False

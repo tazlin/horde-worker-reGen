@@ -93,6 +93,54 @@ A form runs one at a time inline on the control thread; the service enforces its
 emits, so the alchemy coordinator's submit path (R2 upload, then submit) consumes it without knowing which
 lane produced it.
 
+## When the lane runs
+
+The lane is started only while work needs it. A lane with nothing to serve still holds a CUDA context on the
+card and spends tens of seconds of CPU priming its annotators at every start, and the reclaim ladder would stop
+it again for the next post-processing chain that does not fit beside it.
+
+One pure function, `utilities_lane_demand` in `scheduling/workload_flow.py`, answers whether the lane should be
+up and why. Its rules, first match wins:
+
+1. A lane that is disabled, not wanted by the configured workloads or not provisioned, or a worker shutting
+   down, is never wanted.
+2. Warm requirement. The extended-ControlNet opt-in (`extended_controlnet` with `allow_controlnet`) keeps the
+   lane up from boot, since extended ControlNet jobs have no in-graph path and arrive with no lead. So does an
+   alchemist that would offer a form `capability_for_alchemy_form` routes to the lane (`strip_background`,
+   `annotation`), since that offer needs a live lane.
+3. A job in `PENDING_STRIP`.
+4. A job pending or in inference whose post-processing is background removal alone. Its queue wait and
+   generation cover a lane start. A job that also asks for an upscaler or face fixer counts from rule 3 only,
+   once its post-processing chain has left the post-processing lane, so the chain does not find a lane started
+   for it and stop it again.
+5. A ControlNet job that wants pre-annotation and has not been offered to the lane, or a job in
+   `PENDING_ANNOTATION`.
+6. A lane-bound alchemy form pending dispatch or in flight.
+
+Every start goes through `ProcessLifecycleManager.start_utilities_processes`, which refuses without demand: the
+boot bring-up, a VRAM-deferred retry (dropped once the demand lapses), the replacement's final start after a
+crash or recycle, and the reclaim ladder's restore. A crash with no demand therefore leaves the lane down and
+still counts one recovery.
+
+A per-tick driver, `reconcile_utilities_demand`, brings the lane up on the tick after work arrives that needs
+it, whichever path the work arrived by (an image pop, an alchemy pop, a strip handed back after a lane loss). It
+acts only after the boot bring-up, with no lane in the map, no pause, no replacement under way and no deferred
+start pending, and a start that fails outright is tried again only once the demand lapses and returns. Each
+start it makes is recorded as an `IMAGE_UTILITIES_ROUTING` decision on the subject `utilities_lane`, which
+opens with `withhold`/`no_demand` while the lane is held down and resolves with `admit` and the demand that
+started it.
+
+The reclaim ladder's restore (`restore_utilities_off_gpu`) lifts its pause and discharges its obligation either
+way, but starts the lane only with demand. Without it the lane stays down and the restore logs
+`Reclaim ladder: leaving the image-utilities lane down until a job needs it.` once per stretch the lane stays
+down. A lane that is down holds no context, so the arbiter offers no utilities rung for it. A ladder pause that
+outlives every owner that could restore it (no saturation episode, post-processing borrow or recovery remedy
+claims it, held for the stranded-lane debounce) is restored by the driver once a job needs the lane.
+
+A lane that is down because nothing needs it is not a failure. Recovery, the hung-process watchdog and the
+crash reaper act on processes in the map only, the strip and annotation stages wait or fall through as they do
+while the lane restarts, and the dashboard's process table lists the lane only while it runs.
+
 ## Liveness and recovery
 
 The adapter polls the service's health endpoint on the child heartbeat cadence and emits a heartbeat only
