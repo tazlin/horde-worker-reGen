@@ -542,8 +542,10 @@ class BridgeDataLoader:
 
         if bridge_data.only_models_on_disk:
             offered_custom_models = set(bridge_data.image_models_to_load).intersection(custom_model_names)
+            # Custom names are judged by startup validation, so the on-disk pass sees only reference models
+            # and its drop line names only models it decided on.
             bridge_data.image_models_to_load = BridgeDataLoader._filter_to_models_on_disk(
-                bridge_data.image_models_to_load,
+                [name for name in bridge_data.image_models_to_load if name not in custom_model_names],
                 horde_model_reference_manager,
             )
             # The public reference manager cannot see the worker-local overlay yet. Startup validation is

@@ -14,6 +14,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE, MODEL_REFERENCE_CATEGORY
+from loguru import logger
 
 from horde_worker_regen.bridge_data import load_config
 from horde_worker_regen.bridge_data.load_config import (
@@ -43,6 +44,7 @@ def _make_bridge(
     image_models_to_skip: list[str] | None = None,
     load_large_models: bool = False,
     only_models_on_disk: bool = False,
+    custom_models: list[str] | None = None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         meta_load_instructions=meta_load_instructions,
@@ -51,7 +53,7 @@ def _make_bridge(
         image_models_to_skip=image_models_to_skip if image_models_to_skip is not None else [],
         only_models_on_disk=only_models_on_disk,
         load_large_models=load_large_models,
-        custom_models=[],
+        custom_models=[SimpleNamespace(name=name) for name in custom_models or []],
     )
 
 
@@ -274,6 +276,32 @@ def test_listed_beta_model_on_disk_survives_the_whole_config_path(
         result = BridgeDataLoader._resolve_meta_instructions(bridge, manager)  # type: ignore[arg-type]
 
     assert sorted(result) == sorted([_BETA_ON_DISK, _CANONICAL_ON_DISK])
+
+
+def test_custom_model_is_kept_and_never_reported_dropped_by_the_on_disk_pass(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A configured custom name is judged by startup validation, so the on-disk pass neither drops nor names it."""
+    manager = _on_disk_manager(tmp_path, monkeypatch)
+    info_lines: list[str] = []
+    sink_id = logger.add(lambda message: info_lines.append(message.record["message"]), level="INFO")
+    bridge = _make_bridge(
+        image_models_to_load=["Custom-Model", _BETA_ON_DISK, _BETA_NOT_ON_DISK],
+        only_models_on_disk=True,
+        custom_models=["Custom-Model"],
+    )
+
+    try:
+        with patch.object(load_config, "_make_image_model_load_resolver", return_value=Mock()):
+            result = BridgeDataLoader._resolve_meta_instructions(bridge, manager)  # type: ignore[arg-type]
+    finally:
+        logger.remove(sink_id)
+
+    assert sorted(result) == sorted(["Custom-Model", _BETA_ON_DISK])
+    drop_lines = [line for line in info_lines if "not present on disk" in line]
+    assert len(drop_lines) == 1
+    assert "Custom-Model" not in drop_lines[0]
 
 
 def test_meta_all_instruction_keeps_beta_model_on_disk(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
