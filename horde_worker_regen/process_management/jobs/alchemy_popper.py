@@ -18,13 +18,15 @@ the image-utilities lane; text-output forms (caption, interrogation, nsfw, vecto
 process. Dispatch is keyed on :class:`WorkerCapability`, not process type, and so is the offer: a form
 whose lane is not up is withheld from the pop (:func:`expand_offered_forms`), and one whose lane goes away
 after the pop is handed back faulted once its dispatch deadline passes, since no other process could ever
-take it.
+take it. The image-utilities lane is the exception on the offer side. It runs only while work needs it, so
+its forms are also offered while it is down by policy, and a popped form waits for the lane to start.
 """
 
 from __future__ import annotations
 
 import asyncio
 import base64
+import enum
 import statistics
 import time
 from asyncio import CancelledError
@@ -93,8 +95,10 @@ from horde_worker_regen.process_management.models.model_availability import (
     PostProcessorPresence,
 )
 from horde_worker_regen.process_management.resources.resource_budget import CommittedReserveLedger
+from horde_worker_regen.process_management.scheduling.dispatch_affinity import utilities_lane_hold_expired
 from horde_worker_regen.process_management.scheduling.workload_flow import (
     AlchemyFormDemand,
+    UtilitiesLaneOutlook,
     WorkloadKind,
     capability_for_alchemy_form,
 )
@@ -205,7 +209,21 @@ return at (``SAFETY_READINESS_LATENCY_CEILING_SECONDS``), which covers a lane pa
 after a crash, or cold-starting its weights. A form still undispatchable past that is waiting on a lane the
 worker's worst case says is not coming, and it holds a ``queue_size`` slot the pop gate counts, so holding
 it forever costs the flow every later form too.
+
+A form waiting for an image-utilities lane that is not loaded is bounded more tightly (see
+:meth:`AlchemyCoordinator._utilities_lane_fault_cause`).
 """
+
+
+class _UndispatchableCause(enum.StrEnum):
+    """Why a popped form is handed back faulted without reaching a process."""
+
+    DEADLINE_PASSED = "deadline_passed"
+    """The dispatch deadline passed with no process able to take the form."""
+    LANE_HOLD_EXPIRED = "lane_hold_expired"
+    """The image-utilities lane was starting or down by policy for longer than the lane hold allows."""
+    LANE_UNAVAILABLE = "lane_unavailable"
+    """The image-utilities lane crashed, its start was refused, or it was disabled."""
 
 
 def lane_bound_post_processor_candidates() -> list[str]:
@@ -275,8 +293,10 @@ def expand_offered_forms(
     interrogation, nsfw and the rest) on the safety process. None of the three has an alternative home, so an
     accepted form whose lane is down, held off the GPU to reclaim its context, or momentarily restarting could
     only strand. Offer and dispatch read the same routing, so the worker cannot advertise work it would then
-    send nowhere. The three flags default True for config-only callers that cannot see runtime process state;
-    the pop path passes the live readings.
+    send nowhere. The image-utilities lane runs only while work needs it, so its flag reads "the lane serves or
+    will serve once a popped form starts it" (:meth:`AlchemyCoordinator._utilities_lane_healthy`). The three
+    flags default True for config-only callers that cannot see runtime process state; the pop path passes the
+    live readings.
 
     ``strip_background`` additionally needs its lane provisioned at all (:func:`strip_background_available`),
     which is a property of the install rather than of the running process.
@@ -413,8 +433,10 @@ class AlchemyCoordinator:
     _runtime_config: RuntimeConfig
     _api_sessions: ApiSessions
 
-    _annotation_types_provider: Callable[[], frozenset[str]] | None = None
+    _annotation_types_provider: Callable[[], frozenset[str] | None] | None = None
     """Class-level default so a coordinator built without its constructor offers no annotation types."""
+    _utilities_lane_outlook_provider: Callable[[], UtilitiesLaneOutlook] | None = None
+    """Class-level default so a coordinator built without its constructor offers and waits for a loaded lane only."""
     _model_availability: ModelAvailability | None = None
     """Class-level default so a coordinator built without its constructor withholds nothing for presence."""
     _withheld_post_processors: frozenset[str] = frozenset()
@@ -475,8 +497,9 @@ class AlchemyCoordinator:
         reserve_ledger: CommittedReserveLedger | None = None,
         canned_alchemy_source: CannedAlchemySource | None = None,
         run_metrics: WorkerRunMetrics | None = None,
-        annotation_types_provider: Callable[[], frozenset[str]] | None = None,
+        annotation_types_provider: Callable[[], frozenset[str] | None] | None = None,
         model_availability: ModelAvailability | None = None,
+        utilities_lane_outlook_provider: Callable[[], UtilitiesLaneOutlook] | None = None,
     ) -> None:
         """Initialize with the shared main-process collaborators.
 
@@ -495,9 +518,12 @@ class AlchemyCoordinator:
             run_metrics: The shared run-metrics aggregator. Each finished form is recorded here (its name,
                 pop->submit timing, and outcome) so alchemy gets the same recent-jobs and rollup
                 observability image generation has. ``None`` (unit tests) disables that recording.
-            annotation_types_provider: Return the control types currently servable by utilities lanes.
+            annotation_types_provider: Return the control types the annotation offer may carry now, or None when
+                no lane has reported a servable set this session, which counts as image-utilities lane demand.
             model_availability: The shared on-disk availability, read for which post-processors are present
                 so a form whose model is missing is not offered. ``None`` (unit tests) withholds nothing.
+            utilities_lane_outlook_provider: Return whether a lane-bound form may wait for the image-utilities
+                lane. ``None`` (unit tests) offers and waits for a loaded lane only.
         """
         self._state = state
         self._process_map = process_map
@@ -510,6 +536,7 @@ class AlchemyCoordinator:
         self._run_metrics = run_metrics
         self._annotation_types_provider = annotation_types_provider
         self._model_availability = model_availability
+        self._utilities_lane_outlook_provider = utilities_lane_outlook_provider
         self._withheld_post_processors = frozenset()
         self.num_canned_forms_completed = 0
         self.num_canned_forms_faulted = 0
@@ -607,27 +634,28 @@ class AlchemyCoordinator:
     def utilities_form_demand(self) -> AlchemyFormDemand:
         """Return this flow's part of the image-utilities lane's demand, as plain form names.
 
-        ``offerable`` is what :func:`expand_offered_forms` would offer with every lane up and every control type
-        servable, so a lane-bound form the alchemist configures counts before the lane has run and reported its
-        servable set. ``waiting`` is every form pending dispatch or in flight. Which of them run on the lane is
-        decided by :func:`~horde_worker_regen.process_management.scheduling.workload_flow.utilities_lane_demand`.
+        ``waiting`` is every form pending dispatch or in flight. Which of them run on the lane is read by
+        :func:`~horde_worker_regen.process_management.scheduling.workload_flow.utilities_lane_demand`.
+        ``annotation_set_unlearned`` holds when :func:`expand_offered_forms` would offer annotation with every
+        lane up and every control type servable, and the annotation provider reports that no lane has reported a
+        servable set this session. The offer cannot name control types until the lane runs once.
         """
-        bridge_data = self.bridge_data
-        offerable = (
-            frozenset(
-                expand_offered_forms(
-                    bridge_data,
-                    annotation_types=CLASSIC_CONTROL_TYPES | EXTENDED_CONTROL_TYPES,
-                    presence=self._post_processor_presence(),
-                ),
-            )
-            if bridge_data.alchemist is True
-            else frozenset()
-        )
         waiting = tuple(spec.form for spec in self._pending_forms) + tuple(
             spec.form for spec in self._in_flight.values()
         )
-        return AlchemyFormDemand(offerable=offerable, waiting=waiting)
+        return AlchemyFormDemand(annotation_set_unlearned=self._annotation_set_unlearned(), waiting=waiting)
+
+    def _annotation_set_unlearned(self) -> bool:
+        """Return whether the alchemist offers annotation and no lane has reported a servable set to carry."""
+        bridge_data = self.bridge_data
+        if bridge_data.alchemist is not True or self._annotation_types_provider is None:
+            return False
+        annotation_configured = KNOWN_ALCHEMY_FORMS.annotation.value in expand_offered_forms(
+            bridge_data,
+            annotation_types=CLASSIC_CONTROL_TYPES | EXTENDED_CONTROL_TYPES,
+            presence=self._post_processor_presence(),
+        )
+        return annotation_configured and self._annotation_types_provider() is None
 
     @staticmethod
     def _decode_image_resolution(source_image_bytes: bytes) -> tuple[int, int] | None:
@@ -788,10 +816,14 @@ class AlchemyCoordinator:
             return False
 
         # Don't pop work no process can currently take. strip_background runs on the image-utilities lane,
-        # so that lane counts as a place work can land alongside the graph and CLIP lanes.
+        # so that lane counts as a place work can land alongside the graph and CLIP lanes, and so does a lane
+        # coming up, since a popped lane form starts it.
         graph_available = self._process_map.get_first_available(WorkerCapability.ALCHEMY_GRAPH) is not None
         clip_available = self._process_map.get_first_available(WorkerCapability.ALCHEMY_CLIP) is not None
-        utilities_available_lane = self._process_map.get_first_available(WorkerCapability.IMAGE_UTILITIES) is not None
+        utilities_available_lane = (
+            self._process_map.get_first_available(WorkerCapability.IMAGE_UTILITIES) is not None
+            or self._utilities_lane_coming_up()
+        )
         if not (graph_available or clip_available or utilities_available_lane):
             return False
 
@@ -809,12 +841,29 @@ class AlchemyCoordinator:
         return self._has_vram_headroom() and self._has_ram_headroom()
 
     def _utilities_lane_healthy(self) -> bool:
-        """Return True when an image-utilities lane process is up and past startup.
+        """Return True when an image-utilities lane process is up and past startup, or the lane will serve.
 
-        Gates the ``strip_background`` offer at pop time: the form has no in-graph fallback, so it must not
-        be advertised while no lane can serve it (a still-starting, ending, or absent lane).
+        Gates the lane-bound offers (``strip_background``, and ``annotation`` together with its control types)
+        at pop time. Neither form has an in-graph fallback. The lane runs only while work needs it, and a popped
+        form is that work, so the offer also stands while the lane is starting or down by policy and the demand
+        driver starts it on the next tick. A paused, crashed, refused or disabled lane withholds the offer.
         """
-        return self._process_map.num_loaded_utilities_processes() > 0
+        return self._process_map.num_loaded_utilities_processes() > 0 or self._utilities_lane_outlook() is (
+            UtilitiesLaneOutlook.WILL_SERVE
+        )
+
+    def _utilities_lane_outlook(self) -> UtilitiesLaneOutlook | None:
+        """Return whether a lane-bound form may wait for the image-utilities lane, or None without a provider."""
+        if self._utilities_lane_outlook_provider is None:
+            return None
+        return self._utilities_lane_outlook_provider()
+
+    def _utilities_lane_coming_up(self) -> bool:
+        """Return True when no image-utilities lane is loaded and one will serve once it starts."""
+        return (
+            self._process_map.num_loaded_utilities_processes() == 0
+            and self._utilities_lane_outlook() is UtilitiesLaneOutlook.WILL_SERVE
+        )
 
     def _post_process_lane_healthy(self) -> bool:
         """Return True when a dedicated post-processing lane process is up and past startup.
@@ -843,14 +892,15 @@ class AlchemyCoordinator:
         name would raise a validation error (crash-looping the pop loop) rather than a handled skip. An empty
         result withholds the form entirely: the server reads an absent or empty ``annotation_types`` as
         matching every type, so offering the form without a servable, nameable type would draw work no lane
-        here can produce.
+        here can produce. A provider that returns None (no set reported yet) withholds the form the same way.
         """
         if self._annotation_types_provider is None:
             return frozenset()
+        servable = self._annotation_types_provider()
+        if servable is None:
+            return frozenset()
         nameable = {member.value for member in KNOWN_ANNOTATION_CONTROL_TYPES}
-        return frozenset(
-            control_type for control_type in self._annotation_types_provider() if control_type in nameable
-        )
+        return frozenset(control_type for control_type in servable if control_type in nameable)
 
     def _post_processor_presence(self) -> PostProcessorPresence:
         """Return which post-processors the download process reports on disk; unknown withholds nothing."""
@@ -1275,8 +1325,10 @@ class AlchemyCoordinator:
         on any available capable process rather than stranded.
 
         A form nothing can take waits for its lane until its deadline, then goes back to the horde faulted
-        (:meth:`_fault_undispatchable_form`): the offer gate only ever advertises forms whose lane is up, so
-        a form that outlives the deadline is one whose lane went away after the pop and has not returned.
+        (:meth:`_fault_undispatchable_form`). The offer gate advertises graph and CLIP forms only while their
+        lane is up, so such a form that outlives the deadline is one whose lane went away after the pop and has
+        not returned. A lane-bound form popped while the image-utilities lane is down waits on a tighter bound
+        (:meth:`_utilities_lane_fault_cause`).
         """
         still_pending: deque[AlchemyFormSpec] = deque()
         now = time.monotonic()
@@ -1306,16 +1358,56 @@ class AlchemyCoordinator:
                 )
                 continue
 
+            if capability is WorkerCapability.IMAGE_UTILITIES:
+                lane_fault_cause = self._utilities_lane_fault_cause(spec)
+                if lane_fault_cause is not None:
+                    self._fault_undispatchable_form(spec, capability, cause=lane_fault_cause)
+                    continue
             deadline = self._pending_form_deadlines.get(spec.form_id)
             if deadline is not None and now >= deadline:
-                self._fault_undispatchable_form(spec, capability)
+                self._fault_undispatchable_form(spec, capability, cause=_UndispatchableCause.DEADLINE_PASSED)
                 continue
             still_pending.append(spec)
 
         self._pending_forms = still_pending
 
-    def _fault_undispatchable_form(self, spec: AlchemyFormSpec, capability: WorkerCapability) -> None:
-        """Hand a form back to the horde faulted after its dispatch deadline passed with no process to take it.
+    def _utilities_lane_fault_cause(self, spec: AlchemyFormSpec) -> _UndispatchableCause | None:
+        """Return why a lane-bound form no process took must be faulted now, or None while it may wait.
+
+        A loaded lane busy with another form, and a lane a reclaim or residency owner holds down, keep the
+        dispatch deadline as before. A lane that is starting or down by policy is started by the demand driver,
+        and the form waits for it as long as an extended-ControlNet job waits for the lane
+        (:func:`~horde_worker_regen.process_management.scheduling.dispatch_affinity.utilities_lane_hold_expired`).
+        The form's dispatch deadline stands in for a ttl and there is no sampling figure, so the wait ends at the
+        anti-starvation share of the deadline, which covers a lane start and a cold first pass. A lane that
+        crashed, whose start was refused, or that was disabled is not coming up, so the form is faulted at once
+        and the horde reissues it to a worker that can serve it.
+        """
+        if self._process_map.num_loaded_utilities_processes() > 0:
+            return None
+        match self._utilities_lane_outlook():
+            case UtilitiesLaneOutlook.WILL_SERVE:
+                hold_expired = utilities_lane_hold_expired(
+                    now=time.time(),
+                    popped_at=self._form_time_popped.get(spec.form_id),
+                    ttl=PENDING_FORM_DISPATCH_DEADLINE_SECONDS,
+                    recent_job_ttl=None,
+                    expected_sampling_seconds=None,
+                )
+                return _UndispatchableCause.LANE_HOLD_EXPIRED if hold_expired else None
+            case UtilitiesLaneOutlook.UNAVAILABLE:
+                return _UndispatchableCause.LANE_UNAVAILABLE
+            case UtilitiesLaneOutlook.PAUSED | None:
+                return None
+
+    def _fault_undispatchable_form(
+        self,
+        spec: AlchemyFormSpec,
+        capability: WorkerCapability,
+        *,
+        cause: _UndispatchableCause,
+    ) -> None:
+        """Hand a form back to the horde faulted when no process will take it in time.
 
         Nothing else expires a pending form, and a pending form holds one of the ``queue_size`` slots the pop
         gate counts, so a form whose lane never returns would stop the flow popping anything else for the rest
@@ -1338,10 +1430,19 @@ class AlchemyCoordinator:
                 time_popped=time_popped,
             ),
         )
+        match cause:
+            case _UndispatchableCause.DEADLINE_PASSED:
+                why = (
+                    f"passed its {PENDING_FORM_DISPATCH_DEADLINE_SECONDS:.0f}s dispatch deadline with no "
+                    f"{capability.name} process able to take it"
+                )
+            case _UndispatchableCause.LANE_HOLD_EXPIRED:
+                why = "waited longer than the lane hold allows for the image-utilities lane to start"
+            case _UndispatchableCause.LANE_UNAVAILABLE:
+                why = "needs the image-utilities lane, which crashed, was refused a start or is disabled"
         logger.warning(
-            f"Alchemy form {spec.form_id} ({spec.form}) passed its "
-            f"{PENDING_FORM_DISPATCH_DEADLINE_SECONDS:.0f}s dispatch deadline with no {capability.name} "
-            "process able to take it; faulting it back to the horde so another worker can serve it.",
+            f"Alchemy form {spec.form_id} ({spec.form}) {why}; faulting it back to the horde so another worker "
+            "can serve it.",
         )
 
     def _reap_lost_in_flight_forms(self) -> None:

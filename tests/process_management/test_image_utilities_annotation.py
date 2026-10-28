@@ -31,6 +31,9 @@ from loguru import logger
 
 from horde_worker_regen.consts import EXTENDED_CONTROL_TYPES
 from horde_worker_regen.process_management.ipc.messages import (
+    AlchemyFormSpec,
+    HordeAlchemyControlMessage,
+    HordeAlchemyResultMessage,
     HordeAnnotationResultMessage,
     HordeAnnotatorAvailabilityMessage,
     HordeControlFlag,
@@ -50,6 +53,7 @@ from horde_worker_regen.process_management.jobs.alchemy_popper import expand_off
 from horde_worker_regen.process_management.jobs.job_tracker import JobStage, JobTracker
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
+from horde_worker_regen.process_management.lifecycle.process_lifecycle import PauseOwner
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.process_manager import HordeWorkerProcessManager
@@ -59,6 +63,8 @@ from horde_worker_regen.process_management.scheduling.dispatch_affinity import (
     fallback_ttl_seconds,
 )
 from horde_worker_regen.process_management.scheduling.slot_duty import SlotDutyBucket
+from horde_worker_regen.process_management.scheduling.workload_flow import routes_to_utilities_lane
+from horde_worker_regen.process_management.simulation._canned_scenarios import CannedAlchemySource
 from horde_worker_regen.process_management.worker_entry_points import ProcessEntryPoints
 from tests.process_management.conftest import (
     make_job_pop_response,
@@ -366,11 +372,51 @@ class TestLaneDisabled:
         assert not _sent(util).called
 
 
+def _alchemist_with_the_lane_down(
+    monkeypatch: pytest.MonkeyPatch, **bridge_overrides: object
+) -> HordeWorkerProcessManager:
+    """Build an alchemist offering post-processing and annotation, with the lane enabled, provisioned and down."""
+    monkeypatch.setattr(alchemy_popper, "strip_background_available", lambda: True)
+    monkeypatch.setattr(alchemy_popper, "server_supports_interrogation_form", lambda _form: True)
+    overrides: dict[str, object] = {
+        "enable_image_utilities": True,
+        "alchemist": True,
+        "forms": ["post-process", "annotation"],
+    }
+    overrides.update(bridge_overrides)
+    pm = make_testable_process_manager(**overrides)
+    lifecycle = pm._process_lifecycle
+    lifecycle._entry_points = ProcessEntryPoints(  # type: ignore[arg-type]
+        utilities_adapter_factory=lambda *_args, **_kwargs: _FakeAdapter(),
+    )
+    lifecycle._ctx.Pipe.return_value = (Mock(), Mock())
+    pm._download_coordinator.inference_processes_started = True
+    return pm
+
+
+def _lane_forms_offered(pm: HordeWorkerProcessManager) -> set[str]:
+    """Return the lane-bound forms the alchemy pop would offer now, read through the coordinator's live gates."""
+    coordinator = pm._alchemy_coordinator
+    offered = expand_offered_forms(
+        coordinator.bridge_data,
+        utilities_lane_healthy=coordinator._utilities_lane_healthy(),
+        annotation_types=coordinator._annotation_types(),
+    )
+    return {form for form in offered if routes_to_utilities_lane(form)}
+
+
+_STRIP_FORM = "strip_background"
+_ANNOTATION_FORM = "annotation"
+
+
 class TestStripPopGating:
-    """(f) The strip_background offer flips with the utilities lane's health."""
+    """(f) The lane-bound alchemy offers follow whether the lane serves or will serve."""
 
     def test_strip_offered_only_when_lane_healthy(self, monkeypatch) -> None:  # noqa: ANN001
-        """strip_background is offered when the lane is up and withheld when it is down."""
+        """The pure offer function keeps strip_background exactly when its lane reading allows it.
+
+        The reading the coordinator passes now means "the lane serves or will serve"; the rows below drive it.
+        """
         monkeypatch.setattr(alchemy_popper, "strip_background_available", lambda: True)
         bridge_data = make_mock_bridge_data(forms=["post-process"])
 
@@ -379,6 +425,92 @@ class TestStripPopGating:
 
         assert any(is_strip_background_form(form) for form in offered_healthy)
         assert not any(is_strip_background_form(form) for form in offered_unhealthy)
+
+    def test_strip_is_offered_while_the_lane_is_down_by_policy(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A lane that is down because nothing needs it will start for a popped strip, so the offer stands."""
+        pm = _alchemist_with_the_lane_down(monkeypatch)
+        assert pm._process_map.num_utilities_processes() == 0
+        assert pm._process_lifecycle.utilities_lane_will_serve()
+
+        assert _STRIP_FORM in _lane_forms_offered(pm)
+
+    def test_strip_is_offered_while_the_lane_is_loaded(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A loaded lane serves the form as before."""
+        pm = _alchemist_with_the_lane_down(monkeypatch)
+        _add_utilities_process(pm)
+
+        assert _STRIP_FORM in _lane_forms_offered(pm)
+
+    @pytest.mark.parametrize("lane_state", ["paused", "crashed", "start-refused", "disabled"])
+    def test_strip_is_withheld_while_the_lane_will_not_serve(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        lane_state: str,
+    ) -> None:
+        """A paused, crashed, refused or disabled lane is not coming up on demand, so the offer is withheld."""
+        pm = _alchemist_with_the_lane_down(monkeypatch)
+        lifecycle = pm._process_lifecycle
+        match lane_state:
+            case "paused":
+                lifecycle._utilities_gpu_paused = True
+                lifecycle._utilities_pause_owner = PauseOwner.RECLAIM_LADDER
+            case "crashed":
+                lifecycle._initiate_utilities_replacement()
+            case "start-refused":
+                lifecycle._utilities_demand_start_attempted = True
+            case "disabled":
+                pm.bridge_data.enable_image_utilities = False
+        assert not lifecycle.utilities_lane_will_serve()
+
+        assert _STRIP_FORM not in _lane_forms_offered(pm)
+
+    def test_annotation_is_not_offered_before_the_lane_has_reported_a_set(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """With no servable set learned this session the offer cannot carry any types, so it is withheld."""
+        pm = _alchemist_with_the_lane_down(monkeypatch)
+
+        assert _ANNOTATION_FORM not in _lane_forms_offered(pm)
+
+    def test_annotation_is_offered_from_the_set_kept_from_the_lanes_last_run(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A lane that reported its set and then left by policy leaves that set for the offer to carry."""
+        pm = _alchemist_with_the_lane_down(monkeypatch)
+        _add_utilities_process(pm)
+        _mark_servable(pm, ["canny", "depth"])
+        del pm._process_map[_UTILITIES_PROCESS_ID]
+        assert pm._servable_control_types() == frozenset(), "the live set is pruned with the lane"
+
+        assert _ANNOTATION_FORM in _lane_forms_offered(pm)
+        assert pm._alchemy_coordinator._annotation_types() == frozenset({"canny", "depth"})
+
+    def test_a_lane_crash_drops_the_kept_set(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """After a crash replacement the kept set is not offered, even once the lane will serve again."""
+        pm = _alchemist_with_the_lane_down(monkeypatch)
+        lifecycle = pm._process_lifecycle
+        _add_utilities_process(pm)
+        _mark_servable(pm, ["canny"])
+        del pm._process_map[_UTILITIES_PROCESS_ID]
+        lifecycle._initiate_utilities_replacement()
+        lifecycle._utilities_processes_should_be_replaced = False
+        assert lifecycle.utilities_lane_will_serve()
+
+        assert _ANNOTATION_FORM not in _lane_forms_offered(pm)
+
+    def test_disabling_the_lane_drops_the_kept_set(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A lane switched off and on again does not offer the set from before it was switched off."""
+        pm = _alchemist_with_the_lane_down(monkeypatch)
+        _add_utilities_process(pm)
+        _mark_servable(pm, ["canny"])
+        del pm._process_map[_UTILITIES_PROCESS_ID]
+        pm.bridge_data.enable_image_utilities = False
+        pm._reconcile_utilities_demand()
+        pm.bridge_data.enable_image_utilities = True
+
+        assert _ANNOTATION_FORM not in _lane_forms_offered(pm)
 
 
 class TestReturnControlMapDelivery:
@@ -1205,6 +1337,151 @@ class TestUtilitiesLaneOnDemandEnsemble:
         started = [reason for verdict, reason in decisions if verdict is DecisionVerdict.ADMIT]
         assert started == ["strip_only_job", "strip_only_job"]
         assert (DecisionVerdict.WITHHOLD, "no_demand") in decisions
+
+
+class _AlchemyLaneRig:
+    """An alchemist offering post-processing with the lane down, driven tick by tick through the real coordinator.
+
+    A tick runs the alchemy dispatch, the lane's replacement machine and the demand driver. The pop goes through
+    the coordinator's pop policy with a canned source, and only the VRAM and RAM headroom readings are stubbed.
+    """
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, *, device_free_mb: float = 24000.0) -> None:
+        self.pm = _alchemist_with_the_lane_down(
+            monkeypatch,
+            forms=["post-process"],
+            queue_size=1,
+            alchemy_max_concurrency=1,
+            alchemy_allow_concurrent=True,
+            device_free_mb=device_free_mb,
+        )
+        self.coordinator = self.pm._alchemy_coordinator
+        self.constructed: list[_FakeAdapter] = []
+
+        def _factory(*_args: object, **_kwargs: object) -> _FakeAdapter:
+            adapter = _FakeAdapter()
+            self.constructed.append(adapter)
+            return adapter
+
+        self.pm._process_lifecycle._entry_points = ProcessEntryPoints(  # type: ignore[arg-type]
+            utilities_adapter_factory=_factory,
+        )
+        monkeypatch.setattr(self.coordinator, "_has_vram_headroom", lambda: True)
+        monkeypatch.setattr(self.coordinator, "_has_ram_headroom", lambda: True)
+
+    def lane(self) -> HordeProcessInfo | None:
+        lanes = [info for info in self.pm._process_map.values() if info.process_type is HordeProcessType.UTILITIES]
+        return lanes[0] if lanes else None
+
+    def tick(self) -> None:
+        self.coordinator.dispatch_pending_forms()
+        self.pm._process_lifecycle._replace_all_utilities_process()
+        self.pm._reconcile_utilities_demand()
+
+    def pop_strip_form(self) -> AlchemyFormSpec:
+        spec = AlchemyFormSpec(form_id=str(uuid.uuid4()), form=_STRIP_FORM, source_image_bytes=b"source")
+        self.coordinator.set_canned_alchemy_source(CannedAlchemySource([spec]))
+        self.coordinator._canned_alchemy_pop()
+        return spec
+
+
+class TestAlchemyStripWithTheLaneDown:
+    """A strip form offered and popped while the lane is down by policy starts the lane and waits for it."""
+
+    async def test_a_popped_strip_form_starts_the_lane_and_is_served(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The offer stands with the lane down, the pop starts it, the form waits and goes to the loaded lane."""
+        rig = _AlchemyLaneRig(monkeypatch)
+        for _ in range(3):
+            rig.tick()
+        assert rig.constructed == [], "an offer alone does not start the lane"
+        assert _STRIP_FORM in _lane_forms_offered(rig.pm)
+
+        spec = rig.pop_strip_form()
+        assert [pending.form_id for pending in rig.coordinator._pending_forms] == [spec.form_id]
+
+        rig.tick()
+        assert len(rig.constructed) == 1, "the popped form starts the lane"
+        lane = rig.lane()
+        assert lane is not None
+        for _ in range(3):
+            rig.tick()
+        assert [pending.form_id for pending in rig.coordinator._pending_forms] == [spec.form_id], "the form waits"
+        assert len(rig.coordinator._pending_submits) == 0
+        assert not _sent(lane).called
+
+        lane.last_process_state = HordeProcessState.WAITING_FOR_JOB
+        rig.tick()
+        assert len(rig.coordinator._pending_forms) == 0
+        sent = _sent(lane).call_args.args[0]
+        assert isinstance(sent, HordeAlchemyControlMessage)
+        assert sent.control_flag is HordeControlFlag.START_ALCHEMY
+        assert sent.form.form_id == spec.form_id
+
+        rig.coordinator.on_alchemy_result(
+            HordeAlchemyResultMessage(
+                process_id=lane.process_id,
+                process_launch_identifier=lane.process_launch_identifier,
+                info="stripped",
+                form_id=spec.form_id,
+                form=spec.form,
+                state=GENERATION_STATE.ok,
+            ),
+        )
+        assert [submit.result_message.state for submit in rig.coordinator._pending_submits] == [GENERATION_STATE.ok]
+        assert len(rig.constructed) == 1
+
+    async def test_a_lane_start_refused_for_vram_faults_the_popped_form(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A lane whose start is deferred for VRAM is not coming up, so the form goes back to the horde."""
+        rig = _AlchemyLaneRig(monkeypatch, device_free_mb=100.0)
+        assert _STRIP_FORM in _lane_forms_offered(rig.pm)
+        spec = rig.pop_strip_form()
+
+        for _ in range(3):
+            rig.tick()
+
+        assert rig.constructed == []
+        assert rig.pm._process_lifecycle.has_pending_gpu_starts()
+        assert len(rig.coordinator._pending_forms) == 0
+        faulted = [submit.result_message for submit in rig.coordinator._pending_submits]
+        assert [(message.form_id, message.state) for message in faulted] == [(spec.form_id, GENERATION_STATE.faulted)]
+        assert _STRIP_FORM not in _lane_forms_offered(rig.pm), "the offer is withheld while the start is deferred"
+
+    def test_an_annotation_alchemist_starts_the_lane_once_to_learn_its_set(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """With no set learned the lane starts, and once it has reported, annotation is offered with it down."""
+        rig = _AlchemyLaneRig(monkeypatch)
+        rig.pm.bridge_data.forms = ["annotation"]
+        assert _ANNOTATION_FORM not in _lane_forms_offered(rig.pm)
+
+        rig.tick()
+        assert len(rig.constructed) == 1, "the annotation offer needs a set, so the lane starts to report one"
+        lane = rig.lane()
+        assert lane is not None
+        lane.last_process_state = HordeProcessState.WAITING_FOR_JOB
+        rig.pm._on_annotator_availability(
+            HordeAnnotatorAvailabilityMessage(
+                process_id=lane.process_id,
+                process_launch_identifier=lane.process_launch_identifier,
+                info="availability",
+                servable_control_types=["canny"],
+            ),
+        )
+        assert rig.pm._process_lifecycle.utilities_lane_demand() is None, "the rule lapses at the first report"
+
+        assert rig.pm._inference_scheduler.pause_utilities_lane(None) is True
+        for _ in range(4):
+            rig.tick()
+        assert rig.lane() is None
+        assert rig.pm._inference_scheduler.restore_utilities_lane(None) is True
+        for _ in range(3):
+            rig.tick()
+        assert rig.lane() is None, "with nothing waiting the restore leaves the lane down"
+        assert len(rig.constructed) == 1
+
+        assert _ANNOTATION_FORM in _lane_forms_offered(rig.pm)
+        assert rig.coordinator._annotation_types() == frozenset({"canny"})
 
 
 class _ExtendedLaneRig:

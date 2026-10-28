@@ -190,8 +190,9 @@ def job_wants_pre_annotation(job: ImageGenerateJobPopResponse) -> bool:
 class UtilitiesLaneDemandReason(enum.StrEnum):
     """Why the image-utilities lane should be up: the first rule of :func:`utilities_lane_demand` that holds."""
 
-    ALCHEMY_FORM_WARM = "alchemy_form_warm"
-    """The alchemist offers a form that runs on the lane, and the offer needs a live lane."""
+    ALCHEMY_ANNOTATION_UNLEARNED = "alchemy_annotation_unlearned"
+    """The alchemist offers annotation and no lane has reported a servable set since the session began or the
+    kept set was dropped, so the offer cannot carry any control types until the lane runs once."""
     PENDING_STRIP = "pending_strip"
     """A job waits for or runs its background strip."""
     STRIP_ONLY_JOB = "strip_only_job"
@@ -207,10 +208,21 @@ class UtilitiesLaneDemandReason(enum.StrEnum):
 class AlchemyFormDemand:
     """The alchemy flow's part of the image-utilities lane's demand, as plain form names."""
 
-    offerable: frozenset[str] = frozenset()
-    """Every form the alchemist would offer with each lane up and every annotator servable."""
+    annotation_set_unlearned: bool = False
+    """The alchemist offers annotation and no servable control-type set is known to carry in the offer."""
     waiting: tuple[str, ...] = ()
     """The forms pending dispatch or in flight, one entry per form."""
+
+
+class UtilitiesLaneOutlook(enum.StrEnum):
+    """Whether a lane-bound alchemy form may wait for the image-utilities lane, read by the alchemy flow."""
+
+    WILL_SERVE = "will_serve"
+    """The lane is up, coming up, or down by policy and started on demand."""
+    PAUSED = "paused"
+    """A reclaim or residency owner holds the lane down and restores it when its episode ends."""
+    UNAVAILABLE = "unavailable"
+    """The lane crashed, its start was refused, it is disabled, or the worker is shutting down."""
 
 
 @dataclass(frozen=True)
@@ -240,20 +252,25 @@ def utilities_lane_demand(inputs: UtilitiesLaneDemandInputs) -> UtilitiesLaneDem
     The rules, first match wins:
 
     1. A disabled, unwanted or unprovisioned lane, or a worker shutting down, is never wanted.
-    2. Warm requirement: an offerable alchemy form that routes to the lane, since an alchemy offer of a lane
-       form needs a live lane.
+    2. An alchemist offering annotation with no servable set learned. The alchemy offer stands while the lane is
+       down by policy (``strip_background`` always, ``annotation`` with the set kept from the lane's last run),
+       so the lane is not kept warm for an offer. The annotation offer must name control types, though, and only
+       a lane run reports them. Strips and ControlNet jobs arrive with traffic, and no setting promises that one
+       will start the lane, so an annotation alchemist could go a whole session without one. This rule starts
+       the lane once to learn the set and lapses at the lane's first report.
     3. A job in ``PENDING_STRIP``.
     4. A job pending or in inference whose post-processing is background removal alone. Its lead (queue wait
        plus generation) covers a lane start. A job with an upscaler or face fixer counts from rule 3 only, so
        its own post-processing chain does not find a lane started for it and stop it again.
     5. A ControlNet pre-annotation candidate, or a job in ``PENDING_ANNOTATION``. Extended-ControlNet jobs
        count here, so the lane starts at their pop and dispatch holds them until it can serve their type.
-    6. A lane-bound alchemy form pending or in flight.
+    6. A lane-bound alchemy form pending or in flight. The alchemy offer stands while the lane is down by
+       policy, so a popped form starts the lane through this rule and waits for it at dispatch.
     """
     if not inputs.lane_available or inputs.shutting_down:
         return None
-    if any(routes_to_utilities_lane(form) for form in inputs.alchemy.offerable):
-        return UtilitiesLaneDemandReason.ALCHEMY_FORM_WARM
+    if inputs.alchemy.annotation_set_unlearned:
+        return UtilitiesLaneDemandReason.ALCHEMY_ANNOTATION_UNLEARNED
     if inputs.jobs_pending_strip > 0:
         return UtilitiesLaneDemandReason.PENDING_STRIP
     if inputs.strip_only_jobs_before_strip > 0:

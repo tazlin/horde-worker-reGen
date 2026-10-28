@@ -200,7 +200,10 @@ Alchemy applies that rule to all three of its families at once, keyed on the cap
 `strip_background` and `annotation` need the image-utilities lane, and the CLIP-stack forms (caption,
 interrogation, nsfw, aesthetic and the rest) need the safety process. No form has a second home, so each family
 leaves the offer while its own lane is down and returns when it is back. The offer and the dispatch read the
-same routing table, so the worker cannot advertise a form it would then have nowhere to send.
+same routing table, so the worker cannot advertise a form it would then have nowhere to send. The image-utilities
+lane runs only while work needs it, so its forms stay offered while it is down by policy and a popped form starts
+it and waits for it on a tighter bound than the deadline below (see
+[Image utilities lane](image_utilities_lane.md#alchemy-forms)).
 
 A lane can also go away *after* a form is popped, and the form then sits in the alchemy coordinator's pending
 queue holding one of the `queue_size` slots the pop gate counts. Each pending form therefore carries a

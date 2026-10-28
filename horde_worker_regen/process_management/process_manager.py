@@ -300,6 +300,7 @@ from horde_worker_regen.process_management.scheduling.pop_throttler import CONSE
 from horde_worker_regen.process_management.scheduling.slot_duty import SlotDutyAccumulator
 from horde_worker_regen.process_management.scheduling.workload_flow import (
     FlowCoordinator,
+    UtilitiesLaneOutlook,
     WorkloadKind,
     job_wants_pre_annotation,
 )
@@ -1688,6 +1689,12 @@ class HordeWorkerProcessManager:
         # id, learned from the lane's availability snapshots. The pre-annotation scan keys on the union of
         # these; an entry is pruned when its process leaves the map so a dead lane never appears servable.
         self._annotator_servable_types: dict[int, frozenset[str]] = {}
+        # The servable set the lane reported on its last run, kept after the lane leaves the map so the alchemy
+        # annotation offer can stand while the lane is down by policy. None until a lane reports this session, and
+        # dropped back to None by a crash replacement or a disabled lane. The replacement count is the lifecycle's
+        # unintended-replacement count when the set was noted.
+        self._kept_servable_control_types: frozenset[str] | None = None
+        self._kept_servable_replacement_count = 0
         # Whether each extended control type's annotator weights are on disk, probed once per type and cleared when
         # the download process reports a change in ControlNet or post-processor presence.
         self._extended_annotator_presence: dict[str, bool] = {}
@@ -2123,8 +2130,9 @@ class HordeWorkerProcessManager:
             reserve_ledger=self._reserve_ledger,
             canned_alchemy_source=canned_alchemy_source,
             run_metrics=self._run_metrics,
-            annotation_types_provider=self._servable_control_types,
+            annotation_types_provider=self._alchemy_annotation_types,
             model_availability=self._model_availability,
+            utilities_lane_outlook_provider=self._utilities_lane_outlook,
         )
         self._message_dispatcher.set_alchemy_result_handler(self._alchemy_coordinator.on_alchemy_result)
         self._message_dispatcher.set_annotation_result_handler(self._on_annotation_result)
@@ -4109,7 +4117,11 @@ class HordeWorkerProcessManager:
         Waits for the boot bring-up, which starts the lanes once their models can be on disk, so the lane is never
         started ahead of the pool it serves. The decision record opens while the lane is held down for want of
         demand and resolves with the demand that started it.
+
+        The kept servable set is checked first on every tick, so a lane disabled and enabled again between two
+        alchemy pops still drops the set from before.
         """
+        self._kept_servable_set()
         if not self._download_coordinator.inference_processes_started:
             return
         outcome = self._process_lifecycle.reconcile_utilities_demand(pause_stranded=self._utilities_pause_stranded())
@@ -4911,6 +4923,49 @@ class HordeWorkerProcessManager:
             servable |= types
         return frozenset(servable)
 
+    def _kept_servable_set(self) -> frozenset[str] | None:
+        """Return the servable set kept from the lane's last run, or None when none is known.
+
+        The set is dropped when the lane is disabled or was replaced after a crash or a hang since the set was
+        noted, so a lane that comes back after either reports its set afresh before annotation is offered from it.
+        """
+        lifecycle = self._process_lifecycle
+        lane_lost = (
+            not lifecycle.utilities_process_enabled()
+            or lifecycle.utilities_unintended_replacements != self._kept_servable_replacement_count
+        )
+        if lane_lost:
+            self._kept_servable_control_types = None
+        return self._kept_servable_control_types
+
+    def _alchemy_annotation_types(self) -> frozenset[str] | None:
+        """Return the control types the alchemy annotation offer may carry now, or None when none is known.
+
+        A live lane that has reported answers with its set. Without one, the set kept from the lane's last run
+        stands while the lane will serve (:meth:`ProcessLifecycleManager.utilities_lane_will_serve`), since a
+        popped annotation form starts the lane and waits for it. A lane that will not serve gives an empty set.
+        None means no lane has reported a set since the session began or the kept set was dropped, which the
+        alchemy flow reports as lane demand so the lane starts once to report it.
+        """
+        kept = self._kept_servable_set()
+        live = self._servable_control_types()
+        if self._annotator_servable_types:
+            return live
+        if kept is None:
+            return None
+        if self._process_lifecycle.utilities_lane_will_serve():
+            return kept
+        return frozenset()
+
+    def _utilities_lane_outlook(self) -> UtilitiesLaneOutlook:
+        """Return whether a lane-bound alchemy form may wait for the image-utilities lane."""
+        lifecycle = self._process_lifecycle
+        if lifecycle.utilities_lane_will_serve():
+            return UtilitiesLaneOutlook.WILL_SERVE
+        if lifecycle.utilities_process_enabled() and lifecycle.utilities_pause_owner is not None:
+            return UtilitiesLaneOutlook.PAUSED
+        return UtilitiesLaneOutlook.UNAVAILABLE
+
     def _extended_controlnet_ready(self) -> bool:
         """Return whether every extended controlnet type can be served now or once the lane is up (fail-closed).
 
@@ -5141,8 +5196,10 @@ class HordeWorkerProcessManager:
         )
 
     def _on_annotator_availability(self, message: HordeAnnotatorAvailabilityMessage) -> None:
-        """Cache which control types the reporting image-utilities lane can annotate right now."""
+        """Cache which control types the reporting image-utilities lane can annotate right now, and keep the set."""
         self._annotator_servable_types[message.process_id] = frozenset(message.servable_control_types)
+        self._kept_servable_control_types = self._servable_control_types()
+        self._kept_servable_replacement_count = self._process_lifecycle.utilities_unintended_replacements
 
     def _on_annotation_result(self, message: HordeAnnotationResultMessage) -> None:
         """Release a parked job on an annotation result.

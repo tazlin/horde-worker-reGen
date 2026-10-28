@@ -837,6 +837,7 @@ class ProcessLifecycleManager:
         # Marks the *next* image-utilities-lane rebuild as a deliberate cycle (an operator recycle), so its
         # completion is not counted as a crash recovery (mirrors ``_post_process_replacement_intentional``).
         self._utilities_replacement_intentional = False
+        self._utilities_unintended_replacements = 0
         # Runtime override forcing the safety process off-GPU (cpu_only) even when safety_on_gpu is configured.
         # Whole-card residency, verified reclaim, and runtime fit policy request this through one scheduler
         # reconciler so the safety process's CUDA context is freed without overlapping replacement cycles.
@@ -2489,7 +2490,18 @@ class ProcessLifecycleManager:
 
     def _initiate_utilities_replacement(self) -> None:
         """Flag the image-utilities lane for replacement so the control loop's state machine restarts it."""
+        if not self._utilities_processes_should_be_replaced and not self._utilities_replacement_intentional:
+            self._utilities_unintended_replacements += 1
         self._utilities_processes_should_be_replaced = True
+
+    @property
+    def utilities_unintended_replacements(self) -> int:
+        """Return how many times this session the image-utilities lane was replaced after a crash or a hang.
+
+        A ladder pause and an operator recycle mark their replacement intentional and are not counted. A reader
+        compares the count against the value it noted earlier to tell whether the lane crashed since then.
+        """
+        return self._utilities_unintended_replacements
 
     def _replace_all_utilities_process(self) -> None:
         """Replace the dedicated image-utilities process across control-loop ticks.

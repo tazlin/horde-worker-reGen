@@ -49,10 +49,15 @@ def test_an_enabled_lane_with_nothing_to_serve_is_not_wanted() -> None:
     [
         _with(lane_available=False, jobs_pending_strip=1),
         _with(shutting_down=True, jobs_pending_strip=1),
-        _with(lane_available=False, alchemy=AlchemyFormDemand(offerable=frozenset({_STRIP}))),
-        _with(shutting_down=True, alchemy=AlchemyFormDemand(offerable=frozenset({_STRIP}))),
+        _with(lane_available=False, alchemy=AlchemyFormDemand(annotation_set_unlearned=True)),
+        _with(shutting_down=True, alchemy=AlchemyFormDemand(annotation_set_unlearned=True)),
     ],
-    ids=["unavailable-with-a-strip", "shutting-down-with-a-strip", "unavailable-warm", "shutting-down-warm"],
+    ids=[
+        "unavailable-with-a-strip",
+        "shutting-down-with-a-strip",
+        "unavailable-annotation-unlearned",
+        "shutting-down-annotation-unlearned",
+    ],
 )
 def test_a_disabled_lane_or_a_shutdown_wins_over_every_demand(inputs: UtilitiesLaneDemandInputs) -> None:
     """Rule 1 is checked first, so no later rule brings up a lane that cannot or must not run."""
@@ -74,17 +79,16 @@ def test_a_pending_extended_controlnet_job_is_demand(control_type: str) -> None:
     assert utilities_lane_demand(_with(pre_annotation_candidates=1)) is UtilitiesLaneDemandReason.CONTROLNET_ANNOTATION
 
 
-@pytest.mark.parametrize("form", [_STRIP, _ANNOTATION], ids=["strip_background", "annotation"])
-def test_an_offerable_lane_form_keeps_the_lane_warm(form: str) -> None:
-    """Every form the routing sends to the lane counts, read through the routing itself."""
-    inputs = _with(alchemy=AlchemyFormDemand(offerable=frozenset({_CAPTION, form})))
-    assert utilities_lane_demand(inputs) is UtilitiesLaneDemandReason.ALCHEMY_FORM_WARM
+def test_an_alchemy_offer_does_not_keep_the_lane_warm() -> None:
+    """The alchemy offer stands while the lane is down by policy, so the predicate reads no offered forms."""
+    assert "offerable" not in {field.name for field in dataclasses.fields(AlchemyFormDemand)}
+    assert all("warm" not in reason.value for reason in UtilitiesLaneDemandReason)
 
 
-def test_offerable_forms_served_elsewhere_do_not_keep_the_lane_warm() -> None:
-    """Caption and upscaler forms run on other lanes, so they do not want this one."""
-    inputs = _with(alchemy=AlchemyFormDemand(offerable=frozenset({_CAPTION, _UPSCALER})))
-    assert utilities_lane_demand(inputs) is None
+def test_an_annotation_alchemist_with_no_learned_set_starts_the_lane_once() -> None:
+    """The annotation offer needs the lane's servable set, and only a lane run reports it."""
+    inputs = _with(alchemy=AlchemyFormDemand(annotation_set_unlearned=True))
+    assert utilities_lane_demand(inputs) is UtilitiesLaneDemandReason.ALCHEMY_ANNOTATION_UNLEARNED
 
 
 def test_a_job_pending_its_strip_is_demand() -> None:
@@ -141,14 +145,17 @@ def test_forms_waiting_for_other_lanes_are_not_demand() -> None:
 def test_the_first_rule_that_holds_names_the_reason() -> None:
     """With every rule holding, the reason follows the documented order."""
     every_rule = _with(
-        alchemy=AlchemyFormDemand(offerable=frozenset({_STRIP}), waiting=(_STRIP,)),
+        alchemy=AlchemyFormDemand(annotation_set_unlearned=True, waiting=(_STRIP,)),
         jobs_pending_strip=1,
         strip_only_jobs_before_strip=1,
         pre_annotation_candidates=1,
         jobs_pending_annotation=1,
     )
     expected_order = [
-        (UtilitiesLaneDemandReason.ALCHEMY_FORM_WARM, {"alchemy": AlchemyFormDemand(waiting=(_STRIP,))}),
+        (
+            UtilitiesLaneDemandReason.ALCHEMY_ANNOTATION_UNLEARNED,
+            {"alchemy": AlchemyFormDemand(waiting=(_STRIP,))},
+        ),
         (UtilitiesLaneDemandReason.PENDING_STRIP, {"jobs_pending_strip": 0}),
         (UtilitiesLaneDemandReason.STRIP_ONLY_JOB, {"strip_only_jobs_before_strip": 0}),
         (

@@ -36,6 +36,8 @@ from horde_worker_regen.process_management.jobs.job_models import PendingAlchemy
 from horde_worker_regen.process_management.lifecycle.horde_process import WorkerCapability
 from horde_worker_regen.process_management.models.model_availability import PostProcessorPresence
 from horde_worker_regen.process_management.resources.resource_budget import CommittedReserveLedger
+from horde_worker_regen.process_management.scheduling.dispatch_affinity import ANTI_STARVATION_TTL_FRACTION
+from horde_worker_regen.process_management.scheduling.workload_flow import UtilitiesLaneOutlook
 
 
 class _RecordingQueue:
@@ -677,6 +679,10 @@ class _StubProcessMap:
         self.available = available
         self.free_vram_mb = free_vram_mb
         self.requested_capabilities: list[WorkerCapability] = []
+        self.loaded_utilities_processes = 0
+
+    def num_loaded_utilities_processes(self) -> int:
+        return self.loaded_utilities_processes
 
     def get_first_available(
         self,
@@ -876,6 +882,92 @@ class TestAlchemyDispatch:
         submit = coordinator._pending_submits[0]
         assert submit.submit_result == {"nsfw": False}
         assert submit.time_popped == 123.0
+
+
+_LANE_HOLD_SECONDS = ANTI_STARVATION_TTL_FRACTION * alchemy_popper.PENDING_FORM_DISPATCH_DEADLINE_SECONDS
+"""How long a lane-bound form waits for a lane that is not loaded: the anti-starvation share of its deadline."""
+
+
+def _lane_form_waiting(
+    outlook: UtilitiesLaneOutlook,
+    *,
+    popped_seconds_ago: float = 0.0,
+    loaded_utilities_processes: int = 0,
+) -> AlchemyCoordinator:
+    """Queue one strip form with no image-utilities process available and the lane reading ``outlook``."""
+    process_map = _StubProcessMap({})
+    process_map.loaded_utilities_processes = loaded_utilities_processes
+    coordinator = _make_coordinator(process_map)
+    coordinator._utilities_lane_outlook_provider = lambda: outlook
+    coordinator._queue_pending_form(
+        AlchemyFormSpec(form_id="form-1", form="strip_background", source_image_bytes=b"hi"),
+    )
+    coordinator._form_time_popped["form-1"] = time.time() - popped_seconds_ago
+    return coordinator
+
+
+class TestLaneBoundFormDispatch:
+    """A strip form popped while the image-utilities lane is down waits for it on the lane hold."""
+
+    def test_a_form_waits_while_the_lane_comes_up(self) -> None:
+        """The demand driver starts the lane, so the form stays queued inside the hold."""
+        coordinator = _lane_form_waiting(UtilitiesLaneOutlook.WILL_SERVE, popped_seconds_ago=_LANE_HOLD_SECONDS - 5)
+
+        coordinator.dispatch_pending_forms()
+
+        assert [spec.form_id for spec in coordinator._pending_forms] == ["form-1"]
+        assert len(coordinator._pending_submits) == 0
+
+    def test_a_form_past_the_lane_hold_is_faulted(self) -> None:
+        """The hold ends at the anti-starvation share of the form's deadline, well before the deadline."""
+        coordinator = _lane_form_waiting(UtilitiesLaneOutlook.WILL_SERVE, popped_seconds_ago=_LANE_HOLD_SECONDS + 1)
+        assert coordinator._pending_form_deadlines["form-1"] > time.monotonic()
+
+        coordinator.dispatch_pending_forms()
+
+        assert len(coordinator._pending_forms) == 0
+        assert [submit.result_message.state for submit in coordinator._pending_submits] == [GENERATION_STATE.faulted]
+
+    def test_a_form_is_faulted_at_once_when_the_lane_will_not_come_up(self) -> None:
+        """A crashed, refused or disabled lane is not waited for."""
+        coordinator = _lane_form_waiting(UtilitiesLaneOutlook.UNAVAILABLE)
+
+        coordinator.dispatch_pending_forms()
+
+        assert len(coordinator._pending_forms) == 0
+        assert [submit.result_message.state for submit in coordinator._pending_submits] == [GENERATION_STATE.faulted]
+        assert coordinator._pending_form_deadlines == {}
+
+    def test_a_form_waits_out_a_pause_on_its_deadline(self) -> None:
+        """A paused lane is restored by its owner, so the form keeps the dispatch deadline as before."""
+        coordinator = _lane_form_waiting(UtilitiesLaneOutlook.PAUSED, popped_seconds_ago=_LANE_HOLD_SECONDS + 1)
+
+        coordinator.dispatch_pending_forms()
+
+        assert [spec.form_id for spec in coordinator._pending_forms] == ["form-1"]
+        assert len(coordinator._pending_submits) == 0
+
+    def test_a_form_waits_for_a_busy_loaded_lane_on_its_deadline(self) -> None:
+        """A loaded lane serving another form is not a lane coming up, so the hold does not apply."""
+        coordinator = _lane_form_waiting(
+            UtilitiesLaneOutlook.UNAVAILABLE,
+            popped_seconds_ago=_LANE_HOLD_SECONDS + 1,
+            loaded_utilities_processes=1,
+        )
+
+        coordinator.dispatch_pending_forms()
+
+        assert [spec.form_id for spec in coordinator._pending_forms] == ["form-1"]
+        assert len(coordinator._pending_submits) == 0
+
+    def test_without_a_lane_reading_a_form_keeps_the_deadline(self) -> None:
+        """A coordinator built without the lane provider waits on the deadline as before."""
+        coordinator = _lane_form_waiting(UtilitiesLaneOutlook.UNAVAILABLE, popped_seconds_ago=_LANE_HOLD_SECONDS + 1)
+        coordinator._utilities_lane_outlook_provider = None
+
+        coordinator.dispatch_pending_forms()
+
+        assert [spec.form_id for spec in coordinator._pending_forms] == ["form-1"]
 
 
 class TestAnnotationTypesProvider:

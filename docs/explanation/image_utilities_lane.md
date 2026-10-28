@@ -104,9 +104,12 @@ up and why. Its rules, first match wins:
 
 1. A lane that is disabled, not wanted by the configured workloads or not provisioned, or a worker shutting
    down, is never wanted.
-2. Warm requirement. An alchemist that would offer a form `capability_for_alchemy_form` routes to the lane
-   (`strip_background`, `annotation`) keeps the lane up, since that offer needs a live lane. The
-   extended-ControlNet opt-in does not keep it up (see [Extended ControlNet](#extended-controlnet)).
+2. An alchemist offering `annotation` before any lane has reported a servable set this session, or since the
+   kept set was dropped. No offer keeps the lane up (see [Alchemy forms](#alchemy-forms)), but the annotation
+   offer has to name control types and only a lane run reports them. Strips and ControlNet jobs are traffic, so
+   no setting promises another start, and this rule starts the lane once to learn the set. It lapses at the
+   lane's first report. The extended-ControlNet opt-in does not keep the lane up either (see
+   [Extended ControlNet](#extended-controlnet)).
 3. A job in `PENDING_STRIP`.
 4. A job pending or in inference whose post-processing is background removal alone. Its queue wait and
    generation cover a lane start. A job that also asks for an upscaler or face fixer counts from rule 3 only,
@@ -114,7 +117,8 @@ up and why. Its rules, first match wins:
    for it and stop it again.
 5. A ControlNet job that wants pre-annotation and has not been offered to the lane, or a job in
    `PENDING_ANNOTATION`. An extended-ControlNet job with a source image counts here like any other.
-6. A lane-bound alchemy form pending dispatch or in flight.
+6. A lane-bound alchemy form pending dispatch or in flight. The form was offered and popped with the lane
+   down, so this rule is what starts the lane for it.
 
 Every start goes through `ProcessLifecycleManager.start_utilities_processes`, which refuses without demand: the
 boot bring-up, a VRAM-deferred retry (dropped once the demand lapses), the replacement's final start after a
@@ -139,6 +143,28 @@ claims it, held for the stranded-lane debounce) is restored by the driver once a
 A lane that is down because nothing needs it is not a failure. Recovery, the hung-process watchdog and the
 crash reaper act on processes in the map only, the strip and annotation stages wait or fall through as they do
 while the lane restarts, and the dashboard's process table lists the lane only while it runs.
+
+### Alchemy forms
+
+The alchemy forms that route to the lane (`strip_background`, `annotation`) have no other home, but a lane that
+is down by policy starts for a popped form, so the offer does not need a live lane. The alchemy pop gate
+(`AlchemyCoordinator._utilities_lane_healthy`) offers them while a lane is loaded or while
+`utilities_lane_will_serve` holds, and withholds them while the lane is paused, crashed, refused for VRAM or
+disabled.
+
+`annotation` also needs control types to name in the pop. The worker keeps the servable set the lane reported on
+its last run (`HordeWorkerProcessManager._kept_servable_set`) and offers it while the lane will serve and no live
+lane has reported. A crash or hang replacement and a disabled lane drop the kept set, so a lane that comes back
+reports its set afresh before annotation is offered from it. Before the lane has reported once there is no set,
+which is rule 2 above.
+
+A popped lane-bound form is lane demand under rule 6, so the driver starts the lane on the next tick. At
+dispatch (`AlchemyCoordinator._utilities_lane_fault_cause`) a form with no loaded lane waits while the lane will
+serve, bounded by `dispatch_affinity.utilities_lane_hold_expired`, the clock extended-ControlNet jobs wait on.
+The form's dispatch deadline (`PENDING_FORM_DISPATCH_DEADLINE_SECONDS`) stands in for its ttl and there is no
+sampling figure, so the wait ends at the anti-starvation share of that deadline. A form whose lane crashed, had
+its start refused or was disabled is faulted back to the horde at once. A form whose lane a reclaim or residency
+owner holds paused, or whose loaded lane is busy with another form, keeps the dispatch deadline as before.
 
 ### Extended ControlNet
 
@@ -317,8 +343,9 @@ whole post-processing bucket (the API cannot accept upscale/face-fix while refus
 Beyond that static provisioning gate the two features diverge at runtime:
 
 - **`strip_background` has no in-graph fallback** (the main venv is purged of `rembg`), so its alchemy
-  offer is additionally gated on a **healthy** utilities lane process existing right now: a provisioned but
-  crashed or restarting lane withholds the `strip_background` offer until it recovers.
+  offer is additionally gated on a lane that is loaded or will serve (see [Alchemy forms](#alchemy-forms)). A
+  lane that is down by policy keeps the offer, since a popped form starts it. A paused, crashed, refused or
+  disabled lane withholds the offer until it recovers.
 - **ControlNet pops are not gated on runtime lane health.** A provisioned lane that is momentarily down
   still pops controlnet work, because the in-graph preprocessor is a real dynamic fallback: the job is
   simply dispatched with no premade map. The provisioning coercion, not runtime health, is the controlnet
