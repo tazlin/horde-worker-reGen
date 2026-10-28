@@ -42,6 +42,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     AuxModelKind,
     AuxModelRef,
     AuxPrefetchEntry,
+    AuxPrefetchFailureKind,
     AuxPrefetchOutcome,
     HordeAuxPrefetchResultMessage,
 )
@@ -68,6 +69,13 @@ retry is not delayed longer than needed, and never longer than the class's own s
 window lapses the reference is fetchable again, so cooling it further would be pointless). While a job's only
 outstanding references are cooling it holds a live per-job deadline, so it stays bounded exactly as any unresolved
 prefetch does and still counts as aux-held against deadlock detection."""
+
+_DISK_REFUSAL_SKIP_SECONDS = 60.0
+"""How long a reference refused for a full cache volume stays skipped before a later job asks for it again.
+
+The download process judges the volume afresh on every request, and each request costs a metadata lookup before
+the refusal. A short skip spares that lookup for the jobs popped right behind the refused one, and a volume that
+recovers serves the file again within the window."""
 
 _AUX_SALVAGE_TTL_FRACTION = 0.35
 """Fraction of a job's horde ttl by which its auxiliary prefetch must land or be salvaged (dispatched without).
@@ -210,8 +218,12 @@ class AuxPrefetchCoordinator:
             )
 
         if entries:
-            base_deadline = now + max(0.0, self._download_timeout_provider())
-            self._deadlines[job_id] = self._bounded_deadline(job, base_deadline, now=now)
+            base_deadline = self._deadline_anchor(job_id, now=now) + max(0.0, self._download_timeout_provider())
+            deadline = self._bounded_deadline(job, base_deadline, now=now)
+            if deadline <= now and self._job_tracker.was_aux_resolve_requeued(job_id):
+                self._salvage_after_aux_resolve(job, now=now)
+                return
+            self._deadlines[job_id] = deadline
             # A fresh request is a fresh attempt: forget any deferral/cooling bookkeeping a prior attempt left.
             self._forget_deferral_state(job_id)
             pins = self._current_pins()
@@ -237,6 +249,46 @@ class AuxPrefetchCoordinator:
         # skipped), so its dispatch gate clears without another request.
         self._cooling_deadline_jobs.discard(job_id)
         self._job_tracker.mark_job_aux_prepared_if_ready(job_id)
+
+    def _deadline_anchor(self, job_id: GenerationID, *, now: float) -> float:
+        """Return when a job's prefetch budget starts: its pop after an aux-resolve requeue, else ``now``.
+
+        An inference child returns a job whose files it cannot resolve without charging an inference attempt. The
+        download process may keep reporting such a file present (an ad-hoc reference whose record the child's copy
+        lacks), so re-requesting with a fresh budget each time would cycle the job forever. Measuring the budget
+        from the pop bounds every later hold of that job by the one it had at the pop.
+        """
+        if not self._job_tracker.was_aux_resolve_requeued(job_id):
+            return now
+        tracked = self._job_tracker.get_tracked_job(job_id)
+        if tracked is None or tracked.time_popped is None:
+            return now
+        return tracked.time_popped
+
+    def _salvage_after_aux_resolve(self, job: ImageGenerateJobPopResponse, *, now: float) -> None:
+        """Serve a job returned for unresolved files whose prefetch budget has run out, without those files.
+
+        Only a job with an aux-resolve requeue reaches here. Each outstanding reference is recorded skipped
+        incident-scoped, exactly as a deadline expiry records it, and no request is sent. The child skips those
+        references, so the job cannot return again for them.
+        """
+        job_id = job.id_
+        if job_id is None:
+            return
+        outstanding = self._outstanding_entries(job)
+        for kind, name, is_version in outstanding:
+            self._job_tracker.mark_aux_skipped(
+                name,
+                is_version=is_version,
+                is_ti=kind is AuxModelKind.TI,
+                expires_at=now + STRIKE_DECAY_SECONDS,
+            )
+        self._cooling_deadline_jobs.discard(job_id)
+        if self._salvage_via_skip(job_id):
+            logger.info(
+                f"Aux prefetch budget for job {str(job_id)[:8]} ran out after its inference process could not "
+                f"resolve its files; dispatching without {len(outstanding)} reference(s).",
+            )
 
     def _bounded_deadline(
         self,
@@ -311,6 +363,9 @@ class AuxPrefetchCoordinator:
                 continue
             if outcome.rejection_reason is not None:
                 self._skip_rejected_aux(outcome)
+                continue
+            if outcome.failure_kind is AuxPrefetchFailureKind.DISK_FULL:
+                self._skip_disk_refused_aux(outcome, now=now)
                 continue
             self._fault_failed_outcome(outcome, now=now)
 
@@ -691,6 +746,40 @@ class AuxPrefetchCoordinator:
                 self._deadlines.pop(job_id, None)
                 self._forget_deferral_state(job_id)
 
+    def _skip_disk_refused_aux(self, outcome: AuxPrefetchOutcome, *, now: float) -> None:
+        """Let every job waiting on a file the full cache volume refused proceed without it, arming no backoff.
+
+        The download process refuses a file when the volume cannot hold it above the free-space floor with every
+        unpinned ad-hoc entry evicted. That is a local disk condition, so it neither arms nor advances the
+        CDN download backoff, and the waiting jobs dispatch without the file and spend no inference attempt. The
+        owner of the LoRA offer under that condition is the disk guard: ``ProcessManager``'s exhaustion verdict
+        sets ``WorkerState.lora_disk_exhausted``, which the job popper reads to withhold ``allow_lora``. This path
+        does not withhold the offer. The reference is skipped for :data:`_DISK_REFUSAL_SKIP_SECONDS`, recorded
+        even when no job is still waiting so a job popped right behind does not repeat the refused request.
+        """
+        is_ti = outcome.kind is AuxModelKind.TI
+        self._job_tracker.mark_aux_skipped(
+            outcome.name,
+            is_version=outcome.is_version,
+            is_ti=is_ti,
+            expires_at=now + _DISK_REFUSAL_SKIP_SECONDS,
+        )
+        self._reference_cooldowns.pop(self._outcome_key(outcome), None)
+        salvaged = [
+            job_id
+            for job_id in outcome.requesting_job_ids
+            if self._is_pending(job_id) and self._salvage_via_skip(job_id)
+        ]
+        served = (
+            f"Dispatching job(s) {', '.join(str(job_id)[:8] for job_id in salvaged)} without it."
+            if salvaged
+            else "No job is still waiting on it."
+        )
+        logger.info(
+            f"Aux ({'TI' if is_ti else 'LoRA'}) prefetch for {outcome.name!r} refused because the cache volume is "
+            f"full. {served} The download backoff is not armed.",
+        )
+
     def _fault_failed_outcome(self, outcome: AuxPrefetchOutcome, *, now: float) -> None:
         """Resolve the still-pending jobs waiting on one failed prefetch outcome, arming its class backoff once.
 
@@ -889,12 +978,22 @@ class AuxPrefetchCoordinator:
 
         Retryability is read *before* the strike lands: while an incident is already active a fresh failure is
         terminal (requeuing would only re-enter the same failing download path), otherwise it is retryable.
-        ``reference`` names the offending file in the warning when the strike traces to one specific reference
-        (a reported failure); it is None for the deadline path, whose job may carry several references.
+        A strike is taken at most once per open window. A failure while the window is open leaves the ladder
+        where it is, so a burst of references failing together counts as one incident, and the ladder advances
+        only when a failure follows the window's expiry. ``reference`` names the offending file in the warning
+        when the strike traces to one specific reference (a reported failure). It is None for the deadline path,
+        whose job may carry several references.
         """
-        retryable = not self._state.lora_download_backoff.is_escalation_active(now)
-        window = self._state.lora_download_backoff.register_timeout(now)
+        backoff = self._state.lora_download_backoff
+        retryable = not backoff.is_escalation_active(now)
         named = f" for {reference!r}" if reference is not None else ""
+        if backoff.pops_suppressed(now):
+            logger.info(
+                f"Aux (LoRA) prefetch failed{named} while LoRA job pops are already withheld for "
+                f"{backoff.remaining_seconds(now):.0f}s more. The backoff stays at strike {backoff.strikes}.",
+            )
+            return retryable
+        window = backoff.register_timeout(now)
         logger.warning(
             f"Aux (LoRA) prefetch failed{named}; withholding LoRA job pops for {window:.0f}s "
             f"(strike {self._state.lora_download_backoff.strikes}).",
@@ -909,11 +1008,19 @@ class AuxPrefetchCoordinator:
         only re-enter the same failing download path), otherwise it is retryable. Unlike the LoRA backoff this
         window cannot suppress pop traffic: the pop request has no per-request textual-inversion capability flag
         (there is no textual-inversion analogue to ``allow_lora``), so the window influences fault classification
-        only. ``reference`` names the offending file in the warning when the strike traces to one reference.
+        only. As for LoRA, a strike is taken at most once per open window. ``reference`` names the offending file
+        in the warning when the strike traces to one reference.
         """
-        retryable = not self._state.ti_download_backoff.is_escalation_active(now)
-        window = self._state.ti_download_backoff.register_timeout(now)
+        backoff = self._state.ti_download_backoff
+        retryable = not backoff.is_escalation_active(now)
         named = f" for {reference!r}" if reference is not None else ""
+        if backoff.pops_suppressed(now):
+            logger.info(
+                f"Aux (TI) prefetch failed{named} while the textual-inversion download backoff is already active "
+                f"for {backoff.remaining_seconds(now):.0f}s more. The backoff stays at strike {backoff.strikes}.",
+            )
+            return retryable
+        window = backoff.register_timeout(now)
         logger.warning(
             f"Aux (TI) prefetch failed{named}; textual-inversion download backoff active for {window:.0f}s "
             f"(strike {self._state.ti_download_backoff.strikes}).",

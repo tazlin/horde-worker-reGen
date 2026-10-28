@@ -2,15 +2,18 @@
 
 The parent marks a job aux-prepared from the download process's per-job presence reports. When an inference
 child then cannot resolve one of those files (an eviction after the report, or a reference record the ad-hoc
-cache lost), the report no longer holds. If the retryable fault requeued the job while it still read as
-prepared, the reconcile sweep would never re-request the files and the scheduler would keep re-dispatching the
-job into the same resolve failure until its attempts were exhausted, with no download ever issued. These tests
-pin the withdrawal contract: an ``AUX_RESOLVE_FAILED_INFO`` fault clears the job's prepared flag and its presence
-reports, the reconcile sweep re-arms a fresh prefetch for the requeued job, and a subsequent successful outcome
-makes it dispatchable again.
+cache lost), the report no longer holds. If the fault requeued the job while it still read as prepared, the
+reconcile sweep would never re-request the files and the scheduler would keep re-dispatching the job into the same
+resolve failure, with no download ever issued. These tests pin the withdrawal contract: an
+``AUX_RESOLVE_FAILED_INFO`` fault clears the job's prepared flag and its presence reports without spending an
+inference attempt, the reconcile sweep re-arms a fresh prefetch for the requeued job, a subsequent successful
+outcome makes it dispatchable again, and once the prefetch budget measured from the job's pop runs out the job is
+served without the file.
 """
 
 from __future__ import annotations
+
+import time
 
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse, LorasPayloadEntry
 from horde_sdk.ai_horde_api.consts import GENERATION_STATE
@@ -124,11 +127,12 @@ class TestResolveFaultWithdrawsPreparation:
         coordinator.on_prefetch_result(_ok_outcome(job, "styleA"))
         assert tracker.are_job_aux_models_prepared(job) is True
 
-    async def test_terminal_resolve_fault_still_forgets_the_presence_report(self) -> None:
-        """With no attempts left the job faults out, and its contradicted presence report is still withdrawn.
+    async def test_resolve_fault_spends_no_attempt_and_forgets_the_presence_report(self) -> None:
+        """A one-attempt budget still requeues the job, and its contradicted presence report is withdrawn.
 
-        A later job referencing the same file goes through a fresh prefetch, whose presence probe in the download
-        process re-verifies the disk.
+        No inference ran, so the requeue charges no inference attempt and is no degraded retry. A later job
+        referencing the same file goes through a fresh prefetch, whose presence probe in the download process
+        re-verifies the disk.
         """
         tracker = JobTracker()
         tracker.set_retry_policy(1)
@@ -142,7 +146,9 @@ class TestResolveFaultWithdrawsPreparation:
         await dispatcher._handle_faulted_inference_result(_resolve_fault_message(job), job_info)
 
         tracked = tracker.get_tracked_job(job.id_)
-        assert tracked is not None and tracked.stage != JobStage.PENDING_INFERENCE
+        assert tracked is not None and tracked.stage == JobStage.PENDING_INFERENCE
+        assert tracked.inference_attempts == 0
+        assert tracked.needs_degraded_dispatch is False
         assert tracker.is_lora_present_for_job(job, _lora("styleB")) is False
 
         follow_up = make_job_pop_response("some-model", loras=[_lora("styleB")])
@@ -151,6 +157,42 @@ class TestResolveFaultWithdrawsPreparation:
         coordinator.on_job_popped(follow_up)
         assert tracker.are_job_aux_models_prepared(follow_up) is False
         assert len(sender.calls) == requests_before + 1
+
+    async def test_resolve_cycle_ends_once_the_budget_from_the_pop_runs_out(self) -> None:
+        """A job the child keeps returning is served without the file once its budget from the pop runs out.
+
+        The download process can keep reporting a file present that the child cannot resolve, and each requeue
+        spends no attempt. The coordinator measures such a job's prefetch budget from its pop, so a re-request past
+        that budget sends nothing and dispatches the job with the reference skipped.
+        """
+        tracker = JobTracker()
+        tracker.set_retry_policy(1)
+        now = [time.time()]
+        sender = _SenderSpy()
+        coordinator = AuxPrefetchCoordinator(
+            job_tracker=tracker,
+            state=WorkerState(),
+            prefetch_sender=sender,
+            download_timeout_provider=lambda: 120.0,
+            pin_sender=lambda pins: None,
+            clock=lambda: now[0],
+        )
+        job = await _prepare_job_via_prefetch(tracker, coordinator, "styleD")
+        await mark_job_in_progress_async(tracker, job)
+        dispatcher = _make_dispatcher(job_tracker=tracker)
+
+        job_info = await tracker.get_job_info(job)
+        assert job_info is not None
+        await dispatcher._handle_faulted_inference_result(_resolve_fault_message(job), job_info)
+        assert tracker.are_job_aux_models_prepared(job) is False
+
+        now[0] += 121.0
+        requests_before = len(sender.calls)
+        coordinator.reconcile_and_refresh_pins()
+
+        assert len(sender.calls) == requests_before
+        assert tracker.is_lora_skipped(_lora("styleD")) is True
+        assert tracker.are_job_aux_models_prepared(job) is True
 
     async def test_non_aux_fault_leaves_preparation_intact(self) -> None:
         """An ordinary generation fault must not withdraw preparation: the files are still on disk."""

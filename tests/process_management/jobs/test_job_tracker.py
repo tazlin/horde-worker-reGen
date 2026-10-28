@@ -9,7 +9,7 @@ from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse, LorasP
 
 from horde_worker_regen.process_management.ipc.messages import HordeImageResult
 from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
-from horde_worker_regen.process_management.jobs.job_tracker import JobStage, JobTracker
+from horde_worker_regen.process_management.jobs.job_tracker import InferenceFailureResolution, JobStage, JobTracker
 from tests.process_management.conftest import (
     make_job_pop_response,
     make_mock_job,
@@ -572,3 +572,38 @@ class TestQueueQueries:
         assert job_tracker.is_measured_attempt(target) is False
         assert job_tracker.has_spent_measured_attempt_on_device(target, 0) is False
         assert job_tracker.is_measured_attempt(other) is True
+
+
+class TestAuxResolveRequeue:
+    """A child that could not resolve a job's auxiliary files returns the job to the queue without a charge."""
+
+    async def test_aux_resolve_requeue_spends_no_attempt_and_keeps_the_full_budget(
+        self,
+        job_tracker: JobTracker,
+    ) -> None:
+        """The requeue leaves ``inference_attempts`` unchanged, so a later real failure still gets every retry."""
+        job_tracker.set_retry_policy(2)
+        job = await track_popped_job_async(
+            job_tracker,
+            make_job_pop_response(loras=[LorasPayloadEntry(name="12345", is_version=True)]),
+        )
+        assert job.id_ is not None
+        mark_job_aux_prepared(job_tracker, job)
+        await mark_job_in_progress_async(job_tracker, job)
+
+        resolution = await job_tracker.requeue_for_aux_resolve(job)
+
+        tracked = job_tracker.get_tracked_job(job.id_)
+        assert tracked is not None
+        assert resolution is InferenceFailureResolution.RETRY
+        assert tracked.stage is JobStage.PENDING_INFERENCE
+        assert tracked.inference_attempts == 0
+        assert tracked.degraded_retry_used is False
+        assert tracked.needs_degraded_dispatch is False
+        assert tracked.aux_models_prepared is False
+
+        mark_job_aux_prepared(job_tracker, job)
+        await mark_job_in_progress_async(job_tracker, job)
+        first_failure = await job_tracker.handle_job_fault(job, retryable=True)
+        assert first_failure is InferenceFailureResolution.RETRY
+        assert tracked.inference_attempts == 1

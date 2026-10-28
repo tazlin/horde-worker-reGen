@@ -2230,25 +2230,40 @@ class MessageDispatcher:
             await self._record_terminal_inference_fault(message, job_id, detail={"host_commit_refused": True})
             return
 
-        # A child that could not resolve a job's auxiliary files faults it retryably (:data:`AUX_RESOLVE_FAILED_INFO`).
+        # A child that could not resolve a job's auxiliary files returns it (:data:`AUX_RESOLVE_FAILED_INFO`).
         # The download process reported those files present for this job under its eviction pins, so a miss
         # means a file was evicted between that report and the child's read, or the ad-hoc reference lost the
         # file's record. Neither is a CivitAI download failure, so the fault does not arm the LoRA-download
-        # backoff and flows through the ordinary retryable path. Withdrawing the job's prepared state and its
-        # presence reports re-gates the job out of dispatch, and the prefetch reconcile sweep then asks the
-        # download process about every file the job references again.
+        # backoff. The child checks before any load, so no inference ran and the requeue charges no inference
+        # attempt, no degraded retry and no lane streak. The tracker withdraws the job's prepared state and its
+        # presence reports, and the prefetch reconcile sweep then asks the download process about every file the
+        # job references again, within the deadline the coordinator measures from the job's pop.
         if message.info == AUX_RESOLVE_FAILED_INFO:
-            self._job_tracker.invalidate_job_aux_preparation(message.sdk_api_job_info)
+            resolution = await self._job_tracker.requeue_for_aux_resolve(message.sdk_api_job_info)
+            if resolution is not InferenceFailureResolution.FAULTED:
+                self._action_ledger.record(
+                    LedgerEventType.INFERENCE_RETRIED,
+                    process_id=message.process_id,
+                    job_id=job_id,
+                    reason=message.info,
+                    detail={"degraded": False, "resource_failure": False},
+                )
+                # Log contract: analysis/log_signatures.py (job_faulted_on_process).
+                logger.warning(
+                    f"Job {job_id} faulted on process {message.process_id} ({message.info}); requeued for "
+                    "another attempt.",
+                )
+                return
+            await self._record_terminal_inference_fault(message, job_id, detail={"resource_failure": False})
+            return
         # A CUDA context fault is a verdict on the process, which is replaced for it. Its "out of memory" wording
         # must not earn the degraded retry or count against the model and the card the way an allocator OOM does.
         resource_failure = is_resource_failure(message.info) and not message.cuda_context_fault
-        # Faults the worker already attributes elsewhere stay out of the lane streak: a missing auxiliary file is a
-        # download-path miss, a disaggregated stage fault is about the pipeline's shape, and a measured attempt's
-        # failure is the card's ceiling. Read before the tracker resolves the fault, which ends the measured attempt.
-        counts_against_lane = (
-            message.info != AUX_RESOLVE_FAILED_INFO
-            and not is_disaggregated_completion
-            and not self._job_tracker.is_measured_attempt(message.sdk_api_job_info)
+        # Faults the worker already attributes elsewhere stay out of the lane streak: a disaggregated stage fault is
+        # about the pipeline's shape, and a measured attempt's failure is the card's ceiling. Read before the
+        # tracker resolves the fault, which ends the measured attempt.
+        counts_against_lane = not is_disaggregated_completion and not self._job_tracker.is_measured_attempt(
+            message.sdk_api_job_info,
         )
 
         resolution = await self._job_tracker.handle_job_fault(

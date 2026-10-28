@@ -21,6 +21,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     AuxModelKind,
     AuxModelRef,
     AuxPrefetchEntry,
+    AuxPrefetchFailureKind,
     AuxPrefetchOutcome,
     HordeAuxPrefetchResultMessage,
 )
@@ -1143,3 +1144,101 @@ class TestAuxHoldReporting:
 
         assert [message for message in first if "auxiliary file(s)" in message]
         assert [message for message in second if "auxiliary file(s)" in message]
+
+
+def _failed_lora_message(
+    job: ImageGenerateJobPopResponse,
+    name: str,
+    *,
+    failure_kind: AuxPrefetchFailureKind,
+    is_version: bool = False,
+) -> HordeAuxPrefetchResultMessage:
+    """A retryable failure outcome for one LoRA of one job, carrying the download process's failure kind."""
+    assert job.id_ is not None
+    return HordeAuxPrefetchResultMessage(
+        process_id=9000,
+        process_launch_identifier=1,
+        info="r",
+        outcomes=[
+            AuxPrefetchOutcome(
+                kind=AuxModelKind.LORA,
+                name=name,
+                is_version=is_version,
+                ok=False,
+                retryable=True,
+                failure_kind=failure_kind,
+                detail="download failed",
+                requesting_job_ids=[job.id_],
+            ),
+        ],
+    )
+
+
+class TestBackoffStrikeAccounting:
+    """The LoRA download backoff counts CDN incidents, never local disk refusals or repeats inside one window."""
+
+    async def test_disk_full_refusals_never_arm_the_backoff(self) -> None:
+        """Five references refused for a full volume inside one window serve their jobs without arming a strike.
+
+        A full volume is a local condition the disk guard owns. Each job dispatches without the refused file,
+        spends no inference attempt, and LoRA pops are not withheld by the download backoff.
+        """
+        tracker = JobTracker()
+        jobs = [_job(loras=[_lora(f"{100 + index}", is_version=True)]) for index in range(5)]
+        for job in jobs:
+            await track_popped_job_async(tracker, job)
+        # Anchored to real time, since the tracker judges a skip verdict's expiry against the wall clock.
+        real_clock = _Clock()
+        real_clock.now = time.time()
+        coordinator, _sender, state, clock = _make(tracker, clock=real_clock)
+        for job in jobs:
+            coordinator.on_job_popped(job)
+
+        for index, job in enumerate(jobs):
+            coordinator.on_prefetch_result(
+                _failed_lora_message(
+                    job,
+                    f"{100 + index}",
+                    failure_kind=AuxPrefetchFailureKind.DISK_FULL,
+                    is_version=True,
+                )
+            )
+            clock.now += 5.0
+
+        assert state.lora_download_backoff.strikes == 0
+        assert state.lora_download_backoff.pops_suppressed(clock.now) is False
+        for job in jobs:
+            assert job.id_ is not None
+            assert tracker.are_job_aux_models_prepared(job) is True
+            tracked = tracker.get_tracked_job(job.id_)
+            assert tracked is not None and tracked.inference_attempts == 0
+
+    async def test_failures_inside_one_open_window_take_one_strike(self) -> None:
+        """Two plain failures inside one open window advance the ladder once, and one after it expires advances it."""
+        tracker = JobTracker()
+        first = _job(loras=[_lora("styleA")])
+        second = _job(loras=[_lora("styleB")])
+        third = _job(loras=[_lora("styleC")])
+        for job in (first, second, third):
+            await track_popped_job_async(tracker, job)
+        coordinator, _sender, state, clock = _make(tracker)
+        for job in (first, second, third):
+            coordinator.on_job_popped(job)
+
+        coordinator.on_prefetch_result(
+            _failed_lora_message(first, "styleA", failure_kind=AuxPrefetchFailureKind.DOWNLOAD_FAILED)
+        )
+        assert state.lora_download_backoff.strikes == 1
+        clock.now += 5.0
+        coordinator.on_prefetch_result(
+            _failed_lora_message(second, "styleB", failure_kind=AuxPrefetchFailureKind.DOWNLOAD_FAILED)
+        )
+        assert state.lora_download_backoff.strikes == 1
+
+        # The first window is over, so the next failure continues the incident one rung up.
+        clock.now += 60.0
+        assert state.lora_download_backoff.pops_suppressed(clock.now) is False
+        coordinator.on_prefetch_result(
+            _failed_lora_message(third, "styleC", failure_kind=AuxPrefetchFailureKind.DOWNLOAD_FAILED)
+        )
+        assert state.lora_download_backoff.strikes == 2

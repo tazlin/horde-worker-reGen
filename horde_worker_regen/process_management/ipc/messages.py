@@ -821,6 +821,18 @@ class AuxModelKind(StrEnum):
     TI = "ti"
 
 
+class AuxPrefetchFailureKind(StrEnum):
+    """Why an auxiliary prefetch did not place its file on disk; the parent routes each kind to its owner."""
+
+    DOWNLOAD_FAILED = auto()
+    """The fetch returned no file and surfaced no reason: a transfer or upstream failure the CDN backoff counts."""
+    REJECTED = auto()
+    """The fetch terminally refused the file (``rejection_reason`` says why); its jobs proceed without it."""
+    DISK_FULL = auto()
+    """The cache volume could not hold the file above its free-space floor with every unpinned ad-hoc entry
+    evicted. A local disk condition the disk guard owns, never a CDN strike."""
+
+
 class AuxModelRef(BaseModel):
     """Identity of an ad-hoc auxiliary file: the payload reference plus which manager resolves it.
 
@@ -880,6 +892,8 @@ class AuxPrefetchOutcome(BaseModel):
     SFW-only worker; for a textual inversion the reason the fetch API permanently refused it). Set only on a
     failed (``ok`` False) outcome; it directs the parent to skip that file and dispatch the job without it
     rather than faulting the job. None for a success or a transient (retryable) failure."""
+    failure_kind: AuxPrefetchFailureKind | None = None
+    """Why the file is not on disk when ``ok`` is False, else None."""
     requesting_job_ids: list[GenerationID] = Field(default_factory=list)
     """The pending jobs that requested this file, so the parent can mark or fault them precisely."""
 

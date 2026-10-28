@@ -69,6 +69,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     AuxModelKind,
     AuxModelRef,
     AuxPrefetchEntry,
+    AuxPrefetchFailureKind,
     AuxPrefetchOutcome,
     HordeAuxPrefetchControlMessage,
     HordeAuxPrefetchResultMessage,
@@ -118,6 +119,7 @@ _MAX_DOWNLOAD_ATTEMPTS = 3
 """How many times a per-file fetch (image/aux) is re-attempted after a transient failure before giving up."""
 _RETRY_BACKOFF_SECONDS = 10.0
 """Delay before re-queuing a failed per-file fetch (kept short; the scheduler then re-admits it)."""
+
 
 _ADHOC_PREFETCH_TIMEOUT_SECONDS = 1800.0
 """Upper bound on one ad-hoc LoRA/TI fetch wait, so a wedged fetch frees the download slot.
@@ -327,6 +329,9 @@ class HordeDownloadProcess(HordeProcess):
         # task dedup key, stashed by the fetch path and drained when its per-task outcome is emitted, so the
         # outcome can carry the reason and mark the fetch non-retryable.
         self._aux_rejections: dict[tuple[DownloadKind, str, str], str] = {}
+        # Ad-hoc aux fetches the engine skipped for a condition that can clear (its typed skip reason, such as a
+        # full cache volume), keyed and drained like the rejections, so the outcome carries the failure kind.
+        self._aux_skip_kinds: dict[tuple[DownloadKind, str, str], AuxPrefetchFailureKind] = {}
         # Aux-prefetch entries whose model manager was not yet loaded when their request arrived are stashed
         # here (never failed: a still-loading downloader is transient, and faulting would self-inflict a job
         # fault plus a pop backoff on the parent). They are replayed through the normal staging path once the
@@ -897,6 +902,8 @@ class HordeDownloadProcess(HordeProcess):
             return True
         if manager.is_lora_available(task.model_name, is_version=is_version):
             return True
+        if self._stash_adhoc_skip(task, rejected_reason, label="LoRA"):
+            return False
         if rejected_reason is not None:
             # A terminal rejection (bad/too-large/NSFW metadata) will never land on disk. Record it so the
             # emitted outcome tells the parent to skip this LoRA and dispatch the job without it.
@@ -951,6 +958,8 @@ class HordeDownloadProcess(HordeProcess):
             return True
         if manager.fuzzy_find_ti_key(task.model_name) is not None:
             return True
+        if self._stash_adhoc_skip(task, rejected_reason, label="TI"):
+            return False
         if rejected_reason is not None:
             # A terminal rejection (the Hordeling permanently refuses this embedding, or its metadata is
             # bad/too-large/NSFW) will never land on disk. Record it so the emitted outcome tells the parent
@@ -972,14 +981,50 @@ class HordeDownloadProcess(HordeProcess):
             )
         return False
 
+    def _stash_adhoc_skip(self, task: DownloadTask, fetch_reason: str | None, *, label: str) -> bool:
+        """Stash the failure kind of a fetch the ad-hoc engine skipped, and return whether it was such a skip.
+
+        The engine reports a skip for a condition that can clear as a typed ``AdhocDownloadSkipReason``, distinct
+        from its terminal rejection reasons, so the file is not memoized as unusable. A full cache volume becomes
+        ``DISK_FULL``, which the parent handles as a disk condition. A skip reason this process does not know
+        reports a plain failure. The import is local because hordelib's model managers load torch, and the
+        parent imports this module.
+        """
+        from hordelib.model_manager.civitai_adhoc import AdhocDownloadSkipReason
+
+        if not isinstance(fetch_reason, AdhocDownloadSkipReason):
+            return False
+        skip_reason = fetch_reason
+        failure_kind = (
+            AuxPrefetchFailureKind.DISK_FULL
+            if skip_reason == AdhocDownloadSkipReason.DISK_FULL
+            else AuxPrefetchFailureKind.DOWNLOAD_FAILED
+        )
+        with self._lock:
+            self._aux_skip_kinds[task.dedup_key] = failure_kind
+        logger.warning(
+            f"Download process: {label} {task.model_name!r} not fetched because the ad-hoc engine skipped it "
+            f"({skip_reason}).",
+        )
+        return True
+
     def _emit_prefetch_outcome(self, task: DownloadTask, *, ok: bool, aborted: bool, reason: str | None) -> None:
         """Report one finished ad-hoc prefetch task back to every job that requested it."""
         with self._lock:
             job_ids = self._prefetch_jobs.pop(task.dedup_key, set())
             rejection = self._aux_rejections.pop(task.dedup_key, None)
+            skip_kind = self._aux_skip_kinds.pop(task.dedup_key, None)
         kind = AuxModelKind.LORA if task.kind is DownloadKind.LORA else AuxModelKind.TI
         is_version = task.manager_key == LORA_VERSION_MANAGER_KEY
         succeeded = ok and not aborted
+        failure_kind: AuxPrefetchFailureKind | None = None
+        if not succeeded:
+            if rejection is not None:
+                failure_kind = AuxPrefetchFailureKind.REJECTED
+            elif skip_kind is not None:
+                failure_kind = skip_kind
+            else:
+                failure_kind = AuxPrefetchFailureKind.DOWNLOAD_FAILED
         outcome = AuxPrefetchOutcome(
             kind=kind,
             name=task.model_name,
@@ -989,6 +1034,7 @@ class HordeDownloadProcess(HordeProcess):
             # parent's per-job deadline (the parent owns the terminal give-up for those).
             retryable=rejection is None,
             rejection_reason=rejection,
+            failure_kind=failure_kind,
             detail=None if succeeded else (rejection or reason or ("aborted" if aborted else "download failed")),
             requesting_job_ids=sorted(job_ids, key=str),
         )

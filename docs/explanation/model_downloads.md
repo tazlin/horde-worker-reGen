@@ -205,7 +205,22 @@ file can never become usable), a plain-failure skip is incident-scoped: it lapse
 backoff's decay window, so a reference that merely failed during an outage is retried once
 the incident passes instead of being silently omitted for the rest of the session.
 
-Each auxiliary class holds its own escalating download backoff. The LoRA backoff also
+A *disk-full* refusal is neither. hordelib skips a download when the cache volume cannot hold
+the file above its free-space floor even with every unpinned ad-hoc entry evicted. The fetch
+returns that skip as `AdhocDownloadSkipReason.DISK_FULL`, a sibling of the terminal rejection
+reasons, and the download process reports the outcome as `AuxPrefetchFailureKind.DISK_FULL`
+(the other kinds are `DOWNLOAD_FAILED` and `REJECTED`). A full volume is a local
+condition, so the coordinator does not arm or advance the download backoff for it. The
+waiting jobs dispatch without the file, the reference stays skipped for a minute, and no
+inference attempt is spent. The LoRA offer under a full volume belongs to the disk guard
+alone: `ProcessManager._evaluate_lora_disk_exhaustion` sets `lora_disk_exhausted`, and the
+popper withholds `allow_lora` while it holds.
+
+Each auxiliary class holds its own escalating download backoff. A strike starts a window of
+60 s that doubles per strike up to 1800 s, and the ladder resets after 15 minutes without a
+strike. A strike is taken at most once per open window: a reference that fails while the
+window is open leaves the ladder where it is, so a burst of references failing together is
+one incident. The ladder advances only when a failure follows the window's expiry. The LoRA backoff also
 gates pop-time LoRA advertising, because the pop request carries an `allow_lora`
 capability flag the worker can withhold. The pop request has no per-request
 textual-inversion capability flag (no textual-inversion analogue to `allow_lora`), so
@@ -260,9 +275,14 @@ was already reported present for it: this is the liveness that heals. The tracke
 policy bounds the total attempts, so a permanently failing job still faults rather than
 looping. Should an inference child later fail to resolve a prefetched file (an eviction
 between the download process's report and the child's read, or a reference record the
-ad-hoc cache lost), its retryable fault withdraws the job's prepared state and its presence
-reports, so the reconcile sweep asks the download process again instead of the scheduler
-re-dispatching the job into the same failure. The coordinator also
+ad-hoc cache lost), it returns the job before loading anything. The requeue spends no
+inference attempt and no degraded retry, and it withdraws the job's prepared state and its
+presence reports, so the reconcile sweep asks the download process again instead of the
+scheduler re-dispatching the job into the same failure. Because the requeue is free, the
+coordinator measures that job's prefetch budget from its pop rather than from each
+re-request. Once the budget is spent the job is served with the references skipped, so a
+file the download process keeps reporting present while the child cannot read it does not
+cycle the job forever. The coordinator also
 pushes a pins-only eviction update whenever the set of still-referenced auxiliary files
 changes (for example when a job completes), coalesced so an unchanged set is never re-sent.
 

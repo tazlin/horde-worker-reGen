@@ -19,12 +19,14 @@ from typing import TYPE_CHECKING
 
 import pytest
 from horde_sdk.ai_horde_api.fields import GenerationID
+from hordelib.model_manager.civitai_adhoc import AdhocDownloadSkipReason
 from hordelib.model_manager.lora import LoRaRejectionReason
 
 from horde_worker_regen.process_management.ipc.messages import (
     AuxModelKind,
     AuxModelRef,
     AuxPrefetchEntry,
+    AuxPrefetchFailureKind,
     AuxPrefetchOutcome,
     HordeAuxPrefetchControlMessage,
     HordeAuxPrefetchResultMessage,
@@ -43,7 +45,7 @@ class _FakeLoraManager:
         present: set[str] | None = None,
         *,
         fetch_succeeds: bool = True,
-        reject_reason: LoRaRejectionReason | None = None,
+        reject_reason: LoRaRejectionReason | AdhocDownloadSkipReason | None = None,
     ) -> None:
         self.present = set(present or set())
         self.fetch_succeeds = fetch_succeeds
@@ -82,7 +84,7 @@ class _FakeLoraManager:
         is_version: bool = False,
         job_context: dict | None = None,
         progress_callback: Callable[[int, int], None] | None = None,
-    ) -> tuple[str | None, LoRaRejectionReason | None]:
+    ) -> tuple[str | None, LoRaRejectionReason | AdhocDownloadSkipReason | None]:
         # The download process calls this reason-returning variant; delegate to the recorder so subclasses
         # (timeout-then-present, disk-guard) keep their behaviour, and pair a non-landing fetch with the
         # configured terminal rejection (None models a transient failure the parent may still retry).
@@ -346,6 +348,30 @@ def test_failed_fetch_reports_failure_outcome(monkeypatch: pytest.MonkeyPatch) -
     # no rejection reason, so the parent faults-and-retries rather than skipping the LoRA.
     assert outcomes[0].retryable is True
     assert outcomes[0].rejection_reason is None
+    assert outcomes[0].failure_kind is AuxPrefetchFailureKind.DOWNLOAD_FAILED
+    assert [str(j) for j in outcomes[0].requesting_job_ids] == [_JOB_A]
+
+
+def test_disk_full_refusal_reports_the_disk_full_outcome(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A fetch hordelib skipped for a full cache volume reports the disk-full kind.
+
+    hordelib returns the skip as a typed ``AdhocDownloadSkipReason``, distinct from its terminal rejection reasons.
+    The outcome stays retryable and carries no rejection reason.
+    """
+    lora = _FakeLoraManager(present=set(), fetch_succeeds=False, reject_reason=AdhocDownloadSkipReason.DISK_FULL)
+    process = _make_process(monkeypatch, lora=lora, ti=None)
+
+    process._handle_aux_prefetch_request(
+        HordeAuxPrefetchControlMessage(entries=[_entry("135867", is_version=True, job=_JOB_A)]),
+    )
+    _drain_scheduler(process)
+
+    outcomes = [o for o in _collect_prefetch_outcomes(process) if o.name == "135867"]
+    assert len(outcomes) == 1
+    assert outcomes[0].ok is False
+    assert outcomes[0].failure_kind is AuxPrefetchFailureKind.DISK_FULL
+    assert outcomes[0].retryable is True
+    assert outcomes[0].rejection_reason is None
     assert [str(j) for j in outcomes[0].requesting_job_ids] == [_JOB_A]
 
 
@@ -368,6 +394,7 @@ def test_terminal_rejection_reports_non_retryable_outcome_with_reason(monkeypatc
     assert outcomes[0].ok is False
     assert outcomes[0].retryable is False
     assert outcomes[0].rejection_reason == str(LoRaRejectionReason.INVALID)
+    assert outcomes[0].failure_kind is AuxPrefetchFailureKind.REJECTED
     assert [str(j) for j in outcomes[0].requesting_job_ids] == [_JOB_A]
 
 

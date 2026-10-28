@@ -359,6 +359,12 @@ class TrackedJob:
 
     Bounded by :data:`MAX_HOST_COMMIT_REQUEUES` and kept apart from ``inference_attempts``, since a refusal is a
     host memory condition and no verdict on the job."""
+    aux_resolve_requeued: bool = False
+    """Whether an inference child has returned this job because its auxiliary files did not resolve.
+
+    Such a requeue spends no inference attempt. The prefetch coordinator bounds the job's later auxiliary holds
+    from its pop instead, so a file the download process keeps reporting present while the child cannot read it
+    does not cycle the job forever."""
     needs_degraded_dispatch: bool = False
     """Set when this job's next dispatch should run degraded/isolated (consumed by the scheduler)."""
     admitted_over_budget: bool = False
@@ -2677,6 +2683,67 @@ class JobTracker:
         if self._terminal_fault_observer is not None:
             self._terminal_fault_observer(faulted_job.model)
         return InferenceFailureResolution.FAULTED
+
+    async def requeue_for_aux_resolve(self, faulted_job: ImageGenerateJobPopResponse) -> InferenceFailureResolution:
+        """Return a job whose inference child could not resolve its auxiliary files to ``PENDING_INFERENCE``.
+
+        The child checks the files before any load or sampling, so no inference ran. The requeue spends no
+        inference attempt and no degraded retry, so a later generation failure still has the job's whole retry
+        budget. The job's prepared state and its presence reports are withdrawn, which gates it out of dispatch
+        until the prefetch coordinator re-requests its files. That coordinator bounds the cycle with the deadline
+        it measures from the job's pop.
+
+        Args:
+            faulted_job: The job the child returned.
+
+        Returns:
+            ``RETRY`` when the job was requeued. ``FAULTED`` when it is untracked, already submitted, was never
+            formally queued, or the stage transition was refused, in which case it is faulted terminally.
+        """
+        self.invalidate_job_aux_preparation(faulted_job)
+        tracked = self._tracked_for(faulted_job)
+
+        if tracked is None or tracked.job_info is None:
+            logger.error(f"Job {faulted_job.id_} not found in jobs_lookup")
+            return InferenceFailureResolution.FAULTED
+
+        if tracked.stage == JobStage.PENDING_SUBMIT:
+            logger.warning(f"Job {faulted_job.id_} already in completed_jobs")
+            return InferenceFailureResolution.FAULTED
+
+        # Released before deciding, as the ordinary fault path does, so a requeue cannot race the orchestrator's
+        # re-dispatch of held disaggregation state and a terminal fault leaves none behind.
+        if faulted_job.id_ is not None and self._inference_failure_release_observer is not None:
+            self._inference_failure_release_observer(faulted_job.id_)
+
+        # The child returned the job before loading anything, so the attempt says nothing about the card's ceiling.
+        if tracked.measured_attempt:
+            tracked.measured_attempt = False
+            tracked.measured_attempt_device_index = None
+
+        requeued = tracked.time_popped is not None and (
+            tracked.stage is JobStage.PENDING_INFERENCE or self._set_stage(tracked, JobStage.PENDING_INFERENCE)
+        )
+        if requeued:
+            tracked.aux_resolve_requeued = True
+            return InferenceFailureResolution.RETRY
+
+        reason = "auxiliary files did not resolve in the inference process"
+        tracked.fault_origin = JobFaultOrigin.GENERATION
+        tracked.job_info.fault_job()
+        self._record_fault_diagnostics(tracked, is_resource_failure=False, fault_reason=reason)
+        if self._set_stage(tracked, JobStage.PENDING_SUBMIT):
+            # Counted here for the reason the ordinary terminal path gives: no later step counts a fault decided now.
+            self._total_num_completed_jobs += 1
+            self._count_job_faulted(tracked)
+        if self._terminal_fault_observer is not None:
+            self._terminal_fault_observer(faulted_job.model)
+        return InferenceFailureResolution.FAULTED
+
+    def was_aux_resolve_requeued(self, job_id: GenerationID) -> bool:
+        """Return whether an inference child has returned this job because its auxiliary files did not resolve."""
+        tracked = self.get_tracked_job(job_id)
+        return tracked is not None and tracked.aux_resolve_requeued
 
     def handle_job_fault_now(
         self,
