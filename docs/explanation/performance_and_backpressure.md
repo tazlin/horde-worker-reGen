@@ -216,13 +216,29 @@ safety-recovery hold and the VRAM/RAM budget alike before it is admitted.
 The post-processing lane is also downstream of inference, but its pressure is not a reason
 to stop all image intake. When the worker already has two or more accepted
 post-processing commitments, the next image pop keeps ordinary generation enabled and
-temporarily stops advertising `allow_post_processing`. A commitment includes a queued or
-running inference job that requested post-processing as well as a job already waiting for
-or running on the PP lane, plus graph-backed alchemy forms waiting for or running on that
-same lane. This means a burst of large batched PP jobs is counted before the first one
-finishes inference, and alchemy cannot hide lane occupancy from image-job offer shaping.
-The single lane gets a chance to drain without blocking non-post-processing jobs that the
-inference pool can still serve.
+temporarily stops advertising `allow_post_processing`. The depth counts the jobs the
+post-processing lane will serve: a queued or running inference job whose requested chain
+includes an upscaler or face fixer, a job already waiting for or running on the PP lane,
+and graph-backed alchemy forms waiting for or running on that same lane. A job counts once
+however many forms it requested. Background removal runs on the image-utilities lane, so a
+strip-only job does not count, and a job waiting for its strip has already left the PP lane.
+This means a burst of large batched PP jobs is counted before the first one finishes
+inference, and alchemy cannot hide lane occupancy from image-job offer shaping. The single
+lane gets a chance to drain without blocking non-post-processing jobs that the inference
+pool can still serve.
+
+The post-processing fault breaker's trigger is VRAM over-commit alone: a chain faulted with
+a resource-class failure, a chain whose peak never fit the card within the admission
+patience, a lane reaped silent mid-pass, and a chain whose result never returned. Every
+site that faults post-processing or a background strip reports a typed
+`PostProcessingFaultCause`, and `JobTracker.note_post_processing_overcommit_fault` counts
+only `VRAM_OVERCOMMIT`. The breaker clears on a VRAM probe, and the horde has one
+`allow_post_processing` flag for every form, so a latency or configuration fault that fed
+it would withhold the upscales and face fixes the PP lane can still serve. A strip that
+runs slowly is bounded by its own budgets on the image-utilities lane instead (see
+[strip_background rerouting](image_utilities_lane.md#strip_background-rerouting)): 180 s for a dispatched pass, 180 s at the
+head of the strip queue, and a stage cap of one pass per job the worker admits to intake
+plus its own.
 
 This shaping applies only while the dedicated post-processing lane is enabled. It composes
 after the normal feature-readiness checks and the post-processing fault breaker: if

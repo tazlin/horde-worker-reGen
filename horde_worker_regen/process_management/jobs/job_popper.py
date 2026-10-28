@@ -19,6 +19,7 @@ from horde_sdk.ai_horde_api.apimodels import (
     ImageGenerateJobPopResponse,
 )
 from horde_sdk.ai_horde_api.consts import RC
+from horde_sdk.generation_parameters.alchemy.consts import is_strip_background_form
 from horde_sdk.generation_parameters.image.sampler_work import SamplerExecutionContractVersion
 from horde_sdk.worker.dispatch.ai_horde.image.convert import apply_image_worker_feature_flags_to_pop_request
 from loguru import logger
@@ -1651,15 +1652,20 @@ class JobPopper:
         return self._safety_backpressure_engaged
 
     def _post_processing_commitment_depth(self) -> int:
-        """Return accepted jobs that still require the post-processing lane.
+        """Return accepted jobs that the post-processing lane will serve.
 
-        Count jobs before they reach the lane too: a burst of already-popped large PP jobs can otherwise sit in
-        the inference queue and only become visible as post-processing pressure after the worker has accepted
-        several more PP jobs. Graph alchemy forms share the same single lane, so an injected provider adds
-        their pending/running count without coupling the popper to the alchemy coordinator.
+        A job counts once when its requested chain includes an upscaler or face fixer. Background removal runs
+        on the image-utilities lane, so a strip-only job counts against neither the post-processing lane nor
+        this depth, and a job waiting for its strip has already left the post-processing lane. Jobs are
+        counted before they reach the lane too. A burst of already-popped large post-processing jobs can
+        otherwise sit in the inference queue and only become visible as post-processing pressure after the
+        worker has accepted several more. Graph alchemy forms share the same single lane, so an injected
+        provider adds their pending and running count without coupling the popper to the alchemy coordinator.
         """
         accepted_before_lane = sum(
-            1 for job in self._job_tracker.jobs_pending_inference if bool(job.payload.post_processing)
+            1
+            for job in self._job_tracker.jobs_pending_inference
+            if any(not is_strip_background_form(form) for form in job.payload.post_processing or ())
         )
         try:
             shared_lane_commitments = max(0, int(self._post_processing_lane_commitments_provider()))

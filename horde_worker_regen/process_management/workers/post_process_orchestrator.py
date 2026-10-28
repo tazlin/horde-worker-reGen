@@ -15,7 +15,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeProcessState,
 )
 from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
-from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
+from horde_worker_regen.process_management.jobs.job_tracker import JobTracker, PostProcessingFaultCause
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.lifecycle.process_lifecycle import PauseOwner, ProcessLifecycleManager
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
@@ -887,7 +887,7 @@ class PostProcessOrchestrator:
             "The horde will reissue it to another worker.",
         )
         if feeds_breaker:
-            self._job_tracker.note_post_processing_overcommit_fault()
+            self._job_tracker.note_post_processing_overcommit_fault(PostProcessingFaultCause.VRAM_OVERCOMMIT)
         await self._job_tracker.fault_post_inference_job(job_info, reason=reason)
         self._deferrals.pop(str(job_info.sdk_api_job_info.id_), None)
 

@@ -153,7 +153,7 @@ from horde_worker_regen.process_management.jobs.alchemy_popper import (
 from horde_worker_regen.process_management.jobs.image_coordinator import ImageGenerationCoordinator
 from horde_worker_regen.process_management.jobs.job_popper import JobPopper
 from horde_worker_regen.process_management.jobs.job_submitter import JobSubmitter
-from horde_worker_regen.process_management.jobs.job_tracker import JobStage, JobTracker
+from horde_worker_regen.process_management.jobs.job_tracker import JobStage, JobTracker, PostProcessingFaultCause
 from horde_worker_regen.process_management.jobs.text_generation_coordinator import (
     READY_SLOW_START_NOTICE_SECONDS,
     TextGenerationCoordinator,
@@ -2714,9 +2714,9 @@ class HordeWorkerProcessManager:
 
         A post-processing peak that cannot be hosted (a single-process worker on a tiny card, or a card a job
         over-commits) faults the job; the horde reissues it, but a worker that keeps faulting trips the horde's
-        forced-maintenance, the very spiral this guards against. When such faults (the scheduler's
-        unhostable-peak faults and the lifecycle's reaped post-processing stalls) exceed the configured
-        threshold within the window, stop advertising post-processing so the worker is no longer handed
+        forced-maintenance, the very spiral this guards against. When such faults (the
+        :attr:`PostProcessingFaultCause.VRAM_OVERCOMMIT` cause, the only one the tracker counts) exceed the
+        configured threshold within the window, stop advertising post-processing so the worker is no longer handed
         upscale/face-fix jobs it cannot host. Making room for a chain is the dispatch-side reclaim ladder's job,
         so a fault here only counts. Once latched, the fault-count breaker auto-recovers on a quiet window and
         the offer probe (see :meth:`_maybe_reenable_post_processing_after_breaker`).
@@ -5236,15 +5236,16 @@ class HordeWorkerProcessManager:
         return None
 
     _PENDING_STRIP_TIMEOUT_SECONDS = 180.0
-    """How long one dispatched background strip may run before its job is faulted without images.
+    """How long one dispatched background strip may run, and how long the head of the strip queue may wait.
 
-    Measured from the moment the strip is handed to a lane, never from stage entry: the lane runs strips one
-    at a time, so a job's wait for its turn is unrelated to how long its own pass may take. A job still
-    queued is judged instead against a wait budget of this many seconds per strip ahead of it plus its own
-    (see :meth:`_age_out_pending_strips`), which is the longest the queue in front of it can legitimately
-    take. A dead or unresponsive lane is caught sooner by the orphan reconcile. On expiry the job is a
-    no-image fault (reissued), because background removal has no in-graph fallback: this matches the
-    post-processing lane, which also faults a job whose requested post-processing could not run."""
+    A dispatched strip is measured from the moment it is handed to a lane, never from stage entry. The lane
+    runs strips one at a time, so a job's wait for its turn is unrelated to how long its own pass may take. A
+    queued strip is clocked only once it reaches the head of the queue (the first queued strip with no
+    dispatched strip ahead of it), and the head gets this same budget to be handed a lane. Time spent behind a
+    running pass is bounded by :meth:`_strip_stage_cap_seconds` instead. A dead or unresponsive lane is caught
+    sooner by the orphan reconcile. On expiry the job is a no-image fault (reissued), because background
+    removal has no in-graph fallback. The post-processing lane also faults a job whose requested
+    post-processing could not run."""
 
     _MAX_STRIP_DISPATCH_ATTEMPTS = 2
     """How many lanes a single job's background strip may be handed to before it is written off.
@@ -5252,6 +5253,20 @@ class HordeWorkerProcessManager:
     A strip whose lane goes away is re-queued for the replacement rather than faulted, since the images are
     still held and the pass is still runnable. This bounds that: a job whose images take the lane down with
     them cannot walk through replacement after replacement."""
+
+    def _strip_stage_cap_seconds(self) -> float:
+        """Return the longest a job may spend in the background-strip stage, queue wait and run together.
+
+        One execution budget for each job the worker admits to intake at once, plus the job's own pass. A
+        queue deeper than the worker's intake is not one its lane can work through in time, and a job held
+        past it has outlived any wait the worker could have promised when it popped the job. The intake budget
+        is the job popper's, per card and summed across cards, so the cap follows ``queue_size`` and
+        ``max_threads`` and does not encode one machine. A queued strip is faulted once a fresh pass could
+        no longer finish inside the cap, so a strip dispatched before then always gets its full execution
+        budget.
+        """
+        admitted_depth = self._job_popper._intake_budget(self.bridge_data)
+        return self._PENDING_STRIP_TIMEOUT_SECONDS * (admitted_depth + 1)
 
     async def _on_strip_result(self, message: HordeStripResultMessage) -> None:
         """Adopt a background-strip result: on success move the job to safety, on a fault reissue it.
@@ -5284,7 +5299,8 @@ class HordeWorkerProcessManager:
             )
             return
         reason = message.fault_reason or "background removal failed"
-        self._job_tracker.note_post_processing_overcommit_fault()
+        logger.error(f"Faulting job {str(message.job_id)[:8]} without images: its background strip failed: {reason}.")
+        self._job_tracker.note_post_processing_overcommit_fault(PostProcessingFaultCause.STRIP_SERVICE_FAILURE)
         await self._job_tracker.fault_post_inference_job(job_info, reason=reason)
         self._run_metrics.record_decision(
             decision_kind=DecisionKind.IMAGE_UTILITIES_ROUTING,
@@ -5348,18 +5364,19 @@ class HordeWorkerProcessManager:
         )
 
     async def _advance_pending_strips(self) -> None:
-        """Reconcile, age out, and dispatch the image-utilities background-strip stage for generation jobs.
+        """Reconcile, dispatch, and age out the image-utilities background-strip stage for generation jobs.
 
-        Runs once per control-loop tick. Orphaned strips (their lane gone) and aged-out strips are faulted
-        without images first (the reissue policy background removal shares with the post-processing lane),
-        then a fresh eligible job is offered to an idle lane. A no-op unless the operator enabled the lane,
-        so a default (mock-truthy) config never activates it.
+        Runs once per control-loop tick. Orphaned strips (their lane gone) are re-queued or faulted first,
+        then each idle lane is handed the next eligible strip, then strips past their budgets are faulted
+        without images (the reissue policy background removal shares with the post-processing lane). The
+        dispatch runs before the age-out, so a waiter is never faulted in the tick a lane frees for it. A
+        no-op unless the operator enabled the lane, so a default (mock-truthy) config never activates it.
         """
         if self.bridge_data.enable_image_utilities is not True:
             return
         await self._reconcile_orphaned_strip_jobs()
-        await self._age_out_pending_strips()
         self._dispatch_pending_strips()
+        await self._age_out_pending_strips()
 
     async def _reconcile_orphaned_strip_jobs(self) -> None:
         """Re-queue (or, past the attempt cap, fault) any strip job whose owning lane process is gone.
@@ -5380,7 +5397,11 @@ class HordeWorkerProcessManager:
             if tracked.strip_dispatch_attempts >= self._MAX_STRIP_DISPATCH_ATTEMPTS or not (
                 tracked.job_info is not None and tracked.job_info.images_bytes
             ):
-                await self._fault_strip_job(tracked, cause="lane_gone", detail="its image-utilities lane is gone")
+                await self._fault_strip_job(
+                    tracked,
+                    cause=PostProcessingFaultCause.STRIP_LANE_GONE,
+                    detail="its image-utilities lane is gone",
+                )
                 continue
             if self._job_tracker.requeue_strip_for_dispatch(tracked.job_id):
                 logger.info(
@@ -5396,41 +5417,76 @@ class HordeWorkerProcessManager:
                 )
 
     async def _age_out_pending_strips(self) -> None:
-        """Fault (no images) any strip job that has outlived the budget its position earns it.
+        """Fault (no images) any strip job that has outlived its execution budget, its head wait or the stage cap.
 
-        A dispatched strip is judged on how long it has been running on its lane; a strip still queued is
-        judged on how long it has been waiting for one, against a budget that grows with the number of
-        strips ahead of it, because the lane serves them one at a time and each may take a full execution
-        budget. Nothing about a job's wait for its turn is therefore counted against its own pass.
+        A dispatched strip is judged on how long it has been running on its lane. A queued strip at the head
+        of the queue (no dispatched strip ahead of it) is judged on how long it has waited there for a lane,
+        against one execution budget. A queued strip behind a running pass has no clock of its own, since
+        the lane serves strips one at a time and that wait is the lane's time. Every queued strip is also
+        faulted once its time in the stage leaves no room for a pass inside :meth:`_strip_stage_cap_seconds`.
+        Runs after the tick's dispatch, so a strip handed a lane this tick is judged as dispatched.
         """
         now = time.time()
-        for jobs_ahead, tracked in enumerate(self._job_tracker.jobs_pending_strip):
+        execution_budget = self._PENDING_STRIP_TIMEOUT_SECONDS
+        stage_cap = self._strip_stage_cap_seconds()
+        dispatched_strip_ahead = False
+        head_found = False
+        for tracked in self._job_tracker.jobs_pending_strip:
             if tracked.strip_dispatched_at is not None:
-                age = now - tracked.strip_dispatched_at
-                budget = self._PENDING_STRIP_TIMEOUT_SECONDS
-                detail = f"its background strip ran {age:.0f}s on the lane without a result"
-            else:
-                waiting_since = max(tracked.current_stage_since or now, tracked.strip_requeued_at or 0.0)
-                age = now - waiting_since
-                budget = self._PENDING_STRIP_TIMEOUT_SECONDS * (jobs_ahead + 1)
-                detail = f"its background strip waited {age:.0f}s for a lane behind {jobs_ahead} other strip(s)"
-            if age < budget:
+                dispatched_strip_ahead = True
+                run_seconds = now - tracked.strip_dispatched_at
+                if run_seconds >= execution_budget:
+                    await self._fault_strip_job(
+                        tracked,
+                        cause=PostProcessingFaultCause.STRIP_LATENCY,
+                        detail=f"its background strip ran {run_seconds:.0f}s on the lane without a result",
+                    )
                 continue
-            await self._fault_strip_job(tracked, cause="age_out", detail=detail)
 
-    async def _fault_strip_job(self, tracked: TrackedJob, *, cause: str, detail: str) -> None:
+            at_head = not dispatched_strip_ahead and not head_found
+            head_found = True
+            if not at_head:
+                tracked.strip_head_since = None
+            elif tracked.strip_head_since is None:
+                tracked.strip_head_since = now
+
+            stage_seconds = now - (tracked.current_stage_since or now)
+            if stage_seconds + execution_budget > stage_cap:
+                await self._fault_strip_job(
+                    tracked,
+                    cause=PostProcessingFaultCause.STRIP_LATENCY,
+                    detail=(
+                        f"its background strip was still queued after {stage_seconds:.0f}s in the strip stage, "
+                        f"leaving no room for a pass inside the {stage_cap:.0f}s strip stage cap"
+                    ),
+                )
+                continue
+            if tracked.strip_head_since is None:
+                continue
+            head_wait_seconds = now - tracked.strip_head_since
+            if head_wait_seconds >= execution_budget:
+                await self._fault_strip_job(
+                    tracked,
+                    cause=PostProcessingFaultCause.STRIP_LATENCY,
+                    detail=(
+                        f"its background strip waited {head_wait_seconds:.0f}s at the head of the strip queue "
+                        "without a free image-utilities lane"
+                    ),
+                )
+
+    async def _fault_strip_job(self, tracked: TrackedJob, *, cause: PostProcessingFaultCause, detail: str) -> None:
         """Report a no-image fault for a strip job that cannot complete, so the horde reissues it."""
         if tracked.job_info is None:
             return
         logger.error(f"Faulting job {str(tracked.job_id)[:8]} without images: {detail}.")
-        self._job_tracker.note_post_processing_overcommit_fault()
+        self._job_tracker.note_post_processing_overcommit_fault(cause)
         await self._job_tracker.fault_post_inference_job(tracked.job_info, reason=detail)
         self._run_metrics.record_decision(
             decision_kind=DecisionKind.IMAGE_UTILITIES_ROUTING,
             subject=f"job:{str(tracked.job_id)[:8]}",
             verdict=DecisionVerdict.DENY,
             reason="strip_faulted_no_images",
-            inputs={"cause": cause},
+            inputs={"cause": cause.value},
         )
 
     def _dispatch_pending_strips(self) -> None:

@@ -20,7 +20,12 @@ from horde_worker_regen.process_management.config.worker_state import (
 )
 from horde_worker_regen.process_management.ipc.action_ledger import ActionLedger, LedgerEventType
 from horde_worker_regen.process_management.ipc.message_dispatcher import MessageDispatcher
-from horde_worker_regen.process_management.jobs.job_tracker import JobFaultOrigin, JobStage, JobTracker
+from horde_worker_regen.process_management.jobs.job_tracker import (
+    JobFaultOrigin,
+    JobStage,
+    JobTracker,
+    PostProcessingFaultCause,
+)
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_lifecycle import ProcessLifecycleManager
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
@@ -748,7 +753,7 @@ class WorkerRecoveryCoordinator:
                     reason=reason,
                     detail={"stuck_seconds": round(now - first_seen, 1), "post_process_requeues": requeues},
                 )
-                self._job_tracker.note_post_processing_overcommit_fault()
+                self._job_tracker.note_post_processing_overcommit_fault(PostProcessingFaultCause.VRAM_OVERCOMMIT)
                 self._reserve_ledger.release(POST_PROCESS_RESERVE_FLOW, str(job_id))
                 tracked = self._job_tracker.get_tracked_job(job_id)
                 if tracked is not None and tracked.job_info is not None:

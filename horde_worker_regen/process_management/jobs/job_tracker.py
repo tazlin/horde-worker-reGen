@@ -272,6 +272,34 @@ class JobFaultOrigin(enum.StrEnum):
     condition the worker cannot influence would compound into a longer local outage."""
 
 
+class PostProcessingFaultCause(enum.StrEnum):
+    """Why a job that needed post-processing or a background strip was faulted without images.
+
+    The post-processing fault breaker withholds the post-processing offer when the card cannot host the
+    post-processing peak, and the breaker clears on a VRAM probe. Only :attr:`VRAM_OVERCOMMIT` is evidence of
+    that, so it is the only cause :meth:`JobTracker.note_post_processing_overcommit_fault` counts. The other
+    causes are faults the breaker's clear condition cannot observe, and withholding the single
+    ``allow_post_processing`` flag for them would also withhold the upscales and face fixes the
+    post-processing lane can serve.
+    """
+
+    VRAM_OVERCOMMIT = enum.auto()
+    """The post-processing peak could not be hosted on the card. A chain faulted with a resource-class failure,
+    a chain whose peak never fit the card's free VRAM within the admission patience, a post-processing lane
+    reaped silent mid-pass, and a chain whose result never returned after its requeues all report this."""
+    POST_PROCESSING_LANE_DISABLED = enum.auto()
+    """A job requested upscaling or face fixing while the dedicated post-processing lane is disabled."""
+    STRIP_LATENCY = enum.auto()
+    """A background strip outlived its execution budget, its wait at the head of the strip queue, or the
+    strip stage cap."""
+    STRIP_SERVICE_FAILURE = enum.auto()
+    """The image-utilities service returned a failed background strip."""
+    STRIP_LANE_GONE = enum.auto()
+    """A background strip's image-utilities lane went away after the job had spent its dispatch attempts."""
+    UTILITIES_LANE_DISABLED = enum.auto()
+    """A job requested background removal while the image-utilities lane is disabled."""
+
+
 @dataclass
 class TrackedJob:
     """A single job known to the worker, with its current lifecycle stage."""
@@ -415,12 +443,13 @@ class TrackedJob:
     job can sit legitimately queued behind other strips for far longer than any one strip may take. Cleared
     when the job is re-queued for another lane, so the replacement gets the full budget rather than inheriting
     the dead lane's elapsed time."""
-    strip_requeued_at: float | None = None
-    """Epoch time this job's strip was last returned to the queue after its lane went away, or None.
+    strip_head_since: float | None = None
+    """Epoch time this queued strip reached the head of the strip queue, or None while it is not there.
 
-    The queue-wait budget is measured from the later of stage entry and this stamp, so a job handed back for
-    dispatch to a replacement lane is judged on how long it has waited for that lane rather than on the time
-    already spent on the dead one."""
+    The head is the first queued strip with no dispatched strip ahead of it. The queue-wait budget is measured
+    from here, because a strip behind a running pass is waiting on the lane's time and not its own. The parent
+    stamps it on the first tick the job is at the head and clears it on dispatch, on requeue after a lost lane,
+    and whenever a strip ahead takes the head back."""
     strip_dispatch_attempts: int = 0
     """How many times this job's background strip has been dispatched to a lane.
 
@@ -803,12 +832,19 @@ class JobTracker:
         cutoff = current - window_seconds
         return sum(1 for t in self._recent_resource_fault_times if t >= cutoff)
 
-    def note_post_processing_overcommit_fault(self) -> None:
-        """Record one post-processing VRAM-over-commit fault for the feature-level circuit breaker.
+    def note_post_processing_overcommit_fault(self, cause: PostProcessingFaultCause) -> None:
+        """Record a post-processing fault for the feature-level circuit breaker when it is a VRAM over-commit.
 
-        Fed from both the scheduler (a peak the planner cannot host, faulted at dispatch) and the process
-        lifecycle (a slot reaped silent in post-processing). Feature-level, so no per-model streak is kept.
+        Every site that faults a job's post-processing or background strip reports here with its cause, so the
+        classification has one owner. Only :attr:`PostProcessingFaultCause.VRAM_OVERCOMMIT` is counted,
+        because the breaker's clear condition is a VRAM probe and nothing else the breaker can do helps the
+        other causes. Feature-level, so no per-model streak is kept.
+
+        Args:
+            cause: Why the job was faulted.
         """
+        if cause is not PostProcessingFaultCause.VRAM_OVERCOMMIT:
+            return
         now = time.time()
         self._recent_post_processing_fault_times.append(now)
         cutoff = now - self._RESOURCE_FAULT_RETENTION_SECONDS
@@ -1304,7 +1340,7 @@ class JobTracker:
         tracked.job_info = job_info
         tracked.strip_process_id = None
         tracked.strip_dispatched_at = None
-        tracked.strip_requeued_at = None
+        tracked.strip_head_since = None
         tracked.strip_dispatch_attempts = 0
         if from_post_processing:
             self._total_num_post_processing_progress += 1
@@ -1326,7 +1362,7 @@ class JobTracker:
         if tracked is not None and tracked.stage == JobStage.PENDING_STRIP:
             tracked.strip_process_id = process_id
             tracked.strip_dispatched_at = time.time()
-            tracked.strip_requeued_at = None
+            tracked.strip_head_since = None
             tracked.strip_dispatch_attempts += 1
 
     def requeue_strip_for_dispatch(self, job_id: GenerationID) -> bool:
@@ -1334,7 +1370,8 @@ class JobTracker:
 
         The lane a strip was dispatched to going away says nothing about the job: the images are still held
         and the pass is still runnable, so the job is re-armed for dispatch instead of being written off.
-        Stamps the re-queue time, which restarts the queue-wait budget for the new lane.
+        The head-of-queue clock restarts once the job is at the head again, so the replacement lane's start is
+        not charged with the time already spent on the lost one.
 
         Returns:
             True if the job was re-armed, False if it is not a dispatched strip job.
@@ -1344,7 +1381,7 @@ class JobTracker:
             return False
         tracked.strip_process_id = None
         tracked.strip_dispatched_at = None
-        tracked.strip_requeued_at = time.time()
+        tracked.strip_head_since = None
         return True
 
     @property

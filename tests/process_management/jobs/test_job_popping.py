@@ -176,6 +176,14 @@ async def _queue_n_popped_jobs_requesting_post_processing(job_tracker: JobTracke
         )
 
 
+async def _queue_n_popped_jobs_requesting(job_tracker: JobTracker, n: int, post_processing: list[str]) -> None:
+    """Place ``n`` accepted jobs requesting ``post_processing`` that have not left the inference queue."""
+    for index in range(n):
+        await job_tracker.record_popped_job(
+            make_job_pop_response(model=f"accepted_{index}", post_processing=post_processing),
+        )
+
+
 async def _queue_n_popped_jobs_without_post_processing(job_tracker: JobTracker, n: int) -> None:
     """Place ``n`` accepted ordinary image jobs that do not need the post-processing lane."""
     for index in range(n):
@@ -1063,12 +1071,20 @@ class TestPostProcessingBacklogOfferShaping:
         availability: ModelAvailability | None = None,
         urgent: bool = False,
         shared_lane_commitments: int = 0,
+        accepted_strip_only_depth: int = 0,
+        accepted_strip_and_upscale_depth: int = 0,
     ) -> tuple[object, WorkerState]:
         """Drive one pop with configured post-processing commitments and return the request and state."""
         job_tracker = JobTracker()
         job_tracker.set_performance_mode_thresholds(1000)
         await job_tracker.increment_jobs_completed()
         await _queue_n_popped_jobs_requesting_post_processing(job_tracker, accepted_post_processing_depth)
+        await _queue_n_popped_jobs_requesting(job_tracker, accepted_strip_only_depth, ["strip_background"])
+        await _queue_n_popped_jobs_requesting(
+            job_tracker,
+            accepted_strip_and_upscale_depth,
+            ["strip_background", "RealESRGAN_x4plus"],
+        )
         await _queue_n_popped_jobs_without_post_processing(job_tracker, accepted_non_post_processing_depth)
         await _queue_n_jobs_for_post_processing(job_tracker, post_processing_backlog_depth)
 
@@ -1134,6 +1150,36 @@ class TestPostProcessingBacklogOfferShaping:
         )
 
         assert request.allow_post_processing is True
+
+    async def test_strip_only_jobs_do_not_count_against_the_post_processing_lane(self) -> None:
+        """A strip-only job runs on the image-utilities lane, so any number of them leaves the offer open."""
+        request, _state = await self._pop_and_capture_request(
+            post_processing_backlog_depth=0,
+            accepted_strip_only_depth=3,
+        )
+
+        assert request.allow_post_processing is True
+
+    async def test_strip_and_upscale_job_counts_once(self) -> None:
+        """A job requesting a strip and an upscale is one job for the post-processing lane, below the limit."""
+        request, _state = await self._pop_and_capture_request(
+            post_processing_backlog_depth=0,
+            accepted_strip_and_upscale_depth=1,
+            accepted_strip_only_depth=2,
+        )
+
+        assert request.allow_post_processing is True
+
+    async def test_upscale_jobs_at_the_limit_withhold_with_strip_only_jobs_present(self) -> None:
+        """Jobs that need the post-processing lane still withhold at the configured depth."""
+        request, _state = await self._pop_and_capture_request(
+            post_processing_backlog_depth=0,
+            accepted_strip_and_upscale_depth=1,
+            accepted_post_processing_depth=1,
+            accepted_strip_only_depth=2,
+        )
+
+        assert request.allow_post_processing is False
 
     async def test_graph_alchemy_lane_commitments_suppress_post_processing_offer(self) -> None:
         """Graph alchemy occupies the same post-processing lane and counts toward offer shaping."""

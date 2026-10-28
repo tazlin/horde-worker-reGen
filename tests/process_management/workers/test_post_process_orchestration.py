@@ -19,6 +19,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     ModelLoadState,
 )
 from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
+from horde_worker_regen.process_management.jobs.job_tracker import PostProcessingFaultCause
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.lifecycle.process_lifecycle import PauseOwner
@@ -231,7 +232,7 @@ class TestStartPostProcessing:
         await tracker.begin_post_processing(active_job)
 
         for _ in range(2):
-            tracker.note_post_processing_overcommit_fault()
+            tracker.note_post_processing_overcommit_fault(PostProcessingFaultCause.VRAM_OVERCOMMIT)
         process_manager._apply_post_processing_fault_breaker()
         await process_manager.start_post_processing()
 

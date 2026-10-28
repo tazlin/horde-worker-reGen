@@ -47,7 +47,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeProcessState,
 )
 from horde_worker_regen.process_management.ipc.supervisor_channel import WorkerEventKind, WorkerEventSink
-from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
+from horde_worker_regen.process_management.jobs.job_tracker import JobTracker, PostProcessingFaultCause
 from horde_worker_regen.process_management.lifecycle.child_crash_capture import (
     read_last_startup_crash,
     read_startup_crash_for_launch,
@@ -5485,7 +5485,7 @@ class ProcessLifecycleManager:
                 # hosted (or the pass wedged). Feed the feature-level circuit breaker so a run of these
                 # disables post-processing before the worker keeps faulting into forced-maintenance.
                 if state == HordeProcessState.POST_PROCESSING:
-                    self._job_tracker.note_post_processing_overcommit_fault()
+                    self._job_tracker.note_post_processing_overcommit_fault(PostProcessingFaultCause.VRAM_OVERCOMMIT)
                 self._initiate_post_process_replacement()
                 self._replace_all_post_process_process()
             if process_info.process_type == HordeProcessType.UTILITIES:

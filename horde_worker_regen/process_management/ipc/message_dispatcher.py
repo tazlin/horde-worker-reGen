@@ -53,7 +53,11 @@ from horde_worker_regen.process_management.ipc.messages import (
 from horde_worker_regen.process_management.ipc.supervisor_channel import WorkerEventKind, WorkerEventSink
 from horde_worker_regen.process_management.jobs.failure_classification import is_resource_failure
 from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
-from horde_worker_regen.process_management.jobs.job_tracker import InferenceFailureResolution, JobTracker
+from horde_worker_regen.process_management.jobs.job_tracker import (
+    InferenceFailureResolution,
+    JobTracker,
+    PostProcessingFaultCause,
+)
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.lifecycle.process_lifecycle import InferenceLaneOutcome
@@ -2058,7 +2062,9 @@ class MessageDispatcher:
                     f"({requested_post_processing}) but the dedicated post-processing lane is disabled; "
                     "reporting the job faulted without images.",
                 )
-                self._job_tracker.note_post_processing_overcommit_fault()
+                self._job_tracker.note_post_processing_overcommit_fault(
+                    PostProcessingFaultCause.POST_PROCESSING_LANE_DISABLED,
+                )
                 await self._job_tracker.fault_post_inference_job(job_info, reason=reason)
                 return
             if has_strip:
@@ -2084,7 +2090,7 @@ class MessageDispatcher:
             f"Job {job_info.sdk_api_job_info.id_} requested background removal but the image-utilities lane "
             "is disabled; reporting the job faulted without images.",
         )
-        self._job_tracker.note_post_processing_overcommit_fault()
+        self._job_tracker.note_post_processing_overcommit_fault(PostProcessingFaultCause.UTILITIES_LANE_DISABLED)
         await self._job_tracker.fault_post_inference_job(job_info, reason=reason)
 
     async def _handle_post_process_result(self, message: HordePostProcessResultMessage) -> None:
@@ -2143,7 +2149,7 @@ class MessageDispatcher:
             # model file that will not read) says nothing about VRAM, and counting it spends reclaim on a
             # problem reclaim cannot fix and moves the worker toward dropping a feature it can still serve.
             if message.fault_is_resource_class:
-                self._job_tracker.note_post_processing_overcommit_fault()
+                self._job_tracker.note_post_processing_overcommit_fault(PostProcessingFaultCause.VRAM_OVERCOMMIT)
             self._action_ledger.record(
                 LedgerEventType.POST_PROCESS_FAULTED,
                 process_id=message.process_id,

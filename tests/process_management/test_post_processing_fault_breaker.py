@@ -20,12 +20,26 @@ import pytest
 from horde_sdk.ai_horde_api import GENERATION_STATE
 from loguru import logger
 
-from horde_worker_regen.process_management.ipc.messages import HordeImageResult
+from horde_worker_regen.process_management.ipc.messages import (
+    HordeImageResult,
+    HordeInferenceResultMessage,
+    HordeProcessState,
+    HordeStripResultMessage,
+)
 from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
-from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
+from horde_worker_regen.process_management.jobs.job_tracker import JobTracker, PostProcessingFaultCause, TrackedJob
+from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.process_manager import HordeWorkerProcessManager
 from horde_worker_regen.process_management.resources.vram_arbiter import DeviceVramState, MeasuredVramSnapshot
-from tests.process_management.conftest import device_wide_reading, make_job_pop_response, make_testable_process_manager
+from tests.process_management.conftest import (
+    device_wide_reading,
+    make_job_pop_response,
+    make_mock_process_info,
+    make_testable_process_manager,
+)
+
+_UTILITIES_PROCESS_ID = 7
+"""The image-utilities lane's process id in the strip rows."""
 
 _LARGE_CARD_TOTAL_MB = 24000.0
 """A card whose achievable ceiling seats the post-processing peak, so the arbiter can only FITS or DEFER."""
@@ -100,12 +114,24 @@ class TestPostProcessingFaultCounter:
         job_tracker = JobTracker()
         assert job_tracker.count_recent_post_processing_faults(600) == 0
 
-        job_tracker.note_post_processing_overcommit_fault()
-        job_tracker.note_post_processing_overcommit_fault()
+        job_tracker.note_post_processing_overcommit_fault(PostProcessingFaultCause.VRAM_OVERCOMMIT)
+        job_tracker.note_post_processing_overcommit_fault(PostProcessingFaultCause.VRAM_OVERCOMMIT)
 
         assert job_tracker.count_recent_post_processing_faults(600) == 2
         # A zero-width window excludes faults recorded a moment ago (the boundary is strict-enough to prune).
         assert job_tracker.count_recent_post_processing_faults(-1) == 0
+
+    def test_only_the_vram_overcommit_cause_is_counted(self) -> None:
+        """A VRAM over-commit moves the count; every other cause leaves it where it was."""
+        job_tracker = JobTracker()
+
+        for cause in PostProcessingFaultCause:
+            if cause is not PostProcessingFaultCause.VRAM_OVERCOMMIT:
+                job_tracker.note_post_processing_overcommit_fault(cause)
+        assert job_tracker.count_recent_post_processing_faults(600) == 0
+
+        job_tracker.note_post_processing_overcommit_fault(PostProcessingFaultCause.VRAM_OVERCOMMIT)
+        assert job_tracker.count_recent_post_processing_faults(600) == 1
 
 
 class TestPostProcessingFaultBreaker:
@@ -121,12 +147,12 @@ class TestPostProcessingFaultBreaker:
 
         # Exactly the threshold is tolerated (the trip is strictly greater-than).
         for _ in range(4):
-            manager._job_tracker.note_post_processing_overcommit_fault()
+            manager._job_tracker.note_post_processing_overcommit_fault(PostProcessingFaultCause.VRAM_OVERCOMMIT)
         manager._apply_post_processing_fault_breaker()
         assert manager._state.post_processing_disabled_by_breaker is False
 
         # One more crosses it: the breaker trips and stamps the time.
-        manager._job_tracker.note_post_processing_overcommit_fault()
+        manager._job_tracker.note_post_processing_overcommit_fault(PostProcessingFaultCause.VRAM_OVERCOMMIT)
         manager._apply_post_processing_fault_breaker()
         assert manager._state.post_processing_disabled_by_breaker is True
         assert manager._state.post_processing_breaker_tripped_at > 0
@@ -138,7 +164,7 @@ class TestPostProcessingFaultBreaker:
             post_processing_fault_window_seconds=600,
         )
         for _ in range(2):
-            manager._job_tracker.note_post_processing_overcommit_fault()
+            manager._job_tracker.note_post_processing_overcommit_fault(PostProcessingFaultCause.VRAM_OVERCOMMIT)
         manager._apply_post_processing_fault_breaker()
         assert manager._state.post_processing_disabled_by_breaker is True
 
@@ -153,7 +179,7 @@ class TestPostProcessingFaultBreaker:
             post_processing_fault_window_seconds=1800,
         )
         for _ in range(10):
-            manager._job_tracker.note_post_processing_overcommit_fault()
+            manager._job_tracker.note_post_processing_overcommit_fault(PostProcessingFaultCause.VRAM_OVERCOMMIT)
         manager._apply_post_processing_fault_breaker()
         assert manager._state.post_processing_disabled_by_breaker is False
 
@@ -165,7 +191,7 @@ class TestPostProcessingBreakerAutoRecovery:
     def _trip_breaker(manager: HordeWorkerProcessManager) -> None:
         """Drive the breaker to its latched state with two faults at the currently-mocked wall-clock time."""
         for _ in range(2):
-            manager._job_tracker.note_post_processing_overcommit_fault()
+            manager._job_tracker.note_post_processing_overcommit_fault(PostProcessingFaultCause.VRAM_OVERCOMMIT)
         manager._apply_post_processing_fault_breaker()
 
     def test_stays_disabled_while_every_card_denies_then_re_enables(
@@ -354,3 +380,108 @@ class TestPostProcessingHeadroomGate:
                 assert manager._state.post_processing_withheld_for_headroom is False
 
         assert not [message for message in messages if "post-processing advertising" in message]
+
+
+async def _dispatched_strip_job(manager: HordeWorkerProcessManager) -> TrackedJob:
+    """Park a strip-only job with images on an idle utilities lane, dispatch it, and return its record."""
+    lane = make_mock_process_info(
+        _UTILITIES_PROCESS_ID,
+        model_name=None,
+        state=HordeProcessState.WAITING_FOR_JOB,
+        process_type=HordeProcessType.UTILITIES,
+    )
+    manager._process_map[_UTILITIES_PROCESS_ID] = lane
+    job = make_job_pop_response(post_processing=["strip_background"])
+    assert job.id_ is not None
+    job_info = await manager._job_tracker.record_popped_job(job, time_popped=time.time())
+    await manager._job_tracker.mark_inference_started(job)
+    job_info.job_image_results = [HordeImageResult(image_bytes=b"raw-image")]
+    await manager._job_tracker.queue_for_strip(job_info, from_post_processing=False)
+    await manager._advance_pending_strips()
+    tracked = manager._job_tracker.get_tracked_job(job.id_)
+    assert tracked is not None
+    assert tracked.strip_dispatched_at is not None
+    # The lane is busy with this strip until its result arrives.
+    lane.last_process_state = HordeProcessState.ALCHEMY_STARTING
+    return tracked
+
+
+class TestStripFaultsDoNotFeedTheBreaker:
+    """The breaker counts post-processing VRAM over-commit only; strip faults are faulted jobs and nothing more."""
+
+    async def test_strip_age_out_does_not_move_the_count(self) -> None:
+        """A strip that overran its execution budget is faulted without images and leaves the count alone."""
+        manager = make_testable_process_manager(enable_image_utilities=True)
+        tracked = await _dispatched_strip_job(manager)
+        tracked.strip_dispatched_at = time.time() - (manager._PENDING_STRIP_TIMEOUT_SECONDS + 5.0)
+
+        await manager._advance_pending_strips()
+
+        assert tracked.job_info is not None
+        assert tracked.job_info.state == GENERATION_STATE.faulted
+        assert manager._job_tracker.count_recent_post_processing_faults(1800) == 0
+
+    async def test_strip_service_failure_does_not_move_the_count(self) -> None:
+        """A strip the utilities service failed is faulted without images and leaves the count alone."""
+        manager = make_testable_process_manager(enable_image_utilities=True)
+        tracked = await _dispatched_strip_job(manager)
+
+        await manager._on_strip_result(
+            HordeStripResultMessage(
+                process_id=_UTILITIES_PROCESS_ID,
+                process_launch_identifier=0,
+                info="failed",
+                job_id=tracked.job_id,
+                images_bytes=[],
+                state=GENERATION_STATE.faulted,
+                fault_reason="did not respond within 120.0s",
+            ),
+        )
+
+        assert tracked.job_info is not None
+        assert tracked.job_info.state == GENERATION_STATE.faulted
+        assert manager._job_tracker.count_recent_post_processing_faults(1800) == 0
+
+    async def test_utilities_lane_disabled_does_not_move_the_count(self) -> None:
+        """A strip job arriving while the utilities lane is disabled is faulted and leaves the count alone."""
+        manager = make_testable_process_manager(enable_image_utilities=False)
+        job = make_job_pop_response(post_processing=["strip_background"])
+        assert job.id_ is not None
+        await manager._job_tracker.record_popped_job(job, time_popped=time.time())
+        await manager._job_tracker.mark_inference_started(job)
+
+        await manager._message_dispatcher._handle_inference_result(
+            HordeInferenceResultMessage(
+                process_id=99,
+                process_launch_identifier=0,
+                info="",
+                state=GENERATION_STATE.ok,
+                sdk_api_job_info=job,
+                job_image_results=[HordeImageResult(image_bytes=b"raw")],
+            ),
+        )
+
+        tracked = manager._job_tracker.get_tracked_job(job.id_)
+        assert tracked is not None
+        assert tracked.job_info is not None
+        assert tracked.job_info.state == GENERATION_STATE.faulted
+        assert manager._job_tracker.count_recent_post_processing_faults(1800) == 0
+
+    async def test_five_strip_faults_inside_the_window_do_not_trip_the_breaker(self) -> None:
+        """Five strip faults inside the window, over the threshold of four, leave the offer open."""
+        manager = make_testable_process_manager(
+            enable_image_utilities=True,
+            post_processing_fault_breaker_enabled=True,
+            post_processing_fault_threshold=4,
+            post_processing_fault_window_seconds=1800,
+        )
+        for _ in range(5):
+            tracked = await _dispatched_strip_job(manager)
+            tracked.strip_dispatched_at = time.time() - (manager._PENDING_STRIP_TIMEOUT_SECONDS + 5.0)
+            await manager._advance_pending_strips()
+            assert tracked.job_info is not None
+            assert tracked.job_info.state == GENERATION_STATE.faulted
+
+        manager._apply_post_processing_fault_breaker()
+
+        assert manager._state.post_processing_disabled_by_breaker is False

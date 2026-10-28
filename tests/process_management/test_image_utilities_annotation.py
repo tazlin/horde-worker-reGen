@@ -17,11 +17,16 @@ from __future__ import annotations
 import base64
 import time
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from unittest.mock import Mock
 
+import pytest
 from horde_sdk.ai_horde_api import GENERATION_STATE
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
+from horde_sdk.ai_horde_api.fields import GenerationID
 from horde_sdk.generation_parameters.alchemy.consts import is_strip_background_form
+from loguru import logger
 
 from horde_worker_regen.consts import EXTENDED_CONTROL_TYPES
 from horde_worker_regen.process_management.ipc.messages import (
@@ -558,20 +563,35 @@ class TestStripAgeOut:
     """A strip that outlives the bounded timeout is a no-image fault, so a job is never parked forever."""
 
     async def test_age_out_faults_strip_job_without_images(self) -> None:
-        """A strip sitting past the timeout is faulted without images."""
+        """A strip whose lane never frees is faulted without images once its stay leaves no room for a pass."""
         pm = make_testable_process_manager(enable_image_utilities=True)
-        _add_utilities_process(pm)
+        _add_utilities_process(pm, state=HordeProcessState.ALCHEMY_STARTING)
         job = await _park_strip_job(pm)
         assert job.id_ is not None
 
         tracked = pm._job_tracker.get_tracked_job(job.id_)
         assert tracked is not None
-        tracked.current_stage_since = time.time() - (pm._PENDING_STRIP_TIMEOUT_SECONDS + 5.0)
+        tracked.current_stage_since = time.time() - pm._strip_stage_cap_seconds()
         await pm._advance_pending_strips()
 
         assert tracked.stage == JobStage.PENDING_SUBMIT
         assert tracked.job_info is not None
         assert tracked.job_info.state == GENERATION_STATE.faulted
+
+    async def test_strip_with_a_free_lane_is_dispatched_whatever_its_stage_age(self) -> None:
+        """A strip the lane can take this tick is dispatched, never faulted in the same tick."""
+        pm = make_testable_process_manager(enable_image_utilities=True)
+        util = _add_utilities_process(pm)
+        job = await _park_strip_job(pm)
+        assert job.id_ is not None
+
+        tracked = pm._job_tracker.get_tracked_job(job.id_)
+        assert tracked is not None
+        tracked.current_stage_since = time.time() - pm._strip_stage_cap_seconds()
+        await pm._advance_pending_strips()
+
+        assert tracked.stage == JobStage.PENDING_STRIP
+        assert tracked.strip_process_id == util.process_id
 
 
 class TestStripBudgets:
@@ -613,8 +633,8 @@ class TestStripBudgets:
         assert tracked.job_info is not None
         assert tracked.job_info.state == GENERATION_STATE.faulted
 
-    async def test_queued_strip_earns_a_budget_for_each_strip_ahead_of_it(self) -> None:
-        """A job waiting behind another strip is allowed that strip's budget on top of its own."""
+    async def test_queued_strip_is_not_charged_for_the_strip_ahead_of_it(self) -> None:
+        """A job waiting behind a running strip survives any wait short of the stage cap."""
         pm = make_testable_process_manager(enable_image_utilities=True)
         _add_utilities_process(pm)
         first = await _park_strip_job(pm)
@@ -630,14 +650,227 @@ class TestStripBudgets:
         assert head.strip_dispatched_at is not None
         assert waiter.strip_dispatched_at is None, "the single serial lane takes one strip at a time"
 
-        # Waiting longer than one strip's budget, but less than the two it is owed behind the running one.
-        waiter.current_stage_since = time.time() - (pm._PENDING_STRIP_TIMEOUT_SECONDS * 1.5)
+        queue_wait_limit = pm._strip_stage_cap_seconds() - pm._PENDING_STRIP_TIMEOUT_SECONDS
+        waiter.current_stage_since = time.time() - (queue_wait_limit - 5.0)
         await pm._age_out_pending_strips()
         assert waiter.stage == JobStage.PENDING_STRIP
+        assert waiter.strip_head_since is None
 
-        waiter.current_stage_since = time.time() - (pm._PENDING_STRIP_TIMEOUT_SECONDS * 2.5)
+        waiter.current_stage_since = time.time() - (queue_wait_limit + 5.0)
         await pm._age_out_pending_strips()
         assert waiter.stage == JobStage.PENDING_SUBMIT
+
+
+def _strip_result(job_id: GenerationID, *, ok: bool = True) -> HordeStripResultMessage:
+    """Build the utilities lane's result for one background strip, stripped images or a fault."""
+    return HordeStripResultMessage(
+        process_id=_UTILITIES_PROCESS_ID,
+        process_launch_identifier=0,
+        info="ok" if ok else "failed",
+        job_id=job_id,
+        images_bytes=[b"stripped"] if ok else [],
+        state=GENERATION_STATE.ok if ok else GENERATION_STATE.faulted,
+        fault_reason=None if ok else "background removal failed",
+    )
+
+
+@contextmanager
+def _captured_messages() -> Iterator[list[str]]:
+    """Collect every loguru message emitted inside the block."""
+    messages: list[str] = []
+    sink_id = logger.add(lambda message: messages.append(message.record["message"]), level="TRACE")
+    try:
+        yield messages
+    finally:
+        logger.remove(sink_id)
+
+
+class TestStripHeadOfQueueClock:
+    """A queued strip is clocked from the moment it reaches the head of the queue, never from stage entry."""
+
+    async def test_waiter_is_dispatched_in_the_tick_its_predecessor_frees_the_lane(self) -> None:
+        """A strip that waited longer than one execution budget behind a long pass is dispatched, not faulted.
+
+        The waiter's time behind the running strip is the lane's time, so the tick the lane frees for it
+        hands it the lane.
+        """
+        pm = make_testable_process_manager(enable_image_utilities=True)
+        util = _add_utilities_process(pm)
+        first = await _park_strip_job(pm)
+        second = await _park_strip_job(pm)
+        assert first.id_ is not None
+        assert second.id_ is not None
+        await pm._advance_pending_strips()
+        util.last_process_state = HordeProcessState.ALCHEMY_STARTING
+
+        running = pm._job_tracker.get_tracked_job(first.id_)
+        waiter = pm._job_tracker.get_tracked_job(second.id_)
+        assert running is not None
+        assert waiter is not None
+        assert running.strip_dispatched_at is not None
+        now = time.time()
+        running.current_stage_since = now - 175.0
+        running.strip_dispatched_at = now - 170.0
+        waiter.current_stage_since = now - (pm._PENDING_STRIP_TIMEOUT_SECONDS + 10.0)
+        await pm._advance_pending_strips()
+        assert waiter.stage == JobStage.PENDING_STRIP
+        assert waiter.strip_dispatched_at is None
+
+        await pm._on_strip_result(_strip_result(first.id_))
+        util.last_process_state = HordeProcessState.WAITING_FOR_JOB
+        await pm._advance_pending_strips()
+
+        assert waiter.stage == JobStage.PENDING_STRIP
+        assert waiter.strip_process_id == util.process_id
+        sent = _sent(util).call_args.args[0]
+        assert isinstance(sent, HordeStartStripControlMessage)
+        assert sent.job_id == second.id_
+
+    async def test_waiter_behind_a_running_strip_is_not_clocked(self) -> None:
+        """A strip with a dispatched strip ahead of it has no head clock running, short of the stage cap."""
+        pm = make_testable_process_manager(enable_image_utilities=True)
+        util = _add_utilities_process(pm)
+        await _park_strip_job(pm)
+        second = await _park_strip_job(pm)
+        assert second.id_ is not None
+        await pm._advance_pending_strips()
+        util.last_process_state = HordeProcessState.ALCHEMY_STARTING
+
+        waiter = pm._job_tracker.get_tracked_job(second.id_)
+        assert waiter is not None
+        queue_wait_limit = pm._strip_stage_cap_seconds() - pm._PENDING_STRIP_TIMEOUT_SECONDS
+        assert queue_wait_limit - 5.0 > pm._PENDING_STRIP_TIMEOUT_SECONDS
+        waiter.current_stage_since = time.time() - (queue_wait_limit - 5.0)
+        await pm._advance_pending_strips()
+
+        assert waiter.stage == JobStage.PENDING_STRIP
+        assert waiter.strip_head_since is None
+
+    async def test_head_waiter_with_no_free_lane_ages_out_after_one_execution_budget(self) -> None:
+        """A strip at the head whose lane never frees is faulted once it has waited one execution budget there."""
+        pm = make_testable_process_manager(enable_image_utilities=True)
+        _add_utilities_process(pm, state=HordeProcessState.ALCHEMY_STARTING)
+        job = await _park_strip_job(pm)
+        assert job.id_ is not None
+        await pm._advance_pending_strips()
+
+        tracked = pm._job_tracker.get_tracked_job(job.id_)
+        assert tracked is not None
+        assert tracked.strip_head_since is not None
+        tracked.strip_head_since = time.time() - (pm._PENDING_STRIP_TIMEOUT_SECONDS - 5.0)
+        await pm._advance_pending_strips()
+        assert tracked.stage == JobStage.PENDING_STRIP
+
+        tracked.strip_head_since = time.time() - (pm._PENDING_STRIP_TIMEOUT_SECONDS + 5.0)
+        with _captured_messages() as messages:
+            await pm._advance_pending_strips()
+
+        assert tracked.stage == JobStage.PENDING_SUBMIT
+        assert tracked.job_info is not None
+        assert tracked.job_info.state == GENERATION_STATE.faulted
+        assert tracked.job_info.job_image_results is None
+        assert any("at the head of the strip queue" in message for message in messages)
+
+    async def test_waiter_past_the_stage_cap_is_faulted_with_its_detail(self) -> None:
+        """A strip still queued when no pass could finish inside the stage cap is faulted, naming the cap."""
+        pm = make_testable_process_manager(enable_image_utilities=True)
+        util = _add_utilities_process(pm)
+        await _park_strip_job(pm)
+        second = await _park_strip_job(pm)
+        assert second.id_ is not None
+        await pm._advance_pending_strips()
+        util.last_process_state = HordeProcessState.ALCHEMY_STARTING
+
+        stage_cap = pm._strip_stage_cap_seconds()
+        assert stage_cap == pm._PENDING_STRIP_TIMEOUT_SECONDS * (
+            pm.bridge_data.queue_size + pm.bridge_data.max_threads + 1
+        )
+        waiter = pm._job_tracker.get_tracked_job(second.id_)
+        assert waiter is not None
+        queue_wait_limit = stage_cap - pm._PENDING_STRIP_TIMEOUT_SECONDS
+        waiter.current_stage_since = time.time() - (queue_wait_limit - 5.0)
+        await pm._advance_pending_strips()
+        assert waiter.stage == JobStage.PENDING_STRIP
+
+        waiter.current_stage_since = time.time() - (queue_wait_limit + 5.0)
+        with _captured_messages() as messages:
+            await pm._advance_pending_strips()
+
+        assert waiter.stage == JobStage.PENDING_SUBMIT
+        assert waiter.job_info is not None
+        assert waiter.job_info.state == GENERATION_STATE.faulted
+        assert any(
+            str(second.id_)[:8] in message and f"{stage_cap:.0f}s strip stage cap" in message for message in messages
+        )
+
+
+class TestSlowStripLaneEnsemble:
+    """A strip lane slower than strip arrivals faults only the strips it cannot reach, and nothing else."""
+
+    async def test_slow_strips_keep_the_post_processing_offer_and_breaker_closed(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Seven strip jobs against a lane serving each in most of an execution budget.
+
+        The post-processing lane serves none of these jobs, so the offer stays advertised and the breaker
+        stays closed, while the strips that cannot be reached inside the stage cap are faulted on it.
+        """
+        clock = [100_000.0]
+        monkeypatch.setattr(time, "time", lambda: clock[0])
+        pm = make_testable_process_manager(enable_image_utilities=True)
+        util = _add_utilities_process(pm)
+        service_seconds = pm._PENDING_STRIP_TIMEOUT_SECONDS * 0.9
+        arrival_interval_seconds = 34.0
+        tick_seconds = 1.0
+
+        jobs = [make_job_pop_response(post_processing=["strip_background"]) for _ in range(7)]
+        job_infos = [await pm._job_tracker.record_popped_job(job, time_popped=clock[0]) for job in jobs]
+        arrivals = [clock[0] + index * arrival_interval_seconds for index in range(len(jobs))]
+        arrived = 0
+        in_flight: tuple[GenerationID, float] | None = None
+        stripped: set[GenerationID] = set()
+
+        with _captured_messages() as messages:
+            while arrived < len(jobs) or pm._job_tracker.jobs_pending_strip:
+                while arrived < len(jobs) and clock[0] >= arrivals[arrived]:
+                    await pm._job_tracker.mark_inference_started(jobs[arrived])
+                    job_infos[arrived].job_image_results = [HordeImageResult(image_bytes=b"raw")]
+                    await pm._job_tracker.queue_for_strip(job_infos[arrived], from_post_processing=False)
+                    arrived += 1
+                if in_flight is not None and clock[0] >= in_flight[1]:
+                    await pm._on_strip_result(_strip_result(in_flight[0]))
+                    stripped.add(in_flight[0])
+                    util.last_process_state = HordeProcessState.WAITING_FOR_JOB
+                    in_flight = None
+                await pm._advance_pending_strips()
+                for tracked in pm._job_tracker.jobs_pending_strip:
+                    if tracked.strip_dispatched_at is not None and (
+                        in_flight is None or in_flight[0] != tracked.job_id
+                    ):
+                        in_flight = (tracked.job_id, clock[0] + service_seconds)
+                        util.last_process_state = HordeProcessState.ALCHEMY_STARTING
+
+                pm._apply_post_processing_fault_breaker()
+                assert pm._state.post_processing_disabled_by_breaker is False
+                assert pm._job_popper._should_withhold_post_processing_offer(pm.bridge_data) is False
+                assert pm._job_popper._post_processing_offer_withheld_reason() is None
+                clock[0] += tick_seconds
+
+        job_ids = [job.id_ for job in jobs if job.id_ is not None]
+        assert len(job_ids) == len(jobs)
+        faulted = {job_id for job_id in job_ids if job_id not in stripped}
+        assert stripped, "the lane serves the strips it reaches"
+        assert faulted, "a lane this slow cannot reach every strip inside the stage cap"
+        assert pm._job_tracker.count_recent_post_processing_faults(1800) == 0
+        stage_cap_faults = [message for message in messages if "strip stage cap" in message]
+        assert len(stage_cap_faults) == len(faulted)
+        assert not [message for message in messages if "at the head of the strip queue" in message]
+        for job_id in faulted:
+            tracked = pm._job_tracker.get_tracked_job(job_id)
+            assert tracked is not None
+            assert tracked.job_info is not None
+            assert tracked.job_info.state == GENERATION_STATE.faulted
 
 
 class TestStripLaneReplacement:
@@ -652,13 +885,17 @@ class TestStripLaneReplacement:
         await pm._advance_pending_strips()
 
         util.mp_process.is_alive.return_value = False
+        requeued_at = time.time()
         await pm._advance_pending_strips()
 
         tracked = pm._job_tracker.get_tracked_job(job.id_)
         assert tracked is not None
         assert tracked.stage == JobStage.PENDING_STRIP
         assert tracked.strip_process_id is None
-        assert tracked.strip_requeued_at is not None
+        assert tracked.strip_dispatched_at is None
+        # Back at the head with no lane alive, so its head clock restarts at the requeue.
+        assert tracked.strip_head_since is not None
+        assert tracked.strip_head_since >= requeued_at
         assert tracked.job_info is not None
         assert tracked.job_info.images_bytes == [b"raw-image"]
 

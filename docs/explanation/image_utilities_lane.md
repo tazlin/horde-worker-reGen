@@ -195,9 +195,17 @@ write-off is deliberately hard to reach, because a reissue asks the horde to buy
 
 - **Execution budget** (180s): how long one strip may run, timed from the moment it is dispatched to a lane.
   A job's wait for its turn is never counted against its own pass.
-- **Queue-wait budget**: a strip still waiting for a lane is allowed 180s for each strip ahead of it plus its
-  own, since the lane serves them one at a time and each may legitimately take a full execution budget. The
-  clock restarts when a strip is handed back to the queue.
+- **Head-of-queue budget** (180s): a queued strip is clocked only once it reaches the head of the queue,
+  the first queued strip with no dispatched strip ahead of it. Time spent behind a running pass is the lane's
+  time and is not charged to the waiter. Each tick dispatches before it ages strips out, so a waiter is never
+  faulted in the tick a lane frees for it. The clock restarts when a strip is handed back to the queue.
+- **Stage cap**: one execution budget for each job the worker admits to intake at once (`queue_size` plus
+  `max_threads`, summed across cards) plus the job's own pass, measured from stage entry. A queued strip is
+  faulted once a fresh pass could no longer finish inside the cap, so a dispatched strip always keeps its full
+  execution budget.
+- **The breaker**: strip faults (a timeout, a service failure, a lost lane, the lane disabled) are faulted
+  jobs and nothing more. They do not feed the post-processing fault breaker, which counts VRAM over-commit
+  only.
 - **Lane replacement**: a lane going away does not spoil the job. Its images are still held, so the strip is
   re-queued for the replacement lane; only after a bounded number of lanes (two) is it written off. This is
   what the orphan reconcile does instead of faulting on sight.
