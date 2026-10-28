@@ -986,8 +986,8 @@ class HordeDownloadProcess(HordeProcess):
 
         The engine reports a skip for a condition that can clear as a typed ``AdhocDownloadSkipReason``, distinct
         from its terminal rejection reasons, so the file is not memoized as unusable. A full cache volume becomes
-        ``DISK_FULL``, which the parent handles as a disk condition. A skip reason this process does not know
-        reports a plain failure. The import is local because hordelib's model managers load torch, and the
+        ``DISK_FULL``, which the parent handles as a disk condition. A skip reason this process does not recognize
+        is reported as a plain failure. The import is local because hordelib's model managers load torch, and the
         parent imports this module.
         """
         from hordelib.model_manager.civitai_adhoc import AdhocDownloadSkipReason

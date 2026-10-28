@@ -106,7 +106,7 @@ def test_pending_only_model_keeps_its_real_baseline_when_beta_is_opted_in(monkey
     monkeypatch.setenv("HORDELIB_BETA_MODEL_CATEGORIES", "image_generation")
 
     class _PendingProviderStub:
-        """The owner reads the pending category through the built provider once before it queries."""
+        """The merged view reads the pending category through the built provider once before it queries."""
 
         def fetch_category(self, _category: object) -> dict[str, ImageGenerationModelRecord]:
             return {pending_model: pending_record}

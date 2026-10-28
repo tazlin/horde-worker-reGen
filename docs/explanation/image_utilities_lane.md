@@ -95,27 +95,27 @@ lane produced it.
 
 ## When the lane runs
 
-The lane is started only while work needs it. A lane with nothing to serve still holds a CUDA context on the
+The lane is started only while work needs it. An idle lane still holds a CUDA context on the
 card and spends tens of seconds of CPU priming its annotators at every start, and the reclaim ladder would stop
 it again for the next post-processing chain that does not fit beside it.
 
-One pure function, `utilities_lane_demand` in `scheduling/workload_flow.py`, answers whether the lane should be
+One pure function, `utilities_lane_demand` in `scheduling/workload_flow.py`, returns whether the lane should be
 up and why. Its rules, first match wins:
 
 1. A lane that is disabled, not wanted by the configured workloads or not provisioned, or a worker shutting
    down, is never wanted.
 2. An alchemist offering `annotation` before any lane has reported a servable set this session, or since the
    kept set was dropped. No offer keeps the lane up (see [Alchemy forms](#alchemy-forms)), but the annotation
-   offer has to name control types and only a lane run reports them. Strips and ControlNet jobs are traffic, so
-   no setting promises another start, and this rule starts the lane once to learn the set. It lapses at the
+   offer has to list control types and only a lane run reports them. Strips and ControlNet jobs depend on traffic, so
+   no setting guarantees another start, and this rule starts the lane once to read the set. It lapses at the
    lane's first report. The extended-ControlNet opt-in does not keep the lane up either (see
    [Extended ControlNet](#extended-controlnet)).
 3. A job in `PENDING_STRIP`.
 4. A job pending or in inference whose post-processing is background removal alone. Its queue wait and
-   generation cover a lane start. A job that also asks for an upscaler or face fixer counts from rule 3 only,
-   once its post-processing chain has left the post-processing lane, so the chain does not find a lane started
-   for it and stop it again.
-5. A ControlNet job that wants pre-annotation and has not been offered to the lane, or a job in
+   generation cover a lane start. A job that also requests an upscaler or face fixer counts from rule 3 only,
+   once its post-processing chain has left the post-processing lane, so a lane is not started for the chain and
+   stopped again.
+5. A ControlNet job that needs pre-annotation and has not been offered to the lane, or a job in
    `PENDING_ANNOTATION`. An extended-ControlNet job with a source image counts here like any other.
 6. A lane-bound alchemy form pending dispatch or in flight. The form was offered and popped with the lane
    down, so this rule is what starts the lane for it.
@@ -136,23 +136,23 @@ started it.
 The reclaim ladder's restore (`restore_utilities_off_gpu`) lifts its pause and discharges its obligation either
 way, but starts the lane only with demand. Without it the lane stays down and the restore logs
 `Reclaim ladder: leaving the image-utilities lane down until a job needs it.` once per stretch the lane stays
-down. A lane that is down holds no context, so the arbiter offers no utilities rung for it. A ladder pause that
+down. A lane that is down does not hold a context, so the arbiter does not offer a utilities rung for it. A ladder pause that
 outlives every owner that could restore it (no saturation episode, post-processing borrow or recovery remedy
 claims it, held for the stranded-lane debounce) is restored by the driver once a job needs the lane.
 
-A lane that is down because nothing needs it is not a failure. Recovery, the hung-process watchdog and the
+A lane that is down because no job needs it is not a failure. Recovery, the hung-process watchdog and the
 crash reaper act on processes in the map only, the strip and annotation stages wait or fall through as they do
 while the lane restarts, and the dashboard's process table lists the lane only while it runs.
 
 ### Alchemy forms
 
-The alchemy forms that route to the lane (`strip_background`, `annotation`) have no other home, but a lane that
+The alchemy forms that route to the lane (`strip_background`, `annotation`) cannot run anywhere else, but a lane that
 is down by policy starts for a popped form, so the offer does not need a live lane. The alchemy pop gate
 (`AlchemyCoordinator._utilities_lane_healthy`) offers them while a lane is loaded or while
 `utilities_lane_will_serve` holds, and withholds them while the lane is paused, crashed, refused for VRAM or
 disabled.
 
-`annotation` also needs control types to name in the pop. The worker keeps the servable set the lane reported on
+`annotation` also needs control types to list in the pop. The worker keeps the servable set the lane reported on
 its last run (`HordeWorkerProcessManager._kept_servable_set`) and offers it while the lane will serve and no live
 lane has reported. A crash or hang replacement and a disabled lane drop the kept set, so a lane that comes back
 reports its set afresh before annotation is offered from it. Before the lane has reported once there is no set,
@@ -168,9 +168,9 @@ owner holds paused, or whose loaded lane is busy with another form, keeps the di
 
 ### Extended ControlNet
 
-Extended ControlNet types have no in-graph preprocessor, so an extended job can only run once the lane has
+Extended ControlNet types do not have an in-graph preprocessor, so an extended job can only run once the lane has
 derived its control map. The lane is not kept up for them. `ProcessLifecycleManager.utilities_lane_will_serve`
-says whether a job may wait for the lane. It is true while the lane runs or starts, and while the lane is down
+returns whether a job may wait for the lane. It is true while the lane runs or starts, and while the lane is down
 by policy (enabled, provisioned, not paused by a reclaim or residency owner, no start deferred for VRAM, no crash
 replacement under way, no demand start that failed outright). A crashed, paused or refused lane is not waited
 for.
@@ -184,7 +184,7 @@ Each control-loop tick, before the annotation pass and the scheduling cycle,
 
 - A job whose type is in the live servable set, or that already carries its derived map, passes on to
   pre-annotation or inference.
-- A job that wants pre-annotation of a type the lane cannot serve yet is held while the lane will serve, no live
+- A job that needs pre-annotation of a type the lane cannot serve yet is held while the lane will serve, no live
   lane has reported its servable set yet, and the type's weights are on disk. `InferenceScheduler.reconcile_utilities_lane_holds` records the hold in the
   `DispatchHoldLedger`, logs `Holding extended-ControlNet job <id> for the image-utilities lane, which cannot
   serve control type <type> yet.` and records an `INFERENCE_DISPATCH` decision (`withhold`,
@@ -197,12 +197,12 @@ Each control-loop tick, before the annotation pass and the scheduling cycle,
   the skip budget (`affinity_budget_seconds`), which stands in for the tail after sampling. This is longer than
   the anti-starvation share, since a held job has not been offered a lane and there is no head to step aside.
   With no sampling figure the hold ends at the anti-starvation share. A job with no ttl is measured against
-  `dispatch_affinity.fallback_ttl_seconds`, the most recent ttl the worker saw or the skip budget's default. A live lane that has reported a set without the job's
+  `dispatch_affinity.fallback_ttl_seconds`, the most recent ttl the worker received or the skip budget's default. A live lane that has reported a set without the job's
   type is not waited for.
 
-The weights check (`_extended_annotators_on_disk`) probes each extended type once and keeps the answer until the
+The weights check (`_extended_annotators_on_disk`) probes each extended type once and caches the result until the
 download process reports a change in ControlNet or post-processor presence, so the pop offer and the per-tick
-hold check read a cached answer.
+hold check read a cached result.
 
 The hold is released on the tick the lane reports the job's type servable, and the annotation pass parks the job
 for its map in the same tick.
@@ -317,8 +317,8 @@ write-off is deliberately hard to reach, because a reissue asks the horde to buy
   `max_threads`, summed across cards) plus the job's own pass, measured from stage entry. A queued strip is
   faulted once a fresh pass could no longer finish inside the cap, so a dispatched strip always keeps its full
   execution budget.
-- **The breaker**: strip faults (a timeout, a service failure, a lost lane, the lane disabled) are faulted
-  jobs and nothing more. They do not feed the post-processing fault breaker, which counts VRAM over-commit
+- **The breaker**: strip faults (a timeout, a service failure, a lost lane, the lane disabled) affect only the
+  job that faulted. They do not feed the post-processing fault breaker, which counts VRAM over-commit
   only.
 - **Lane replacement**: a lane going away does not spoil the job. Its images are still held, so the strip is
   re-queued for the replacement lane; only after a bounded number of lanes (two) is it written off. This is

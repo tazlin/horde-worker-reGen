@@ -822,15 +822,15 @@ class AuxModelKind(StrEnum):
 
 
 class AuxPrefetchFailureKind(StrEnum):
-    """Why an auxiliary prefetch did not place its file on disk; the parent routes each kind to its owner."""
+    """Why an auxiliary prefetch did not place its file on disk. The parent handles each kind separately."""
 
     DOWNLOAD_FAILED = auto()
-    """The fetch returned no file and surfaced no reason: a transfer or upstream failure the CDN backoff counts."""
+    """The fetch returned neither a file nor a reason. A transfer or upstream failure that the CDN backoff counts."""
     REJECTED = auto()
-    """The fetch terminally refused the file (``rejection_reason`` says why); its jobs proceed without it."""
+    """The fetch terminally refused the file (``rejection_reason`` gives the reason). Its jobs proceed without it."""
     DISK_FULL = auto()
     """The cache volume could not hold the file above its free-space floor with every unpinned ad-hoc entry
-    evicted. A local disk condition the disk guard owns, never a CDN strike."""
+    evicted. A local disk condition handled by the disk guard, not a CDN strike."""
 
 
 class AuxModelRef(BaseModel):
@@ -869,7 +869,7 @@ class HordeAuxPrefetchControlMessage(HordeControlMessage):
     control_flag: HordeControlFlag = HordeControlFlag.PREFETCH_AUX_MODELS
     entries: list[AuxPrefetchEntry] = Field(default_factory=list)
     """The auxiliary files to ensure on disk: every reference of the job not skipped, cooling or already reported
-    present for it. An entry already on disk is answered with an immediate success."""
+    present for it. An entry already on disk is reported as an immediate success."""
     pins: list[AuxModelRef] = Field(default_factory=list)
     """Every auxiliary file referenced by any tracked job, protected from eviction while still needed."""
 

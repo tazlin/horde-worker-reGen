@@ -81,7 +81,7 @@ _UTILITIES_LANE_NOT_EXERCISED = (
     "the image-utilities lane runs an out-of-venv capability service the dry-run harness does not launch"
 )
 _UTILITIES_LANE_NOT_WANTED = (
-    "the image-utilities lane starts only for work it serves, and the dry-run contract scenario carries no "
+    "the image-utilities lane starts only for work it serves, and the dry-run contract scenario does not include a "
     "background strip, ControlNet job or lane-bound alchemy form"
 )
 _WHOLE_CARD_NOT_EXERCISED = (

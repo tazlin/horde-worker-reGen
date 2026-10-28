@@ -282,7 +282,7 @@ def test_custom_model_is_kept_and_never_reported_dropped_by_the_on_disk_pass(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A configured custom name is judged by startup validation, so the on-disk pass neither drops nor names it."""
+    """Startup validation checks a configured custom name, so the on-disk pass neither drops nor lists it."""
     manager = _on_disk_manager(tmp_path, monkeypatch)
     info_lines: list[str] = []
     sink_id = logger.add(lambda message: info_lines.append(message.record["message"]), level="INFO")

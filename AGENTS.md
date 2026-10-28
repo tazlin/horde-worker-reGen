@@ -238,9 +238,9 @@ Start from the mechanism, not the file. Each line states the owner of one questi
   age-out runs under a ladder pause regardless.
 - **Whether a LoRA or TI is on disk:** the download process, which holds the files, runs every evictor and does not
   report an eviction to the parent. `AuxPrefetchCoordinator` sends every reference of a popped job that is not
-  skipped or cooling, and the download process applies the request's eviction pins before it answers a present
-  entry with an immediate success. The parent records that answer per job (`TrackedJob.aux_present_lora_keys`,
-  `aux_present_ti_keys`) and keeps no worker-wide presence belief.
+  skipped or cooling, and the download process applies the request's eviction pins before it reports a present
+  entry as an immediate success. The parent records that result per job (`TrackedJob.aux_present_lora_keys`,
+  `aux_present_ti_keys`) and does not keep a worker-wide record of presence.
 
 ## Code quality
 
@@ -340,7 +340,7 @@ uv run pytest -m chaos_sweep        # generated wedge-liveness sweep (pre-releas
   `tests/process_management/manager/test_orchestrator_torch_free.py` is the tripwire.
 - **Subprocesses must never download model references.** The parent owns reference downloading; use
   `reference_helper` for an offline reference manager in a child. On-disk layout facts live in
-  `horde_model_reference.on_disk_layout`. Beta (pending-queue) records reach children the same way: the parent
+  `horde_model_reference.on_disk_layout`. Beta (pending-queue) records reach children the same way. The parent
   writes them with `beta_source.share_pending_records_with_children`, which sets `HORDELIB_BETA_MODELS_DIR`
   for the processes spawned after it.
 - **Telemetry is off by default** (expensive even with no collector). See

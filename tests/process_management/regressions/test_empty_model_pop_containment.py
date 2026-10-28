@@ -483,7 +483,7 @@ class TestRefusedLoadReturnsToHostAdmission:
         ]
 
     async def test_a_host_refused_preload_is_judged_by_host_admission_before_any_dispatch(self) -> None:
-        """After LOADING then a host-commit FAILED, the next pass re-judges the load and sends no START_INFERENCE."""
+        """After a host-commit FAILED, the next pass re-evaluates the load and does not send START_INFERENCE."""
         pm = make_testable_process_manager(
             enable_vram_budget=True,
             vram_reserve_mb=2000,

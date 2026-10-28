@@ -415,7 +415,7 @@ class TestStripPopGating:
     def test_strip_offered_only_when_lane_healthy(self, monkeypatch) -> None:  # noqa: ANN001
         """The pure offer function keeps strip_background exactly when its lane reading allows it.
 
-        The reading the coordinator passes now means "the lane serves or will serve"; the rows below drive it.
+        The reading the coordinator passes now means "the lane serves or will serve". The rows below drive it.
         """
         monkeypatch.setattr(alchemy_popper, "strip_background_available", lambda: True)
         bridge_data = make_mock_bridge_data(forms=["post-process"])
@@ -427,7 +427,7 @@ class TestStripPopGating:
         assert not any(is_strip_background_form(form) for form in offered_unhealthy)
 
     def test_strip_is_offered_while_the_lane_is_down_by_policy(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """A lane that is down because nothing needs it will start for a popped strip, so the offer stands."""
+        """A lane that is down because no job needs it will start for a popped strip, so the offer stands."""
         pm = _alchemist_with_the_lane_down(monkeypatch)
         assert pm._process_map.num_utilities_processes() == 0
         assert pm._process_lifecycle.utilities_lane_will_serve()
@@ -468,7 +468,7 @@ class TestStripPopGating:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """With no servable set learned this session the offer cannot carry any types, so it is withheld."""
+        """With no servable set reported this session the offer cannot carry any types, so it is withheld."""
         pm = _alchemist_with_the_lane_down(monkeypatch)
 
         assert _ANNOTATION_FORM not in _lane_forms_offered(pm)
@@ -708,7 +708,7 @@ class TestStripAgeOut:
     """A strip that outlives the bounded timeout is a no-image fault, so a job is never parked forever."""
 
     async def test_age_out_faults_strip_job_without_images(self) -> None:
-        """A strip whose lane never frees is faulted without images once its stay leaves no room for a pass."""
+        """A strip whose lane never frees is faulted without images once its stay no longer leaves room for a pass."""
         pm = make_testable_process_manager(enable_image_utilities=True)
         _add_utilities_process(pm, state=HordeProcessState.ALCHEMY_STARTING)
         job = await _park_strip_job(pm)
@@ -872,7 +872,7 @@ class TestStripHeadOfQueueClock:
         assert sent.job_id == second.id_
 
     async def test_waiter_behind_a_running_strip_is_not_clocked(self) -> None:
-        """A strip with a dispatched strip ahead of it has no head clock running, short of the stage cap."""
+        """A strip with a dispatched strip ahead of it does not have a head clock running, short of the stage cap."""
         pm = make_testable_process_manager(enable_image_utilities=True)
         util = _add_utilities_process(pm)
         await _park_strip_job(pm)
@@ -917,7 +917,7 @@ class TestStripHeadOfQueueClock:
         assert any("at the head of the strip queue" in message for message in messages)
 
     async def test_waiter_past_the_stage_cap_is_faulted_with_its_detail(self) -> None:
-        """A strip still queued when no pass could finish inside the stage cap is faulted, naming the cap."""
+        """A strip still queued when no pass fits inside the stage cap is faulted with the cap in its detail."""
         pm = make_testable_process_manager(enable_image_utilities=True)
         util = _add_utilities_process(pm)
         await _park_strip_job(pm)
@@ -958,7 +958,7 @@ class TestSlowStripLaneEnsemble:
     ) -> None:
         """Seven strip jobs against a lane serving each in most of an execution budget.
 
-        The post-processing lane serves none of these jobs, so the offer stays advertised and the breaker
+        The post-processing lane does not serve any of these jobs, so the offer stays advertised and the breaker
         stays closed, while the strips that cannot be reached inside the stage cap are faulted on it.
         """
         clock = [100_000.0]
@@ -1246,7 +1246,7 @@ class TestStripTailRouting:
 
 
 class TestUtilitiesLaneOnDemandEnsemble:
-    """The lane comes up for strip work, stays down once released with nothing waiting, and returns for the next."""
+    """The lane comes up for strip work, stays down once released with no job waiting, and returns for the next."""
 
     async def test_strip_bursts_start_the_lane_and_a_ladder_restore_without_strips_leaves_it_down(
         self,
@@ -1292,7 +1292,7 @@ class TestUtilitiesLaneOnDemandEnsemble:
 
         for _ in range(3):
             _tick()
-        assert constructed == [], "nothing needs the lane, so nothing starts it"
+        assert constructed == [], "the lane is not needed, so it is not started"
 
         jobs = [make_job_pop_response(post_processing=["strip_background"]) for _ in range(3)]
         job_infos = [await pm._job_tracker.record_popped_job(job, time_popped=time.time()) for job in jobs]
@@ -1450,7 +1450,7 @@ class TestAlchemyStripWithTheLaneDown:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """With no set learned the lane starts, and once it has reported, annotation is offered with it down."""
+        """With no set reported the lane starts, and once it has reported, annotation is offered with it down."""
         rig = _AlchemyLaneRig(monkeypatch)
         rig.pm.bridge_data.forms = ["annotation"]
         assert _ANNOTATION_FORM not in _lane_forms_offered(rig.pm)
@@ -1477,7 +1477,7 @@ class TestAlchemyStripWithTheLaneDown:
         assert rig.pm._inference_scheduler.restore_utilities_lane(None) is True
         for _ in range(3):
             rig.tick()
-        assert rig.lane() is None, "with nothing waiting the restore leaves the lane down"
+        assert rig.lane() is None, "with no job waiting the restore leaves the lane down"
         assert len(rig.constructed) == 1
 
         assert _ANNOTATION_FORM in _lane_forms_offered(rig.pm)
@@ -1581,7 +1581,8 @@ class TestExtendedControlnetWaitsForTheLane:
         assert rig.pm._inference_scheduler.job_awaits_utilities_lane(job)
 
         lane.last_process_state = HordeProcessState.WAITING_FOR_JOB
-        # The held job takes no slot by design, so the deadlock detector does not read the idle processes as a wedge.
+        # The held job does not take a slot by design, so the deadlock detector does not read the idle processes as a
+        # wedge.
         rig.pm._state.last_job_pop_time = time.time() - 60
         idle_id = max(rig.pm._process_map) + 1
         rig.pm._process_map[idle_id] = make_mock_process_info(
@@ -1676,7 +1677,7 @@ class TestExtendedControlnetWaitsForTheLane:
         age_seconds: float,
         held: bool,
     ) -> None:
-        """With no ttl on the job and none seen, the hold reads the skip budget's default ttl."""
+        """With no ttl on the job and none received, the hold reads the skip budget's default ttl."""
         rig = _ExtendedLaneRig(monkeypatch)
         assert rig.pm._state.recent_job_ttl is None
         # The two ages sit either side of the fallback's anti-starvation share.
@@ -1761,7 +1762,7 @@ class TestExtendedControlnetWaitsForTheLane:
         assert expired == ([] if held else [job])
 
     async def test_a_held_head_is_stepped_past_and_names_the_lane_hold(self) -> None:
-        """Selection skips a lane-held head for the job behind it, and the empty slot names the hold."""
+        """Selection skips a lane-held head for the job behind it, and the empty slot is attributed to the hold."""
         process_info = make_mock_process_info(
             0, model_name="stable_diffusion", state=HordeProcessState.PRELOADED_MODEL
         )

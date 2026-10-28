@@ -13329,9 +13329,9 @@ class InferenceScheduler:
     ) -> list[ImageGenerateJobPopResponse]:
         """Hold each extended-ControlNet job waiting for the image-utilities lane while its deadline allows.
 
-        ``waiting`` pairs each job with its control type. The caller has judged that the lane is up or coming up
-        and cannot serve that type yet. A held job is skipped by selection, so the jobs behind it dispatch, and it
-        names the empty slot ``UTILITIES_LANE_BRING_UP``. The wait is bounded by
+        ``waiting`` pairs each job with its control type. The caller has checked that the lane is up or coming up
+        and cannot serve that type yet. A held job is skipped by selection, so the jobs behind it dispatch, and an
+        empty slot behind it is attributed to ``UTILITIES_LANE_BRING_UP``. The wait is bounded by
         ``dispatch_affinity.utilities_lane_hold_expired``: the job's ttl from pop, less its expected sampling seconds
         from the performance model, less the skip budget, or the anti-starvation share when no sampling figure
         exists. A job past that bound is returned for the caller to fault rather than held. Every hold for a job

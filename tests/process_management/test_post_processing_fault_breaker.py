@@ -122,7 +122,7 @@ class TestPostProcessingFaultCounter:
         assert job_tracker.count_recent_post_processing_faults(-1) == 0
 
     def test_only_the_vram_overcommit_cause_is_counted(self) -> None:
-        """A VRAM over-commit moves the count; every other cause leaves it where it was."""
+        """A VRAM over-commit moves the count. Every other cause leaves it where it was."""
         job_tracker = JobTracker()
 
         for cause in PostProcessingFaultCause:
@@ -407,7 +407,7 @@ async def _dispatched_strip_job(manager: HordeWorkerProcessManager) -> TrackedJo
 
 
 class TestStripFaultsDoNotFeedTheBreaker:
-    """The breaker counts post-processing VRAM over-commit only; strip faults are faulted jobs and nothing more."""
+    """The breaker counts post-processing VRAM over-commit only. A strip fault affects only the faulted job."""
 
     async def test_strip_age_out_does_not_move_the_count(self) -> None:
         """A strip that overran its execution budget is faulted without images and leaves the count alone."""

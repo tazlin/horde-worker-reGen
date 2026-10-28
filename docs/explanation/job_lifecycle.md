@@ -187,7 +187,7 @@ control-loop tick for it. One preload per cycle remains the ceiling. One cycle:
    may run beside them.
 4. **Auxiliary preparation**: a job carrying LoRAs or textual inversions must have those files on disk
    before it may claim sampling admission. The pop-time prefetch pipeline is the only preparation path: at
-   pop the parent asks the dedicated download process to place the job's auxiliary files on
+   pop the parent sends the dedicated download process a request to place the job's auxiliary files on
    disk while the job stays `PENDING_INFERENCE`, so dispatch finds them already cached (see
    [pop-time auxiliary prefetch](model_downloads.md#pop-time-auxiliary-prefetch)). While unprepared, the job
    is invisible to dispatch selection: it is never chosen as the dispatch head and owns no lane and no VRAM

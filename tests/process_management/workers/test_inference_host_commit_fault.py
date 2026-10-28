@@ -232,7 +232,7 @@ def test_a_failed_run_unloads_and_goes_idle_without_reloading() -> None:
 
 
 def test_a_refused_preload_leaves_no_active_model() -> None:
-    """A preload refused after the previous model was reported unloaded leaves the child naming no model."""
+    """A preload refused after the previous model was reported unloaded leaves the child without an active model."""
     other_model = "AlbedoBase XL (SDXL)"
     queue = _RecordingQueue()
     child = _child_whose_dispatch_preload_raises(queue, HostCommitError("commit refused"))

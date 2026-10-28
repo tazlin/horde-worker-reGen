@@ -3,7 +3,7 @@
 The lane's parent-side adapter is injected as a fake through the ``ProcessEntryPoints`` seam, so these
 tests exercise the ``ProcessLifecycleManager`` start / defer / end / replace machinery without launching a
 real cross-venv subprocess. The lane starts only when a job needs it, so the shared builder registers a
-background-strip alchemy form as waiting, which wants the lane with no image job in hand, unless a row asks for no
+background-strip alchemy form as waiting, which creates lane demand with no image job in hand, unless a row opts out of
 demand.
 """
 
@@ -88,8 +88,8 @@ def _make_utilities_plm(
 ) -> ProcessLifecycleManager:
     """Build a lifecycle manager with the utilities lane enabled and a fake adapter factory injected.
 
-    ``demand`` registers a waiting background-strip alchemy form, which wants the lane with no image job in hand.
-    Extended ControlNet is opted in throughout, as it is by default, and does not by itself want the lane.
+    ``demand`` registers a waiting background-strip alchemy form, which creates lane demand with no image job in hand.
+    Extended ControlNet is opted in throughout, as it is by default, and does not by itself create lane demand.
     """
     bridge_data = Mock()
     bridge_data.image_models_to_load = ["stable_diffusion"]
@@ -297,7 +297,7 @@ async def _queue_strip_only_job(plm: ProcessLifecycleManager) -> None:
 
 
 async def test_start_refuses_without_demand_and_starts_with_it() -> None:
-    """Every start path goes through the demand check, so a lane nothing needs is not started."""
+    """Every start path goes through the demand check, so a lane that no job needs is not started."""
     constructed: list[_FakeAdapter] = []
     plm = _make_utilities_plm(constructed=constructed, demand=False)
 
@@ -392,7 +392,7 @@ async def test_driver_restores_a_stranded_ladder_pause_only_with_demand() -> Non
 
     _set_lane_form_waiting(plm, waiting=False)
     assert plm.reconcile_utilities_demand(pause_stranded=True).started_for is None
-    assert plm.is_utilities_gpu_paused is True, "a stranded pause with nothing to serve is left alone"
+    assert plm.is_utilities_gpu_paused is True, "a stranded pause is left alone while no job needs the lane"
 
     _set_lane_form_waiting(plm, waiting=True)
     restored = plm.reconcile_utilities_demand(pause_stranded=True)

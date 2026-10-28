@@ -1,11 +1,11 @@
 """Parent-side coordination of the ad-hoc auxiliary (LoRA/TI) prefetch pipeline.
 
 At job pop the parent asks the dedicated download process to place a job's LoRAs and textual inversions on
-disk while the job stays pending, so dispatch finds them on disk and the inference path short-circuits its own
-download. The download process is the one owner of whether a file is on disk: it holds the files, runs every
-evictor, and answers an entry already present with an immediate success after applying the eviction pins the
-same request carries. The parent keeps no presence belief of its own, so every reference of a popped job that is
-not skipped or cooling is sent. This coordinator owns the three seams of that flow that live outside the download
+disk while the job stays pending, so the files are on disk at dispatch and the inference path skips its own
+download. Only the download process checks whether a file is on disk. It holds the files, runs every
+evictor, and reports an entry already present as an immediate success after applying the eviction pins the
+same request carries. The parent does not track presence itself, so every reference of a popped job that is
+not skipped or cooling is sent. This coordinator handles the three parts of that flow that live outside the download
 process:
 
 - the pop-time trigger, which sends the job's references (plus the eviction-pin set of every file any tracked
@@ -71,9 +71,9 @@ outstanding references are cooling it holds a live per-job deadline, so it stays
 prefetch does and still counts as aux-held against deadlock detection."""
 
 _DISK_REFUSAL_SKIP_SECONDS = 60.0
-"""How long a reference refused for a full cache volume stays skipped before a later job asks for it again.
+"""How long a reference refused for a full cache volume stays skipped before a later job requests it again.
 
-The download process judges the volume afresh on every request, and each request costs a metadata lookup before
+The download process checks the volume afresh on every request, and each request costs a metadata lookup before
 the refusal. A short skip spares that lookup for the jobs popped right behind the refused one, and a volume that
 recovers serves the file again within the window."""
 
@@ -162,7 +162,7 @@ class AuxPrefetchCoordinator:
         # until its wall-clock entry here has passed, so a requeued job cannot re-enter the failing download
         # path within a second and burn both attempts. Expired entries are pruned as they are read.
         self._reference_cooldowns: dict[tuple[AuxModelKind, str, bool], float] = {}
-        # Jobs whose live deadline is a bounding-only hold (every outstanding reference is cooling, nothing is in
+        # Jobs whose live deadline is a bounding-only hold (every outstanding reference is cooling, no reference is in
         # flight for them). Reconcile must revisit these once their cooldowns lapse, unlike a job holding a
         # genuine in-flight deadline, which it leaves alone.
         self._cooling_deadline_jobs: set[GenerationID] = set()
@@ -183,7 +183,7 @@ class AuxPrefetchCoordinator:
 
         A job with none is ignored. Otherwise every reference not under a skip verdict or a re-fetch cooldown is
         sent with the current eviction-pin set, and a per-job deadline is armed. A reference already on disk is
-        answered by the download process without a fetch. Never blocks on anything network-bound.
+        handled by the download process without a fetch. Never blocks on anything network-bound.
         """
         self._request_prefetch_for_job(job)
 
@@ -193,9 +193,9 @@ class AuxPrefetchCoordinator:
         Shared by the pop-time trigger and the periodic reconcile sweep so both build the request the same
         way: the job's outstanding references (see :meth:`_outstanding_entries`) plus the current eviction pins,
         arming a fresh per-job deadline. A reference within its post-failure re-fetch cooldown is held back rather
-        than re-requested. A job whose whole outstanding set is currently cooling issues no request but keeps a
-        live bounding deadline so it stays bounded. A job with nothing outstanding (every reference reported
-        present for it by an earlier answer, or skipped) is marked prepared with no request. A job with no
+        than re-requested. A job whose whole outstanding set is currently cooling does not issue a request but keeps a
+        live bounding deadline so it stays bounded. A job with no outstanding reference (every reference reported
+        present for it by an earlier report, or skipped) is marked prepared with no request. A job with no
         auxiliary files or no id is ignored.
         """
         job_id = job.id_
@@ -343,8 +343,8 @@ class AuxPrefetchCoordinator:
     def on_prefetch_result(self, message: HordeAuxPrefetchResultMessage) -> None:
         """Consume per-entry prefetch outcomes: record present files, prepare ready jobs, requeue or salvage failures.
 
-        A success is recorded for the jobs it names only. It is the download process's answer to their request,
-        given after it applied the pins that keep the file on disk while those jobs are tracked.
+        A success is recorded for the jobs it lists only. It is the download process's response to their request,
+        sent after it applied the pins that keep the file on disk while those jobs are tracked.
         """
         now = self._clock()
         for outcome in message.outcomes:
@@ -747,12 +747,12 @@ class AuxPrefetchCoordinator:
                 self._forget_deferral_state(job_id)
 
     def _skip_disk_refused_aux(self, outcome: AuxPrefetchOutcome, *, now: float) -> None:
-        """Let every job waiting on a file the full cache volume refused proceed without it, arming no backoff.
+        """Let every job waiting on a file the full cache volume refused proceed without it or arming a backoff.
 
         The download process refuses a file when the volume cannot hold it above the free-space floor with every
         unpinned ad-hoc entry evicted. That is a local disk condition, so it neither arms nor advances the
-        CDN download backoff, and the waiting jobs dispatch without the file and spend no inference attempt. The
-        owner of the LoRA offer under that condition is the disk guard: ``ProcessManager``'s exhaustion verdict
+        CDN download backoff, and the waiting jobs dispatch without the file and do not spend an inference attempt. The
+        LoRA offer under that condition is controlled by the disk guard. ``ProcessManager``'s exhaustion verdict
         sets ``WorkerState.lora_disk_exhausted``, which the job popper reads to withhold ``allow_lora``. This path
         does not withhold the offer. The reference is skipped for :data:`_DISK_REFUSAL_SKIP_SECONDS`, recorded
         even when no job is still waiting so a job popped right behind does not repeat the refused request.
@@ -928,7 +928,7 @@ class AuxPrefetchCoordinator:
         """The job's outstanding auxiliary references as ``(kind, name, is_version)`` identity tuples.
 
         A reference is outstanding until the download process reports it present for this job or it falls under
-        a live skip verdict. A report for another job does not count, because the parent keeps no belief about
+        a live skip verdict. A report for another job does not count, because the parent does not track
         what is on disk and the file may have been evicted since that report.
         """
         entries: list[tuple[AuxModelKind, str, bool]] = []
@@ -980,7 +980,7 @@ class AuxPrefetchCoordinator:
         terminal (requeuing would only re-enter the same failing download path), otherwise it is retryable.
         A strike is taken at most once per open window. A failure while the window is open leaves the ladder
         where it is, so a burst of references failing together counts as one incident, and the ladder advances
-        only when a failure follows the window's expiry. ``reference`` names the offending file in the warning
+        only when a failure follows the window's expiry. ``reference`` is the offending file shown in the warning
         when the strike traces to one specific reference (a reported failure). It is None for the deadline path,
         whose job may carry several references.
         """
@@ -1008,7 +1008,7 @@ class AuxPrefetchCoordinator:
         only re-enter the same failing download path), otherwise it is retryable. Unlike the LoRA backoff this
         window cannot suppress pop traffic: the pop request has no per-request textual-inversion capability flag
         (there is no textual-inversion analogue to ``allow_lora``), so the window influences fault classification
-        only. As for LoRA, a strike is taken at most once per open window. ``reference`` names the offending file
+        only. As for LoRA, a strike is taken at most once per open window. ``reference`` is the offending file shown
         in the warning when the strike traces to one reference.
         """
         backoff = self._state.ti_download_backoff

@@ -939,7 +939,7 @@ post-processing runs, and pausing it leaves safety on the card. Safety off-GPU f
 CPU until the restore. The reclaim ladder books the utilities pause as a restore obligation and lifts it once
 the card reads `HEALTHY`. The lane starts again then only if a job needs it (see
 [When the lane runs](image_utilities_lane.md#when-the-lane-runs)), so a lane stopped for a chain usually stays
-down, and a lane that is down offers no rung. A deficit the demotion or an eviction may close is priced again on the next
+down, and a lane that is down does not offer a rung. A deficit the demotion or an eviction may close is priced again on the next
 evaluation before a lane is moved; a deficit larger than a lane's return never moves it. The reserve bypass is
 preserved: a disabled VRAM budget or a zero-peak chain always admits. The lane's non-memory guards (the
 allocator-guard cap fault and sampling co-residency hold) stay.

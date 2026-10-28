@@ -1,9 +1,9 @@
 """The merged canonical-plus-beta model reference view for every torch-free worker context.
 
-Beta models are records in a PRIMARY's pending queue. A reader sees them only through ``query`` with the
+Beta models are records in a PRIMARY's pending queue. A reader gets them only through ``query`` with the
 pending source listed first, because ``get_all_model_references`` reads the canonical source alone. The
 parent's ``stable_diffusion_reference``, the config-load filters, the TUI catalog and the benchmark planners
-all read the merged view here, so a model that one context can serve is known to every other context and to
+all read the merged view here, so every other context sees a model that one context can serve, as do
 the inference children, which resolve the same two sources in the same order.
 
 - :func:`merged_category_records` returns one category's merged records and the names the pending queue
@@ -16,9 +16,9 @@ the inference children, which resolve the same two sources in the same order.
   never fetch the pending queue over the network. :func:`publish_pending_records` writes the files, and
   :func:`pending_publish_retry_seconds` paces the parent's retry of a publish that left a category unwritten.
 
-``hordelib.beta_models`` owns the opt-in (which categories are in beta, how the pending provider is built,
-and the source order). It is torch-free and imported lazily, so a process that never reads the view does
-not pay for it. Nothing here writes the opt-in, so only a process that already declared beta reaches the
+The opt-in (which categories are in beta, how the pending provider is built, and the source order) is defined
+in ``hordelib.beta_models``. It is torch-free and imported lazily, so a process that never reads the view does
+not pay for it. The opt-in is not written here, so only a process that already declared beta reaches the
 network.
 """
 
@@ -52,7 +52,7 @@ BOUNDED_PENDING_RETRY_MAX_ATTEMPTS = 1
 BETA_MODELS_DIR_ENV_VAR = "HORDELIB_BETA_MODELS_DIR"
 """The variable ``hordelib.beta_models`` reads to serve pending records from files instead of the PRIMARY.
 
-hordelib owns the name. It is spelled here because horde-engine releases without the file-backed provider do not
+hordelib defines the name. It is spelled here because horde-engine releases without the file-backed provider do not
 define it, and on those releases the variable is inert.
 """
 
@@ -215,7 +215,7 @@ def publish_pending_records(
 def share_pending_records_with_children(manager: ModelReferenceManager) -> bool:
     """Publish the pending records and set :data:`BETA_MODELS_DIR_ENV_VAR` for the processes spawned after this.
 
-    Spawned processes inherit the environment, so their pending provider serves these files and makes no
+    Spawned processes inherit the environment, so their pending provider serves these files and does not make a
     network request. The calling process keeps the provider it already registered. A failed write is logged,
     and the children read whatever files the last successful write left. The variable is set whatever the
     outcome.
@@ -242,7 +242,7 @@ def pending_publish_retry_seconds(manager: ModelReferenceManager) -> float | Non
     """Return the registered pending provider's cache TTL, the shortest useful wait before a publish is retried.
 
     Returns:
-        The TTL in seconds, or None when no pending provider is registered or it states no TTL.
+        The TTL in seconds, or None when no pending provider is registered or it does not state a TTL.
     """
     from horde_model_reference import PENDING_SOURCE_ID
 
@@ -313,7 +313,7 @@ def _read_pending_first(
 
     ``hordelib.beta_models.build_pending_provider`` returns None, and logs why, when the PRIMARY URL or the
     API key is missing. The network provider reports a failed fetch as None instead of raising, and the
-    manager's query reads that the same as an empty queue, so the provider is asked first and a None makes
+    manager's query reads that the same as an empty queue, so the provider is queried first and a None makes
     the read fail open. The query that follows is served from the provider's cache.
     """
     from horde_model_reference import PENDING_SOURCE_ID

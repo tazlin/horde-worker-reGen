@@ -184,9 +184,9 @@ def _offline_category_reference(category: str) -> Mapping[str, GenericModelRecor
     missing or present.
 
     For a category the environment opted into beta the pending (beta) records are laid over the canonical
-    ones, so a beta post-processor's files are found through its pending record. The pending queue has no
+    ones, so a beta post-processor's files are found through its pending record. The pending queue does not have an
     on-disk form, so that half is a network read. It is bounded to one short attempt and fails open to the
-    canonical records. Nothing here writes the opt-in, so a fake or dry-run run with no worker config never
+    canonical records. The opt-in is not written here, so a fake or dry-run run without a worker config never
     reaches the network and gets the canonical view.
     """
     try:
@@ -209,7 +209,7 @@ def beta_post_processor_names() -> frozenset[str]:
     benchmark counts as beta matches what a child loads from the pending source.
 
     Returns an empty set when beta is not opted into or cannot be read. It never returns None, since the
-    absence of beta is a fact and not an unknown.
+    absence of beta is a known fact.
     """
     try:
         from horde_model_reference.meta_consts import MODEL_REFERENCE_CATEGORY
@@ -237,7 +237,7 @@ def post_processor_names_in_reference() -> frozenset[str] | None:
 
     The view spans both sources a child resolves a post-processor through. Each category is read through
     :func:`_offline_category_reference`, which lays the PRIMARY's pending queue over the canonical on-disk
-    reference when the operator opted the category into beta. Without that opt-in the answer is the
+    reference when the operator opted the category into beta. Without that opt-in the result is the
     canonical one.
 
     None means "unreadable" (every canonical category failed to load) as distinct from an empty set, so a

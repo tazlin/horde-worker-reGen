@@ -8,10 +8,10 @@ fails with ENOSPC and can take co-located worker data down with it.
 This module adds a disk-space floor on top of the byte budget, split across the two processes that
 matter:
 
-* In the download process (which owns the writable :class:`LoraModelManager` and is the only caller),
+* In the download process (which holds the writable :class:`LoraModelManager` and is the only caller),
   :func:`constrain_lora_cache_to_disk` runs before each ad-hoc LoRA fetch. It shrinks the effective ad-hoc
   budget to fit the free space and evicts least-recently-used ad-hoc LoRAs until the floor is clear,
-  skipping the files the parent's eviction pins protect. The parent is not told about an eviction. It asks
+  skipping the files the parent's eviction pins protect. The parent is not notified of an eviction. It queries
   the download process whether a file is present for each job instead. The guard relies only on the
   manager's stable public surface, so it works against the currently published hordelib as well as newer
   builds.

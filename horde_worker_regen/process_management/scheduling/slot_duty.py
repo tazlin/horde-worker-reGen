@@ -83,8 +83,9 @@ class SlotDutyBucket(StrEnum):
     keeps one from seizing a lane by any path."""
     UTILITIES_LANE_BRING_UP = "utilities_lane_bring_up"
     """The head is an extended-ControlNet job whose control type the image-utilities lane cannot serve yet while
-    the lane starts or primes its annotators. It has no in-graph path, so it holds no lane and cannot sample until
-    the lane reports the type servable. Selection skips it, so a sibling is dispatched meanwhile."""
+    the lane starts or primes its annotators. It does not have an in-graph path, so it does not hold a lane
+    and cannot sample until the lane reports the type servable. Selection skips it, so a sibling is dispatched
+    meanwhile."""
     UNEXPLAINED = "unexplained"
     """No gate claimed the empty slot: the scheduler-stall-shaped case worth reporting."""
 

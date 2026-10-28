@@ -198,7 +198,7 @@ class UtilitiesLaneDemandReason(enum.StrEnum):
     STRIP_ONLY_JOB = "strip_only_job"
     """A queued or sampling job will need its strip once inference ends, with no post-processing chain first."""
     CONTROLNET_ANNOTATION = "controlnet_annotation"
-    """A ControlNet job wants its control map derived on the lane, or is parked for it. An extended-ControlNet job
+    """A ControlNet job needs its control map derived on the lane, or is parked for it. An extended-ControlNet job
     counts here like any other, and dispatch holds it until the lane can serve its control type."""
     ALCHEMY_FORM_WAITING = "alchemy_form_waiting"
     """An alchemy form that runs on the lane is pending dispatch or in flight."""
@@ -209,7 +209,7 @@ class AlchemyFormDemand:
     """The alchemy flow's part of the image-utilities lane's demand, as plain form names."""
 
     annotation_set_unlearned: bool = False
-    """The alchemist offers annotation and no servable control-type set is known to carry in the offer."""
+    """The alchemist offers annotation and no servable control-type set is available for the offer."""
     waiting: tuple[str, ...] = ()
     """The forms pending dispatch or in flight, one entry per form."""
 
@@ -238,30 +238,31 @@ class UtilitiesLaneDemandInputs:
     strip_only_jobs_before_strip: int
     """Jobs pending or in inference whose post-processing is background removal alone."""
     pre_annotation_candidates: int
-    """ControlNet jobs pending inference that want pre-annotation and have not been offered to the lane."""
+    """ControlNet jobs pending inference that need pre-annotation and have not been offered to the lane."""
     jobs_pending_annotation: int
     """Jobs in ``PENDING_ANNOTATION``."""
 
 
 def utilities_lane_demand(inputs: UtilitiesLaneDemandInputs) -> UtilitiesLaneDemandReason | None:
-    """Return why the image-utilities lane should be up, or None when nothing needs it.
+    """Return why the image-utilities lane should be up, or None when no job needs it.
 
-    The one owner of that question. Every lane start reads it, and so does the reclaim ladder's restore, so a
-    lane stopped to free its context stays down until work arrives that only the lane can serve.
+    This is the only place that checks whether the lane is wanted. Every lane start reads it, and so does the
+    reclaim ladder's restore, so a lane stopped to free its
+    context stays down until work arrives that only the lane can serve.
 
     The rules, first match wins:
 
     1. A disabled, unwanted or unprovisioned lane, or a worker shutting down, is never wanted.
-    2. An alchemist offering annotation with no servable set learned. The alchemy offer stands while the lane is
+    2. An alchemist offering annotation with no servable set reported yet. The alchemy offer stands while the lane is
        down by policy (``strip_background`` always, ``annotation`` with the set kept from the lane's last run),
-       so the lane is not kept warm for an offer. The annotation offer must name control types, though, and only
-       a lane run reports them. Strips and ControlNet jobs arrive with traffic, and no setting promises that one
+       so the lane is not kept warm for an offer. The annotation offer must list control types, though, and only
+       a lane run reports them. Strips and ControlNet jobs arrive with traffic, and no setting guarantees that one
        will start the lane, so an annotation alchemist could go a whole session without one. This rule starts
-       the lane once to learn the set and lapses at the lane's first report.
+       the lane once to read the set and lapses at the lane's first report.
     3. A job in ``PENDING_STRIP``.
     4. A job pending or in inference whose post-processing is background removal alone. Its lead (queue wait
        plus generation) covers a lane start. A job with an upscaler or face fixer counts from rule 3 only, so
-       its own post-processing chain does not find a lane started for it and stop it again.
+       a lane is not started for its own post-processing chain and stopped again.
     5. A ControlNet pre-annotation candidate, or a job in ``PENDING_ANNOTATION``. Extended-ControlNet jobs
        count here, so the lane starts at their pop and dispatch holds them until it can serve their type.
     6. A lane-bound alchemy form pending or in flight. The alchemy offer stands while the lane is down by

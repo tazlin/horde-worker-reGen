@@ -642,16 +642,16 @@ class ProcessMap(dict[int, HordeProcessInfo]):
             self[process_id].record_preload_intent(last_job_referenced)
 
     def on_model_load_failed(self, process_id: int, horde_model_name: str) -> None:
-        """Forget the model a lane was loading, because the lane reported that load failed.
+        """Drop the lane's record of the model it was loading, because the lane reported that load failed.
 
-        A lane record names a model only after a load report said the lane holds it or is loading it, and a
+        A lane record holds a model name only after a load report said the lane holds the model or is loading it, and a
         failed load means it holds neither. Dispatch and the preload gate read this record, so a record left
-        naming the refused model sends its jobs straight back to the lane as resident, past the host admission
+        holding the refused model's name sends its jobs straight back to the lane as resident, past the host admission
         a cold load goes through.
 
         The child reports its previous model unloaded from RAM before it reports the new load, and that report
-        already cleared the lane's residency, so only the load's own record is dropped here. A record naming
-        another model is kept: a failure reported before any load began (a blank name) leaves the previous
+        already cleared the lane's residency, so only the load's own record is dropped here. A record holding
+        another model's name is kept: a failure reported before any load began (a blank name) leaves the previous
         model in place.
 
         Args:

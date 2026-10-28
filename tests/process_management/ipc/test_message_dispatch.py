@@ -1646,7 +1646,7 @@ class TestHostCommitRefusalRequeue:
 
     @pytest.mark.parametrize("failure_info", [HOST_COMMIT_FAILED_INFO, "failed to load"])
     async def test_a_failed_load_leaves_no_lane_holding_the_model(self, failure_info: str) -> None:
-        """LOADING then FAILED leaves no lane record of the model, for a host refusal and any other failure."""
+        """LOADING then FAILED does not leave a lane record of the model, for a host refusal and any other failure."""
         process_info = make_mock_process_info(2, model_name=None)
         process_info.process_launch_identifier = 4
         process_map = ProcessMap({2: process_info})
