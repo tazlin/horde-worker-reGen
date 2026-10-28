@@ -400,7 +400,7 @@ async def test_mixed_job_with_valid_and_unfetchable_lora_dispatches_with_the_val
 
     The job carries a LoRA that caches and one that is unfetchable; a co-waiting job wants only the unfetchable
     one. Once the unfetchable reference reaches its terminal verdict and is memoized skipped, the mixed job's
-    whole set is resolved (one cached, one skipped), so it dispatches with the valid LoRA, and the ghost-only
+    whole set is resolved (one present, one skipped), so it dispatches with the valid LoRA, and the ghost-only
     co-waiter is likewise served without the file. Neither is faulted for the doomed reference they share.
     """
     clock = _Clock()
@@ -419,7 +419,7 @@ async def test_mixed_job_with_valid_and_unfetchable_lora_dispatches_with_the_val
         ),
     )
 
-    assert tracker.is_lora_cached(_lora("good")) is True
+    assert tracker.is_lora_present_for_job(mixed, _lora("good")) is True
     assert _faulted(tracker, [mixed, ghost_only]) == []
     assert _prepared(tracker, mixed)
     assert _prepared(tracker, ghost_only)

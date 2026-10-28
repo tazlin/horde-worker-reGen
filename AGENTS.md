@@ -236,9 +236,11 @@ Start from the mechanism, not the file. Each line states the owner of one questi
   `ProcessManager._beneficiary_waiting` reports the booked job waiting, asked with the paused lane's kind, so a job
   waiting for post-processing never holds the post-processing lane. The post-processing orchestrator's 90 s
   age-out runs under a ladder pause regardless.
-- **Whether a LoRA is on disk:** two owners, the parent's `JobTracker._cached_lora_keys` and hordelib's ad-hoc
-  cache in the download process (eviction pins from `aux_prefetch_coordinator.py` cover every queued job). The
-  cache does not report an eviction to the parent.
+- **Whether a LoRA or TI is on disk:** the download process, which holds the files, runs every evictor and does not
+  report an eviction to the parent. `AuxPrefetchCoordinator` sends every reference of a popped job that is not
+  skipped or cooling, and the download process applies the request's eviction pins before it answers a present
+  entry with an immediate success. The parent records that answer per job (`TrackedJob.aux_present_lora_keys`,
+  `aux_present_ti_keys`) and keeps no worker-wide presence belief.
 
 ## Code quality
 

@@ -8,16 +8,18 @@ fails with ENOSPC and can take co-located worker data down with it.
 This module adds a disk-space floor on top of the byte budget, split across the two processes that
 matter:
 
-* In the inference subprocess (which owns the live :class:`LoraModelManager`),
-  :func:`constrain_lora_cache_to_disk` runs before each LoRA-bearing job: it shrinks the effective
-  ad-hoc budget to fit the free space and evicts least-recently-used ad-hoc LoRAs until the floor is
-  clear, making room for the job's LoRAs. It relies only on the manager's stable public surface, so
-  it works against the currently published hordelib as well as newer builds.
+* In the download process (which owns the writable :class:`LoraModelManager` and is the only caller),
+  :func:`constrain_lora_cache_to_disk` runs before each ad-hoc LoRA fetch. It shrinks the effective ad-hoc
+  budget to fit the free space and evicts least-recently-used ad-hoc LoRAs until the floor is clear,
+  skipping the files the parent's eviction pins protect. The parent is not told about an eviction. It asks
+  the download process whether a file is present for each job instead. The guard relies only on the
+  manager's stable public surface, so it works against the currently published hordelib as well as newer
+  builds.
 
 * In the main process (which has no manager), :func:`is_lora_disk_exhausted` decides whether to stop
   advertising LoRA support at all. It disables LoRAs only when even evicting every ad-hoc entry
   could not clear the floor (read from the persisted ``lora.json``), so a recoverable shortfall is
-  left to the inference-side eviction rather than latching the worker out of LoRA work.
+  left to the download process's eviction rather than latching the worker out of LoRA work.
 
 Deliberately torch-free and hordelib-free at import time so the main (orchestrator) process can use
 it without dragging in the inference stack.
@@ -222,7 +224,7 @@ def constrain_lora_cache_to_disk(
 def read_evictable_adhoc_mb(lora_reference_path: Path) -> float:
     """Return the total megabytes of ad-hoc LoRA versions recorded in the persisted ``lora.json``.
 
-    This is the amount the inference-side guard could reclaim by eviction (default-set LoRAs are not
+    This is the amount the download process's guard could reclaim by eviction (default-set LoRAs are not
     evictable and are excluded). Best-effort: a missing or unreadable reference yields ``0.0``, which
     makes the caller treat a shortfall as unsolvable (the disk-safe default).
     """
@@ -254,8 +256,8 @@ def is_lora_disk_exhausted(*, free_mb_value: float | None, floor_mb: float, evic
 
     Exhausted means free space is below the floor *and* evicting every ad-hoc LoRA still would not
     reach it, so the shortfall is structural (e.g. non-LoRA data) rather than something the
-    inference-side eviction can recover. A recoverable shortfall returns ``False`` so LoRAs keep
-    being offered and the next LoRA job's eviction makes room.
+    download process's eviction can recover. A recoverable shortfall returns ``False`` so LoRAs keep
+    being offered and the next ad-hoc LoRA fetch's eviction makes room.
     """
     if free_mb_value is None or floor_mb <= 0:
         return False

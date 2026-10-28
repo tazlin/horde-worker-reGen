@@ -132,12 +132,24 @@ job can sample. Running them on an inference lane occupies a GPU-feeding process
 the length of the transfer, so the worker instead prefetches them off the inference
 lanes: at pop the parent's
 [`AuxPrefetchCoordinator`][horde_worker_regen.process_management.models.aux_prefetch_coordinator.AuxPrefetchCoordinator]
-computes the job's not-yet-cached auxiliary files and asks the dedicated download
-process to place them on disk while the job stays `PENDING_INFERENCE`. Each file is
-fetched at most once even when several jobs share it, an already-present file
-short-circuits without a CivitAI round-trip, and the request carries an eviction-pin
-set (every auxiliary file any tracked job still references) so a file one pending job
-needs is not evicted before that job dispatches.
+sends every auxiliary file the job references to the dedicated download process,
+which places them on disk while the job stays `PENDING_INFERENCE`. Each file is
+fetched at most once even when several jobs share it, and the request carries an
+eviction-pin set (every auxiliary file any tracked job still references) so a file one
+pending job needs is not evicted before that job dispatches.
+
+The download process is the one owner of whether a LoRA or textual inversion is on
+disk. It holds the files and runs every evictor (the free-disk floor guard and
+hordelib's ad-hoc budget and room evictors), and none of them reports an eviction to
+the parent. The parent therefore keeps no presence belief of its own. A popped job's
+request names every reference except one under a skip verdict or a re-fetch cooldown,
+including files an earlier job downloaded, since the file may have been evicted after
+that job's pin lapsed. The download process applies the request's pins first and then
+answers an entry already on disk with an immediate success, without a CivitAI
+round-trip. A success is recorded for the jobs it names only, so a later job for the
+same file asks again. A report stays true for its job while the job is tracked,
+because the pins cover the job, so a re-request for the same job leaves out a file
+already reported present for it.
 
 The prefetch pipeline is the only preparation path. Until it clears a job's gate the job
 is invisible to dispatch selection: it is never chosen as the dispatch head and holds no
@@ -165,9 +177,9 @@ ad-hoc cache to its free-space floor, evicting least-recently-used ad-hoc LoRAs 
 manager's own pin-aware eviction so a file another pending job still references is never
 evicted to make room.
 
-The download process reports a per-file outcome back to the parent. A success marks
-the session auxiliary cache and, once every LoRA and textual inversion a pending job
-needs is present, clears that job's dispatch gate. Failure handling is kind-agnostic
+The download process reports a per-file outcome back to the parent. A success is
+recorded against each job it names and, once every LoRA and textual inversion a pending
+job needs is reported present for it (or skipped), clears that job's dispatch gate. Failure handling is kind-agnostic
 across LoRAs and textual inversions. A terminal *rejection* (a file the fetch API
 permanently refuses: a LoRA that is invalid, too large, NSFW on an SFW-only worker, or
 definitively not found upstream; a textual inversion the API rejects or reports missing)
@@ -243,13 +255,14 @@ progress, and the completed file serves the faulted job's retry, and every later
 from cache. In the same
 periodic step a reconcile sweep re-requests any pending auxiliary-bearing job that has no
 request in flight (a retryable-failure requeue, a lost result message, or a download-process
-restart that dropped its in-flight map) and marks a job prepared outright when its files are
-already cached: this is the liveness that heals. The tracker's retry policy bounds the total
-attempts, so a permanently failing job still faults rather than looping. Should an inference
-child later fail to resolve a prefetched file on disk (a raced eviction or disk error), its
-retryable fault withdraws the job's prepared state and forgets the contradicted session-cache
-entries, so the reconcile sweep re-requests the files instead of the scheduler re-dispatching
-the job into the same failure. The coordinator also
+restart that dropped its in-flight map) and marks a job prepared outright when every file
+was already reported present for it: this is the liveness that heals. The tracker's retry
+policy bounds the total attempts, so a permanently failing job still faults rather than
+looping. Should an inference child later fail to resolve a prefetched file (an eviction
+between the download process's report and the child's read, or a reference record the
+ad-hoc cache lost), its retryable fault withdraws the job's prepared state and its presence
+reports, so the reconcile sweep asks the download process again instead of the scheduler
+re-dispatching the job into the same failure. The coordinator also
 pushes a pins-only eviction update whenever the set of still-referenced auxiliary files
 changes (for example when a job completes), coalesced so an unchanged set is never re-sent.
 

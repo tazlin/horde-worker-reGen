@@ -1,15 +1,19 @@
 """Parent-side coordination of the ad-hoc auxiliary (LoRA/TI) prefetch pipeline.
 
 At job pop the parent asks the dedicated download process to place a job's LoRAs and textual inversions on
-disk while the job stays pending, so dispatch finds them already cached and the inference path
-short-circuits its own download. This coordinator owns the three seams of that flow that live outside the
-download process:
+disk while the job stays pending, so dispatch finds them on disk and the inference path short-circuits its own
+download. The download process is the one owner of whether a file is on disk: it holds the files, runs every
+evictor, and answers an entry already present with an immediate success after applying the eviction pins the
+same request carries. The parent keeps no presence belief of its own, so every reference of a popped job that is
+not skipped or cooling is sent. This coordinator owns the three seams of that flow that live outside the download
+process:
 
-- the pop-time trigger, which computes the not-yet-known-cached auxiliary set (plus the eviction-pin set of
-  every file any tracked job still references) and sends one prefetch request;
-- the completion/failure wiring, which marks each cached file, clears a job's dispatch gate once its full
-  auxiliary set is present, requeues a job for a re-fetch on a retryable failure, and salvage-dispatches it
-  without a reference the fetch terminally cannot satisfy; and
+- the pop-time trigger, which sends the job's references (plus the eviction-pin set of every file any tracked
+  job still references) in one prefetch request;
+- the completion/failure wiring, which records each file the download process reports present for its
+  requesting jobs, clears a job's dispatch gate once its full auxiliary set is present, requeues a job for a
+  re-fetch on a retryable failure, and salvage-dispatches it without a reference the fetch terminally cannot
+  satisfy; and
 - a per-job deadline (derived from the configured download timeout, capped against the job's ttl and,
   while the worker winds down, against a short grace window) that bounds how long a job waits on its
   prefetch: at expiry the job is served without its outstanding references, whether they never started or
@@ -62,7 +66,7 @@ the two failures burn both of a job's inference attempts inside a second. The ef
 ``min(_AUX_REFETCH_COOLDOWN_SECONDS, remaining class-backoff window)``: capped at this constant so a legitimate
 retry is not delayed longer than needed, and never longer than the class's own suppression window (once that
 window lapses the reference is fetchable again, so cooling it further would be pointless). While a job's only
-uncached references are cooling it holds a live per-job deadline, so it stays bounded exactly as any unresolved
+outstanding references are cooling it holds a live per-job deadline, so it stays bounded exactly as any unresolved
 prefetch does and still counts as aux-held against deadlock detection."""
 
 _AUX_SALVAGE_TTL_FRACTION = 0.35
@@ -150,7 +154,7 @@ class AuxPrefetchCoordinator:
         # until its wall-clock entry here has passed, so a requeued job cannot re-enter the failing download
         # path within a second and burn both attempts. Expired entries are pruned as they are read.
         self._reference_cooldowns: dict[tuple[AuxModelKind, str, bool], float] = {}
-        # Jobs whose live deadline is a bounding-only hold (every uncached reference is cooling, nothing is in
+        # Jobs whose live deadline is a bounding-only hold (every outstanding reference is cooling, nothing is in
         # flight for them). Reconcile must revisit these once their cooldowns lapse, unlike a job holding a
         # genuine in-flight deadline, which it leaves alone.
         self._cooling_deadline_jobs: set[GenerationID] = set()
@@ -169,9 +173,9 @@ class AuxPrefetchCoordinator:
     def on_job_popped(self, job: ImageGenerateJobPopResponse) -> None:
         """Trigger prefetch for a freshly popped job carrying LoRAs and/or textual inversions.
 
-        A job with none is ignored. A job whose full auxiliary set is already cached this session has its
-        dispatch gate cleared immediately (no request). Otherwise the not-yet-cached entries are sent with the
-        current eviction-pin set, and a per-job deadline is armed. Never blocks on anything network-bound.
+        A job with none is ignored. Otherwise every reference not under a skip verdict or a re-fetch cooldown is
+        sent with the current eviction-pin set, and a per-job deadline is armed. A reference already on disk is
+        answered by the download process without a fetch. Never blocks on anything network-bound.
         """
         self._request_prefetch_for_job(job)
 
@@ -179,10 +183,11 @@ class AuxPrefetchCoordinator:
         """Build and issue one job's prefetch request (or clear its gate when nothing needs fetching).
 
         Shared by the pop-time trigger and the periodic reconcile sweep so both build the request the same
-        way: the not-yet-cached entries plus the current eviction pins, arming a fresh per-job deadline. A
-        reference within its post-failure re-fetch cooldown is held back rather than re-requested. A job whose
-        whole not-yet-cached set is currently cooling issues no request but keeps a live bounding deadline so it
-        stays bounded; a job whose whole set is already cached is marked prepared with no request; a job with no
+        way: the job's outstanding references (see :meth:`_outstanding_entries`) plus the current eviction pins,
+        arming a fresh per-job deadline. A reference within its post-failure re-fetch cooldown is held back rather
+        than re-requested. A job whose whole outstanding set is currently cooling issues no request but keeps a
+        live bounding deadline so it stays bounded. A job with nothing outstanding (every reference reported
+        present for it by an earlier answer, or skipped) is marked prepared with no request. A job with no
         auxiliary files or no id is ignored.
         """
         job_id = job.id_
@@ -196,27 +201,13 @@ class AuxPrefetchCoordinator:
         now = self._clock()
         entries: list[AuxPrefetchEntry] = []
         cooling = False  # at least one still-needed reference is within its post-failure re-fetch cooldown
-        for lora in loras:
-            if self._job_tracker.is_lora_cached(lora) or self._job_tracker.is_lora_skipped(lora):
-                continue
-            if self._reference_is_cooling((AuxModelKind.LORA, lora.name, bool(lora.is_version)), now):
+        for kind, name, is_version in self._outstanding_entries(job):
+            if self._reference_is_cooling((kind, name, is_version), now):
                 cooling = True
                 continue
             entries.append(
-                AuxPrefetchEntry(
-                    kind=AuxModelKind.LORA,
-                    name=lora.name,
-                    is_version=bool(lora.is_version),
-                    requesting_job_id=job_id,
-                ),
+                AuxPrefetchEntry(kind=kind, name=name, is_version=is_version, requesting_job_id=job_id),
             )
-        for ti in tis:
-            if self._job_tracker.is_ti_cached(ti.name) or self._job_tracker.is_ti_skipped(ti.name):
-                continue
-            if self._reference_is_cooling((AuxModelKind.TI, ti.name, False), now):
-                cooling = True
-                continue
-            entries.append(AuxPrefetchEntry(kind=AuxModelKind.TI, name=ti.name, requesting_job_id=job_id))
 
         if entries:
             base_deadline = now + max(0.0, self._download_timeout_provider())
@@ -228,7 +219,7 @@ class AuxPrefetchCoordinator:
             self._remember_sent_pins(pins)
             logger.debug(
                 f"Requested aux prefetch for job {str(job_id)[:8]}: "
-                f"{len(entries)} entr{'y' if len(entries) == 1 else 'ies'} not yet cached.",
+                f"{len(entries)} entr{'y' if len(entries) == 1 else 'ies'} for the download process to resolve.",
             )
             return
 
@@ -242,8 +233,8 @@ class AuxPrefetchCoordinator:
             self._cooling_deadline_jobs.add(job_id)
             return
 
-        # Everything this job needs is already on disk this session; clear its dispatch gate now so it does not
-        # fall through to the inference-side preparation path.
+        # The download process already reported every remaining reference present for this job (or it is
+        # skipped), so its dispatch gate clears without another request.
         self._cooling_deadline_jobs.discard(job_id)
         self._job_tracker.mark_job_aux_prepared_if_ready(job_id)
 
@@ -298,16 +289,21 @@ class AuxPrefetchCoordinator:
                 self._deadlines[job_id] = cap
 
     def on_prefetch_result(self, message: HordeAuxPrefetchResultMessage) -> None:
-        """Consume per-entry prefetch outcomes: mark cached files, prepare ready jobs, requeue or salvage failures."""
+        """Consume per-entry prefetch outcomes: record present files, prepare ready jobs, requeue or salvage failures.
+
+        A success is recorded for the jobs it names only. It is the download process's answer to their request,
+        given after it applied the pins that keep the file on disk while those jobs are tracked.
+        """
         now = self._clock()
         for outcome in message.outcomes:
             if outcome.ok:
-                self._job_tracker.mark_aux_prefetched(
-                    outcome.name,
-                    is_version=outcome.is_version,
-                    is_ti=outcome.kind is AuxModelKind.TI,
-                )
                 for job_id in outcome.requesting_job_ids:
+                    self._job_tracker.record_aux_present(
+                        job_id,
+                        outcome.name,
+                        is_version=outcome.is_version,
+                        is_ti=outcome.kind is AuxModelKind.TI,
+                    )
                     if self._job_tracker.mark_job_aux_prepared_if_ready(job_id):
                         self._deadlines.pop(job_id, None)
                         self._forget_deferral_state(job_id)
@@ -384,7 +380,7 @@ class AuxPrefetchCoordinator:
         in_flight: dict[str, tuple[int, int]],
         now: float,
     ) -> bool:
-        """Extend a job's deadline when its not-yet-cached files are still downloading; return whether it did.
+        """Extend a job's deadline when its outstanding files are still downloading; return whether it did.
 
         Defers only while at least one of the job's outstanding files is present in the downloader's in-flight
         set and (a) reports no byte progress it could stall on, or (b) reports bytes that advanced since the last
@@ -400,7 +396,7 @@ class AuxPrefetchCoordinator:
         job_id = job.id_
         if job_id is None:
             return False
-        matched = [name for name in self._uncached_entry_names(job) if name in in_flight]
+        matched = [name for name in self._outstanding_entry_names(job) if name in in_flight]
         if not matched:
             return False
         if self._deferrals.get(job_id, 0) >= _MAX_DEADLINE_DEFERRALS:
@@ -439,7 +435,7 @@ class AuxPrefetchCoordinator:
         for job_id in self._deadlines:
             tracked = self._job_tracker.get_tracked_job(job_id)
             if tracked is not None:
-                awaited |= self._uncached_entry_names(tracked.sdk_api_job_info)
+                awaited |= self._outstanding_entry_names(tracked.sdk_api_job_info)
         self._last_inflight_bytes = {
             name: observed for name, observed in self._last_inflight_bytes.items() if name in awaited
         }
@@ -481,16 +477,9 @@ class AuxPrefetchCoordinator:
             return True
         return downloaded > previous
 
-    def _uncached_entry_names(self, job: ImageGenerateJobPopResponse) -> set[str]:
-        """The job's auxiliary reference names not yet known cached (the set a prefetch request would fetch)."""
-        names: set[str] = set()
-        for lora in job.payload.loras or []:
-            if not self._job_tracker.is_lora_cached(lora) and not self._job_tracker.is_lora_skipped(lora):
-                names.add(lora.name)
-        for ti in job.payload.tis or []:
-            if not self._job_tracker.is_ti_cached(ti.name) and not self._job_tracker.is_ti_skipped(ti.name):
-                names.add(ti.name)
-        return names
+    def _outstanding_entry_names(self, job: ImageGenerateJobPopResponse) -> set[str]:
+        """The names of the job's outstanding auxiliary references (see :meth:`_outstanding_entries`)."""
+        return {name for _kind, name, _is_version in self._outstanding_entries(job)}
 
     def _forget_deferral_state(self, job_id: GenerationID) -> None:
         """Clear a job's deferral count, one-shot log flag, and cooling-hold marker.
@@ -610,20 +599,13 @@ class AuxPrefetchCoordinator:
         return {job_id for job_id, deadline in self._deadlines.items() if reference < deadline}
 
     def _outstanding_reference_count(self, job: ImageGenerateJobPopResponse) -> int:
-        """How many of a job's auxiliary references are still neither cached nor skipped.
+        """How many of a job's auxiliary references are still outstanding (see :meth:`_outstanding_entries`).
 
-        Mirrors the request builder's own cached/skipped predicate, so the count an operator reads is the
-        same set the prefetch is working through. A reference inside its post-failure cooldown counts as
-        outstanding: the job is still waiting on it.
+        The request builder reads the same set, so the count an operator reads is the set the prefetch is working
+        through. A reference inside its post-failure cooldown counts as outstanding, since the job is still
+        waiting on it.
         """
-        outstanding = 0
-        for lora in job.payload.loras or []:
-            if not self._job_tracker.is_lora_cached(lora) and not self._job_tracker.is_lora_skipped(lora):
-                outstanding += 1
-        for ti in job.payload.tis or []:
-            if not self._job_tracker.is_ti_cached(ti.name) and not self._job_tracker.is_ti_skipped(ti.name):
-                outstanding += 1
-        return outstanding
+        return len(self._outstanding_entries(job))
 
     def _live_holds(self, now: float) -> list[tuple[GenerationID, float, int]]:
         """Every job currently held on its auxiliary prefetch, as ``(job_id, held_seconds, outstanding)``.
@@ -805,7 +787,7 @@ class AuxPrefetchCoordinator:
         job_id = job.id_
         if job_id is None:
             return False
-        outstanding = self._uncached_entries(job)
+        outstanding = self._outstanding_entries(job)
         if not outstanding or any(name in in_flight for _kind, name, _is_version in outstanding):
             return False
         for kind, name, is_version in outstanding:
@@ -837,7 +819,7 @@ class AuxPrefetchCoordinator:
         job_id = job.id_
         if job_id is None:
             return False
-        outstanding = self._uncached_entries(job)
+        outstanding = self._outstanding_entries(job)
         for kind, name, is_version in outstanding:
             self._job_tracker.mark_aux_skipped(
                 name,
@@ -853,19 +835,22 @@ class AuxPrefetchCoordinator:
         )
         return True
 
-    def _uncached_entries(self, job: ImageGenerateJobPopResponse) -> list[tuple[AuxModelKind, str, bool]]:
-        """The job's not-yet-cached auxiliary references as ``(kind, name, is_version)`` identity tuples.
+    def _outstanding_entries(self, job: ImageGenerateJobPopResponse) -> list[tuple[AuxModelKind, str, bool]]:
+        """The job's outstanding auxiliary references as ``(kind, name, is_version)`` identity tuples.
 
-        The name-plus-kind counterpart to :meth:`_uncached_entry_names`, for a caller that must key each
-        outstanding reference by its skip identity rather than only match it against the in-flight name set.
+        A reference is outstanding until the download process reports it present for this job or it falls under
+        a live skip verdict. A report for another job does not count, because the parent keeps no belief about
+        what is on disk and the file may have been evicted since that report.
         """
         entries: list[tuple[AuxModelKind, str, bool]] = []
         for lora in job.payload.loras or []:
-            if not self._job_tracker.is_lora_cached(lora) and not self._job_tracker.is_lora_skipped(lora):
-                entries.append((AuxModelKind.LORA, lora.name, bool(lora.is_version)))
+            if self._job_tracker.is_lora_present_for_job(job, lora) or self._job_tracker.is_lora_skipped(lora):
+                continue
+            entries.append((AuxModelKind.LORA, lora.name, bool(lora.is_version)))
         for ti in job.payload.tis or []:
-            if not self._job_tracker.is_ti_cached(ti.name) and not self._job_tracker.is_ti_skipped(ti.name):
-                entries.append((AuxModelKind.TI, ti.name, False))
+            if self._job_tracker.is_ti_present_for_job(job, ti.name) or self._job_tracker.is_ti_skipped(ti.name):
+                continue
+            entries.append((AuxModelKind.TI, ti.name, False))
         return entries
 
     def _salvage_via_skip(self, job_id: GenerationID) -> bool:

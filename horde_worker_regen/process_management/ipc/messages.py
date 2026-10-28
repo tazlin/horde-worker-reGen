@@ -856,7 +856,8 @@ class HordeAuxPrefetchControlMessage(HordeControlMessage):
 
     control_flag: HordeControlFlag = HordeControlFlag.PREFETCH_AUX_MODELS
     entries: list[AuxPrefetchEntry] = Field(default_factory=list)
-    """The auxiliary files to ensure on disk (already filtered to the not-yet-known-cached set)."""
+    """The auxiliary files to ensure on disk: every reference of the job not skipped, cooling or already reported
+    present for it. An entry already on disk is answered with an immediate success."""
     pins: list[AuxModelRef] = Field(default_factory=list)
     """Every auxiliary file referenced by any tracked job, protected from eviction while still needed."""
 

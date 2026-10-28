@@ -761,8 +761,8 @@ class HordeInferenceProcess(HordeProcess):
         mistake a download for a hung sampler. A file listed in ``skipped_aux`` was terminally rejected from
         ad-hoc download (invalid, too large, or NSFW on an SFW-only worker) and is tolerated as intentionally
         absent: the generator skips it and records a fault-metadata entry. Any other missing file returns
-        ``False`` and the caller faults the job retryably, which the parent's prefetch reconcile sweep
-        re-requests, so a raced eviction self-heals.
+        ``False`` and the caller faults the job retryably, and the parent's prefetch reconcile sweep asks the
+        download process for the file again.
 
         Args:
             job_info (ImageGenerateJobPopResponse): The job whose auxiliary references are checked.
@@ -1935,7 +1935,7 @@ class HordeInferenceProcess(HordeProcess):
 
         Routes through the ordinary faulted-result path (so the parent's retry/backoff brain owns the
         outcome), tagging the result's ``info`` with :data:`AUX_RESOLVE_FAILED_INFO` so the parent can
-        classify it as a retryable prefetch race rather than a generation failure. The process is kept
+        classify it as a retryable presence miss rather than a generation failure. The process is kept
         alive with its model resident and returned to ``WAITING_FOR_JOB``.
         """
         self._last_inference_error = AUX_RESOLVE_FAILED_INFO
@@ -2015,10 +2015,11 @@ class HordeInferenceProcess(HordeProcess):
             self._run_sample_stage(message)
         elif isinstance(message, HordeInferenceControlMessage):
             if message.control_flag == HordeControlFlag.START_INFERENCE:
-                # The parent's download process placed this job's LoRAs/TIs on disk before the job became
-                # dispatchable, so here the child only confirms them read-only (no network). An unresolved
-                # file means a raced eviction between prefetch and dispatch: fault the job retryably and go
-                # idle, keeping the model resident, so the parent's prefetch reconcile sweep re-requests it.
+                # The download process reported this job's LoRAs/TIs present, under its eviction pins, before
+                # the job became dispatchable, so here the child only confirms them read-only (no network). An
+                # unresolved file means an eviction between that report and this read, or a reference record the
+                # ad-hoc cache lost. The job is faulted retryably and the child goes idle with the model
+                # resident, and the parent's prefetch reconcile sweep asks the download process again.
                 if not self._resolve_aux_models(message.sdk_api_job_info, message.skipped_aux_models):
                     self._fault_job_for_unresolved_aux(message.sdk_api_job_info)
                     return

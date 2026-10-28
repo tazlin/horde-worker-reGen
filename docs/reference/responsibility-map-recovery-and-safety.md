@@ -88,7 +88,7 @@ remedy, so a `DEMOTE_SAFETY_WEIGHTS` remedy's room can be taken back on the next
 
 | Decision | Owner | Rule |
 | --- | --- | --- |
-| A LoRA is on disk | `JobTracker._cached_lora_keys`; hordelib's ad-hoc cache in the download process | The parent's set is "seen present this session" and is withdrawn only when a child fails to resolve a file. hordelib's cache evicts without telling the parent. |
+| A LoRA or TI is on disk | The download process (hordelib's ad-hoc cache; `workers/download_process.py` `_aux_entry_present`) | The parent keeps no belief of its own. Every reference of a popped job that is not skipped or cooling is sent, and the download process answers a present entry with an immediate success after applying the request's pins. The answer is recorded per job (`TrackedJob.aux_present_lora_keys`, `aux_present_ti_keys`) and withdrawn when a child fails to resolve a file. |
 | Which LoRAs are protected from eviction | `models/aux_prefetch_coordinator.py` `AuxPrefetchCoordinator._current_pins`; `workers/download_process.py` `_apply_eviction_pins` | Every file a not-yet-terminal tracked job references is pinned. A version reference resolves through `find_lora_key_by_version` and a name through `fuzzy_find_lora_key`, since the fuzzy lookup reads a number as a model id. A file evicted before its job was popped is not held by a pin. |
 
 ## Limits of what can be read from a log

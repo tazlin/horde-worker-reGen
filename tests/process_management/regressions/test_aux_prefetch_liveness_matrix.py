@@ -108,8 +108,8 @@ class _PrefetchScript:
     """How a job's auxiliary prefetch resolves, from the perspective of the scripted download process.
 
     Attributes:
-        on_disk: The files are already cached at pop, so the coordinator short-circuits with no request and
-            the job is prepared immediately (its completion cycle is zero).
+        on_disk: The files are already on disk at pop, so the download process answers the pop's request at
+            once with a success and the job is prepared in the pop cycle (its completion cycle is zero).
         resolve_cycle: The scheduling cycle at which a success (or failure) outcome is delivered for a job
             whose files were not cached at pop. Ignored when ``on_disk`` is set or when the job is left to its
             download deadline.
@@ -204,18 +204,31 @@ class _AuxLivenessWorld:
     async def pop(self, job: ImageGenerateJobPopResponse, *, script: _PrefetchScript) -> None:
         """Record a popped job and drive its pop-time prefetch exactly as the control loop would.
 
-        For an ``on_disk`` script the referenced files are seeded into the session cache before the coordinator
-        sees the job, so it short-circuits (no request) and the job is prepared at pop.
+        For an ``on_disk`` script the scripted download process answers the pop's request at once with a success
+        for every referenced file, as the real one answers an entry already present, so the job is prepared at pop.
         """
         assert job.id_ is not None
-        if script.on_disk:
-            for lora in job.payload.loras or []:
-                self._job_tracker.mark_aux_prefetched(lora.name, is_version=bool(lora.is_version), is_ti=False)
-            for ti in job.payload.tis or []:
-                self._job_tracker.mark_aux_prefetched(ti.name, is_version=False, is_ti=True)
         await track_popped_job_async(self._job_tracker, job)
         self._scripts[job.id_] = script
         self._coordinator.on_job_popped(job)
+        if script.on_disk:
+            self._coordinator.on_prefetch_result(
+                HordeAuxPrefetchResultMessage(
+                    process_id=9_000,
+                    process_launch_identifier=1,
+                    info="scripted presence answer",
+                    outcomes=[
+                        AuxPrefetchOutcome(
+                            kind=AuxModelKind.LORA,
+                            name=lora.name,
+                            is_version=bool(lora.is_version),
+                            ok=True,
+                            requesting_job_ids=[job.id_],
+                        )
+                        for lora in job.payload.loras or []
+                    ],
+                ),
+            )
 
     def _materialise_preloads(self) -> None:
         """Bring any model preloaded in the previous cycle resident, modelling the child's load completing."""

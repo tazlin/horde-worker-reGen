@@ -106,9 +106,9 @@ async def _pop_aux_held(world: _DispatchWorld, job: ImageGenerateJobPopResponse)
 
 def _land_aux(world: _DispatchWorld, job: ImageGenerateJobPopResponse) -> None:
     """Mark ``job``'s auxiliary files present and the job prepared, as the prefetch completion does."""
-    for lora in job.payload.loras or []:
-        world._job_tracker.mark_aux_prefetched(lora.name, is_version=bool(lora.is_version), is_ti=False)
     assert job.id_ is not None
+    for lora in job.payload.loras or []:
+        world._job_tracker.record_aux_present(job.id_, lora.name, is_version=bool(lora.is_version), is_ti=False)
     assert world._job_tracker.mark_job_aux_prepared_if_ready(job.id_), "precondition: the held job must be released"
 
 

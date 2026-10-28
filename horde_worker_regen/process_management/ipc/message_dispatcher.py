@@ -2230,20 +2230,21 @@ class MessageDispatcher:
             await self._record_terminal_inference_fault(message, job_id, detail={"host_commit_refused": True})
             return
 
-        # A child that could not resolve a job's prefetched auxiliary files on disk faults it retryably
-        # (:data:`AUX_RESOLVE_FAILED_INFO`). That is a local disk race, not a CivitAI download failure, so
-        # it does not arm the LoRA-download backoff: the fault flows through the ordinary retryable path.
-        # Withdrawing the job's prepared state here is what makes the retry meaningful: it re-gates the job
-        # out of dispatch and lets the prefetch reconcile sweep re-request the missing files (the session
-        # cache the preparation was derived from has been contradicted by the disk).
+        # A child that could not resolve a job's auxiliary files faults it retryably (:data:`AUX_RESOLVE_FAILED_INFO`).
+        # The download process reported those files present for this job under its eviction pins, so a miss
+        # means a file was evicted between that report and the child's read, or the ad-hoc reference lost the
+        # file's record. Neither is a CivitAI download failure, so the fault does not arm the LoRA-download
+        # backoff and flows through the ordinary retryable path. Withdrawing the job's prepared state and its
+        # presence reports re-gates the job out of dispatch, and the prefetch reconcile sweep then asks the
+        # download process about every file the job references again.
         if message.info == AUX_RESOLVE_FAILED_INFO:
             self._job_tracker.invalidate_job_aux_preparation(message.sdk_api_job_info)
         # A CUDA context fault is a verdict on the process, which is replaced for it. Its "out of memory" wording
         # must not earn the degraded retry or count against the model and the card the way an allocator OOM does.
         resource_failure = is_resource_failure(message.info) and not message.cuda_context_fault
         # Faults the worker already attributes elsewhere stay out of the lane streak: a missing auxiliary file is a
-        # disk race, a disaggregated stage fault is about the pipeline's shape, and a measured attempt's failure is
-        # the card's ceiling. Read before the tracker resolves the fault, which ends the measured attempt.
+        # download-path miss, a disaggregated stage fault is about the pipeline's shape, and a measured attempt's
+        # failure is the card's ceiling. Read before the tracker resolves the fault, which ends the measured attempt.
         counts_against_lane = (
             message.info != AUX_RESOLVE_FAILED_INFO
             and not is_disaggregated_completion

@@ -1,13 +1,13 @@
 """A child's aux-resolve fault must withdraw the job's prepared state so its files are re-fetched.
 
-The parent marks a job aux-prepared from the download process's prefetch outcomes and, from then on, the
-session cache asserts the files are on disk. When an inference child then cannot resolve one of those files
-(a raced eviction or disk error), the disk has contradicted that cache. If the retryable fault requeued the
-job while it still read as prepared, the reconcile sweep would never re-request the files and the scheduler
-would keep re-dispatching the job into the same resolve failure until its attempts were exhausted, with no
-download ever issued. These tests pin the withdrawal contract: an ``AUX_RESOLVE_FAILED_INFO`` fault clears
-the job's prepared flag and forgets the contradicted cache entries, the reconcile sweep re-arms a fresh
-prefetch for the requeued job, and a subsequent successful outcome makes it dispatchable again.
+The parent marks a job aux-prepared from the download process's per-job presence reports. When an inference
+child then cannot resolve one of those files (an eviction after the report, or a reference record the ad-hoc
+cache lost), the report no longer holds. If the retryable fault requeued the job while it still read as
+prepared, the reconcile sweep would never re-request the files and the scheduler would keep re-dispatching the
+job into the same resolve failure until its attempts were exhausted, with no download ever issued. These tests
+pin the withdrawal contract: an ``AUX_RESOLVE_FAILED_INFO`` fault clears the job's prepared flag and its presence
+reports, the reconcile sweep re-arms a fresh prefetch for the requeued job, and a subsequent successful outcome
+makes it dispatchable again.
 """
 
 from __future__ import annotations
@@ -107,11 +107,11 @@ class TestResolveFaultWithdrawsPreparation:
         await dispatcher._handle_faulted_inference_result(_resolve_fault_message(job), job_info)
 
         # The job is requeued for another attempt but no longer reads as prepared, so the dispatch gate
-        # holds it and the session cache no longer vouches for the missing file.
+        # holds it, and its presence report for the missing file is withdrawn.
         tracked = tracker.get_tracked_job(job.id_)
         assert tracked is not None and tracked.stage == JobStage.PENDING_INFERENCE
         assert tracker.are_job_aux_models_prepared(job) is False
-        assert tracker.is_lora_cached(_lora("styleA")) is False
+        assert tracker.is_lora_present_for_job(job, _lora("styleA")) is False
         # Withdrawal must not be undone by the readiness check alone: only a fresh on-disk report may.
         assert tracker.mark_job_aux_prepared_if_ready(job.id_) is False
 
@@ -124,11 +124,11 @@ class TestResolveFaultWithdrawsPreparation:
         coordinator.on_prefetch_result(_ok_outcome(job, "styleA"))
         assert tracker.are_job_aux_models_prepared(job) is True
 
-    async def test_terminal_resolve_fault_still_forgets_contradicted_cache(self) -> None:
-        """With no attempts left the job faults out, but the lying cache entry must still be dropped.
+    async def test_terminal_resolve_fault_still_forgets_the_presence_report(self) -> None:
+        """With no attempts left the job faults out, and its contradicted presence report is still withdrawn.
 
-        A later job referencing the same file must go through a fresh prefetch (whose presence probe
-        re-verifies the disk) rather than being insta-prepared from the contradicted session cache.
+        A later job referencing the same file goes through a fresh prefetch, whose presence probe in the download
+        process re-verifies the disk.
         """
         tracker = JobTracker()
         tracker.set_retry_policy(1)
@@ -143,7 +143,7 @@ class TestResolveFaultWithdrawsPreparation:
 
         tracked = tracker.get_tracked_job(job.id_)
         assert tracked is not None and tracked.stage != JobStage.PENDING_INFERENCE
-        assert tracker.is_lora_cached(_lora("styleB")) is False
+        assert tracker.is_lora_present_for_job(job, _lora("styleB")) is False
 
         follow_up = make_job_pop_response("some-model", loras=[_lora("styleB")])
         await track_popped_job_async(tracker, follow_up)
@@ -167,4 +167,4 @@ class TestResolveFaultWithdrawsPreparation:
         await dispatcher._handle_faulted_inference_result(message, job_info)
 
         assert tracker.are_job_aux_models_prepared(job) is True
-        assert tracker.is_lora_cached(_lora("styleC")) is True
+        assert tracker.is_lora_present_for_job(job, _lora("styleC")) is True

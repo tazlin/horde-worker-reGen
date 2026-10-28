@@ -485,8 +485,20 @@ class TrackedJob:
 
     With :attr:`time_popped` this measures the wall time a job spent blocked on its auxiliary files being
     placed on disk, which is the part of its queue wait attributable to LoRA/TI fetching rather than to
-    scheduling. A job whose files were already cached stamps this as soon as the prefetch pipeline
-    evaluates it, so its wait reads as ~0 rather than as unknown."""
+    scheduling. A job whose files were already on disk stamps this when the download process's presence answer
+    arrives, so its wait reads as that round trip rather than as unknown."""
+    aux_present_lora_keys: set[str] = field(default_factory=set)
+    """The LoRAs the download process reported present for this job, keyed like the LoRA skip verdicts.
+
+    The download process applies the eviction pins a request carries before it answers, and the pins cover every
+    tracked job that still needs its files, so a LoRA reported present for this job stays on disk while the job
+    is tracked. The set belongs to this job alone. Another job referencing the same LoRA asks the download
+    process itself, because the file may have been evicted once this job's pin lapsed. Cleared by
+    :meth:`JobTracker.invalidate_job_aux_preparation` when an inference child fails to resolve one of the files.
+    """
+    aux_present_ti_keys: set[str] = field(default_factory=set)
+    """The textual inversions the download process reported present for this job, on the terms of
+    :attr:`aux_present_lora_keys`."""
     queue_depth_at_dispatch: int | None = None
     """How many other jobs were queued for or running inference when this job was last dispatched.
 
@@ -646,23 +658,13 @@ class JobTracker:
         # like the fault streaks (device_index, None on a single-GPU host); monotonic across the session.
         self._card_inference_results: dict[int | None, int] = {}
 
-        # LoRA files known present on disk this session, keyed by (name, is_version), learned from the aux
-        # prefetch pipeline's per-file outcomes. Consulted to decide when a pending job's full auxiliary set
-        # is ready so its dispatch gate can clear, and to skip re-requesting files a prior job already placed.
-        # Entries contradicted by the disk (an inference child failed to resolve one) are withdrawn via
-        # invalidate_job_aux_preparation so the next readiness check goes through a fresh prefetch.
-        self._cached_lora_keys: set[str] = set()
+        # The tracker keeps no worker-wide belief about which LoRAs or TIs are on disk. The download process
+        # owns the files and every evictor, so presence is its answer, recorded per job on the tracked job
+        # (TrackedJob.aux_present_lora_keys and aux_present_ti_keys).
 
-        # Textual inversions known present on disk this session, kept in a namespace distinct from the LoRA
-        # cache (a LoRA and a TI may share a name yet resolve to different files). Learned from the aux
-        # prefetch pipeline; consulted alongside the LoRA cache to decide when a job's full auxiliary set is
-        # ready, so its dispatch gate can clear.
-        self._cached_ti_keys: set[str] = set()
-
-        # LoRA/TI files a job references whose ad-hoc download was ruled out. Kept in a namespace distinct
-        # from the cached sets: a skipped file is NOT present, so the on-disk probes (is_lora_cached/
-        # is_ti_cached) keep reporting it absent, but a job's aux set counts as ready once every file is
-        # cached OR skipped, letting a bad LoRA's job dispatch (the generator skips it and records a fault)
+        # LoRA/TI files a job references whose ad-hoc download was ruled out. A skipped file is not on disk, but
+        # a job's aux set counts as ready once every file is reported present for the job or skipped, letting a
+        # bad LoRA's job dispatch (the generator skips it and records a fault)
         # instead of faulting the job. The value is the verdict's expiry: None for a permanent verdict (a
         # surfaced rejection such as invalid, too large, or NSFW on an SFW-only worker; the file will never
         # be usable) and an absolute timestamp for an incident-scoped verdict (a terminal plain download
@@ -2155,21 +2157,30 @@ class JobTracker:
         expires_at = skips[key]
         return expires_at is None or self._clock() < expires_at
 
-    def are_all_job_loras_cached(self, job: ImageGenerateJobPopResponse) -> bool:
-        """Whether every LoRA the job references is cached on disk or terminally skipped (so it need not be)."""
-        return all(
-            self._lora_cache_key(lora) in self._cached_lora_keys
+    def _is_job_aux_set_ready(self, tracked: TrackedJob) -> bool:
+        """Whether every LoRA and TI the job references is reported present for it or under a live skip verdict."""
+        payload = tracked.sdk_api_job_info.payload
+        loras_ready = all(
+            self._lora_cache_key(lora) in tracked.aux_present_lora_keys
             or self._skip_live(self._skipped_lora_keys, self._lora_cache_key(lora))
-            for lora in job.payload.loras or []
+            for lora in payload.loras or []
         )
+        tis_ready = all(
+            self._ti_cache_key(ti.name) in tracked.aux_present_ti_keys
+            or self._skip_live(self._skipped_ti_keys, self._ti_cache_key(ti.name))
+            for ti in payload.tis or []
+        )
+        return loras_ready and tis_ready
 
-    def is_lora_cached(self, lora: LorasPayloadEntry) -> bool:
-        """Whether the file this LoRA payload entry resolves to has been seen present on disk this session."""
-        return self._lora_cache_key(lora) in self._cached_lora_keys
+    def is_lora_present_for_job(self, job: ImageGenerateJobPopResponse, lora: LorasPayloadEntry) -> bool:
+        """Whether the download process reported this LoRA present for this job (see ``aux_present_lora_keys``)."""
+        tracked = self._tracked_for(job)
+        return tracked is not None and self._lora_cache_key(lora) in tracked.aux_present_lora_keys
 
-    def is_ti_cached(self, name: str) -> bool:
-        """Whether the textual inversion named ``name`` has been seen present on disk this session."""
-        return self._ti_cache_key(name) in self._cached_ti_keys
+    def is_ti_present_for_job(self, job: ImageGenerateJobPopResponse, name: str) -> bool:
+        """Whether the download process reported this textual inversion present for this job."""
+        tracked = self._tracked_for(job)
+        return tracked is not None and self._ti_cache_key(name) in tracked.aux_present_ti_keys
 
     def is_lora_skipped(self, lora: LorasPayloadEntry) -> bool:
         """Whether this LoRA's download is currently ruled out (so it must not be re-requested)."""
@@ -2206,30 +2217,25 @@ class JobTracker:
         """Identity of the on-disk file a textual-inversion payload entry resolves to (its reference name)."""
         return f"ti\x1f{name}"
 
-    def are_all_job_tis_cached(self, job: ImageGenerateJobPopResponse) -> bool:
-        """Whether every TI the job references is cached on disk or terminally skipped (so it need not be)."""
-        return all(
-            self._ti_cache_key(ti.name) in self._cached_ti_keys
-            or self._skip_live(self._skipped_ti_keys, self._ti_cache_key(ti.name))
-            for ti in job.payload.tis or []
-        )
+    def record_aux_present(self, job_id: GenerationID, name: str, *, is_version: bool, is_ti: bool) -> None:
+        """Record the download process's report that one auxiliary file (LoRA or TI) is present for one job.
 
-    def mark_aux_prefetched(self, name: str, *, is_version: bool, is_ti: bool) -> None:
-        """Record that one auxiliary file (LoRA or TI) is now present on disk, from the prefetch pipeline.
-
-        Keyed in the same namespaces the per-job readiness checks read, so a later prefetch completion (or a
-        second job sharing the file) can find it already cached.
+        The report is kept on the tracked job only (see :attr:`TrackedJob.aux_present_lora_keys`), so a later
+        job referencing the same file asks the download process again. A job no longer tracked is ignored.
         """
+        tracked = self._tracked_by_id(job_id)
+        if tracked is None:
+            return
         if is_ti:
-            self._cached_ti_keys.add(self._ti_cache_key(name))
+            tracked.aux_present_ti_keys.add(self._ti_cache_key(name))
         else:
-            self._cached_lora_keys.add(self._lora_name_key(name, is_version))
+            tracked.aux_present_lora_keys.add(self._lora_name_key(name, is_version))
 
     def mark_aux_skipped(self, name: str, *, is_version: bool, is_ti: bool, expires_at: float | None = None) -> None:
         """Record an auxiliary file whose download is ruled out so a job's readiness no longer waits on it.
 
-        Unlike ``mark_aux_prefetched`` this does not claim the file is on disk; it only removes the file from
-        what a job's aux set must contain to be ready, so the job dispatches and the generator proceeds
+        Unlike :meth:`record_aux_present` this does not claim the file is on disk. It only removes the file
+        from what a job's aux set must contain to be ready, so the job dispatches and the generator proceeds
         without it.
 
         Args:
@@ -2253,7 +2259,10 @@ class JobTracker:
         skips[key] = expires_at
 
     def mark_job_aux_prepared_if_ready(self, job_id: GenerationID) -> bool:
-        """Set a pending job's aux-prepared flag once every LoRA and TI it needs is cached; return the transition.
+        """Set a pending job's aux-prepared flag once every LoRA and TI it needs is ready; return the transition.
+
+        A file is ready when the download process reported it present for this job or it is under a live skip
+        verdict.
 
         Returns True only on the transition to prepared (so a caller acts once), and False when the job is
         gone, still missing an auxiliary file, or was already prepared. Keeping LoRA and TI keys distinct
@@ -2262,29 +2271,25 @@ class JobTracker:
         tracked = self._tracked_by_id(job_id)
         if tracked is None or tracked.aux_models_prepared or tracked.stage != JobStage.PENDING_INFERENCE:
             return False
-        job = tracked.sdk_api_job_info
-        if not self.are_all_job_loras_cached(job) or not self.are_all_job_tis_cached(job):
+        if not self._is_job_aux_set_ready(tracked):
             return False
         tracked.aux_models_prepared = True
         tracked.aux_models_prepared_at = time.time()
         return True
 
     def invalidate_job_aux_preparation(self, job: ImageGenerateJobPopResponse) -> bool:
-        """Withdraw a job's aux-prepared state after its files failed to resolve on disk.
+        """Withdraw a job's aux-prepared state after its files failed to resolve in the inference child.
 
-        A resolve failure means the disk contradicted the session cache (an eviction or disk error removed
-        a file previously seen present), so the cache entries for every auxiliary file the job references
-        are forgotten along with the job's prepared flag. The prefetch reconcile sweep then re-requests the
-        job's auxiliary files as a fresh pop would; sibling jobs sharing an entry are re-verified by the
-        download process's presence short-circuit rather than trusting the stale cache. Returns True when a
-        tracked job's prepared flag was actually withdrawn.
+        The job's presence reports from the download process are forgotten along with the prepared flag, so the
+        prefetch reconcile sweep asks the download process about every auxiliary file the job references again,
+        as a fresh pop does. Returns True when a tracked job's prepared flag was actually withdrawn.
         """
-        for lora in job.payload.loras or []:
-            self._cached_lora_keys.discard(self._lora_cache_key(lora))
-        for ti in job.payload.tis or []:
-            self._cached_ti_keys.discard(self._ti_cache_key(ti.name))
         tracked = self._tracked_for(job)
-        if tracked is None or not tracked.aux_models_prepared:
+        if tracked is None:
+            return False
+        tracked.aux_present_lora_keys.clear()
+        tracked.aux_present_ti_keys.clear()
+        if not tracked.aux_models_prepared:
             return False
         tracked.aux_models_prepared = False
         tracked.aux_models_prepared_at = None

@@ -250,6 +250,49 @@ def test_present_lora_short_circuits_without_fetch(monkeypatch: pytest.MonkeyPat
     assert [str(j) for j in outcomes[0].requesting_job_ids] == [_JOB_A]
 
 
+class _OrderRecordingLoraManager(_FakeLoraManager):
+    """Records the order of pin applications and presence probes, so a test can read which came first."""
+
+    def __init__(self, present: set[str], events: list[str]) -> None:
+        super().__init__(present=present)
+        self._events = events
+
+    def is_lora_available(self, name: str, is_version: bool = False) -> bool:
+        self._events.append(f"probe:{name}")
+        return super().is_lora_available(name, is_version=is_version)
+
+    def set_eviction_pins(self, keys: set[str]) -> None:
+        self._events.append(f"pins:{','.join(sorted(keys))}")
+        super().set_eviction_pins(keys)
+
+
+def test_present_entry_is_answered_without_fetch_after_its_pin_is_applied(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A present LoRA answers success with no fetch, and the request's pin protects it before the probe reads it.
+
+    The parent keeps no belief of its own about which files are on disk and sends every entry of a popped job. The
+    success it receives for a present file is only sound while the file stays on disk until the job dispatches,
+    which the pin applied in the same request guarantees.
+    """
+    events: list[str] = []
+    lora = _OrderRecordingLoraManager(present={"styleA"}, events=events)
+    process = _make_process(monkeypatch, lora=lora, ti=None)
+
+    process._handle_aux_prefetch_request(
+        HordeAuxPrefetchControlMessage(
+            entries=[_entry("styleA", job=_JOB_A)],
+            pins=[AuxModelRef(kind=AuxModelKind.LORA, name="styleA")],
+        ),
+    )
+
+    assert lora.fetch_calls == []
+    assert lora.pins == {"styleA"}
+    assert events.index("pins:styleA") < events.index("probe:styleA")
+    outcomes = _collect_prefetch_outcomes(process)
+    assert [(outcome.name, outcome.ok, [str(job) for job in outcome.requesting_job_ids]) for outcome in outcomes] == [
+        ("styleA", True, [_JOB_A]),
+    ]
+
+
 def test_missing_lora_is_fetched_and_reported(monkeypatch: pytest.MonkeyPatch) -> None:
     """A missing LoRA is fetched once and reported as a success once it lands."""
     lora = _FakeLoraManager(present=set())

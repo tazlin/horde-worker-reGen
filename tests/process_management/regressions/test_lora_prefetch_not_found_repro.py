@@ -302,7 +302,8 @@ async def test_mixed_job_with_laundered_lora_should_dispatch_with_only_valid() -
 
     Contract (post-fix shape): the root cause surfaces a not-found as a terminal rejection, exactly like a
     too-large one, so all three of the mixed job's LoRAs resolve to a terminal verdict in one result: the valid
-    one caches, and both the too-large and the not-found ones are skipped, leaving the job prepared to dispatch
+    one is reported present for the job, and both the too-large and the not-found ones are skipped, leaving the
+    job prepared to dispatch
     without them. The earlier laundered shape (a retryable not-found failure) is exercised separately by
     ``test_repeated_laundered_lora_failure_salvages_via_memoized_skip``, where a single retryable failure
     requeues the job before the terminal one memoizes the reference and serves the job without it.
@@ -322,7 +323,7 @@ async def test_mixed_job_with_laundered_lora_should_dispatch_with_only_valid() -
         ),
     )
 
-    assert tracker.is_lora_cached(_lora("good")) is True
+    assert tracker.is_lora_present_for_job(job, _lora("good")) is True
     assert tracker.is_lora_skipped(_lora("ghost404")) is True
     assert tracker.are_job_aux_models_prepared(job) is True
 
@@ -446,7 +447,7 @@ async def test_lora_backoff_withholds_next_pop_but_not_queued_jobs() -> None:
 
     queued = _job(loras=[_lora("kept")])
     await track_popped_job_async(tracker, queued)
-    tracker.mark_aux_prefetched("kept", is_version=False, is_ti=False)
+    tracker.record_aux_present(queued.id_, "kept", is_version=False, is_ti=False)
     assert tracker.mark_job_aux_prepared_if_ready(queued.id_) is True
 
     assert popper._effective_allow_lora(bridge_data) is True

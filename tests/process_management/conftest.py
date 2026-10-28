@@ -190,17 +190,18 @@ async def mark_job_in_progress_async(job_tracker: JobTracker, job: object) -> No
 def mark_job_aux_prepared(job_tracker: JobTracker, job: ImageGenerateJobPopResponse) -> None:
     """Simulate the prefetch pipeline placing a job's auxiliary files and clearing its preparation gate.
 
-    Drives the real preparation API (``mark_aux_prefetched`` for each LoRA/TI the job needs, then
-    ``mark_job_aux_prepared_if_ready``) so the job's aux-prepared flag transitions exactly as it does in
-    production, without a live download process. A job whose files are only partially seeded is left
-    unprepared, matching the all-or-nothing gate.
+    Drives the real preparation API (``record_aux_present`` for each LoRA/TI the job needs, as the download
+    process's per-job presence report does, then ``mark_job_aux_prepared_if_ready``) so the job's aux-prepared
+    flag transitions exactly as it does in production, without a live download process. The job must already be
+    tracked. A job whose files are only partially seeded is left unprepared, matching the all-or-nothing gate.
     """
+    if job.id_ is None:
+        return
     for lora in job.payload.loras or []:
-        job_tracker.mark_aux_prefetched(lora.name, is_version=bool(lora.is_version), is_ti=False)
+        job_tracker.record_aux_present(job.id_, lora.name, is_version=bool(lora.is_version), is_ti=False)
     for ti in job.payload.tis or []:
-        job_tracker.mark_aux_prefetched(ti.name, is_version=False, is_ti=True)
-    if job.id_ is not None:
-        job_tracker.mark_job_aux_prepared_if_ready(job.id_)
+        job_tracker.record_aux_present(job.id_, ti.name, is_version=False, is_ti=True)
+    job_tracker.mark_job_aux_prepared_if_ready(job.id_)
 
 
 async def queue_job_for_safety_async(job_tracker: JobTracker, job_info: object) -> None:

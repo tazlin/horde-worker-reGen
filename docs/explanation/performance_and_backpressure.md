@@ -561,7 +561,7 @@ Two mechanisms keep this live. A per-job prefetch deadline (derived from the con
 checked in the periodic scheduling scan) faults a job whose files never land, so it is never left pending
 forever: the backstop. A reconcile sweep in the same periodic step re-requests any pending auxiliary-bearing
 job with no request in flight (a retryable-failure requeue, a lost result, or a restarted download process),
-and marks a job prepared outright when its files are already cached: the liveness that heals. Save-our-ship
+and marks a job prepared outright when every file was already reported present for it: the liveness that heals. Save-our-ship
 recovery defers to this: while the head-of-queue job is auxiliary-gated with its prefetch still in flight (its
 deadline present and unexpired), give-up holds off exactly as it does for a head whose model is still
 materialising, bounded by that deadline so the coordinator resolves the head the moment it lapses (served

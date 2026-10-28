@@ -2803,11 +2803,11 @@ class _DispatchWorld:
         if job.id_ is not None:
             self.popped_at[str(job.id_)] = self.now
         await track_popped_job_async(self._job_tracker, job, time_popped=self.now)
-        for lora in job.payload.loras or []:
-            self._job_tracker.mark_aux_prefetched(lora.name, is_version=bool(lora.is_version), is_ti=False)
-        for ti in job.payload.tis or []:
-            self._job_tracker.mark_aux_prefetched(ti.name, is_version=False, is_ti=True)
         if job.id_ is not None:
+            for lora in job.payload.loras or []:
+                self._job_tracker.record_aux_present(job.id_, lora.name, is_version=bool(lora.is_version), is_ti=False)
+            for ti in job.payload.tis or []:
+                self._job_tracker.record_aux_present(job.id_, ti.name, is_version=False, is_ti=True)
             self._job_tracker.mark_job_aux_prepared_if_ready(job.id_)
 
     # -- intake -------------------------------------------------------------------------------------------

@@ -159,19 +159,134 @@ async def test_pop_without_aux_sends_nothing() -> None:
     assert sender.calls == []
 
 
-async def test_already_cached_pop_clears_gate_without_request() -> None:
-    """When a job's whole auxiliary set is already cached, its gate clears and no request is sent."""
+async def test_present_entry_is_requested_and_its_immediate_success_prepares_the_job() -> None:
+    """A LoRA already on disk is still requested, and the download process's immediate success clears the gate."""
     tracker = JobTracker()
-    lora = _lora("cached-style")
-    job = _job(loras=[lora])
+    job = _job(loras=[_lora("on-disk-style")])
     await track_popped_job_async(tracker, job)
-    tracker.mark_aux_prefetched("cached-style", is_version=False, is_ti=False)
     coordinator, sender, _state, _clock = _make(tracker)
 
     coordinator.on_job_popped(job)
 
-    assert sender.calls == []
+    assert len(sender.calls) == 1
+    assert [entry.name for entry in sender.calls[0][0]] == ["on-disk-style"]
+    assert tracker.are_job_aux_models_prepared(job) is False
+    # The download process answers an entry already present with a success, sent without a fetch.
+    coordinator.on_prefetch_result(_ok_message(job, "on-disk-style"))
     assert tracker.are_job_aux_models_prepared(job) is True
+    assert job.id_ not in coordinator.job_ids_with_live_deadlines()
+
+
+async def test_skipped_and_cooling_references_are_not_requested() -> None:
+    """Every reference of a popped job is requested except one under a skip verdict or a re-fetch cooldown."""
+    clock = _Clock()
+    tracker = JobTracker(clock=clock)
+    coordinator, sender, _state, _clock = _make(tracker, clock=clock)
+    tracker.mark_aux_skipped("skipped", is_version=False, is_ti=False)
+    earlier = _job(loras=[_lora("cooling")])
+    await track_popped_job_async(tracker, earlier)
+    coordinator.on_job_popped(earlier)
+    assert earlier.id_ is not None
+    coordinator.on_prefetch_result(
+        HordeAuxPrefetchResultMessage(
+            process_id=9000,
+            process_launch_identifier=1,
+            info="r",
+            outcomes=[
+                AuxPrefetchOutcome(
+                    kind=AuxModelKind.LORA,
+                    name="cooling",
+                    ok=False,
+                    retryable=True,
+                    detail="transient",
+                    requesting_job_ids=[earlier.id_],
+                ),
+            ],
+        ),
+    )
+
+    job = _job(loras=[_lora("skipped"), _lora("cooling"), _lora("fresh")])
+    await track_popped_job_async(tracker, job)
+    coordinator.on_job_popped(job)
+
+    entries, _pins = sender.calls[-1]
+    assert [entry.name for entry in entries] == ["fresh"]
+
+
+async def test_reference_reported_present_for_the_job_is_not_asked_again_after_a_cooldown() -> None:
+    """A re-request for a job leaves out a reference already reported present for that job.
+
+    The report stays true while the job is tracked, because the pins that protect the file cover the job. Asking
+    again would arm a fresh in-flight deadline that hides the job from the reconcile sweep, so the cooling
+    reference would never be re-requested.
+    """
+    clock = _Clock()
+    tracker = JobTracker(clock=clock)
+    coordinator, sender, _state, _clock = _make(tracker, clock=clock)
+    job = _job(loras=[_lora("landed"), _lora("flaky")])
+    await track_popped_job_async(tracker, job)
+    coordinator.on_job_popped(job)
+    assert job.id_ is not None
+    coordinator.on_prefetch_result(
+        HordeAuxPrefetchResultMessage(
+            process_id=9000,
+            process_launch_identifier=1,
+            info="r",
+            outcomes=[
+                AuxPrefetchOutcome(kind=AuxModelKind.LORA, name="landed", ok=True, requesting_job_ids=[job.id_]),
+                AuxPrefetchOutcome(
+                    kind=AuxModelKind.LORA,
+                    name="flaky",
+                    ok=False,
+                    retryable=True,
+                    detail="transient",
+                    requesting_job_ids=[job.id_],
+                ),
+            ],
+        ),
+    )
+    requests_after_failure = len(sender.calls)
+
+    coordinator.reconcile_and_refresh_pins()
+    assert len(sender.calls) == requests_after_failure
+
+    clock.now += 60.0
+    coordinator.reconcile_and_refresh_pins()
+    assert len(sender.calls) == requests_after_failure + 1
+    assert [entry.name for entry in sender.calls[-1][0]] == ["flaky"]
+    coordinator.on_prefetch_result(_ok_message(job, "flaky"))
+    assert tracker.are_job_aux_models_prepared(job) is True
+
+
+async def test_lora_reported_downloaded_earlier_is_requested_again_for_a_later_job() -> None:
+    """A later job for a LoRA an earlier job downloaded asks the download process again before it dispatches.
+
+    The download process evicts ad-hoc LoRAs (the free-disk floor guard and the over-budget evictor) and does not
+    report an eviction to the parent. Only the download process can say whether the file is still on disk, so the
+    second job's request names the LoRA and the job stays gated until the answer arrives.
+    """
+    tracker = JobTracker()
+    first = _job(loras=[_lora("evictable")])
+    await track_popped_job_async(tracker, first)
+    coordinator, sender, _state, _clock = _make(tracker)
+    coordinator.on_job_popped(first)
+    coordinator.on_prefetch_result(_ok_message(first, "evictable"))
+    assert tracker.are_job_aux_models_prepared(first) is True
+    # The first job leaves the tracker, its pin lapses, and the download process evicts the file. The eviction
+    # sends nothing to the parent.
+    tracker.handle_job_fault_now(first, retryable=False, fault_reason="finished")
+
+    second = _job(loras=[_lora("evictable")])
+    await track_popped_job_async(tracker, second)
+    coordinator.on_job_popped(second)
+
+    assert len(sender.calls) == 2
+    entries, pins = sender.calls[-1]
+    assert [(entry.kind, entry.name, entry.requesting_job_id) for entry in entries] == [
+        (AuxModelKind.LORA, "evictable", second.id_),
+    ]
+    assert {(pin.kind, pin.name) for pin in pins} == {(AuxModelKind.LORA, "evictable")}
+    assert tracker.are_job_aux_models_prepared(second) is False
 
 
 async def test_completion_marks_prepared_and_clears_deadline() -> None:
@@ -722,12 +837,13 @@ async def test_reconcile_does_not_re_arm_a_job_with_a_live_deadline() -> None:
     assert len(sender.calls) == 1
 
 
-async def test_reconcile_marks_prepared_when_everything_already_cached() -> None:
-    """A pending aux job whose files are all cached (no deadline) is marked prepared by the sweep, no request."""
+async def test_reconcile_marks_prepared_when_everything_already_reported_present() -> None:
+    """A pending aux job whose files were all reported present for it (no deadline) is prepared by the sweep."""
     tracker = JobTracker()
     job = _job(loras=[_lora("already")])
     await track_popped_job_async(tracker, job)
-    tracker.mark_aux_prefetched("already", is_version=False, is_ti=False)
+    assert job.id_ is not None
+    tracker.record_aux_present(job.id_, "already", is_version=False, is_ti=False)
     coordinator, sender, _state, _clock = _make(tracker)
 
     coordinator.reconcile_and_refresh_pins()
