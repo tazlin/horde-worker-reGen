@@ -753,7 +753,11 @@ attempt rides the ordinary `FITS` path, so every downstream safety (the per-step
 classification, the whole-card residency machinery) applies unchanged. It is one-shot per accepted job and
 card. The job tracker owns the spent-card receipt, so replacing the arbiter or inference process cannot re-arm
 the same exceptional attempt; an active preload-to-dispatch continuation remains admitted because it is still
-the same attempt. A success teaches the learned peak the true figure and arms no hold. An out-of-memory failure
+the same attempt. An idle copy the VRAM sweep spares, such as a rung-1 run's copy while the run has a next job,
+keeps the card from reading converged-empty, because the worker frees it when the run ends. For the same reason
+the admission room does not list it as a permitted rung, so a deficit only its eviction closes is not closable and
+does not take a service lane. A success teaches the learned peak the true figure and does not arm a hold. An
+out-of-memory failure
 ends the continuation and immediately arms that card's conditional ceiling hold. The ordinary inference retry
 cap may offer the job to a different eligible card, but the failure never earns a degraded retry on the same
 card: the card was already converged and alone. When the normal cap is spent, the job faults through the usual

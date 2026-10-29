@@ -500,6 +500,11 @@ class VramRequest:
     VRAM. The scheduler reclaims it through its own actuator once the head's hold stands; while it exists the
     card is not converged-empty, so the measured-load probe waits for that reclaim rather than loading over
     it."""
+    spared_idle_process_ids: frozenset[int] = frozenset()
+    """The idle inference lanes on the card whose resident copy the VRAM sweep spares for this request, such as a
+    rung-1 run's copy while the run has a next job. The admission room does not permit a rung on them, and while
+    any is listed the card is not converged-empty, so a measured load is not attempted beside a copy the sweep
+    keeps."""
     can_reduce_live_contexts: bool = False
     """True when reducing the live inference-context count is a warranted remedy for this head's over-commit."""
     idle_contexts_teardownable: bool = False
@@ -1072,6 +1077,7 @@ class VramArbiter:
             utilities_reclaim_permitted=state.utilities_reclaim_allowed,
             safety_residency_fixed=state.safety_residency_fixed,
             held_idle_returns_mb=state.held_idle_returns_mb,
+            spared_idle_process_ids=request.spared_idle_process_ids,
         )
 
     def _head_protection_defer(
@@ -1510,11 +1516,16 @@ class VramArbiter:
         live inference processes, not VRAM-resident models, so the always-present target process would make it
         non-zero on a genuinely empty card. Resident-model presence is read through the reclaim signal instead,
         which is exactly the make-room question this predicate asks.
+
+        A copy the sweep spares (``spared_idle_process_ids``) also keeps the card from converging. Make-room
+        cannot take it, but the worker holds it and frees it when its owner (a rung-1 run) ends, so the shortfall
+        is not foreign VRAM or a conservative prediction, and a measured load beside it would only overcommit.
         """
         return (
             measured.outstanding_reservations_mb <= _CONVERGED_EMPTY_RESERVATION_EPSILON_MB
             and not request.has_reclaimable_idle_model
             and not request.has_reclaimable_idle_tenancy
+            and not request.spared_idle_process_ids
             and not request.idle_contexts_teardownable
         )
 
@@ -1679,7 +1690,9 @@ class VramArbiter:
         (the same clock the idle-context teardown waits out). A later rung waits only for the previous one's
         grade (:attr:`VramRequest.lane_rung_grade`), since the episode has already waited the grace once.
         Offered only when the permitted rungs together would close the deficit (a lane paused for a head that
-        still cannot fit is churn), and never when policy withholds lane reclaim.
+        still cannot fit is churn), and never when policy withholds lane reclaim. A copy the sweep spares is not
+        a permitted rung (:attr:`VramRequest.spared_idle_process_ids`), so a deficit only its eviction closes
+        does not take a lane.
         """
         if request.kind not in (VramRequestKind.PRELOAD, VramRequestKind.MONOLITHIC_DISPATCH):
             return None

@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import sys
 from collections.abc import Mapping
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 
 from strenum import StrEnum
@@ -426,6 +427,7 @@ def admission_room(
     utilities_reclaim_permitted: bool,
     safety_residency_fixed: bool = False,
     held_idle_returns_mb: Mapping[int, float] | None = None,
+    spared_idle_process_ids: AbstractSet[int] = frozenset(),
 ) -> AdmissionRoom:
     """Decompose the admission identity for one candidate into tenancy by class and reclaim rungs.
 
@@ -464,6 +466,8 @@ def admission_room(
         held_idle_returns_mb: For each idle inference sibling holding a model or components, what an unload or
             a release would return (MB). A sibling absent from it is a bare context. None treats every idle
             sibling as a bare context.
+        spared_idle_process_ids: Idle inference siblings whose resident copy the VRAM sweep spares for this
+            candidate. No rung returns anything from them, so their whole tenancy is listed as not permitted.
     """
     tenancy: dict[TenantLane, float] = {}
     rungs: list[RoomRung] = []
@@ -484,7 +488,10 @@ def admission_room(
         tenancy[classed] = tenancy.get(classed, 0.0) + charge
         attributed += charge
         if classed is TenantLane.INFERENCE_IDLE:
-            rungs.extend(_idle_sibling_rungs(charge, (held_idle_returns_mb or {}).get(process_id)))
+            held_returns_mb = (
+                0.0 if process_id in spared_idle_process_ids else (held_idle_returns_mb or {}).get(process_id)
+            )
+            rungs.extend(_idle_sibling_rungs(charge, held_returns_mb))
     lane_rungs = (
         (TenantLane.POST_PROCESS, RoomRungKind.POST_PROCESS_LANE, post_process_reclaim_permitted),
         (TenantLane.SAFETY, RoomRungKind.SAFETY_OFF_GPU, safety_reclaim_permitted),

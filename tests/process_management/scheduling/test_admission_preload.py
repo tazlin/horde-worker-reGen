@@ -16,6 +16,17 @@ from horde_worker_regen.analysis.log_signatures import pattern_for
 from horde_worker_regen.process_management.ipc.messages import HordeProcessState
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
+from horde_worker_regen.process_management.resources.admission_identity import TenantLane
+from horde_worker_regen.process_management.resources.vram_arbiter import (
+    _FIRST_PARTY_TEARDOWN_GRACE_SECONDS,
+    ActuatorCommandKind,
+    DeviceVramState,
+    MeasuredVramSnapshot,
+    VramArbiter,
+    VramDisposition,
+    VramRequest,
+    VramRequestKind,
+)
 from horde_worker_regen.process_management.scheduling.admission import preload, pricing
 from horde_worker_regen.process_management.scheduling.admission.commands import FaultCause, FaultJob, ReplaceProcess
 from horde_worker_regen.process_management.scheduling.admission.preload import (
@@ -827,3 +838,101 @@ class TestPageReuseCreditAgainstCommit:
         assert admission.verdict.predicted_mb == reference.verdict.predicted_mb
         assert admission.verdict.reusable_credit_mb == reference.verdict.reusable_credit_mb
         assert admission.fits is admission.verdict.fits
+
+
+_SPARED_CARD_TOTAL_MB = 24000.0
+_SPARED_CARD_FREE_MB = 9000.0
+_SPARED_CARD_NOISE_MB = 1200.0
+_SPARED_CONTEXT_MB = 487.0
+_SPARED_COPY_PROCESS_ID = 1
+_SPARED_COPY_RESERVED_MB = 11500.0
+_POST_PROCESS_PROCESS_ID = 5
+_POST_PROCESS_RESERVED_MB = 808.0
+_SPARED_HEAD_AVAILABLE_MB = _SPARED_CARD_FREE_MB - _SPARED_CARD_NOISE_MB
+"""The head's admission room on the card: device free less the noise buffer, with nothing outstanding."""
+
+
+class TestStarvedHeadLaneRungsBesideASparedCopy:
+    """A starved head's lane rungs read the room a spared copy does not return.
+
+    The head's target lane, a lane holding an idle copy the sweep spares (a rung-1 run's copy while the run has a
+    next job), and the post-processing lane. The copy's whole reservation is what an unload would return, so a
+    room that counted it read a deficit only that eviction closes as closable, and the post-processing lane and
+    safety were stopped for a head they could not seat.
+    """
+
+    @staticmethod
+    def _state() -> DeviceVramState:
+        return DeviceVramState(
+            total_vram_mb=_SPARED_CARD_TOTAL_MB,
+            baseline_mb=1000.0,
+            committed_vram_mb=14000.0,
+            planned_unmaterialized_mb=0.0,
+            committed_is_stale=False,
+            device_free_mb=_SPARED_CARD_FREE_MB,
+            noise_buffer_mb=_SPARED_CARD_NOISE_MB,
+            per_process_reserved_mb={
+                0: 100.0,
+                _SPARED_COPY_PROCESS_ID: _SPARED_COPY_RESERVED_MB,
+                _POST_PROCESS_PROCESS_ID: _POST_PROCESS_RESERVED_MB,
+            },
+            lane_by_process_id={
+                0: TenantLane.INFERENCE_IDLE,
+                _SPARED_COPY_PROCESS_ID: TenantLane.INFERENCE_IDLE,
+                _POST_PROCESS_PROCESS_ID: TenantLane.POST_PROCESS,
+            },
+            held_idle_returns_mb={_SPARED_COPY_PROCESS_ID: _SPARED_COPY_RESERVED_MB},
+            marginal_mb=_SPARED_CONTEXT_MB,
+            post_process_context_count=1,
+            post_process_reclaim_allowed=True,
+        )
+
+    @staticmethod
+    def _verdict(*, deficit_mb: float, spared: frozenset[int]):  # noqa: ANN205
+        request = VramRequest(
+            kind=VramRequestKind.PRELOAD,
+            job_label="head-model",
+            baseline="flux_1",
+            device_index=0,
+            target_process_id=0,
+            candidate_delta_mb=_SPARED_HEAD_AVAILABLE_MB + deficit_mb,
+            is_head_of_queue=True,
+            head_job_id="head",
+            starved_seconds=_FIRST_PARTY_TEARDOWN_GRACE_SECONDS + 1.0,
+            spared_idle_process_ids=spared,
+        )
+        arbiter = VramArbiter()
+        arbiter.begin_cycle(MeasuredVramSnapshot(devices={0: TestStarvedHeadLaneRungsBesideASparedCopy._state()}))
+        return arbiter.evaluate(request)
+
+    def test_no_lane_is_stopped_for_a_deficit_only_the_spared_copy_closes(self) -> None:
+        """Short by more than the post-processing lane returns, the lane is not offered and no load is tried."""
+        deficit_mb = 3000.0
+        assert deficit_mb > _POST_PROCESS_RESERVED_MB + _SPARED_CONTEXT_MB
+
+        verdict = self._verdict(deficit_mb=deficit_mb, spared=frozenset({_SPARED_COPY_PROCESS_ID}))
+
+        assert verdict.disposition is VramDisposition.DEFER
+        assert [command.kind for command in verdict.required_actuations] == []
+        assert not verdict.measured_attempt
+        assert verdict.room is not None
+        assert not verdict.room.closable, verdict.room.describe()
+
+    def test_the_same_copy_unspared_is_room_the_lanes_may_be_spent_toward(self) -> None:
+        """The contrast: when the copy is returnable, the rungs together close the deficit and a lane is offered."""
+        verdict = self._verdict(deficit_mb=3000.0, spared=frozenset())
+
+        assert [command.kind for command in verdict.required_actuations] == [
+            ActuatorCommandKind.PAUSE_POST_PROCESS_LANE,
+        ]
+
+    def test_a_lane_is_still_offered_for_a_deficit_it_closes_beside_a_spared_copy(self) -> None:
+        """Short by less than the post-processing lane returns, the lane is the head's remedy."""
+        deficit_mb = 1000.0
+        assert deficit_mb <= _POST_PROCESS_RESERVED_MB + _SPARED_CONTEXT_MB
+
+        verdict = self._verdict(deficit_mb=deficit_mb, spared=frozenset({_SPARED_COPY_PROCESS_ID}))
+
+        assert [command.kind for command in verdict.required_actuations] == [
+            ActuatorCommandKind.PAUSE_POST_PROCESS_LANE,
+        ]

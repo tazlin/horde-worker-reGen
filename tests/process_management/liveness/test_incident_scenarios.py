@@ -250,10 +250,19 @@ from horde_worker_regen.process_management.scheduling.clearance_lease import (
     GrantState,
 )
 from horde_worker_regen.process_management.scheduling.concurrent_overlap import OVERLAP_HEADWAY_AMPLE_VRAM
-from horde_worker_regen.process_management.scheduling.governance.preload_admission import card_preload_order
+from horde_worker_regen.process_management.scheduling.dispatch_affinity import (
+    _AFFINITY_MAX_SKIPS,
+    AffinitySkipState,
+    affinity_budget_seconds,
+)
+from horde_worker_regen.process_management.scheduling.governance.preload_admission import (
+    AdmissionDecision,
+    card_preload_order,
+)
 from horde_worker_regen.process_management.scheduling.governance.whole_card import (
     _ESTABLISH_WINDOW_LIMIT,
     _ESTABLISH_WINDOW_SECONDS,
+    DominanceRung,
 )
 from horde_worker_regen.process_management.scheduling.inference_scheduler import (
     InferenceScheduler,
@@ -8353,4 +8362,187 @@ async def test_z_defect_reinjection_an_unbooked_safety_check_finds_the_card_full
     assert starved and world.card_overcommits, (
         "without the window a check must land without room and over-commit the card; "
         f"overcommits={world.card_overcommits} checks={_describe_safety_checks(world)} {world.state_dump()}"
+    )
+
+
+_MOSS = _ModelClass("moss", "Moss-Image-Base", KNOWN_IMAGE_GENERATION_BASELINE.moss_image, 5200.0)
+"""A head whose staging charge, its encoder's support weights, is well above its diffusion weights.
+
+Under the lease its preload is priced at that charge, which misses the room beside an idle Flux copy while a Flux
+job's own activation still fits there."""
+
+_RUN_COPY_FOREIGN_MB = 3300.0
+"""Device memory a tenant outside the worker holds from the first tick.
+
+Sized so the Moss head's staging charge misses the room beside the idle Flux copy by more than the
+post-processing lane and safety return together, while a Flux job's activation still fits beside its copy."""
+
+_RUN_COPY_ENCODE_MB = 300.0
+"""The encode working set a staged Flux run job commits, since the run's lane keeps the encoder between jobs."""
+
+_RUN_COPY_TICKS = 60
+"""Ticks the row runs after the jobs arrive: both run jobs, the run's end, and the head's load and sample."""
+
+
+@dataclass
+class RunCopyBehindColdHead:
+    """The finished world of a cold head queued ahead of a rung-1 run's jobs, with the row's inputs."""
+
+    world: _DispatchWorld
+    head: ImageGenerateJobPopResponse
+    run_jobs: list[ImageGenerateJobPopResponse]
+    run_lane_id: int
+    started_at: float
+    head_declined_by_budget: bool
+    """Whether the head's first preload was declined by the budget, the precondition of the row."""
+
+    @property
+    def skip_budget_seconds(self) -> float:
+        """The affinity skip budget the head was given, the bound on how long the card may idle behind it."""
+        return affinity_budget_seconds(self.world.scheduler._state.recent_job_ttl)
+
+    @property
+    def run_windows(self) -> list[_JobWindow]:
+        """The run jobs' windows, in dispatch order."""
+        run_job_ids = {str(job.id_) for job in self.run_jobs}
+        return sorted(
+            (window for window in self.world.job_windows.values() if window.job_id in run_job_ids),
+            key=lambda window: window.dispatched_at,
+        )
+
+
+async def drive_run_copy_behind_cold_head(*, ticks: int = _RUN_COPY_TICKS) -> RunCopyBehindColdHead:
+    """Queue a cold Moss head ahead of two Flux jobs of a rung-1 run whose copy idles on the card.
+
+    The shape the incident needs: two lanes, the run's copy idle on one with the run held on the card, a
+    different-model head whose deficit only that copy's eviction closes, and the head's affinity skip budget
+    already spent by earlier run jobs.
+    """
+    world = _DispatchWorld(
+        card=_CARD_24GB,
+        lane_count=2,
+        max_threads=1,
+        queue_depth=4,
+        whole_card_enabled=True,
+        closed_loop=True,
+        clearance_lease=True,
+        service_contexts=True,
+        safety_off_gpu_allowed=True,
+        tick_seconds=_TICK_SECONDS,
+        extra_model_classes=(_MOSS,),
+        staged_encode_mb_by_model={_FLUX.name: _RUN_COPY_ENCODE_MB},
+        foreign_vram_mb_by_tick={1: _RUN_COPY_FOREIGN_MB},
+    )
+    await world.step()
+    scheduler = world.scheduler
+    run_lane_id = world.inference_lane_ids()[0]
+    world.seed_resident(run_lane_id, _FLUX, in_vram=True)
+    scheduler._process_map[run_lane_id].last_process_state = HordeProcessState.WAITING_FOR_JOB
+    scheduler._whole_card_ledger.record_grant(
+        None,
+        model=_FLUX.name,
+        forecast=None,
+        cooldown_until=0.0,
+        now=scheduler._clock(),
+        rung=DominanceRung.CANNOT_CO_SAMPLE,
+    )
+    head = make_job_pop_response(_MOSS.name, width=1024, height=1024, ddim_steps=20)
+    run_jobs = [make_job_pop_response(_FLUX.name, width=1024, height=1024, ddim_steps=4) for _ in range(2)]
+    await world.pop(head)
+    for run_job in run_jobs:
+        await world.pop(run_job)
+    scheduler._affinity_skip_state = AffinitySkipState(
+        head_job_id=str(head.id_),
+        first_skip_time=scheduler._clock(),
+        skip_count=_AFFINITY_MAX_SKIPS,
+    )
+    started_at = world.now
+    await world.step()
+    admission = scheduler._head_admission.last_preload_admission
+    head_declined_by_budget = (
+        admission is not None
+        and admission.model == _MOSS.name
+        and admission.decision is AdmissionDecision.DEFER_BUDGET
+    )
+    for _ in range(ticks - 1):
+        await world.step()
+    return RunCopyBehindColdHead(
+        world=world,
+        head=head,
+        run_jobs=run_jobs,
+        run_lane_id=run_lane_id,
+        started_at=started_at,
+        head_declined_by_budget=head_declined_by_budget,
+    )
+
+
+async def test_r_run_jobs_pass_a_cold_head_whose_room_the_runs_copy_holds() -> None:
+    """A cold head declined by the preload budget waits while the run's queued jobs sample on the run's copy.
+
+    The failure this encodes: a rung-1 run's copy is spared while the run has queued jobs, and a cold head of
+    another model whose preload only that copy's eviction could seat was declined. The run's jobs could pass the
+    head only within its affinity skip budget, which earlier run jobs had spent, so nothing dispatched and the
+    card idled until the anti-starvation bound ended the run.
+
+    Read as one statement: the run's jobs are seated on the copy while the head waits. The run then ends on
+    drain, the copy is evicted and the head loads, and no service lane moves for the head during the wait.
+    """
+    run = await drive_run_copy_behind_cold_head()
+    world = run.world
+    context = "run copy behind a cold head"
+    assert run.head_declined_by_budget, f"precondition: the head's preload must be declined. {world.state_dump()}"
+
+    windows = run.run_windows
+    assert len(windows) == len(run.run_jobs), f"{context}: a run job never dispatched. {world.state_dump()}"
+    assert all(window.lane_id == run.run_lane_id and not window.loaded_now for window in windows), (
+        f"{context}: a run job did not start on the run's copy ({windows}). {world.state_dump()}"
+    )
+    starts = [window.sample_from for window in windows]
+    ends = [window.sample_until for window in windows]
+    assert None not in starts and None not in ends, f"{context}: a run job did not finish. {world.state_dump()}"
+    sampled_starts = [start for start in starts if start is not None]
+    sampled_ends = [end for end in ends if end is not None]
+    idle_gaps = [sampled_starts[0] - run.started_at] + [
+        later - earlier for earlier, later in zip(sampled_ends, sampled_starts[1:], strict=False)
+    ]
+    assert max(idle_gaps) <= run.skip_budget_seconds, (
+        f"{context}: the card idled {max(idle_gaps):.0f}s with run work pending, past the "
+        f"{run.skip_budget_seconds:.0f}s skip budget. {world.state_dump()}"
+    )
+
+    found, _device = world.scheduler._whole_card_ledger.holder_for_model(_FLUX.name)
+    assert not found, f"{context}: the run did not end once its jobs drained. {world.state_dump()}"
+    assert _FLUX.name not in world.card_resident_models(0).values(), (
+        f"{context}: the run's copy stayed on the card after the run ended. {world.state_dump()}"
+    )
+    head_window = world.job_windows.get(str(run.head.id_))
+    assert head_window is not None and head_window.sample_from is not None, (
+        f"{context}: the head never sampled. {world.state_dump()}"
+    )
+    assert head_window.dispatched_at >= max(sampled_ends), (
+        f"{context}: the head dispatched before the run's jobs drained. {world.state_dump()}"
+    )
+    assert not world.service_lane_pauses, (
+        f"{context}: a service lane was stopped for the head ({world.service_lane_pauses}). {world.state_dump()}"
+    )
+    assert not world.safety_pause_events, (
+        f"{context}: safety was moved off the card for the head ({world.safety_pause_events}). {world.state_dump()}"
+    )
+
+
+async def test_r_defect_reinjection_run_jobs_left_behind_a_cold_head_idle_the_card(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without the seat for a budget-declined cold head, the run's jobs wait behind it and the card idles."""
+    monkeypatch.setattr(InferenceScheduler, "_dominant_run_seat_for_cold_head", lambda _self, _head, _jobs: None)
+    run = await drive_run_copy_behind_cold_head()
+
+    assert run.head_declined_by_budget, f"precondition: the head's preload must be declined. {run.world.state_dump()}"
+    started_within_budget = [
+        window
+        for window in run.run_windows
+        if window.sample_from is not None and window.sample_from - run.started_at <= run.skip_budget_seconds
+    ]
+    assert not started_within_budget, (
+        f"without the seat no run job may sample within the skip budget. {run.world.state_dump()}"
     )

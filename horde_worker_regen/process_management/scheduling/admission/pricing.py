@@ -1385,6 +1385,41 @@ def has_reclaimable_idle_model(
     return False
 
 
+def idle_copies_spared_by_sweep(
+    snapshot: SchedulingSnapshot,
+    target_process_id: int,
+    *,
+    for_head_of_queue: bool,
+    device_index: int | None,
+    make_room_for_model: str | None = None,
+) -> frozenset[int]:
+    """The idle inference lanes on the card whose resident copy the VRAM sweep spares, by process id.
+
+    The admission room does not permit a rung on such a lane, and the card does not read converged-empty while
+    one holds it. The sweep would not take the copy, so counting it as returnable room makes a deficit only its
+    eviction closes read as closable, and the lane rungs would be spent on that deficit. A lane holding the
+    requester's own model, and the requester's target, are left out, as :func:`has_reclaimable_idle_tenancy`
+    leaves them out.
+    """
+    return frozenset(
+        slot.process_id
+        for slot in card_slots(snapshot, device_index)
+        if slot.process_type is HordeProcessType.INFERENCE
+        and slot.process_id != target_process_id
+        and slot.model is not None
+        and slot.model != make_room_for_model
+        and not (slot.is_busy and not slot.parked_preload)
+        and slot.current_job_id is None
+        and sweep_spares_idle_copy(
+            snapshot,
+            slot,
+            target_process_id=target_process_id,
+            for_head_of_queue=for_head_of_queue,
+            device_index=device_index,
+        )
+    )
+
+
 def teardownable_idle_contexts(
     snapshot: SchedulingSnapshot, head_process_id: int, *, device_index: int | None
 ) -> tuple[SlotSnapshot, ...]:
@@ -1450,14 +1485,27 @@ def has_reclaimable_idle_tenancy(
     parked preload live in host RAM returns no VRAM when it is unloaded, so counting it would keep the card from
     reading converged-empty for room the card does not have: the waiter's partial-load seat and measured attempt
     would wait out the lease-acquire timeout and load the same way unpriced.
+
+    A copy the sweep spares for the head (:func:`sweep_spares_idle_copy`) is not counted either, since the head
+    cannot ask it back, which is the eviction mirror's answer for the same lane. That copy still keeps the card
+    from reading converged-empty, through :func:`idle_copies_spared_by_sweep`.
     """
     for slot in card_slots(snapshot, device_index):
         if slot.process_type is not HordeProcessType.INFERENCE or slot.process_id == target_process_id:
             continue
         if head_model is not None and slot.model == head_model:
             continue
-        if (slot.held_component_count > 0 or slot.parked_preload) and slot.resident_weight_models:
-            return True
+        if not ((slot.held_component_count > 0 or slot.parked_preload) and slot.resident_weight_models):
+            continue
+        if sweep_spares_idle_copy(
+            snapshot,
+            slot,
+            target_process_id=target_process_id,
+            for_head_of_queue=True,
+            device_index=device_index,
+        ):
+            continue
+        return True
     return False
 
 

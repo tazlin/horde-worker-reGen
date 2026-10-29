@@ -246,6 +246,13 @@ def build_materialization_request(
             process_id,
             device_index=device_index,
         ),
+        spared_idle_process_ids=pricing.idle_copies_spared_by_sweep(
+            snapshot,
+            process_id,
+            for_head_of_queue=is_head_of_queue,
+            device_index=device_index,
+            make_room_for_model=job.model,
+        ),
         lane_reclaim_permitted=bool(config.starved_head_lane_reclaim),
         has_reclaimable_idle_model=has_reclaimable_idle_model,
         can_reduce_live_contexts=context_reduction.can_reduce_live_contexts,

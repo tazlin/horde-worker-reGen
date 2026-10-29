@@ -16,6 +16,7 @@ from horde_worker_regen.process_management.ipc.messages import HordeProcessState
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from tests.process_management.liveness._dispatch_world import _DispatchWorld
+from tests.process_management.liveness.test_incident_scenarios import drive_run_copy_behind_cold_head
 from tests.process_management.liveness.test_session_replay import _ReplayFigures, _run_w3_window
 
 _RUN_MODEL = "Flux.1-Schnell fp8 (Compact)"
@@ -88,3 +89,38 @@ def test_a_head_held_for_a_runs_weights_does_not_wedge_the_window(run_window: _R
     assert reconciliation_share < _WEDGED_RECONCILIATION_SHARE, figures.describe()
     assert figures.overcommit_ticks == 0, figures.describe()
     assert not run_window.world.clearance_timeouts, figures.describe()
+
+
+async def test_a_cold_head_declined_for_a_runs_room_waits_while_the_run_drains() -> None:
+    """A cold head whose preload the run's spared copy blocks waits while the run's jobs sample on that copy.
+
+    The run's jobs load nothing, the run ends once they drain, the sweep then takes the copy, and the head's
+    preload is admitted into the room it returns. The card does not idle past the head's affinity skip budget
+    while run work is pending.
+    """
+    run = await drive_run_copy_behind_cold_head()
+    world = run.world
+    assert run.head_declined_by_budget, f"precondition: the head's preload must be declined. {world.state_dump()}"
+
+    windows = run.run_windows
+    head_window = world.job_windows.get(str(run.head.id_))
+    assert head_window is not None, f"the head never dispatched. {world.state_dump()}"
+    assert len(windows) == len(run.run_jobs), f"a run job never dispatched. {world.state_dump()}"
+    for window in windows:
+        assert window.lane_id == run.run_lane_id, f"a run job left the run's lane. {world.state_dump()}"
+        assert not window.loaded_now, f"a run job paid a weight load. {world.state_dump()}"
+        assert window.sample_from is not None and window.sample_from < head_window.dispatched_at, (
+            f"a run job did not sample while the head waited. {world.state_dump()}"
+        )
+        assert window.sample_from - run.started_at <= run.skip_budget_seconds * len(run.run_jobs), (
+            f"a run job waited past the skip budget for each job ahead of it. {world.state_dump()}"
+        )
+    assert not world.scheduler._whole_card_ledger.holder_for_model(_RUN_MODEL)[0], (
+        f"the run did not end once its jobs drained. {world.state_dump()}"
+    )
+    assert _RUN_MODEL not in world.card_resident_models(0).values(), (
+        f"the sweep did not take the run's copy once the run ended. {world.state_dump()}"
+    )
+    assert head_window.loaded_now and head_window.sample_from is not None, (
+        f"the head's preload was not admitted into the room the copy returned. {world.state_dump()}"
+    )

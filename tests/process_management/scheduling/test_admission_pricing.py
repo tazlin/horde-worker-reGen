@@ -21,10 +21,20 @@ from horde_worker_regen.process_management.ipc.messages import HordeControlFlag,
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
+from horde_worker_regen.process_management.resources.device_memory_source import (
+    DeviceMemoryReading,
+    DeviceMemorySourceKind,
+    ReadingProvenance,
+)
 from horde_worker_regen.process_management.resources.resource_budget import (
     predict_job_sampler_only_vram_mb,
     predict_job_sampling_vram_mb,
     predict_job_weight_mb,
+)
+from horde_worker_regen.process_management.resources.vram_arbiter import (
+    MeasuredVramSnapshot,
+    VramArbiter,
+    VramRequestKind,
 )
 from horde_worker_regen.process_management.resources.vram_footprints import (
     _MIN_OBSERVATIONS_FOR_MEASURED,
@@ -34,7 +44,7 @@ from horde_worker_regen.process_management.resources.vram_footprints import (
     ResolutionBucket,
     sampling_footprint_key,
 )
-from horde_worker_regen.process_management.scheduling.admission import preload, pricing
+from horde_worker_regen.process_management.scheduling.admission import materialization, preload, pricing
 from horde_worker_regen.process_management.scheduling.clearance_lease import CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS
 from horde_worker_regen.process_management.scheduling.governance.whole_card import DominanceRung
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
@@ -560,6 +570,71 @@ class TestDominantRunCopy:
 
         scheduler._whole_card_ledger.record_run_end(None)
         assert preload.select_preload_target(scheduler.snapshot(), str(jobs[0].id_)) == 1
+
+    async def _warm_run_copy(self, *, pending: list[str]):  # noqa: ANN202
+        """The run's copy on slot 1 with its weights on the device and warm components held between jobs."""
+        scheduler, jobs, run_lane = await self._run_worker(pending=pending)
+        run_lane.held_components = [Mock()]  # type: ignore[attr-defined]
+        scheduler._horde_model_map.update_entry("run", load_state=ModelLoadState.LOADED_IN_VRAM, process_id=1)
+        return scheduler, jobs
+
+    @staticmethod
+    def _head_room(scheduler: InferenceScheduler, head_job_id: str):  # noqa: ANN205
+        """The head's preload request on slot 0, and the admission room the arbiter decomposes it into."""
+        snapshot = scheduler.snapshot()
+        arbiter = VramArbiter()
+        request = materialization.build_materialization_request(
+            snapshot,
+            head_job_id,
+            0,
+            arbiter=arbiter,
+            is_head_of_queue=True,
+            head_outstanding_mb=None,
+            candidate_delta_override_mb=_HEAD_CANDIDATE_MB,
+            kind=VramRequestKind.PRELOAD,
+        ).request
+        reading = DeviceMemoryReading(
+            free_mb=6000.0,
+            total_mb=16000.0,
+            source=DeviceMemorySourceKind.NVML,
+            provenance=ReadingProvenance.DEVICE_WIDE,
+        )
+        state = scheduler.build_vram_arbiter_device_state(None, device_reading=reading)
+        arbiter.begin_cycle(MeasuredVramSnapshot(devices={0: state}))
+        room = VramArbiter._room(request, state, arbiter._measured(request, state))
+        assert room is not None
+        return snapshot, request, room
+
+    async def test_a_spared_run_copy_is_not_room_for_the_head(self) -> None:
+        """The eviction mirror, the tenancy predicate and the admission room agree about the run's copy.
+
+        The sweep does not take the copy while the run has a next job, so no rung returns its room for the head.
+        Counted as room, it made a deficit only its eviction could close read as closable, and the lane rungs
+        were spent on it. Counted as reclaimable tenancy, it told the head the card still had something to give.
+        """
+        scheduler, jobs = await self._warm_run_copy(pending=["other", "run"])
+        snapshot, request, room = self._head_room(scheduler, str(jobs[0].id_))
+
+        assert pricing.has_reclaimable_idle_model(snapshot, 0, for_head_of_queue=True, device_index=None) is False
+        assert pricing.has_reclaimable_idle_tenancy(snapshot, "other", 0, device_index=None) is False
+        assert request.has_reclaimable_idle_tenancy is False
+        assert room.reclaimable_mb == 0.0, room.describe()
+        assert not room.closable, room.describe()
+
+    async def test_the_copy_is_room_again_once_the_run_has_no_next_job(self) -> None:
+        """With the run's work drained the copy is an ordinary idle resident, and all three readers count it."""
+        scheduler, jobs = await self._warm_run_copy(pending=["other"])
+        scheduler._whole_card_ledger.note_terminal_fault("run", now=scheduler._clock())
+        snapshot, request, room = self._head_room(scheduler, str(jobs[0].id_))
+
+        assert pricing.has_reclaimable_idle_model(snapshot, 0, for_head_of_queue=True, device_index=None) is True
+        assert pricing.has_reclaimable_idle_tenancy(snapshot, "other", 0, device_index=None) is True
+        assert request.has_reclaimable_idle_tenancy is True
+        assert room.reclaimable_mb > 0.0, room.describe()
+
+
+_HEAD_CANDIDATE_MB = 9000.0
+"""A head candidate the 6000 MB reading cannot seat, so the room has a deficit for the run's copy to cover."""
 
 
 _FLUX = KNOWN_IMAGE_GENERATION_BASELINE.flux_1
