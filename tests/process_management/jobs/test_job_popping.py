@@ -44,6 +44,7 @@ from horde_worker_regen.process_management.lifecycle.process_map import ProcessM
 from horde_worker_regen.process_management.models.model_availability import ModelAvailability
 from horde_worker_regen.process_management.resources.run_metrics import WorkerRunMetrics
 from horde_worker_regen.process_management.resources.vram_arbiter import DeviceVramState, MeasuredVramSnapshot
+from horde_worker_regen.process_management.scheduling.governance.whole_card import WholeCardPopClaim
 from horde_worker_regen.process_management.scheduling.model_pool import PopLane
 from horde_worker_regen.process_management.scheduling.pop_throttler import CONSECUTIVE_FAILED_JOBS_WAIT_SECONDS
 from horde_worker_regen.process_management.simulation._canned_scenarios import CannedJobSource, make_empty_pop_response
@@ -2797,6 +2798,79 @@ class TestIdleFillEscalationAndGates:
         request: ImageGenerateJobPopRequest = session.submit_request.call_args.args[0]
         assert request.allow_lora is True
         assert request.max_pixels == 64 * 8 * 64 * 64
+
+
+def _standing_claim(model: str) -> WholeCardPopClaim:
+    """A whole-card claim over the offer for ``model``, well inside its maximum hold."""
+    now = time.time()
+    return WholeCardPopClaim(model=model, device_index=None, held_since=now, expires_at=now + 300.0)
+
+
+def _no_job_answer() -> ImageGenerateJobPopResponse:
+    """The horde's answer when it has no job for the offer: a success response with no id."""
+    return ImageGenerateJobPopResponse(id=None, ids=[], payload={})
+
+
+class TestPopTimeStampedOnSentRequest:
+    """``WorkerState.last_job_pop_time`` moves only when a request goes to the horde.
+
+    The deadlock detector clears its latches while a pop is recent. An attempt that ends at a gate reaches no
+    horde and brings no job, so stamping it would hold the detector open for as long as gated attempts repeat.
+    """
+
+    def _popper(self, state: WorkerState, *, claim: WholeCardPopClaim | None = None) -> tuple[JobPopper, Mock]:
+        session = Mock()
+        session.submit_request = AsyncMock(return_value=_no_job_answer())
+        popper = _make_popper(
+            state=state,
+            process_map=_make_process_map_with_available_processes(),
+            horde_client_session=session,
+        )
+        popper._whole_card_pop_claim = lambda: claim
+        return popper, session
+
+    async def test_an_attempt_held_at_the_claim_gate_leaves_the_pop_time(self) -> None:
+        """A claim for a model the offer does not carry ends the attempt at the claim gate with no stamp."""
+        state = WorkerState(last_job_pop_time=0.0)
+        popper, session = self._popper(state, claim=_standing_claim("absent_model"))
+
+        await popper.api_job_pop(urgent=True)
+
+        session.submit_request.assert_not_awaited()
+        assert state.last_pop_gate == str(PopGate.WHOLE_CARD_POP_CLAIM)
+        assert state.last_job_pop_time == 0.0
+
+    async def test_an_attempt_held_at_the_empty_offer_backstop_leaves_the_pop_time(self) -> None:
+        """An offer narrowed to nothing ends the attempt at the backstop with no stamp."""
+        state = WorkerState(last_job_pop_time=0.0)
+        popper, session = self._popper(state)
+
+        with patch.object(popper, "_apply_residency_advertising_bias", return_value=set()):
+            await popper.api_job_pop(urgent=True)
+
+        session.submit_request.assert_not_awaited()
+        assert state.last_pop_gate == str(PopGate.EMPTY_OFFER)
+        assert state.last_job_pop_time == 0.0
+
+    async def test_a_sent_request_stamps_the_pop_time(self) -> None:
+        """A request that reaches the horde moves the pop time, whatever the answer."""
+        state = WorkerState(last_job_pop_time=0.0)
+        popper, session = self._popper(state)
+        before = time.time()
+
+        await popper.api_job_pop()
+
+        session.submit_request.assert_awaited_once()
+        assert state.last_job_pop_time >= before
+
+    async def test_repeated_gated_attempts_do_not_count_as_a_recent_pop(self) -> None:
+        """A run of urgent attempts held at the claim gate leaves ``last_pop_recently`` false throughout."""
+        state = WorkerState(last_job_pop_time=time.time() - 60)
+        popper, _session = self._popper(state, claim=_standing_claim("absent_model"))
+
+        for _ in range(5):
+            await popper.api_job_pop(urgent=True)
+            assert state.last_pop_recently() is False
 
 
 # endregion

@@ -2023,6 +2023,10 @@ class JobPopper:
     async def api_job_pop(self, *, urgent: bool = False) -> None:
         """Pop a job from the API if the queue is not full and preconditions are met.
 
+        The pop time (``WorkerState.last_job_pop_time``) is stamped only when a request is sent to the horde,
+        after every gate. An attempt that ends at a gate leaves it unchanged, so the inter-pop frequency gate
+        measures from the last sent request and gated attempts do not count as a recent pop.
+
         Args:
             urgent: When True, skip the inter-pop frequency gate so the local queue can be
                 refilled back-to-back while a GPU slot is starved. The caller is responsible for
@@ -2174,8 +2178,6 @@ class JobPopper:
         if not urgent and self._pop_throttler.is_pop_too_soon(self._state.last_job_pop_time):
             self._note_pop_gate(PopGate.POP_FREQUENCY_GATE)
             return
-
-        self._state.last_job_pop_time = time.time()
 
         # Equivalent cards form one safe union. Heterogeneous cards cannot: the wire shape would combine
         # models/features/limits contributed by different cards into jobs no card necessarily serves.
@@ -2453,6 +2455,12 @@ class JobPopper:
                     "allow_lora": pop_allow_lora,
                 },
             )
+
+            # Stamped only here, as the request goes out. The deadlock detector clears its latches while this
+            # stamp is recent, and an attempt that ended at a gate above did not reach the horde and did not
+            # bring back a job. The pop frequency gate reads the same stamp, so it measures from the last sent
+            # request.
+            self._state.last_job_pop_time = time.time()
 
             if self._dry_run_skip_api:
                 if self._canned_job_source is None:

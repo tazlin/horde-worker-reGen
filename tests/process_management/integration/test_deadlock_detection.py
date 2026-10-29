@@ -6,27 +6,30 @@ import queue
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from loguru import logger
 
-from horde_worker_regen.process_management.config.worker_state import WorkerState
+from horde_worker_regen.process_management.config.worker_state import PopGate, WorkerState
 from horde_worker_regen.process_management.ipc.action_ledger import ActionLedger
 from horde_worker_regen.process_management.ipc.message_dispatcher import (
     _MIN_STRUCTURAL_QUEUE_WEDGE_SECONDS,
     MessageDispatcher,
 )
 from horde_worker_regen.process_management.ipc.messages import HordeProcessMemoryMessage, HordeProcessState
+from horde_worker_regen.process_management.jobs.job_popper import JobPopper
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.resources.resource_budget import CommittedReserveLedger
+from horde_worker_regen.process_management.scheduling.governance.whole_card import WholeCardPopClaim
 from tests.process_management.conftest import (
     make_mock_bridge_data,
     make_mock_job,
     make_mock_process_info,
+    make_test_api_sessions,
     make_test_model_metadata,
     make_test_runtime_config,
     track_popped_job_async,
@@ -550,3 +553,59 @@ class TestDetectDeadlock:
 
         assert message_dispatcher._in_deadlock is True
         assert message_dispatcher._in_queue_deadlock is True
+
+
+class TestGatedPopAttemptsDoNotMaskQueueDeadlock:
+    """Pop attempts that end at a gate do not reach the horde, so they do not hold the deadlock detector open."""
+
+    async def test_queue_deadlock_latch_forms_while_claim_gated_attempts_repeat(self) -> None:
+        """A queued job with every process idle latches while urgent attempts keep ending at the claim gate.
+
+        The popper and the dispatcher share one ``WorkerState``, so the pop time the detector reads is the one
+        the popper writes. The claim names a model the offer does not carry, so every attempt ends at the
+        claim gate. The pending job's model has no serving process, so nothing else moves the queue.
+        """
+        state = WorkerState(last_job_pop_time=time.time() - 60)
+        job_tracker = JobTracker()
+        await track_popped_job_async(job_tracker, make_mock_job(model="stable_diffusion"))
+        await job_tracker.increment_jobs_completed()
+        process_map = ProcessMap(
+            {
+                0: make_mock_process_info(0, model_name="other_model", state=HordeProcessState.WAITING_FOR_JOB),
+                10: make_mock_process_info(
+                    10,
+                    model_name=None,
+                    state=HordeProcessState.WAITING_FOR_JOB,
+                    process_type=HordeProcessType.SAFETY,
+                ),
+            },
+        )
+        horde_client_session = Mock()
+        horde_client_session.submit_request = AsyncMock()
+        popper = JobPopper(
+            state=state,
+            process_map=process_map,
+            job_tracker=job_tracker,
+            shutdown_manager=Mock(),
+            runtime_config=make_test_runtime_config(bridge_data=make_mock_bridge_data()),
+            api_sessions=make_test_api_sessions(horde_client_session=horde_client_session, aiohttp_session=Mock()),
+            max_inference_processes=1,
+            max_concurrent_inference_processes=1,
+            dry_run_skip_api=False,
+            whole_card_pop_claim=lambda: WholeCardPopClaim(
+                model="claimed_model",
+                device_index=None,
+                held_since=time.time(),
+                expires_at=time.time() + 300.0,
+            ),
+        )
+        message_dispatcher = _make_message_dispatcher(state=state, process_map=process_map, job_tracker=job_tracker)
+
+        for _ in range(3):
+            await popper.api_job_pop(urgent=True)
+            message_dispatcher.detect_deadlock()
+
+        horde_client_session.submit_request.assert_not_awaited()
+        assert state.last_pop_gate == str(PopGate.WHOLE_CARD_POP_CLAIM)
+        assert message_dispatcher._in_queue_deadlock is True
+        assert message_dispatcher._queue_deadlock_model == "stable_diffusion"

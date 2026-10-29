@@ -55,7 +55,7 @@ class PopGate(enum.StrEnum):
     MEGAPIXELSTEP_WAIT = "megapixelstep_wait"
     """The megapixelstep governor is letting large in-flight work drain before more is accepted."""
     POP_FREQUENCY_GATE = "pop_frequency_gate"
-    """The inter-pop cadence has not elapsed since the previous attempt."""
+    """The inter-pop cadence has not elapsed since the last request sent to the horde."""
     NO_ELIGIBLE_MODELS = "no_eligible_models"
     """Model selection produced no model this worker can currently serve."""
     LARGE_MODEL_LIMITS = "large_model_limits"
@@ -122,6 +122,10 @@ class WorkerState:
     shut_down: bool = False
 
     last_job_pop_time: float = 0.0
+    """When the image popper last sent a pop request to the horde, or 0.0 before it has sent one.
+
+    An attempt that ends at a pop gate does not move it. The deadlock detector clears its latches while it is
+    recent, and an attempt held at a gate did not reach the horde and did not bring back a job."""
     last_pop_no_jobs_available: bool = False
     last_pop_maintenance_mode: bool = False
 
@@ -552,5 +556,5 @@ class WorkerState:
         return (now - self.last_pop_attempt_completed_at) <= window_seconds
 
     def last_pop_recently(self) -> bool:
-        """Return True if a job was popped within the last 10 seconds."""
+        """Return True if a pop request was sent to the horde within the last 10 seconds."""
         return (time.time() - self.last_job_pop_time) < 10

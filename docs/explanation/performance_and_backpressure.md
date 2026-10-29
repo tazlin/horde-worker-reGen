@@ -602,6 +602,11 @@ wait do not hold it, while the protective gates (shutdown, RAM/safety backpressu
 hold. It is armed only when a head is genuinely starved with a free sibling, so it is inert in steady
 state. Set `idle_fill_threshold_seconds` to unset to disable it.
 
+The pop time the deadlock detector reads (`WorkerState.last_job_pop_time`) is stamped only when a request is
+sent to the horde. An attempt that ends at a pop gate leaves it unchanged, so a run of gated attempts does
+not hold the detector's queue-deadlock latch open, and the inter-pop cadence gate measures from the last
+sent request.
+
 Already-popped post-processing work has priority over a speculative dispatch while a head waits on its load.
 The post-processing overlap gate waits for active sampling on the PP lane's card, not for the broader
 in-progress job stage, so a lane that is not sampling does not make the PP lane idle. Under the clearance
