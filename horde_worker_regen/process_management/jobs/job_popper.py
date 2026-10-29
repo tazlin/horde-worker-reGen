@@ -2090,7 +2090,11 @@ class JobPopper:
             await asyncio.sleep(3)
             return
 
-        idle_fill_wanted = self._state.wants_idle_fill_candidate
+        # Idle fill yields to a whole-card pop claim. The fill slice holds small models only and the claim narrows
+        # the offer to the claimed model, so applying both empties the offer and the claimed model's own work is
+        # not asked for during the whole hold. While a claim holds, the fill adds no slice, no urgency and no rung.
+        pop_claim = self._whole_card_pop_claim()
+        idle_fill_wanted = self._state.wants_idle_fill_candidate and pop_claim is None
         if idle_fill_wanted:
             urgent = True
 
@@ -2267,7 +2271,6 @@ class JobPopper:
         # of its own with max_power lowered to the largest size that fits, so the horde never returns a job the
         # card cannot host while the other models keep the configured size (max_pixels is one figure for every
         # model in a pop, so a shared pop would cap them all).
-        pop_claim = self._whole_card_pop_claim()
         models, pop_max_power = self._shape_offer_for_serviceability(
             models,
             pop_max_power,
@@ -2320,8 +2323,9 @@ class JobPopper:
 
         # Whole-card pop claim: while a residency holds the card, ask for its model and nothing else, so the
         # horde stops sending work whose arrival would evict the weights the residency exists to keep resident.
-        # Applied last, and to the idle-fill path too: a card held by a residency is not free to be filled with
-        # whatever is quickest, and a residency with no work of its own releases on its own evidence instead.
+        # Applied last. Idle fill is already off under a claim, since a card held by a residency is not free to
+        # be filled with whatever is quickest, and a residency with no work of its own releases on its own
+        # evidence instead.
         if pop_claim is not None:
             models = self._apply_whole_card_pop_claim(models, pop_claim)
             if len(models) == 0:

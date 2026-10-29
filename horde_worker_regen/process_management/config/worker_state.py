@@ -333,7 +333,8 @@ class WorkerState:
     process is free, so the popper should over-pop a small no-LoRA "fill" job up the sd15->sdxl ladder. The
     device may be waiting for a main model or have only mapped auxiliary downloads in progress; a sampler or
     an unclassified in-progress job suppresses the arm. This drives the escalating ``idle_fill_rung`` ladder.
-    Armed and cleared by the scheduler around head-starvation."""
+    Armed and cleared by the scheduler around head-starvation. The popper ignores it while a whole-card pop
+    claim holds, so the claimed model's own work is still asked for."""
 
     idle_fill_rung: int = 0
     """Index into the idle-fill ladder (small sd15 -> large sd15 -> small sd15 and sdxl -> large sd15 and sdxl),

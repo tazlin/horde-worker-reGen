@@ -602,6 +602,11 @@ wait do not hold it, while the protective gates (shutdown, RAM/safety backpressu
 hold. It is armed only when a head is genuinely starved with a free sibling, so it is inert in steady
 state. Set `idle_fill_threshold_seconds` to unset to disable it.
 
+Idle fill yields to a whole-card residency's pop claim. While a claim holds, the popper ignores the arm. The
+offer carries no fill slice, the attempt is not urgent, and an empty answer does not climb the ladder, so the
+ordinary pop goes out narrowed to the claimed model. The fill slice holds small models only and the claim one
+large model, so applying both would empty the offer and the worker would not ask for any work for the whole hold.
+
 The pop time the deadlock detector reads (`WorkerState.last_job_pop_time`) is stamped only when a request is
 sent to the horde. An attempt that ends at a pop gate leaves it unchanged, so a run of gated attempts does
 not hold the detector's queue-deadlock latch open, and the inter-pop cadence gate measures from the last

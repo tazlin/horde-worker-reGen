@@ -2811,6 +2811,70 @@ def _no_job_answer() -> ImageGenerateJobPopResponse:
     return ImageGenerateJobPopResponse(id=None, ids=[], payload={})
 
 
+class TestIdleFillUnderPopClaim:
+    """Idle fill yields to a whole-card pop claim, so the claimed model's own work is still asked for.
+
+    The fill slice holds only small models. A claim for a model outside it would intersect the slice to nothing,
+    and every attempt for the whole hold would end without a request.
+    """
+
+    _FILL_BASELINES: dict[str, KNOWN_IMAGE_GENERATION_BASELINE] = {"sd15a": _SD15_BASELINE, "fluxA": _FLUX_BASELINE}
+
+    def _fill_popper(self, state: WorkerState, *, claim: WholeCardPopClaim | None) -> tuple[JobPopper, Mock]:
+        popper, session = _make_fill_popper(
+            state=state,
+            job_tracker=JobTracker(),
+            bridge_data=make_mock_bridge_data(image_models_to_load=list(self._FILL_BASELINES)),
+        )
+        popper._model_metadata = _FakeModelMetadata(self._FILL_BASELINES)  # type: ignore[assignment]
+        popper._whole_card_pop_claim = lambda: claim
+        session.submit_request = AsyncMock(return_value=_no_job_answer())
+        return popper, session
+
+    async def test_claim_outside_the_fill_slice_still_sends_a_request_for_the_claimed_model(self) -> None:
+        """With fill armed and a claim for a model the fill slice excludes, the request asks for the claimed model."""
+        state = _idle_fill_state(0)
+        popper, session = self._fill_popper(state, claim=_standing_claim("fluxA"))
+
+        await popper.api_job_pop()
+
+        session.submit_request.assert_awaited_once()
+        request: ImageGenerateJobPopRequest = session.submit_request.call_args.args[0]
+        assert request.models == ["fluxA"]
+        assert state.last_pop_gate is None
+
+    async def test_an_empty_answer_under_a_claim_does_not_climb_the_fill_ladder(self) -> None:
+        """The fill rung advances only on an empty answer to a fill offer, and a claimed offer is not one."""
+        state = _idle_fill_state(0)
+        popper, _session = self._fill_popper(state, claim=_standing_claim("fluxA"))
+
+        await popper.api_job_pop()
+
+        assert state.idle_fill_rung == 0
+
+    async def test_fill_does_not_bypass_the_pop_frequency_gate_under_a_claim(self) -> None:
+        """Armed fill does not make the attempt urgent while a claim holds, so the throttle window still applies."""
+        state = _idle_fill_state(0)
+        state.last_job_pop_time = time.time()
+        popper, session = self._fill_popper(state, claim=_standing_claim("fluxA"))
+
+        await popper.api_job_pop()
+
+        session.submit_request.assert_not_awaited()
+        assert state.last_pop_gate == str(PopGate.POP_FREQUENCY_GATE)
+
+    async def test_without_a_claim_fill_offers_its_slice_and_climbs(self) -> None:
+        """With no claim the fill offer is the small-model slice and an empty answer climbs one rung."""
+        state = _idle_fill_state(0)
+        popper, session = self._fill_popper(state, claim=None)
+
+        await popper.api_job_pop()
+
+        request: ImageGenerateJobPopRequest = session.submit_request.call_args.args[0]
+        assert request.models == ["sd15a"]
+        assert state.idle_fill_rung == 1
+
+
 class TestPopTimeStampedOnSentRequest:
     """``WorkerState.last_job_pop_time`` moves only when a request goes to the horde.
 
