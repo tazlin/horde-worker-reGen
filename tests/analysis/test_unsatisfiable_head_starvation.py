@@ -2,7 +2,8 @@
 
 The signature is the VRAM arbiter's head-of-queue starvation diagnostic: the same model deferred with no
 verified progress repeatedly across a long window. The critical case is the one nothing (give-up or
-pop-hold) ever resolves; a give-up or a consecutive-failure pause downgrades it to a warning.
+pop-hold) ever resolves. A give-up, a consecutive-failure pause, or a dominant-model run ended because the
+held model waited past the anti-starvation bound downgrades it to a warning.
 """
 
 from __future__ import annotations
@@ -13,11 +14,23 @@ from horde_worker_regen.analysis.bundle import LogBundle
 from horde_worker_regen.analysis.detectors import Severity
 from horde_worker_regen.analysis.watch import WatchState, watch_pass
 from tests.analysis.test_detectors import _consecutive_pause, _diagnose, _give_up, _starvation_diagnostic
+from tests.analysis.test_finding_copy_style import _emit_problems
 
 _STARTUP_LINE = (
     "2026-06-24 18:29:20.000 | DEBUG | hordelib.utils.logger:set_sinks:269 - Setting up logger for main process"
 )
 _MODEL = "AlbedoBase XL (SDXL)"
+_RUN_MODEL = "Flux.1-Schnell fp8 (Compact)"
+
+
+def _starved_head_run_end(ts: str, *, head: str, run_model: str = _RUN_MODEL, waited_seconds: int = 207) -> str:
+    """The scheduler's line for a dominant-model run ended at the anti-starvation bound, verbatim in shape."""
+    return (
+        f"2026-06-25 {ts} | INFO     | "
+        "horde_worker_regen.process_management.scheduling.inference_scheduler:_end_dominant_run:3081 - "
+        f"Dominant-model run for {run_model} ended because the head job for {head} has waited {waited_seconds}s "
+        "since pop, past the anti-starvation bound."
+    )
 
 
 def _starvation_lines() -> list[str]:
@@ -54,6 +67,37 @@ class TestUnsatisfiableHeadStarvation:
         """A consecutive-failure pop-hold within the window also downgrades it to a warning."""
         findings = _diagnose(tmp_path, _bridge(_consecutive_pause("18:36:00.000")))
         assert findings["unsatisfiable_head_starvation"].severity is Severity.WARNING
+
+    def test_a_run_ended_for_the_held_model_names_the_run(self, tmp_path: Path) -> None:
+        """A dominant-model run ended at the bound for the held model is the action that cleared the hold.
+
+        The finding still reports the hold and its length, names the run's model in the headline and the
+        remediation, and does not say nothing cleared it.
+        """
+        findings = _diagnose(tmp_path, _bridge(_starved_head_run_end("18:35:01.000", head=_MODEL)))
+        finding = findings["unsatisfiable_head_starvation"]
+        assert finding.severity is Severity.WARNING
+        assert "held back 3 times over 300 seconds" in finding.headline
+        assert f'"{_RUN_MODEL}"' in finding.headline
+        assert "nothing ever cleared it" not in finding.headline
+        assert f'"{_RUN_MODEL}"' in finding.action
+        assert "unload_models_from_vram_often" not in finding.action
+        assert not _emit_problems(finding), _emit_problems(finding)
+
+    def test_a_run_ended_for_another_model_does_not_clear_the_hold(self, tmp_path: Path) -> None:
+        """A run ended because a different model waited does not clear this hold."""
+        findings = _diagnose(tmp_path, _bridge(_starved_head_run_end("18:35:01.000", head="Some Other Model")))
+        finding = findings["unsatisfiable_head_starvation"]
+        assert finding.severity is Severity.CRITICAL
+        assert "nothing ever cleared it" in finding.headline
+
+    def test_without_a_run_end_the_wording_is_unchanged(self, tmp_path: Path) -> None:
+        """The hold lines alone keep the uncleared wording and the VRAM advice."""
+        finding = _diagnose(tmp_path, _bridge())["unsatisfiable_head_starvation"]
+        assert finding.headline == (
+            f'"{_MODEL}" was held back 3 times over 300 seconds on an idle card, and nothing ever cleared it.'
+        )
+        assert "`unload_models_from_vram_often`" in finding.action
 
     def test_silent_on_a_single_short_deferral(self, tmp_path: Path) -> None:
         """A single, short deferral is transient backpressure, not a persistent unschedulable head."""

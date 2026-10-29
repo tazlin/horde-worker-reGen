@@ -150,6 +150,9 @@ _GIVE_UP_RE = pattern_for("give_up")
 # starvation duration and the free VRAM that proves the budget was over-conservative.
 _HEAD_STARVATION_MODEL_RE = pattern_for("head_starvation_model")
 _HEAD_STARVATION_AVAILABLE_RE = pattern_for("head_starvation_available")
+# A dominant-model run ended because a different-model head waited past the anti-starvation bound. That run end
+# is the bounded wait that clears a head held behind the run, so it counts as the head's corrective action.
+_STARVED_HEAD_RUN_END_RE = pattern_for("dominant_run_ended_starved_head")
 _DEVICE_FREE_VRAM_RE = re.compile(r"device_free_vram=(\d+)MB")
 # The worker self-pausing pops after three consecutive faults.
 _CONSECUTIVE_PAUSE_RE = pattern_for("consecutive_pause")
@@ -2674,6 +2677,10 @@ def detect_unsatisfiable_head_starvation(context: SessionContext) -> list[Findin
     save-our-ship give-up or a consecutive-failure pop-hold) ever clears it. The head is effectively
     unschedulable and the queue is silently wedged behind it. The model name and the device-idle arithmetic
     are read straight off the worker's force-admit diagnostic; the critical case is the one nothing resolved.
+
+    A dominant-model run ended because this head waited past the anti-starvation bound is also a corrective
+    action. The head was held behind the run rather than refused by the VRAM budget, so that finding names the
+    run in its headline and remediation and does not advise relaxing the budget.
     """
     per_model: dict[str, list[tuple[LogRecord, int]]] = {}
     for record in context.session.records:
@@ -2706,22 +2713,56 @@ def detect_unsatisfiable_head_starvation(context: SessionContext) -> list[Findin
         context.session.records,
         _CONSECUTIVE_PAUSE_RE,
     )
-    resolved = any(
-        storm_start is None or (record.timestamp is not None and record.timestamp >= storm_start)
-        for record in corrective
-    )
+
+    def _within_storm(record: LogRecord) -> bool:
+        return storm_start is None or (record.timestamp is not None and record.timestamp >= storm_start)
+
+    resolved = any(_within_storm(record) for record in corrective)
+    run_ends = [
+        (record, match)
+        for record in context.session.records
+        if (match := _STARVED_HEAD_RUN_END_RE.search(record.message)) is not None
+        and match.group("head") == model
+        and _within_storm(record)
+    ]
+
+    stretch = f"Held back for up to {max_starved}s at a stretch{free_hint}."
+    held_evidence = [_evidence(record) for record, _ in (entries[:2] + entries[-1:])]
+    held_clause = f'"{model}" was held back {len(entries)} times over {idle_window:.0f} seconds on an idle card'
+    if run_ends:
+        run_end_record, run_end = run_ends[0]
+        run_model = run_end.group("model")
+        return [
+            Finding(
+                kind=FindingKind.UNSATISFIABLE_HEAD_STARVATION,
+                severity=Severity.WARNING,
+                headline=f'{held_clause}, until a run of "{run_model}" jobs ended.',
+                action_addendum=(
+                    f'The card was kept for "{run_model}" jobs, and "{model}" waited behind them until a time limit '
+                    "ended that run. The VRAM settings do not cause this, so leave them as they are. If it repeats, "
+                    "send the log with `horde-log bundle` to the worker maintainers."
+                ),
+                evidence=[
+                    stretch,
+                    f'The run of "{run_model}" jobs ended once "{model}" had waited {run_end.group("seconds")}s.',
+                ]
+                + held_evidence
+                + [_evidence(run_end_record)],
+            ),
+        ]
 
     outcome = "the worker eventually gave up or paused" if resolved else "nothing ever cleared it"
-    verdict = (
-        f'"{model}" was held back {len(entries)} times over {idle_window:.0f} seconds on an idle card, and {outcome}.'
-    )
-    stretch = f"Held back for up to {max_starved}s at a stretch{free_hint}."
     return [
         Finding(
             kind=FindingKind.UNSATISFIABLE_HEAD_STARVATION,
             severity=Severity.WARNING if resolved else Severity.CRITICAL,
-            headline=verdict,
-            evidence=[stretch] + [_evidence(record) for record, _ in (entries[:2] + entries[-1:])],
+            headline=f"{held_clause}, and {outcome}.",
+            action_addendum=(
+                "Check that the named model fits this card with room to run. If it does, relax the VRAM budget "
+                "or turn off `unload_models_from_vram_often` and `high_performance_mode`. If it does not, remove "
+                "the model."
+            ),
+            evidence=[stretch] + held_evidence,
         ),
     ]
 

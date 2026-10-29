@@ -604,17 +604,16 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
     FindingSpec(
         kind=FindingKind.UNSATISFIABLE_HEAD_STARVATION,
         title="One model kept being held back on an idle card",
-        action=(
-            "Check that the named model fits this card with room to run. If it does, relax the VRAM budget "
-            "or turn off `unload_models_from_vram_often` and `high_performance_mode`. If it does not, remove "
-            "the model."
-        ),
+        # No fixed advice here. A model refused by the VRAM budget and one held behind another model's run of
+        # jobs call for different fixes, so the detector supplies the advice with each finding.
         detail=(
             "The same model kept reaching the front of the queue and being refused a load while the card sat "
             "idle with memory to spare. Either the budget charges each process more than it costs, or the "
             "model cannot fit beside what the card holds. Over-charging happens when processes "
             "cycle so fast that no settled baseline exists to size them from. A bounded wait is meant to give "
-            "up on such a job so the queue moves. When nothing ever cleared it, the queue was stuck behind it."
+            "up on such a job so the queue moves. When nothing ever cleared it, the queue was stuck behind it. "
+            "A model can also wait behind a run of another model's jobs that keeps the card. That run ends once "
+            "the waiting job passes a time limit, and the finding then names the run."
         ),
         see_also=FindingKind.SCHEDULER_STARVATION_WEDGE,
     ),

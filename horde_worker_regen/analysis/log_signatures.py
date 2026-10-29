@@ -1794,6 +1794,17 @@ _SIGNATURE_LIST: list[LogSignature] = [
         dry_run_reason=_WHOLE_CARD_NOT_EXERCISED,
     ),
     _signature(
+        "dominant_run_ended_starved_head",
+        r"Dominant-model run for (?P<model>.+?) ended because the head job for (?P<head>.+?) has waited "
+        r"(?P<seconds>\d+)s since pop, past the anti-starvation bound",
+        emitter="process_management.scheduling.inference_scheduler:InferenceScheduler._end_dominant_run",
+        sample=(
+            "Dominant-model run for Flux.1-Schnell fp8 (Compact) ended because the head job for Moss-Image-Base "
+            "has waited 207s since pop, past the anti-starvation bound."
+        ),
+        dry_run_reason=_WHOLE_CARD_NOT_EXERCISED,
+    ),
+    _signature(
         "whole_card_prestage",
         r"Pre-staging whole-card head (?P<model>.+?) into a spare process's RAM",
         emitter="process_management.scheduling.inference_scheduler:InferenceScheduler._begin_whole_card_residency",
