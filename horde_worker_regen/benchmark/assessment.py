@@ -12,7 +12,7 @@ import uuid
 from collections.abc import Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, replace
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from statistics import median
 from typing import IO, Protocol
 
@@ -1317,8 +1317,15 @@ class OperatorAssessment:
             notes.append("The models are on solid-state storage.")
         from horde_worker_regen.process_management.scheduling.host_commit import page_file_drive_roots
 
-        model_drives = {Path(path).drive.lower() + "\\" for path in report.machine.storage if Path(path).drive}
-        for drive in sorted(model_drives & page_file_drive_roots()):
+        # Page file roots are Windows drive roots, so the model paths are read as Windows paths on every host.
+        # Off Windows the root set is empty and the note is not added.
+        page_file_drives = page_file_drive_roots()
+        model_drives = {
+            PureWindowsPath(path).drive.lower() + "\\"
+            for path in report.machine.storage
+            if page_file_drives and PureWindowsPath(path).drive
+        }
+        for drive in sorted(model_drives & page_file_drives):
             notes.append(
                 f"A page file shares drive {drive[:2].upper()} with the models. A system-managed page file grows "
                 "into that drive's free space under load, so low-disk warnings there can be page-file growth."

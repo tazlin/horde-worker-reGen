@@ -1613,7 +1613,9 @@ async def test_lease_slots_bound_the_overlap_a_thread_check_needs(
     assert report.suggested_bridge_data.gpu_sampling_lease_slots is None
 
 
-def test_storage_note_names_a_page_file_on_the_model_drive(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_page_file_on_the_model_drive_is_reported_in_the_storage_notes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A page file on the model drive is a host condition the operator should know about."""
     from horde_worker_regen.benchmark.capabilities.result import MachineInfo
     from horde_worker_regen.process_management.scheduling import host_commit

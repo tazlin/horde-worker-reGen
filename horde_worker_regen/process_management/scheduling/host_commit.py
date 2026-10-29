@@ -188,14 +188,18 @@ def _read_paging_file_settings() -> tuple[PageFileSetting, ...]:
     """Read the ``PagingFiles`` registry value.
 
     Raises:
-        OSError: The key or value cannot be read.
+        OSError: The key or value cannot be read, or the host has no registry.
         ValueError: The value is not a string list, or an entry's maximum is not a number.
     """
+    if sys.platform != "win32":
+        raise OSError("the PagingFiles registry value exists only on Windows")
     import winreg
 
-    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _MEMORY_MANAGEMENT_KEY) as key:
-        entries, value_type = winreg.QueryValueEx(key, _PAGING_FILES_VALUE)
-    if value_type != winreg.REG_MULTI_SZ or not isinstance(entries, list):
+    # The ``winreg`` stub exists only for a Windows platform, so a type check configured for another host does
+    # not see its attributes; the platform check above guards the read.
+    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _MEMORY_MANAGEMENT_KEY) as key:  # pyrefly: ignore[missing-attribute]
+        entries, value_type = winreg.QueryValueEx(key, _PAGING_FILES_VALUE)  # pyrefly: ignore[missing-attribute]
+    if value_type != winreg.REG_MULTI_SZ or not isinstance(entries, list):  # pyrefly: ignore[missing-attribute]
         raise ValueError(f"{_PAGING_FILES_VALUE} is registry type {value_type}, not a string list")
     return parse_paging_files([str(entry) for entry in entries])
 
