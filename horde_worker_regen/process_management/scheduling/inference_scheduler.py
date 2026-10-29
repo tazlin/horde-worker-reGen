@@ -10541,12 +10541,14 @@ class InferenceScheduler:
     ) -> tuple[ImageGenerateJobPopResponse, HordeProcessInfo] | None:
         """A pending job of a rung-1 run on the head's card, seatable now on the lane holding the run's weights.
 
-        Offered when a residency gate withheld a head for another model. The run's weights stay on the card while
-        the run has a next job (:func:`pricing.copy_belongs_to_dominant_run`), and the run ends only once its own
-        work drains (:meth:`_restore_siblings_after_whole_card`), so a run job left behind the head would keep the
-        head waiting on itself. The run's job loads nothing and takes no room the head waits for. The cold-head
-        residency bypass in :meth:`get_next_job_and_process` passes a held residency's jobs on the same ground. A
-        degraded retry must run isolated and is never seated this way.
+        Offered for a head of another model in two cases: a residency gate withheld the head's dispatch, or the
+        head is cold and the budget declined its preload (:meth:`_dominant_run_seat_for_cold_head`). The run's
+        weights stay on the card while the run has a next job (:func:`pricing.copy_belongs_to_dominant_run`), and
+        the run ends only once its own work drains or the head passes the anti-starvation bound
+        (:meth:`_restore_siblings_after_whole_card`), so a run job left behind the head would keep the head waiting
+        on itself. The run's job loads nothing and takes no room the head waits for. The cold-head residency
+        bypass in :meth:`get_next_job_and_process` passes a held residency's jobs on the same ground. A degraded
+        retry must run isolated and is never seated this way.
         """
         for candidate_job in candidates:
             if candidate_job is head_job or candidate_job.model is None or candidate_job.model == head_job.model:
@@ -10570,6 +10572,34 @@ class InferenceScheduler:
                 continue
             return candidate_job, candidate_process
         return None
+
+    def _dominant_run_seat_for_cold_head(
+        self,
+        head_job: ImageGenerateJobPopResponse,
+        candidates: list[ImageGenerateJobPopResponse],
+    ) -> tuple[ImageGenerateJobPopResponse, HordeProcessInfo] | None:
+        """The ``dominant_run`` seat for a cold head whose last preload the budget declined, or None.
+
+        The sweep spares a run's copy while the run has a next job, so the room the declined preload needs can be
+        held by the run itself. The run's queued jobs are then the only work that can end the run before the
+        anti-starvation bound does. The seat is scoped to the card the declined preload targeted. On a multi-card
+        host a decline with no target process is not tied to a card, so no seat is offered.
+        """
+        admission = self._head_admission.last_preload_admission
+        if (
+            admission is None
+            or admission.model != head_job.model
+            or admission.decision is not AdmissionDecision.DEFER_BUDGET
+        ):
+            return None
+        target = self._process_map.get(admission.process_id) if admission.process_id is not None else None
+        if target is None and self._multi_gpu_routing_active:
+            return None
+        return self._select_dominant_run_job(
+            head_job,
+            candidates,
+            head_device_index=target.device_index if target is not None else None,
+        )
 
     def _select_cross_card_job(
         self,
@@ -11425,8 +11455,9 @@ class InferenceScheduler:
             # therefore bypass regardless of the affinity budget, on the same ground as the pin-wait exemption.
             # They do not fund a fresh copy, and the head was not going to run in the meantime, so no
             # bypass budget is being spent against it. A rung-1 run does not tear anything down, so the run's jobs
-            # have no such claim here; they reach the card through the ``dominant_run`` seat while the run holds
-            # it. The pop-claim restriction above still applies.
+            # have no such claim here. Past the budget they reach the card through the ``dominant_run`` seat, which
+            # is offered when the head's preload was declined by the budget (below) or the head's dispatch was
+            # withheld by a residency gate. The pop-claim restriction above still applies.
             residency_bypass_models = {
                 residency.model
                 for _residency_device_index, residency in self._whole_card_ledger.teardown_held()
@@ -11461,6 +11492,21 @@ class InferenceScheduler:
                         next_job = candidate_job
                         process_with_model = candidate_process
                         break
+
+            if process_with_model is None and pinned_resident is None:
+                # The budget declined the cold head's preload, and the room it needs can be held by a rung-1 run's
+                # copy, which the sweep spares while the run has a next job. Left behind the head, the run's jobs
+                # would keep the head waiting until the anti-starvation bound ends the run, and the card idles once
+                # the skip budget is spent. The seat does not spend that budget.
+                run_seat = self._dominant_run_seat_for_cold_head(next_job, next_n_jobs)
+                if run_seat is not None:
+                    selection = NextJobAndProcess(
+                        next_job=run_seat[0],
+                        process_with_model=run_seat[1],
+                        line_skip=LineSkip(displaced_job=next_job, reason="dominant_run"),
+                    )
+                    self._pending_line_skip = selection
+                    return selection
 
             if process_with_model is None:
                 # The head is cold and stays that way this cycle. It names no card of its own, so nothing is

@@ -2310,6 +2310,114 @@ class TestDominantRunJobPassesAHeldHead:
         )
 
 
+class TestDominantRunJobPassesABudgetDeclinedColdHead:
+    """A run's job is seated on its lane when a cold head's preload was declined by the budget.
+
+    The run keeps its copy while it has a next job, so the room the head's preload needs can be held by the run
+    itself. Left behind the head, the run's jobs would keep the head waiting until the anti-starvation bound ends
+    the run, with the card idle once the affinity skip budget is spent.
+    """
+
+    async def _cold_head_behind_run(
+        self,
+        *,
+        decision: AdmissionDecision = AdmissionDecision.DEFER_BUDGET,
+        declined_model: str = "head-model",
+        run_device_index: int = 0,
+        max_concurrent: int = 1,
+    ) -> tuple[InferenceScheduler, ImageGenerateJobPopResponse, ImageGenerateJobPopResponse, HordeProcessInfo]:
+        """An empty lane the head's preload targeted, a lane holding the run's copy, and the skip budget spent."""
+        target_lane = make_mock_process_info(0, model_name=None)
+        run_lane = make_mock_process_info(1, model_name="run-model", device_index=run_device_index)
+        scheduler = _make_inference_scheduler(
+            process_map=ProcessMap({0: target_lane, 1: run_lane}),
+            max_concurrent=max_concurrent,
+        )
+        head = make_job_pop_response("head-model")
+        run_job = make_job_pop_response("run-model")
+        await track_popped_job_async(scheduler._job_tracker, head)
+        await track_popped_job_async(scheduler._job_tracker, run_job)
+        scheduler._affinity_skip_state = AffinitySkipState(
+            head_job_id=str(head.id_),
+            first_skip_time=time.time(),
+            skip_count=_AFFINITY_MAX_SKIPS,
+        )
+        holder_key = None if run_device_index == 0 else run_device_index
+        scheduler._whole_card_ledger.record_grant(
+            holder_key,
+            model="run-model",
+            forecast=None,
+            cooldown_until=0.0,
+            now=0.0,
+            rung=DominanceRung.CANNOT_CO_SAMPLE,
+        )
+        scheduler._head_admission.record_preload_admission(
+            decision,
+            model=declined_model,
+            process_id=0,
+            reason="candidate does not fit the measured room",
+        )
+        return scheduler, head, run_job, run_lane
+
+    async def test_the_run_job_is_seated_while_the_head_waits(self) -> None:
+        """The run's job is dispatched on the lane holding the run's weights, and the head keeps its place."""
+        scheduler, head, run_job, run_lane = await self._cold_head_behind_run()
+
+        selection = await scheduler.get_next_job_and_process()
+
+        assert selection is not None
+        assert selection.next_job is run_job
+        assert selection.process_with_model is run_lane
+        assert selection.line_skip is not None
+        assert selection.line_skip.displaced_job is head
+        assert selection.line_skip.reason == "dominant_run"
+
+    async def test_no_run_seats_nothing(self) -> None:
+        """Without a run on the card a job behind the cold head is ordinary resident work past the budget."""
+        scheduler, _head, _run_job, _run_lane = await self._cold_head_behind_run()
+        scheduler._whole_card_ledger.record_run_end(None)
+
+        assert await scheduler.get_next_job_and_process() is None
+
+    async def test_a_head_not_declined_by_the_budget_seats_nothing(self) -> None:
+        """A head whose preload waits on another gate does not wait on the run's room, so no seat is offered."""
+        scheduler, _head, _run_job, _run_lane = await self._cold_head_behind_run(
+            decision=AdmissionDecision.DEFER_CONCURRENCY,
+        )
+
+        assert await scheduler.get_next_job_and_process() is None
+
+    async def test_a_decline_for_another_model_seats_nothing(self) -> None:
+        """The decline record is the most recent one for any job; one naming another model says nothing here."""
+        scheduler, _head, _run_job, _run_lane = await self._cold_head_behind_run(declined_model="third-model")
+
+        assert await scheduler.get_next_job_and_process() is None
+
+    async def test_a_run_on_another_card_seats_nothing(self) -> None:
+        """The head waits on the card its declined preload targeted, which a run elsewhere does not hold."""
+        scheduler, _head, _run_job, _run_lane = await self._cold_head_behind_run(run_device_index=1)
+
+        assert await scheduler.get_next_job_and_process() is None
+
+    async def test_a_degraded_retry_is_not_seated(self) -> None:
+        """A degraded retry must run isolated, so it is never seated ahead of the head."""
+        scheduler, _head, run_job, _run_lane = await self._cold_head_behind_run()
+        tracked = scheduler._job_tracker._tracked_for(run_job)
+        assert tracked is not None
+        tracked.needs_degraded_dispatch = True
+
+        assert await scheduler.get_next_job_and_process() is None
+
+    async def test_a_card_at_its_jobs_in_progress_cap_seats_nothing(self) -> None:
+        """A run job is not seated past the concurrency cap."""
+        scheduler, _head, _run_job, _run_lane = await self._cold_head_behind_run()
+        running = make_job_pop_response("third-model")
+        await track_popped_job_async(scheduler._job_tracker, running)
+        await mark_job_in_progress_async(scheduler._job_tracker, running)
+
+        assert await scheduler.get_next_job_and_process() is None
+
+
 class TestDominantRunEndsForAStarvedHead:
     """A rung-1 run ends once a head for another model has waited past the anti-starvation bound.
 
