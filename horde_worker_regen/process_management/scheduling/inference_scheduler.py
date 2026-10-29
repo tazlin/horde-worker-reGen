@@ -1135,8 +1135,19 @@ class InferenceScheduler:
             return None
         return self._performance_model.expected_overhead_seconds(signature, resident=resident)
 
-    def _log_stream_forecast(self, job: ImageGenerateJobPopResponse, forecast: StreamForecast) -> None:
-        """Log the stream forecast when its decision or materially-relevant measurements change."""
+    def _log_stream_forecast(
+        self,
+        job: ImageGenerateJobPopResponse,
+        forecast: StreamForecast,
+        *,
+        admitted_candidate_mb: float | None = None,
+    ) -> None:
+        """Log the stream forecast when its decision or materially-relevant measurements change.
+
+        ``admitted_candidate_mb`` is the price the preload gate puts to the arbiter, which under the clearance
+        lease is capped at the staging charge and so can differ from the forecast's weights plus reserve. The
+        line carries it so the arbiter's decline figure can be read against the forecast.
+        """
         if not forecast.known:
             return
 
@@ -1144,6 +1155,7 @@ class InferenceScheduler:
         state_key = (
             job.model,
             job_id,
+            diagnostic_mb_bucket(admitted_candidate_mb) if admitted_candidate_mb is not None else None,
             diagnostic_mb_bucket(forecast.weights_mb),
             diagnostic_mb_bucket(forecast.reserve_mb),
             diagnostic_mb_bucket(forecast.free_now_mb),
@@ -1178,8 +1190,11 @@ class InferenceScheduler:
                 f" [whole-card intent retired: the sampling peak measured over "
                 f"{forecast.sampling_peak_observations} observations fits beside a sibling context]"
             )
+        candidate_note = ""
+        if admitted_candidate_mb is not None:
+            candidate_note = f" [preload priced at {admitted_candidate_mb:.0f} MB]"
         logger.debug(
-            f"Stream forecast for {job.model}: {forecast.reason()}{measured_note} "
+            f"Stream forecast for {job.model}: {forecast.reason()}{candidate_note}{measured_note} "
             f"[free_now={forecast.free_now_mb}, after_model_evict={forecast.free_after_model_evict_mb}, "
             f"alone={forecast.free_if_alone_mb}, "
             f"unreclaimable={forecast.unreclaimable_charge_mb:.0f}MB, live_procs="
@@ -8471,7 +8486,11 @@ class InferenceScheduler:
         forecast = pricing.forecast_streaming(snapshot, job, baseline, device_index=target_device_index)
         # Trace the forecast for every budget-gated load so the logs show the residency dynamics, not just the
         # action taken. Unchanged observations are coalesced by _log_stream_forecast.
-        self._log_stream_forecast(job, forecast)
+        self._log_stream_forecast(
+            job,
+            forecast,
+            admitted_candidate_mb=preload_candidate_delta_mb(snapshot, job_id, available_process.process_id),
+        )
 
         if fit_only:
             return self._admit_preload_if_it_fits(

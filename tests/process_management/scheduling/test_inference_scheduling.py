@@ -4266,3 +4266,58 @@ class TestLadderLaneRestoreUnderWholeCard:
 
         assert getattr(sched, restore)(0) is True
         lifecycle_restore.assert_called_once()
+
+
+class TestStreamForecastLineCarriesThePreloadPrice:
+    """The forecast line states the price the preload gate put to the arbiter when the caller supplies it.
+
+    Under the clearance lease the preload price is capped at the staging charge, so it can sit well below the
+    forecast's weights plus reserve. Without the figure on the line, the arbiter's decline cannot be read against
+    the forecast.
+    """
+
+    @staticmethod
+    def _forecast() -> StreamForecast:
+        return StreamForecast(
+            weights_mb=5200.0,
+            reserve_mb=4173.0,
+            base_reserve_mb=1000.0,
+            free_now_mb=6500.0,
+            free_if_alone_mb=23587.0,
+            free_after_model_evict_mb=18595.0,
+            total_vram_mb=24074.0,
+            per_process_overhead_mb=487.0,
+            marginal_process_overhead_mb=487.0,
+            wants_whole_card=False,
+        )
+
+    @staticmethod
+    def _forecast_lines(scheduler: InferenceScheduler, job: ImageGenerateJobPopResponse, **kwargs: float) -> list[str]:
+        lines: list[str] = []
+        sink_id = logger.add(lambda message: lines.append(str(message)), level="DEBUG")
+        try:
+            scheduler._log_stream_forecast(job, TestStreamForecastLineCarriesThePreloadPrice._forecast(), **kwargs)
+        finally:
+            logger.remove(sink_id)
+        return [line for line in lines if "Stream forecast for" in line]
+
+    def test_the_line_states_the_price_beside_the_forecast(self) -> None:
+        """The staging-capped price appears on the line next to the weights-plus-reserve figure."""
+        scheduler = _make_inference_scheduler(process_map=ProcessMap({0: make_mock_process_info(0, model_name=None)}))
+        job = make_job_pop_response(model="head-model")
+
+        lines = self._forecast_lines(scheduler, job, admitted_candidate_mb=7698.0)
+
+        assert len(lines) == 1
+        assert "weights ~5200 MB + 4173 MB reserve" in lines[0]
+        assert "[preload priced at 7698 MB]" in lines[0]
+
+    def test_a_line_without_the_price_is_unchanged(self) -> None:
+        """A caller that has no preload price, such as the dispatch-time disclosure, keeps the old line."""
+        scheduler = _make_inference_scheduler(process_map=ProcessMap({0: make_mock_process_info(0, model_name=None)}))
+        job = make_job_pop_response(model="head-model")
+
+        lines = self._forecast_lines(scheduler, job)
+
+        assert len(lines) == 1
+        assert "preload priced at" not in lines[0]
