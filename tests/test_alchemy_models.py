@@ -940,6 +940,31 @@ class TestLaneBoundFormDispatch:
         assert len(coordinator._pending_forms) == 0
         assert [submit.result_message.state for submit in coordinator._pending_submits] == [GENERATION_STATE.faulted]
 
+    def test_a_form_waits_out_a_deferred_start_on_the_lane_hold(self) -> None:
+        """A start deferred for VRAM is retried once the card has room, so the form waits inside the hold."""
+        coordinator = _lane_form_waiting(
+            UtilitiesLaneOutlook.START_DEFERRED,
+            popped_seconds_ago=_LANE_HOLD_SECONDS - 5,
+        )
+
+        coordinator.dispatch_pending_forms()
+
+        assert [spec.form_id for spec in coordinator._pending_forms] == ["form-1"]
+        assert len(coordinator._pending_submits) == 0
+        assert coordinator._utilities_lane_healthy() is False, "the offer is withheld while the start is deferred"
+
+    def test_a_form_past_the_lane_hold_of_a_deferred_start_is_faulted(self) -> None:
+        """A deferred start bounds the form by the same hold as a lane coming up."""
+        coordinator = _lane_form_waiting(
+            UtilitiesLaneOutlook.START_DEFERRED,
+            popped_seconds_ago=_LANE_HOLD_SECONDS + 1,
+        )
+
+        coordinator.dispatch_pending_forms()
+
+        assert len(coordinator._pending_forms) == 0
+        assert [submit.result_message.state for submit in coordinator._pending_submits] == [GENERATION_STATE.faulted]
+
     def test_a_form_is_faulted_at_once_when_the_lane_will_not_come_up(self) -> None:
         """A crashed, refused or disabled lane is not waited for."""
         coordinator = _lane_form_waiting(UtilitiesLaneOutlook.UNAVAILABLE)

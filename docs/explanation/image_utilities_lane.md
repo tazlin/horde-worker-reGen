@@ -162,9 +162,13 @@ A popped lane-bound form is lane demand under rule 6, so the driver starts the l
 dispatch (`AlchemyCoordinator._utilities_lane_fault_cause`) a form with no loaded lane waits while the lane will
 serve, bounded by `dispatch_affinity.utilities_lane_hold_expired`, the clock extended-ControlNet jobs wait on.
 The form's dispatch deadline (`PENDING_FORM_DISPATCH_DEADLINE_SECONDS`) stands in for its ttl and there is no
-sampling figure, so the wait ends at the anti-starvation share of that deadline. A form whose lane crashed, had
-its start refused or was disabled is faulted back to the horde at once. A form whose lane a reclaim or residency
-owner holds paused, or whose loaded lane is busy with another form, keeps the dispatch deadline as before.
+sampling figure, so the wait ends at the anti-starvation share of that deadline. A form whose lane start is deferred
+for VRAM headroom (`ProcessLifecycleManager.utilities_lane_start_deferred`, outlook `START_DEFERRED`) waits on the
+same clock, since the deferred-start drain starts the lane once the card has room. The offer stays withheld for the
+length of the deferral. A form whose lane crashed, whose start failed or that was disabled is faulted back to the
+horde at once. A form whose lane a reclaim or residency
+owner holds paused, or whose loaded lane is busy with a form, annotation or strip, waits for the full dispatch
+deadline.
 
 ### Extended ControlNet
 
@@ -177,13 +181,19 @@ for.
 
 The worker offers extended ControlNet at pop (`_extended_controlnet_ready`) while the live servable set covers
 every extended type, or while the lane will serve and the extended annotator weights are on disk. A popped
-extended job is lane demand under rule 5, so the driver starts a lane that is down on the next tick.
+extended job is lane demand under rule 5, so the driver starts a lane that is down on the next tick. A job already
+popped is also held while the lane's start is deferred for VRAM headroom, on the same hold, while the offer is
+withheld.
 
 Each control-loop tick, before the annotation pass and the scheduling cycle,
 `_fault_unready_extended_controlnet_jobs` sorts the queued extended jobs:
 
 - A job whose type is in the live servable set, or that already carries its derived map, passes on to
   pre-annotation or inference.
+- A job that brings its own control map (`image_is_control`) needs the extended-ControlNet feature and that map,
+  and no annotator, since hordelib runs the preprocessor as `none`. It passes on to inference whatever the lane's
+  state, because a lane state does not withdraw the offer the job was popped under. Only the feature being off
+  faults it.
 - A job that needs pre-annotation of a type the lane cannot serve yet is held while the lane will serve, no live
   lane has reported its servable set yet, and the type's weights are on disk. `InferenceScheduler.reconcile_utilities_lane_holds` records the hold in the
   `DispatchHoldLedger`, logs `Holding extended-ControlNet job <id> for the image-utilities lane, which cannot

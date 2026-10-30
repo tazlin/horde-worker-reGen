@@ -219,6 +219,9 @@ class UtilitiesLaneOutlook(enum.StrEnum):
 
     WILL_SERVE = "will_serve"
     """The lane is up, coming up, or down by policy and started on demand."""
+    START_DEFERRED = "start_deferred"
+    """The lane's start waits for VRAM headroom. A popped form waits on the same hold clock as for
+    ``WILL_SERVE``, but the offer is withheld, since the card does not have room for the lane yet."""
     PAUSED = "paused"
     """A reclaim or residency owner holds the lane down and restores it when its episode ends."""
     UNAVAILABLE = "unavailable"

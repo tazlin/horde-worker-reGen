@@ -1385,14 +1385,15 @@ class AlchemyCoordinator:
         and the form waits for it as long as an extended-ControlNet job waits for the lane
         (:func:`~horde_worker_regen.process_management.scheduling.dispatch_affinity.utilities_lane_hold_expired`).
         The form's dispatch deadline stands in for a ttl and there is no sampling figure, so the wait ends at the
-        anti-starvation share of the deadline, which covers a lane start and a cold first pass. A lane that
-        crashed, whose start was refused, or that was disabled is not coming up, so the form is faulted at once
-        and the horde reissues it to a worker that can serve it.
+        anti-starvation share of the deadline, which covers a lane start and a cold first pass. A lane whose start
+        waits for VRAM headroom is retried once the card has room, so the form waits on the same clock. A lane that
+        crashed, whose start failed, or that was disabled is not coming up, so the form is faulted at once and the
+        horde reissues it to a worker that can serve it.
         """
         if self._process_map.num_loaded_utilities_processes() > 0:
             return None
         match self._utilities_lane_outlook():
-            case UtilitiesLaneOutlook.WILL_SERVE:
+            case UtilitiesLaneOutlook.WILL_SERVE | UtilitiesLaneOutlook.START_DEFERRED:
                 hold_expired = utilities_lane_hold_expired(
                     now=time.time(),
                     popped_at=self._form_time_popped.get(spec.form_id),

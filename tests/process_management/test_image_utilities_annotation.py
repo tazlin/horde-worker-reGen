@@ -65,7 +65,10 @@ from horde_worker_regen.process_management.scheduling.dispatch_affinity import (
     fallback_ttl_seconds,
 )
 from horde_worker_regen.process_management.scheduling.slot_duty import SlotDutyBucket
-from horde_worker_regen.process_management.scheduling.workload_flow import routes_to_utilities_lane
+from horde_worker_regen.process_management.scheduling.workload_flow import (
+    UtilitiesLaneOutlook,
+    routes_to_utilities_lane,
+)
 from horde_worker_regen.process_management.simulation._canned_scenarios import CannedAlchemySource
 from horde_worker_regen.process_management.worker_entry_points import ProcessEntryPoints
 from tests.process_management.conftest import (
@@ -1588,8 +1591,14 @@ class TestAlchemyStripWithTheLaneDown:
         assert [submit.result_message.state for submit in rig.coordinator._pending_submits] == [GENERATION_STATE.ok]
         assert len(rig.constructed) == 1
 
-    async def test_a_lane_start_refused_for_vram_faults_the_popped_form(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """A lane whose start is deferred for VRAM is not coming up, so the form goes back to the horde."""
+    async def test_a_popped_form_waits_out_a_deferred_start_and_is_served(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A start deferred for VRAM holds the form on the lane hold, and the form is served once the start lands.
+
+        The offer is withheld for the length of the deferral, since the card does not have room for the lane.
+        """
         rig = _AlchemyLaneRig(monkeypatch, device_free_mb=100.0)
         assert _STRIP_FORM in _lane_forms_offered(rig.pm)
         spec = rig.pop_strip_form()
@@ -1597,12 +1606,46 @@ class TestAlchemyStripWithTheLaneDown:
         for _ in range(3):
             rig.tick()
 
+        lifecycle = rig.pm._process_lifecycle
         assert rig.constructed == []
+        assert lifecycle.has_pending_gpu_starts()
+        assert [pending.form_id for pending in rig.coordinator._pending_forms] == [spec.form_id], "the form waits"
+        assert len(rig.coordinator._pending_submits) == 0
+        assert _STRIP_FORM not in _lane_forms_offered(rig.pm), "the offer is withheld while the start is deferred"
+
+        monkeypatch.setattr(lifecycle, "_gpu_start_has_headroom", lambda *_args, **_kwargs: (True, ""))
+        assert lifecycle.drain_pending_gpu_starts() == 1
+        lane = rig.lane()
+        assert lane is not None
+        lane.last_process_state = HordeProcessState.WAITING_FOR_JOB
+        rig.tick()
+
+        assert len(rig.coordinator._pending_forms) == 0
+        assert len(rig.coordinator._pending_submits) == 0
+        sent = _sent(lane).call_args.args[0]
+        assert isinstance(sent, HordeAlchemyControlMessage)
+        assert sent.form.form_id == spec.form_id
+
+    async def test_a_deferred_start_that_never_lands_faults_the_form_on_the_lane_hold(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A start whose headroom never arrives faults the form when the lane hold lapses, and not before."""
+        rig = _AlchemyLaneRig(monkeypatch, device_free_mb=100.0)
+        spec = rig.pop_strip_form()
+        for _ in range(3):
+            rig.tick()
+        assert [pending.form_id for pending in rig.coordinator._pending_forms] == [spec.form_id]
         assert rig.pm._process_lifecycle.has_pending_gpu_starts()
+
+        lane_hold_seconds = ANTI_STARVATION_TTL_FRACTION * alchemy_popper.PENDING_FORM_DISPATCH_DEADLINE_SECONDS
+        rig.coordinator._form_time_popped[spec.form_id] -= lane_hold_seconds + 1
+        rig.tick()
+
+        assert rig.constructed == []
         assert len(rig.coordinator._pending_forms) == 0
         faulted = [submit.result_message for submit in rig.coordinator._pending_submits]
         assert [(message.form_id, message.state) for message in faulted] == [(spec.form_id, GENERATION_STATE.faulted)]
-        assert _STRIP_FORM not in _lane_forms_offered(rig.pm), "the offer is withheld while the start is deferred"
 
     def test_an_annotation_alchemist_starts_the_lane_once_to_learn_its_set(
         self,
@@ -1770,21 +1813,95 @@ class TestExtendedControlnetWaitsForTheLane:
         holds = [record for record in rig.dispatch_decisions if record[1] is DecisionVerdict.WITHHOLD]
         assert holds == [(str(job.id_), DecisionVerdict.WITHHOLD, "awaiting_utilities_lane")], "recorded once"
 
-    async def test_a_lane_start_refused_for_vram_faults_the_job(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """A lane whose start is deferred for VRAM is not coming up, so the job is reissued as before."""
+    async def test_a_deferred_lane_start_holds_the_job_until_the_start_lands(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A start deferred for VRAM keeps the job held, and the job goes to annotation once the lane serves it.
+
+        The extended offer is withdrawn for the length of the deferral, since the card does not have room for the
+        lane.
+        """
         rig = _ExtendedLaneRig(monkeypatch, device_free_mb=100.0)
         job = _make_controlnet_job(control_type="lineart", ttl=600)
         assert job.id_ is not None
         await rig.pm._job_tracker.record_popped_job(job, time_popped=time.time())
 
-        for _ in range(2):
+        for _ in range(3):
             rig.tick()
+
+        lifecycle = rig.pm._process_lifecycle
+        assert rig.constructed == []
+        assert lifecycle.has_pending_gpu_starts()
+        assert job in rig.pm._job_tracker.jobs_pending_inference
+        assert rig.pm._inference_scheduler.job_awaits_utilities_lane(job)
+        assert rig.faults == []
+        assert rig.pm._extended_controlnet_ready() is False, "the offer is withheld while the start is deferred"
+
+        monkeypatch.setattr(lifecycle, "_gpu_start_has_headroom", lambda *_args, **_kwargs: (True, ""))
+        assert lifecycle.drain_pending_gpu_starts() == 1
+        lane = rig.lane()
+        assert lane is not None
+        lane.last_process_state = HordeProcessState.WAITING_FOR_JOB
+        rig.report_servable(["canny", "lineart"])
+        rig.tick()
+
+        assert rig.pm._job_tracker.get_stage(job.id_) == JobStage.PENDING_ANNOTATION
+        sent = _sent(lane).call_args.args[0]
+        assert isinstance(sent, HordeStartAnnotationControlMessage)
+        assert rig.faults == []
+
+    async def test_a_job_carrying_its_own_control_map_runs_while_the_lane_is_paused(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A paused lane withholds the offer from new pops, and a job that does not need an annotator is not faulted.
+
+        The job carries its control map, so it needs only the extended-ControlNet feature. It is neither faulted
+        nor held for the lane, and stays queued for inference.
+        """
+        rig = _ExtendedLaneRig(monkeypatch)
+        _add_utilities_process(rig.pm)
+        assert rig.pm._inference_scheduler.pause_utilities_lane(None) is True
+        for _ in range(3):
+            rig.tick()
+        assert rig.pm._utilities_lane_outlook() is UtilitiesLaneOutlook.PAUSED
+        assert rig.pm._extended_controlnet_ready() is False, "the pause withholds the offer from new pops"
+
+        job = _make_controlnet_job(control_type="lineart", image_is_control=True, ttl=600)
+        assert job.id_ is not None
+        await rig.pm._job_tracker.record_popped_job(job, time_popped=time.time())
+        for _ in range(3):
+            rig.tick()
+
+        assert rig.faults == []
+        assert job in rig.pm._job_tracker.jobs_pending_inference
+        assert rig.pm._job_tracker.get_stage(job.id_) == JobStage.PENDING_INFERENCE
+        assert not rig.pm._inference_scheduler.job_awaits_utilities_lane(job)
+
+    async def test_a_deferred_lane_start_that_never_lands_faults_the_job_on_the_hold(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A start whose headroom never arrives faults the held job when its lane hold lapses, and not before."""
+        rig = _ExtendedLaneRig(monkeypatch, device_free_mb=100.0)
+        job = _make_controlnet_job(control_type="lineart", ttl=600)
+        assert job.id_ is not None
+        await rig.pm._job_tracker.record_popped_job(job, time_popped=time.time())
+        for _ in range(3):
+            rig.tick()
+        assert job in rig.pm._job_tracker.jobs_pending_inference
+        assert rig.faults == []
+
+        tracked = rig.pm._job_tracker.get_tracked_job(job.id_)
+        assert tracked is not None and tracked.time_popped is not None
+        tracked.time_popped -= ANTI_STARVATION_TTL_FRACTION * 600 + 1
+        rig.tick()
 
         assert rig.constructed == []
         assert rig.pm._process_lifecycle.has_pending_gpu_starts()
         assert job not in rig.pm._job_tracker.jobs_pending_inference
-        assert rig.faults == ["extended_controlnet_not_offered"]
-        assert not rig.pm._inference_scheduler.job_awaits_utilities_lane(job)
+        assert len(rig.faults) == 1
 
     async def test_a_job_whose_deadline_cannot_cover_the_bring_up_is_faulted(
         self,

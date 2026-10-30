@@ -536,3 +536,28 @@ def test_a_crashed_paused_or_refused_lane_will_not_serve() -> None:
     assert plm.start_utilities_processes() is False
     assert plm.has_pending_gpu_starts() is True
     assert plm.utilities_lane_will_serve() is False, "start refused for VRAM"
+
+
+def test_a_start_deferred_for_vram_is_reported_as_deferred_only_while_pending() -> None:
+    """The deferred-start reading holds while the lane's start waits for headroom, and not in any other state."""
+    constructed: list[_FakeAdapter] = []
+    free_holder = {"mb": 100.0}
+    plm = _make_utilities_plm(
+        constructed=constructed,
+        device_free_mb_provider=lambda _index: free_holder["mb"],
+        device_total_vram_mb_provider=lambda _index: 24576.0,
+    )
+    assert plm.utilities_lane_start_deferred() is False, "down by policy, no start attempted"
+
+    assert plm.start_utilities_processes() is False
+    assert plm.utilities_lane_start_deferred() is True, "start deferred for VRAM"
+    assert plm.utilities_lane_will_serve() is False
+
+    plm._utilities_gpu_paused = True
+    assert plm.utilities_lane_start_deferred() is False, "paused"
+    plm._utilities_gpu_paused = False
+
+    free_holder["mb"] = 24000.0
+    assert plm.drain_pending_gpu_starts() == 1
+    assert plm.utilities_lane_start_deferred() is False, "started"
+    assert plm.utilities_lane_will_serve() is True

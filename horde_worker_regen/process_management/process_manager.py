@@ -4963,6 +4963,8 @@ class HordeWorkerProcessManager:
         lifecycle = self._process_lifecycle
         if lifecycle.utilities_lane_will_serve():
             return UtilitiesLaneOutlook.WILL_SERVE
+        if lifecycle.utilities_lane_start_deferred():
+            return UtilitiesLaneOutlook.START_DEFERRED
         if lifecycle.utilities_process_enabled() and lifecycle.utilities_pause_owner is not None:
             return UtilitiesLaneOutlook.PAUSED
         return UtilitiesLaneOutlook.UNAVAILABLE
@@ -5264,7 +5266,8 @@ class HordeWorkerProcessManager:
         A job whose control type the image-utilities lane serves, or that already carries its derived control
         map, passes to pre-annotation or inference. A job that needs pre-annotation of a type the lane cannot serve
         yet is held at dispatch while the lane is up or coming up
-        (:meth:`ProcessLifecycleManager.utilities_lane_will_serve`) and the type's annotator weights are on disk.
+        (:meth:`ProcessLifecycleManager.utilities_lane_will_serve`), or while its start waits for VRAM headroom
+        (:meth:`ProcessLifecycleManager.utilities_lane_start_deferred`), and the type's annotator weights are on disk.
         The job is the lane's demand, so a lane that is down starts on the next tick, and the hold lasts until the
         lane reports the type servable or the job's deadline runs out
         (:meth:`InferenceScheduler.reconcile_utilities_lane_holds`). Every other queued extended job is hostile
@@ -5292,16 +5295,18 @@ class HordeWorkerProcessManager:
             # A live lane that has reported its servable set has listed everything it can annotate, so a type
             # missing from that set is not held for. The pruning in _servable_control_types leaves only live lanes.
             lane_reported = bool(self._annotator_servable_types)
-            lane_will_serve = self._process_lifecycle.utilities_lane_will_serve()
+            lane_will_serve = (
+                self._process_lifecycle.utilities_lane_will_serve()
+                or self._process_lifecycle.utilities_lane_start_deferred()
+            )
             for job, control_type in extended_jobs:
                 tracked = self._job_tracker.get_tracked_job(job.id_) if job.id_ is not None else None
                 if control_type in servable or (tracked is not None and tracked.premade_control_map_bytes is not None):
                     continue
                 if not job_wants_pre_annotation(job):
-                    # A job that brings its own control map does not need an annotator, only the offer it was popped
-                    # under.
-                    if not self._extended_controlnet_ready():
-                        unready.append(job)
+                    # A job that brings its own control map needs the extended-ControlNet feature (checked above)
+                    # and that map. It does not need an annotator or a lane, since hordelib runs the preprocessor as
+                    # "none", so the lane's state, whatever it is, does not withdraw the offer it was popped under.
                     continue
                 if (
                     lane_will_serve

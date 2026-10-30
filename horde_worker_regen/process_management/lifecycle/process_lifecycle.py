@@ -2384,6 +2384,21 @@ class ProcessLifecycleManager:
             return False
         return self._utilities_interpreter_available()
 
+    def utilities_lane_start_deferred(self) -> bool:
+        """Return whether the image-utilities lane is down by policy with its start deferred for VRAM headroom.
+
+        The deferred start is retried by :meth:`drain_pending_gpu_starts` once the card has room, so a job already
+        holding for the lane may keep waiting on its hold clock. The lane does not count as will-serve
+        (:meth:`utilities_lane_will_serve`), which keeps the offers withheld while the card lacks room for it.
+        """
+        if not self.utilities_process_enabled() or not self.process_type_wanted(HordeProcessType.UTILITIES):
+            return False
+        if self._state.shutting_down or self._utilities_gpu_paused or self._utilities_processes_should_be_replaced:
+            return False
+        if any(info.process_type is HordeProcessType.UTILITIES for info in self._process_map.values()):
+            return False
+        return self._pending_gpu_start_key(HordeProcessType.UTILITIES, None) in self._pending_gpu_starts
+
     def start_utilities_processes(self) -> bool:
         """Start the dedicated image-utilities lane, if enabled, not already running, and needed.
 
