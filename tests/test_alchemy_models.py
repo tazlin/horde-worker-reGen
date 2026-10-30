@@ -33,7 +33,7 @@ from horde_worker_regen.process_management.jobs.alchemy_popper import (
     required_capability,
 )
 from horde_worker_regen.process_management.jobs.job_models import PendingAlchemySubmitJob
-from horde_worker_regen.process_management.lifecycle.horde_process import WorkerCapability
+from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType, WorkerCapability
 from horde_worker_regen.process_management.models.model_availability import PostProcessorPresence
 from horde_worker_regen.process_management.resources.resource_budget import CommittedReserveLedger
 from horde_worker_regen.process_management.scheduling.dispatch_affinity import ANTI_STARVATION_TTL_FRACTION
@@ -730,6 +730,7 @@ def _make_coordinator(process_map: _StubProcessMap) -> AlchemyCoordinator:
     coordinator._in_flight = {}
     coordinator._in_flight_card = {}
     coordinator._in_flight_owner = {}
+    coordinator._in_flight_dispatched_at = {}
     coordinator._pending_submits = deque()
     coordinator._form_time_popped = {}
     coordinator._estimator = AlchemyHeadroomEstimator()
@@ -894,6 +895,92 @@ class TestAlchemyDispatch:
         submit = coordinator._pending_submits[0]
         assert submit.submit_result == {"nsfw": False}
         assert submit.time_popped == 123.0
+
+
+class _StubTypedProcessInfo(_StubProcessInfo):
+    """A dispatch-seam process that also carries its process type."""
+
+    def __init__(self, process_id: int, process_type: HordeProcessType, process_launch_identifier: int = 0) -> None:
+        super().__init__(process_id, process_launch_identifier)
+        self.process_type = process_type
+
+
+class TestSafetyReplacementHold:
+    """CLIP forms are not sent to a safety process while a replacement is armed, and forms in flight are reported."""
+
+    @staticmethod
+    def _coordinator(armed: list[bool]) -> tuple[AlchemyCoordinator, _StubTypedProcessInfo, _StubTypedProcessInfo]:
+        safety_process = _StubTypedProcessInfo(process_id=2, process_type=HordeProcessType.SAFETY)
+        graph_process = _StubTypedProcessInfo(process_id=1, process_type=HordeProcessType.POST_PROCESS)
+        coordinator = _make_coordinator(
+            _StubProcessMap(
+                {
+                    WorkerCapability.ALCHEMY_CLIP: safety_process,
+                    WorkerCapability.ALCHEMY_GRAPH: graph_process,
+                },
+            ),
+        )
+        coordinator._safety_replacement_armed_provider = lambda: armed[0]
+        return coordinator, safety_process, graph_process
+
+    def test_a_clip_form_waits_while_the_replacement_is_armed(self) -> None:
+        """The form stays pending on its deadline and is sent once the replacement is no longer armed."""
+        armed = [True]
+        coordinator, safety_process, _ = self._coordinator(armed)
+        coordinator._queue_pending_form(AlchemyFormSpec(form_id="form-1", form="caption", source_image_bytes=b"hi"))
+
+        coordinator.dispatch_pending_forms()
+
+        assert safety_process.sent_messages == []
+        assert [spec.form_id for spec in coordinator._pending_forms] == ["form-1"]
+        assert "form-1" in coordinator._pending_form_deadlines
+
+        armed[0] = False
+        coordinator.dispatch_pending_forms()
+
+        assert [m.form.form_id for m in safety_process.sent_messages] == ["form-1"]
+        assert set(coordinator._in_flight) == {"form-1"}
+
+    def test_a_graph_form_is_not_held_by_a_safety_replacement(self) -> None:
+        """Only the safety process is held, and a form for another lane is dispatched as usual."""
+        coordinator, _, graph_process = self._coordinator([True])
+        coordinator._pending_forms.append(
+            AlchemyFormSpec(form_id="form-1", form="RealESRGAN_x4plus", source_image_bytes=b"hi"),
+        )
+
+        coordinator.dispatch_pending_forms()
+
+        assert [m.form.form_id for m in graph_process.sent_messages] == ["form-1"]
+
+    def test_in_flight_form_ages_reads_one_launch_and_clears_on_the_result(self) -> None:
+        """Ages count from dispatch, cover only the named launch, and a result removes the form."""
+        coordinator, _, _ = self._coordinator([False])
+        coordinator._pending_forms.append(AlchemyFormSpec(form_id="form-1", form="nsfw", source_image_bytes=b"hi"))
+        coordinator._form_time_popped["form-1"] = time.time() - 1000.0
+        coordinator.dispatch_pending_forms()
+
+        ages = coordinator.in_flight_form_ages(2, 0)
+
+        assert set(ages) == {"form-1"}
+        # Measured from dispatch, so the time the form waited after its pop is not charged.
+        assert 0.0 <= ages["form-1"] < 60.0
+        assert coordinator.in_flight_form_ages(2, 1) == {}
+        assert coordinator.in_flight_form_ages(1, 0) == {}
+
+        coordinator.on_alchemy_result(
+            HordeAlchemyResultMessage(
+                process_id=2,
+                process_launch_identifier=0,
+                info="test",
+                form_id="form-1",
+                form="nsfw",
+                state=GENERATION_STATE.ok,
+                result_payload={"nsfw": False},
+            ),
+        )
+
+        assert coordinator.in_flight_form_ages(2, 0) == {}
+        assert coordinator._in_flight_dispatched_at == {}
 
 
 _LANE_HOLD_SECONDS = ANTI_STARVATION_TTL_FRACTION * alchemy_popper.PENDING_FORM_DISPATCH_DEADLINE_SECONDS
@@ -1323,6 +1410,7 @@ def _make_policy_coordinator(
     coordinator._in_flight = {f"form-{i}": None for i in range(in_flight)}  # type: ignore[misc]
     coordinator._in_flight_card = {}
     coordinator._in_flight_owner = {}
+    coordinator._in_flight_dispatched_at = {}
     coordinator._estimator = AlchemyHeadroomEstimator()
     coordinator._last_pop_time = 0.0
     # The pop gate reads the hold as well as the instant, and this double skips __init__.

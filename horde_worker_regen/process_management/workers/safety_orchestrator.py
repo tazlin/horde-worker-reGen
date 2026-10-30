@@ -68,6 +68,11 @@ class SafetyOrchestrator:
         if len(self._job_tracker.jobs_pending_safety_check) == 0:
             return
 
+        # An idle process with a replacement armed is ended on the next tick. A check sent to it now would hold
+        # that end for one more check, and a backlog would hold it indefinitely.
+        if self._process_lifecycle.safety_replacement_armed is True:
+            return
+
         safety_process = self._process_map.get_first_available_safety_process()
 
         if safety_process is None:

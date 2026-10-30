@@ -2134,6 +2134,7 @@ class HordeWorkerProcessManager:
             annotation_types_provider=self._alchemy_annotation_types,
             model_availability=self._model_availability,
             utilities_lane_outlook_provider=self._utilities_lane_outlook,
+            safety_replacement_armed_provider=lambda: self._process_lifecycle.safety_replacement_armed,
         )
         self._message_dispatcher.set_alchemy_result_handler(self._on_alchemy_result)
         self._message_dispatcher.set_annotation_result_handler(self._on_annotation_result)
@@ -2142,6 +2143,7 @@ class HordeWorkerProcessManager:
         self._process_lifecycle.set_utilities_alchemy_form_demand_provider(
             self._alchemy_coordinator.utilities_form_demand,
         )
+        self._process_lifecycle.set_in_flight_form_ages_provider(self._alchemy_coordinator.in_flight_form_ages)
 
         self._image_coordinator = ImageGenerationCoordinator(
             state=self._state,

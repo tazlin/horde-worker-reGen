@@ -47,7 +47,12 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeProcessState,
 )
 from horde_worker_regen.process_management.ipc.supervisor_channel import WorkerEventKind, WorkerEventSink
-from horde_worker_regen.process_management.jobs.job_tracker import JobStage, JobTracker, PostProcessingFaultCause
+from horde_worker_regen.process_management.jobs.job_tracker import (
+    JobStage,
+    JobTracker,
+    PostProcessingFaultCause,
+    TrackedJob,
+)
 from horde_worker_regen.process_management.lifecycle.child_crash_capture import (
     read_last_startup_crash,
     read_startup_crash_for_launch,
@@ -630,6 +635,7 @@ class ProcessLifecycleManager:
     _last_process_recovery_lane: HordeProcessType | None
     _safety_processes_should_be_replaced: bool
     _safety_processes_ending: bool
+    _safety_end_deferred_work: frozenset[str]
     _post_process_processes_should_be_replaced: bool
     _post_process_processes_ending: bool
     _recently_recovered: bool
@@ -823,6 +829,11 @@ class ProcessLifecycleManager:
         self._paging_victim_replacements = 0
         self._safety_processes_should_be_replaced = False
         self._safety_processes_ending = False
+        self._safety_end_deferred_work = frozenset()
+        # The alchemy flow's forms running on a process launch, each with its age since dispatch. A CLIP form runs
+        # on the safety process, so a placement move waits for it. The alchemy coordinator is built after this
+        # manager and registers it. Until then, forms are not reported.
+        self._in_flight_form_ages_provider: Callable[[int, int], dict[str, float]] = lambda _pid, _launch: {}
         self._post_process_processes_should_be_replaced = False
         self._post_process_processes_ending = False
         self._post_process_results_known_lost: set[GenerationID] = set()
@@ -2324,6 +2335,14 @@ class ProcessLifecycleManager:
         forms do not count toward the demand.
         """
         self._utilities_alchemy_form_demand_provider = provider
+
+    def set_in_flight_form_ages_provider(self, provider: Callable[[int, int], dict[str, float]]) -> None:
+        """Register the alchemy flow's view of the forms running on a process launch.
+
+        The alchemy coordinator's :meth:`AlchemyCoordinator.in_flight_form_ages`, read by
+        :meth:`_safety_end_waits_for_work`. Until it is registered, a placement move does not wait for a form.
+        """
+        self._in_flight_form_ages_provider = provider
 
     def utilities_lane_demand_inputs(self) -> UtilitiesLaneDemandInputs:
         """Assemble what :func:`utilities_lane_demand` reads from the tracker, the live config and alchemy."""
@@ -4120,13 +4139,20 @@ class ProcessLifecycleManager:
         )
 
     def end_safety_processes(self) -> None:
-        """Ask every safety process to end.
+        """Ask every safety process to end, after the work it is running returns.
 
         The child stays in the owned-PID registry until a reap confirms it dead (the replacement's
         :meth:`_end_replaced_children`, or the shutdown reap), so one that ignores the request is still found
         by the exit backstop.
+
+        A process running a safety check or a CLIP alchemy form is skipped (:meth:`_safety_end_waits_for_work`).
+        This is the one end-request site for every placement move, onto the GPU and off it, so the wait covers
+        both directions. The replacement machine calls this again on each later tick while the process is loaded
+        and has not been sent an end request.
         """
         for process_info in self._process_map.get_stoppable_safety_processes():
+            if self._safety_end_waits_for_work(process_info):
+                continue
             # Mark the end as supervisor-intended before sending the command so the crash reaper does not
             # treat the child's expected exit as a safety-pool crash.
             process_info.end_intended = True
@@ -4134,6 +4160,78 @@ class ProcessLifecycleManager:
             self._process_map.on_process_ending(process_id=process_info.process_id)
 
             logger.info(f"Ended safety process {process_info.process_id}")
+
+    def _safety_end_waits_for_work(self, process_info: HordeProcessInfo) -> bool:
+        """Return whether the end request to this safety process waits for the work it is running.
+
+        An end request discards the work in flight, so a move waits for a safety check
+        (:meth:`JobTracker.is_current_safety_attempt`) or a CLIP alchemy form
+        (:meth:`set_in_flight_form_ages_provider`) running on the process. Neither flow sends new work while
+        :attr:`safety_replacement_armed` is set, so a move waits only for the work already running.
+
+        Each piece of work holds the end until it returns or until ``process_timeout`` has passed since its
+        dispatch, and work past that is treated as wedged. A check can release the end sooner, because the orphan
+        sweep requeues it after its grace whether or not the process is alive. On the GPU that grace
+        (``ORPHAN_SAFETY_GRACE_SECONDS``, 45 s) is below every ``process_timeout`` default. A dead process or a
+        shutdown is not waited on, since a dead process cannot deliver and a shutdown drains the safety backlog.
+        """
+        if self._state.shutting_down or not process_info.is_process_alive():
+            return False
+        timeout_seconds = self._runtime_config.bridge_data.process_timeout
+        # Each entry is the work, its age since dispatch, and what recovers it if the process is ended first.
+        running_work: list[tuple[str, float, str]] = []
+        running_check = self._running_safety_check(process_info)
+        if running_check is not None:
+            running_work.append(
+                (
+                    f"safety check of job {running_check.job_id}",
+                    max(0.0, time.time() - running_check.current_stage_since),
+                    "The orphan sweep re-checks the job.",
+                ),
+            )
+        form_ages = self._in_flight_form_ages_provider(process_info.process_id, process_info.process_launch_identifier)
+        for form_id, age_seconds in form_ages.items():
+            running_work.append(
+                (f"alchemy form {form_id}", age_seconds, "The form is faulted back to the horde."),
+            )
+        held_work = frozenset(work for work, age_seconds, _ in running_work if age_seconds <= timeout_seconds)
+        if not held_work:
+            for work, age_seconds, recovery in running_work:
+                logger.warning(
+                    f"Safety process {process_info.process_id} has run the {work} for {age_seconds:.0f}s, past "
+                    f"process_timeout ({timeout_seconds}s). Ending it without that result. {recovery}",
+                )
+            self._safety_end_deferred_work = frozenset()
+            return False
+        if held_work != self._safety_end_deferred_work:
+            self._safety_end_deferred_work = held_work
+            logger.info(
+                f"Safety process {process_info.process_id} is running the {', '.join(sorted(held_work))}. Ending it "
+                f"after that work returns, or after process_timeout ({timeout_seconds}s) if it does not.",
+            )
+        return True
+
+    def _running_safety_check(self, process_info: HordeProcessInfo) -> TrackedJob | None:
+        """Return the job whose current safety attempt runs on this process launch, if any."""
+        for tracked in self._job_tracker.tracked_jobs():
+            if self._job_tracker.is_current_safety_attempt(
+                tracked.job_id,
+                process_id=process_info.process_id,
+                process_launch_identifier=process_info.process_launch_identifier,
+            ):
+                return tracked
+        return None
+
+    @property
+    def safety_replacement_armed(self) -> bool:
+        """Whether a safety replacement is armed and free to act on the next control-loop tick.
+
+        The safety orchestrator reads this to hold new checks, and the alchemy dispatcher to hold new CLIP forms.
+        Work sent to a process the replacement is about to end would delay the end by one more piece of work, and a
+        backlog would keep delaying it. A replacement parked by recovery does not act, so the live process keeps
+        serving through the park.
+        """
+        return self._safety_processes_should_be_replaced and not self._automatic_replacement_is_parked()
 
     @property
     def is_safety_gpu_paused(self) -> bool:
@@ -4352,6 +4450,10 @@ class ProcessLifecycleManager:
         A no-op when safety is not paused, the caller does not name the request that initiated the pause, or the
         preceding placement rebuild has not reached readiness. The scheduler reconciler retains later requests
         without transferring ownership, then passes the recorded owner only once no request remains.
+
+        The restore is a request. A CPU safety process running a check or a CLIP form is ended once that work
+        returns, bounded per piece of work as :meth:`_safety_end_waits_for_work` states, and no new work is sent to
+        it meanwhile.
 
         Args:
             owner: The request recorded when the current pause began.

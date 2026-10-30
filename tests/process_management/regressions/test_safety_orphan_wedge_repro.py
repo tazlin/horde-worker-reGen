@@ -20,6 +20,8 @@ the safety process actually returned a verdict for it.
 * ``TestRetiredSafetyLaunchVerdictStillApplies`` / ``TestRetiredSafetyLaunchDropsUnownedVerdicts`` - a
   verdict is valid for the job it checked whichever launch produced it, while a verdict for a job some
   later launch now owns stays dropped.
+* ``TestPlacementMoveWaitsForTheCheck`` - a placement move ends the safety process after the check in flight
+  returns its verdict, bounded by ``process_timeout``, so the orphan sweep never requeues that job.
 """
 
 from __future__ import annotations
@@ -30,6 +32,9 @@ from unittest.mock import Mock
 from horde_sdk.ai_horde_api import GENERATION_STATE
 
 from horde_worker_regen.process_management.ipc.messages import (
+    AlchemyFormSpec,
+    HordeAlchemyResultMessage,
+    HordeControlFlag,
     HordeImageResult,
     HordeProcessState,
     HordeSafetyEvaluation,
@@ -38,11 +43,13 @@ from horde_worker_regen.process_management.ipc.messages import (
 from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
 from horde_worker_regen.process_management.jobs.job_tracker import JobStage
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
+from horde_worker_regen.process_management.lifecycle.process_lifecycle import PauseOwner
 from tests.process_management.conftest import (
     make_job_pop_response,
     make_mock_process_info,
     make_testable_process_manager,
     move_job_to_being_safety_checked_async,
+    queue_job_for_safety_async,
 )
 
 
@@ -832,3 +839,245 @@ class TestBusySafetyProcessCountsAsAlive:
         assert pm._job_tracker.get_stage(job_id) == JobStage.PENDING_SUBMIT
         assert job_info.state == GENERATION_STATE.faulted
         assert pm._process_lifecycle.safety_processes_should_be_replaced is True
+
+
+def _sent_end_request(safety_proc: object) -> bool:
+    """Return whether the parent sent ``END_PROCESS`` down this process's pipe."""
+    send = safety_proc.pipe_connection.send  # type: ignore[attr-defined]
+    return any(call.args[0].control_flag == HordeControlFlag.END_PROCESS for call in send.call_args_list)
+
+
+def _pause_safety_off_gpu_for_whole_card(pm: object) -> None:
+    """Put the lifecycle in the state a whole-card residency leaves, with safety paused off the GPU and rebuilt."""
+    lifecycle = pm._process_lifecycle  # type: ignore[attr-defined]
+    lifecycle._safety_gpu_paused = True
+    lifecycle._safety_gpu_pause_owner = PauseOwner.WHOLE_CARD
+    lifecycle.start_safety_processes = Mock()
+
+
+_CLIP_FORM_ID = "clip-form-1"
+"""A CLIP alchemy form, which runs on the safety process."""
+
+
+class TestPlacementMoveWaitsForTheCheck:
+    """A safety placement move ends the process only after the check or CLIP form it is running returns.
+
+    The end of a whole-card residency restores safety to the GPU by replacing the CPU safety process. Ending it
+    on the replacement's first tick would discard the check in flight, and the orphan sweep would requeue the job
+    after its grace, so a job already being checked would pay a second check and the grace on its submit path.
+    The end request waits for the job tracker's current safety attempt to resolve, bounded by ``process_timeout``.
+    """
+
+    async def _restore_with_a_check_in_flight(self, pm: object) -> HordeJobInfo:
+        """Seat a CPU safety process mid-check on one job, then request the restore to the GPU."""
+        _add_busy_safety_process(pm, _SAFETY_PROCESS_ID)
+        _pause_safety_off_gpu_for_whole_card(pm)
+        job_info = _safety_job_info()
+        await _strand_in_safety_checking(
+            pm,
+            job_info,
+            process_id=_SAFETY_PROCESS_ID,
+            process_launch_identifier=0,
+        )
+        assert pm._process_lifecycle.restore_safety_on_gpu(owner=PauseOwner.WHOLE_CARD) is True  # type: ignore[attr-defined]
+        return job_info
+
+    async def test_a_restore_mid_check_ends_the_process_after_the_verdict_reaches_the_job(self) -> None:
+        """The end waits across ticks, the verdict is applied to the job, and only then is the process ended."""
+        pm = make_testable_process_manager()
+        job_info = await self._restore_with_a_check_in_flight(pm)
+        job_id = job_info.sdk_api_job_info.id_
+        assert job_id is not None
+        safety_proc = pm._process_map[_SAFETY_PROCESS_ID]
+        lifecycle = pm._process_lifecycle
+
+        lifecycle._replace_all_safety_process()
+        lifecycle._replace_all_safety_process()
+
+        assert _sent_end_request(safety_proc) is False
+        assert safety_proc.end_intended is False
+        assert safety_proc.last_process_state == HordeProcessState.EVALUATING_SAFETY
+
+        await _deliver_safety_verdict(pm, job_id, 0, [_clean_evaluation()])
+
+        assert job_info.safety_evaluated is True
+        assert pm._job_tracker.get_stage(job_id) == JobStage.PENDING_SUBMIT
+
+        lifecycle._replace_all_safety_process()
+
+        assert _sent_end_request(safety_proc) is True
+        assert safety_proc.end_intended is True
+        assert safety_proc.last_process_state == HordeProcessState.PROCESS_ENDING
+
+    async def test_a_restore_with_no_check_in_flight_ends_the_process_at_once(self) -> None:
+        """An idle process is ended on the replacement's first tick."""
+        pm = make_testable_process_manager()
+        _add_idle_safety_process(pm, _SAFETY_PROCESS_ID)
+        _pause_safety_off_gpu_for_whole_card(pm)
+        safety_proc = pm._process_map[_SAFETY_PROCESS_ID]
+
+        assert pm._process_lifecycle.restore_safety_on_gpu(owner=PauseOwner.WHOLE_CARD) is True
+        pm._process_lifecycle._replace_all_safety_process()
+
+        assert _sent_end_request(safety_proc) is True
+        assert safety_proc.last_process_state == HordeProcessState.PROCESS_ENDING
+
+    async def test_a_check_that_never_returns_is_ended_at_the_unresponsive_timeout(self) -> None:
+        """A check older than ``process_timeout`` no longer holds the end request."""
+        pm = make_testable_process_manager()
+        job_info = await self._restore_with_a_check_in_flight(pm)
+        job_id = job_info.sdk_api_job_info.id_
+        safety_proc = pm._process_map[_SAFETY_PROCESS_ID]
+        lifecycle = pm._process_lifecycle
+
+        lifecycle._replace_all_safety_process()
+        assert _sent_end_request(safety_proc) is False
+
+        (tracked,) = [tracked for tracked in pm._job_tracker.tracked_jobs() if tracked.job_id == job_id]
+        tracked.current_stage_since = time.time() - (pm.bridge_data.process_timeout + 1.0)
+        lifecycle._replace_all_safety_process()
+
+        assert _sent_end_request(safety_proc) is True
+        assert safety_proc.last_process_state == HordeProcessState.PROCESS_ENDING
+
+    async def test_a_dead_process_mid_check_is_not_waited_on(self) -> None:
+        """A process that exited cannot deliver its verdict, so the replacement proceeds on the next tick."""
+        pm = make_testable_process_manager()
+        await self._restore_with_a_check_in_flight(pm)
+        safety_proc = pm._process_map[_SAFETY_PROCESS_ID]
+        safety_proc.mp_process.is_alive.return_value = False
+
+        pm._process_lifecycle._replace_all_safety_process()
+
+        assert _sent_end_request(safety_proc) is True
+
+    async def test_a_new_check_is_not_sent_while_the_replacement_is_armed(self) -> None:
+        """An idle process about to be ended does not take a check, so a backlog cannot hold the move open."""
+        pm = make_testable_process_manager()
+        _add_idle_safety_process(pm, _SAFETY_PROCESS_ID)
+        _pause_safety_off_gpu_for_whole_card(pm)
+        safety_proc = pm._process_map[_SAFETY_PROCESS_ID]
+        job_info = _safety_job_info()
+        await queue_job_for_safety_async(pm._job_tracker, job_info)
+        assert pm._process_lifecycle.restore_safety_on_gpu(owner=PauseOwner.WHOLE_CARD) is True
+
+        await pm.start_evaluate_safety()
+
+        safety_proc.pipe_connection.send.assert_not_called()
+        assert job_info in pm._job_tracker.jobs_pending_safety_check
+
+    async def test_a_job_checked_across_a_restore_is_never_requeued_by_the_orphan_sweep(self) -> None:
+        """Across the whole move, the job keeps the one check and the sweep does not requeue it."""
+        pm = make_testable_process_manager()
+        job_info = await self._restore_with_a_check_in_flight(pm)
+        job_id = job_info.sdk_api_job_info.id_
+        assert job_id is not None
+        safety_proc = pm._process_map[_SAFETY_PROCESS_ID]
+        lifecycle = pm._process_lifecycle
+        coordinator = pm._recovery_coordinator
+
+        verdict_tick = 3
+        for tick in range(6):
+            # The child finishes the check on the verdict tick unless it was sent END_PROCESS first. A child that
+            # reads END_PROCESS exits, and the check it was running does not report.
+            if tick == verdict_tick and not _sent_end_request(safety_proc):
+                await _deliver_safety_verdict(pm, job_id, 0, [_clean_evaluation()])
+            if _sent_end_request(safety_proc):
+                safety_proc.mp_process.is_alive.return_value = False
+            lifecycle._replace_all_safety_process()
+            await coordinator.reconcile_orphaned_safety_jobs()
+
+        # However long the move took, a job still awaiting a verdict would now be past the sweep's grace.
+        if job_id in coordinator.orphan_safety_since:
+            coordinator.orphan_safety_since[job_id] = time.time() - (coordinator.ORPHAN_SAFETY_GRACE_SECONDS + 1.0)
+        await coordinator.reconcile_orphaned_safety_jobs()
+
+        assert _SAFETY_PROCESS_ID not in pm._process_map
+        lifecycle.start_safety_processes.assert_called_once()
+        assert pm._job_tracker.get_stage(job_id) == JobStage.PENDING_SUBMIT
+        assert job_info.safety_evaluated is True
+        assert coordinator.safety_requeue_count == {}
+
+    @staticmethod
+    def _queue_clip_form(pm: object) -> None:
+        """Queue one CLIP form, which routes to the safety process."""
+        pm._alchemy_coordinator._pending_forms.append(  # type: ignore[attr-defined]
+            AlchemyFormSpec(form_id=_CLIP_FORM_ID, form="caption", source_image_bytes=b"img"),
+        )
+
+    def _restore_with_a_clip_form_in_flight(self, pm: object) -> None:
+        """Dispatch a CLIP form to an idle CPU safety process, then request the restore to the GPU."""
+        _add_idle_safety_process(pm, _SAFETY_PROCESS_ID)
+        _pause_safety_off_gpu_for_whole_card(pm)
+        self._queue_clip_form(pm)
+        pm._alchemy_coordinator.dispatch_pending_forms()  # type: ignore[attr-defined]
+        assert _CLIP_FORM_ID in pm._alchemy_coordinator._in_flight  # type: ignore[attr-defined]
+        assert pm._process_lifecycle.restore_safety_on_gpu(owner=PauseOwner.WHOLE_CARD) is True  # type: ignore[attr-defined]
+
+    async def test_a_restore_mid_clip_form_ends_the_process_after_the_form_result(self) -> None:
+        """A CLIP form on the safety process holds the end request until its result reaches the coordinator."""
+        pm = make_testable_process_manager()
+        self._restore_with_a_clip_form_in_flight(pm)
+        safety_proc = pm._process_map[_SAFETY_PROCESS_ID]
+        lifecycle = pm._process_lifecycle
+        alchemy = pm._alchemy_coordinator
+
+        lifecycle._replace_all_safety_process()
+        lifecycle._replace_all_safety_process()
+
+        assert _sent_end_request(safety_proc) is False
+        assert safety_proc.end_intended is False
+
+        alchemy.on_alchemy_result(
+            HordeAlchemyResultMessage(
+                process_id=_SAFETY_PROCESS_ID,
+                process_launch_identifier=safety_proc.process_launch_identifier,
+                info="caption done",
+                form_id=_CLIP_FORM_ID,
+                form="caption",
+                state=GENERATION_STATE.ok,
+                result_payload={"caption": "a cat"},
+            ),
+        )
+
+        assert alchemy._in_flight == {}
+        assert [submit.form_id for submit in alchemy._pending_submits] == [_CLIP_FORM_ID]
+
+        lifecycle._replace_all_safety_process()
+
+        assert _sent_end_request(safety_proc) is True
+        assert safety_proc.last_process_state == HordeProcessState.PROCESS_ENDING
+
+    async def test_a_clip_form_past_the_unresponsive_timeout_does_not_hold_the_end(self) -> None:
+        """A form dispatched longer ago than ``process_timeout`` no longer holds the end request."""
+        pm = make_testable_process_manager()
+        self._restore_with_a_clip_form_in_flight(pm)
+        safety_proc = pm._process_map[_SAFETY_PROCESS_ID]
+        lifecycle = pm._process_lifecycle
+
+        lifecycle._replace_all_safety_process()
+        assert _sent_end_request(safety_proc) is False
+
+        pm._alchemy_coordinator._in_flight_dispatched_at[_CLIP_FORM_ID] = time.monotonic() - (
+            pm.bridge_data.process_timeout + 1.0
+        )
+        lifecycle._replace_all_safety_process()
+
+        assert _sent_end_request(safety_proc) is True
+        assert safety_proc.last_process_state == HordeProcessState.PROCESS_ENDING
+
+    async def test_a_clip_form_is_not_sent_while_the_replacement_is_armed(self) -> None:
+        """An idle process about to be ended does not take a CLIP form, so a stream of forms cannot hold the move."""
+        pm = make_testable_process_manager()
+        _add_idle_safety_process(pm, _SAFETY_PROCESS_ID)
+        _pause_safety_off_gpu_for_whole_card(pm)
+        safety_proc = pm._process_map[_SAFETY_PROCESS_ID]
+        assert pm._process_lifecycle.restore_safety_on_gpu(owner=PauseOwner.WHOLE_CARD) is True
+        assert pm._process_lifecycle.safety_replacement_armed is True
+        self._queue_clip_form(pm)
+
+        pm._alchemy_coordinator.dispatch_pending_forms()
+
+        safety_proc.pipe_connection.send.assert_not_called()
+        assert pm._alchemy_coordinator._in_flight == {}
+        assert [spec.form_id for spec in pm._alchemy_coordinator._pending_forms] == [_CLIP_FORM_ID]

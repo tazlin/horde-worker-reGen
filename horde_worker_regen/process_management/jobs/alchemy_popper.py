@@ -87,7 +87,7 @@ from horde_worker_regen.process_management.ipc.messages import (
 from horde_worker_regen.process_management.ipc.supervisor_channel import WorkerEventKind
 from horde_worker_regen.process_management.jobs.job_models import PendingAlchemySubmitJob
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
-from horde_worker_regen.process_management.lifecycle.horde_process import WorkerCapability
+from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType, WorkerCapability
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.model_availability import (
     UNKNOWN_POST_PROCESSOR_PRESENCE,
@@ -437,6 +437,8 @@ class AlchemyCoordinator:
     """Class-level default so a coordinator built without its constructor offers no annotation types."""
     _utilities_lane_outlook_provider: Callable[[], UtilitiesLaneOutlook] | None = None
     """Class-level default so a coordinator built without its constructor offers and waits for a loaded lane only."""
+    _safety_replacement_armed_provider: Callable[[], bool] | None = None
+    """Class-level default so a coordinator built without its constructor does not hold a CLIP form back."""
     _model_availability: ModelAvailability | None = None
     """Class-level default so a coordinator built without its constructor withholds nothing for presence."""
     _withheld_post_processors: frozenset[str] = frozenset()
@@ -462,6 +464,12 @@ class AlchemyCoordinator:
     A result arrives only from the exact launch the form was sent to, so this lets the reaper tell a
     form whose owning process has died (its result will never come) from one that is merely still running.
     """
+    _in_flight_dispatched_at: dict[str, float]
+    """form_id -> the monotonic instant the form was sent to its process.
+
+    A placement move ends the safety process only after the CLIP form it is running returns, and the wait is
+    bounded by ``process_timeout`` from this instant (:meth:`in_flight_form_ages`). The pop instant would charge
+    the form's time in the queue against that bound."""
     _pending_submits: deque[PendingAlchemySubmitJob]
     _form_time_popped: dict[str, float]
     _abandoned_form_ids: frozenset[str] = frozenset()
@@ -500,6 +508,7 @@ class AlchemyCoordinator:
         annotation_types_provider: Callable[[], frozenset[str] | None] | None = None,
         model_availability: ModelAvailability | None = None,
         utilities_lane_outlook_provider: Callable[[], UtilitiesLaneOutlook] | None = None,
+        safety_replacement_armed_provider: Callable[[], bool] | None = None,
     ) -> None:
         """Initialize with the shared main-process collaborators.
 
@@ -524,6 +533,9 @@ class AlchemyCoordinator:
                 so a form whose model is missing is not offered. ``None`` (unit tests) withholds nothing.
             utilities_lane_outlook_provider: Return whether a lane-bound form may wait for the image-utilities
                 lane. ``None`` (unit tests) offers and waits for a loaded lane only.
+            safety_replacement_armed_provider: Return whether a safety replacement is armed
+                (:attr:`ProcessLifecycleManager.safety_replacement_armed`). While it is, CLIP forms are not sent to
+                a safety process. With ``None`` (unit tests) forms are not held back.
         """
         self._state = state
         self._process_map = process_map
@@ -537,6 +549,7 @@ class AlchemyCoordinator:
         self._annotation_types_provider = annotation_types_provider
         self._model_availability = model_availability
         self._utilities_lane_outlook_provider = utilities_lane_outlook_provider
+        self._safety_replacement_armed_provider = safety_replacement_armed_provider
         self._withheld_post_processors = frozenset()
         self.num_canned_forms_completed = 0
         self.num_canned_forms_faulted = 0
@@ -552,6 +565,7 @@ class AlchemyCoordinator:
         self._in_flight = {}
         self._in_flight_card = {}
         self._in_flight_owner = {}
+        self._in_flight_dispatched_at = {}
         self._pending_submits = deque()
         self._form_time_popped = {}
         self._form_resolution: dict[str, tuple[int, int] | None] = {}
@@ -767,6 +781,7 @@ class AlchemyCoordinator:
         self._in_flight.clear()
         self._in_flight_card.clear()
         self._in_flight_owner.clear()
+        self._in_flight_dispatched_at.clear()
         return len(pending_ids) + len(submit_ids) + len(in_flight_ids)
 
     @property
@@ -1342,6 +1357,8 @@ class AlchemyCoordinator:
             process_info = self._admissible_process(capability)
             if process_info is None:
                 process_info = self._process_map.get_first_available(capability)
+            if process_info is not None and self._safety_process_held(process_info):
+                process_info = None
 
             if process_info is not None and process_info.safe_send_message(
                 HordeAlchemyControlMessage(
@@ -1356,6 +1373,7 @@ class AlchemyCoordinator:
                     process_info.process_id,
                     process_info.process_launch_identifier,
                 )
+                self._in_flight_dispatched_at[spec.form_id] = time.monotonic()
                 self._pending_form_deadlines.pop(spec.form_id, None)
                 if capability is WorkerCapability.IMAGE_UTILITIES:
                     process_info.note_utilities_work_sent()
@@ -1473,6 +1491,7 @@ class AlchemyCoordinator:
             spec = self._in_flight.pop(form_id, None)
             self._in_flight_card.pop(form_id, None)
             self._in_flight_owner.pop(form_id, None)
+            self._in_flight_dispatched_at.pop(form_id, None)
             self._form_time_popped.pop(form_id, None)
             self.num_forms_faulted += 1
             form_name = spec.form if spec is not None else "unknown"
@@ -1480,6 +1499,29 @@ class AlchemyCoordinator:
                 f"Alchemy form {form_id} ({form_name}) lost: the process it was dispatched to is gone "
                 "before a result arrived; dropping it so its resource reserve is released.",
             )
+
+    def in_flight_form_ages(self, process_id: int, process_launch_identifier: int) -> dict[str, float]:
+        """Return the forms running on this process launch, each with the seconds since it was dispatched.
+
+        The process lifecycle reads this before it ends a safety process for a placement move. A CLIP form runs on
+        the safety process, and an end request discards it, so the end waits for the form's result.
+        """
+        now = time.monotonic()
+        return {
+            form_id: max(0.0, now - self._in_flight_dispatched_at.get(form_id, now))
+            for form_id, owner in self._in_flight_owner.items()
+            if owner == (process_id, process_launch_identifier)
+        }
+
+    def _safety_process_held(self, process_info: HordeProcessInfo) -> bool:
+        """Return whether a form must not be sent to this process because a safety replacement is armed.
+
+        The replacement ends the process once its work returns, so a form sent now would hold the end for one more
+        form, and a stream of forms would hold it indefinitely. The safety orchestrator holds checks the same way.
+        """
+        if self._safety_replacement_armed_provider is None:
+            return False
+        return process_info.process_type is HordeProcessType.SAFETY and self._safety_replacement_armed_provider()
 
     def _sync_reserve_ledger(self) -> None:
         """Publish each in-flight alchemy form's predicted VRAM/RAM cost into the shared ledger.
@@ -1526,6 +1568,7 @@ class AlchemyCoordinator:
         spec = self._in_flight.pop(message.form_id, None)
         device_index = self._in_flight_card.pop(message.form_id, None)
         self._in_flight_owner.pop(message.form_id, None)
+        self._in_flight_dispatched_at.pop(message.form_id, None)
         if spec is None:
             logger.warning(f"Received alchemy result for unknown form {message.form_id} ({message.form})")
 

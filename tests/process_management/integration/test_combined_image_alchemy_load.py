@@ -125,6 +125,7 @@ def _make_coordinator(
     coordinator._in_flight = {f"form-{i}": None for i in range(in_flight)}  # type: ignore[misc]
     coordinator._in_flight_card = {}
     coordinator._in_flight_owner = {}
+    coordinator._in_flight_dispatched_at = {}
     coordinator._pending_submits = deque()
     coordinator._form_time_popped = {}
     coordinator._estimator = AlchemyHeadroomEstimator()
