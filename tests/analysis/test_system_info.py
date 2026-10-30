@@ -36,6 +36,36 @@ class TestSystemInfo:
         assert info["disk"]["cache_home"]["total_bytes"] > 0
 
 
+class TestNvidiaSmiSummary:
+    """The driver block of the system report, read from a stubbed nvidia-smi."""
+
+    @pytest.mark.parametrize(
+        ("header", "expected"),
+        [
+            ("| NVIDIA-SMI 610.88  KMD Version: 610.88  CUDA UMD Version: 13.3 |", "13.3"),
+            ("| NVIDIA-SMI 560.94   Driver Version: 560.94   CUDA Version: 12.6 |", "12.6"),
+            ("NVIDIA-SMI has failed because it couldn't communicate with the NVIDIA driver.", None),
+        ],
+    )
+    def test_reads_the_driver_cuda_ceiling(
+        self, monkeypatch: pytest.MonkeyPatch, header: str, expected: str | None
+    ) -> None:
+        """The CUDA ceiling is read from either header spelling, and is None when the header lacks it."""
+
+        def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            stdout = header if len(command) == 1 else "NVIDIA GeForce RTX 4090, 8.9, 610.88\n"
+            return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+
+        monkeypatch.setattr(system_info.shutil, "which", lambda name: "nvidia-smi")
+        monkeypatch.setattr(system_info.subprocess, "run", fake_run)
+        summary = system_info.nvidia_smi_summary()
+        assert summary is not None
+        assert summary["driver_max_cuda_version"] == expected
+        assert summary["gpus"] == [
+            {"name": "NVIDIA GeForce RTX 4090", "compute_cap": "8.9", "driver_version": "610.88"}
+        ]
+
+
 @pytest.fixture
 def fake_sysfs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Point the probe at a sysfs tree under tmp_path, with device entries named ``major_minor``.

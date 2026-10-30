@@ -14,12 +14,23 @@ from worker_bootstrap import detect
         ("CUDA Version: 13.0", (13, 0)),
         ("CUDA Version: 13.2", (13, 2)),
         ("CUDA Version:13.2", (13, 2)),
+        # Drivers that renamed the header field to "CUDA UMD Version" and added "KMD Version".
+        ("| NVIDIA-SMI 610.88  KMD Version: 610.88  CUDA UMD Version: 13.3 |", (13, 3)),
+        (
+            "| NVIDIA-SMI 610.88                 KMD Version: 610.88        CUDA UMD Version: 13.3     |",
+            (13, 3),
+        ),
+        # The `nvidia-smi -q` spellings of both fields.
+        ("    CUDA Version                          : 13.3 [Deprecated; will be removed in CUDA 14.0.", (13, 3)),
+        ("    CUDA UMD Version                      : 13.3", (13, 3)),
+        ("KMD Version: 610.88", (0, 0)),
+        ("CUDA Version: unknown", (0, 0)),
         ("no cuda header here", (0, 0)),
         ("", (0, 0)),
     ],
 )
 def test_parse_cuda_version(smi_output: str, expected: tuple[int, int]) -> None:
-    """The (major, minor) CUDA version is parsed from the nvidia-smi header ((0, 0) when absent)."""
+    """The (major, minor) CUDA ceiling is parsed from either header spelling ((0, 0) when absent)."""
     assert detect.parse_cuda_version(smi_output) == expected
 
 
@@ -44,19 +55,27 @@ def test_cuda_build(version: tuple[int, int], expected: str) -> None:
 @pytest.mark.parametrize(
     ("smi_output", "expected"),
     [
-        ("8.6", (8, 6)),
-        ("12.0\n", (12, 0)),
-        ("8.9\n12.0\n", (12, 0)),  # mixed GPUs -> highest wins
-        ("compute_cap\n7.5", (7, 5)),
-        ("", (0, 0)),
-        ("no caps here", (0, 0)),
-        ("Failed to initialize NVML: Driver/library version mismatch\nNVML library version: 580.178\n", (0, 0)),
-        ("8.6\r\n", (8, 6)),
+        ("8.6", ((8, 6),)),
+        ("12.0\n", ((12, 0),)),
+        ("8.9\n12.0\n", ((8, 9), (12, 0))),  # every card, in nvidia-smi's order
+        ("12.0\n6.1\n", ((12, 0), (6, 1))),
+        ("8.9, 610.88\n12.0, 610.88\n", ((8, 9), (12, 0))),  # the driver version as a second field
+        ("compute_cap\n7.5", ((7, 5),)),
+        ("", ()),
+        ("no caps here", ()),
+        ("Failed to initialize NVML: Driver/library version mismatch\nNVML library version: 580.178\n", ()),
+        ("8.6\r\n", ((8, 6),)),
     ],
 )
-def test_parse_compute_cap(smi_output: str, expected: tuple[int, int]) -> None:
-    """parse_compute_cap returns the highest compute capability in the query output ((0, 0) when absent)."""
+def test_parse_compute_cap(smi_output: str, expected: tuple[tuple[int, int], ...]) -> None:
+    """parse_compute_cap returns every whole-line compute capability in the query output."""
     assert detect.parse_compute_cap(smi_output) == expected
+
+
+def test_parse_gpu_query_reads_driver_version() -> None:
+    """The driver version comes from the second CSV field, and is None for a capability-only reading."""
+    assert detect.parse_gpu_query("8.9, 610.88\n") == detect.GpuQuery(((8, 9),), "610.88")
+    assert detect.parse_gpu_query("8.9\n") == detect.GpuQuery(((8, 9),), None)
 
 
 @pytest.mark.parametrize(
@@ -89,7 +108,127 @@ def test_cuda_build_architecture_window(
     expected: str,
 ) -> None:
     """The driver-based build is clamped into the GPU's valid arch window (cu126 floor and ceiling)."""
-    assert detect._cuda_build(version, compute_cap) == expected
+    assert detect._cuda_build(version, (compute_cap,)) == expected
+
+
+def _gpus(*capabilities: tuple[int, int], driver_version: str | None = "610.88") -> detect.GpuQuery:
+    """A live GPU reading of the given cards."""
+    return detect.GpuQuery(capabilities=capabilities, driver_version=driver_version)
+
+
+@pytest.mark.parametrize(
+    ("driver", "capabilities", "policy", "expected"),
+    [
+        # The all policy takes the intersection of the cards' windows.
+        ((13, 3), ((6, 1), (7, 5)), detect.MixedCardPolicy.ALL, detect.CU126),
+        ((12, 8), ((8, 9), (12, 0)), detect.MixedCardPolicy.ALL, detect.CU130),
+        # A single build cannot run a pre-Turing card beside a Blackwell one, so all falls back to the highest card.
+        ((13, 3), ((6, 1), (12, 0)), detect.MixedCardPolicy.ALL, detect.CU132),
+        ((13, 3), ((6, 1), (12, 0)), detect.MixedCardPolicy.HIGHEST, detect.CU132),
+        ((13, 3), ((6, 1), (12, 0)), detect.MixedCardPolicy.LOWEST, detect.CU126),
+        ((13, 3), ((6, 1), (7, 5)), detect.MixedCardPolicy.HIGHEST, detect.CU132),
+        ((12, 8), ((8, 9), (12, 0)), detect.MixedCardPolicy.LOWEST, detect.CU126),
+        # None is the non-interactive default, all.
+        ((13, 3), ((7, 5), (6, 1)), None, detect.CU126),
+        ((13, 3), ((6, 1), (12, 0)), None, detect.CU132),
+    ],
+)
+def test_cuda_build_mixed_card_policy(
+    driver: tuple[int, int],
+    capabilities: tuple[tuple[int, int], ...],
+    policy: detect.MixedCardPolicy | None,
+    expected: str,
+) -> None:
+    """The policy sets which cards the build must carry kernels for."""
+    assert detect._cuda_build(driver, capabilities, policy) == expected
+
+
+def _nvidia_detection(
+    monkeypatch: pytest.MonkeyPatch,
+    driver: tuple[int, int],
+    gpus: detect.GpuQuery,
+) -> None:
+    """Stub the NVIDIA probes with one driver ceiling and one GPU reading."""
+    monkeypatch.setattr(detect, "_nvidia_present", lambda: True)
+    monkeypatch.setattr(detect, "_nvidia_smi_path", lambda: "nvidia-smi")
+    monkeypatch.setattr(detect, "_nvidia_cuda_version", lambda: driver)
+    monkeypatch.setattr(detect, "_nvidia_gpu_query", lambda: gpus)
+
+
+def test_detection_records_every_card_and_the_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A pre-Turing card beside a Blackwell one records both cards, the policy and the card left without kernels."""
+    _nvidia_detection(monkeypatch, (13, 3), _gpus((6, 1), (12, 0)))
+    decision = detect.describe_backend_selection()
+    assert decision.final_token == detect.CU132
+    assert decision.mixed_card_policy is detect.MixedCardPolicy.HIGHEST
+    assert decision.to_dict()["compute_capabilities"] == ["6.1", "12.0"]
+    assert decision.to_dict()["mixed_card_policy"] == "highest"
+    assert "a single build cannot run every card" in decision.reason
+    assert "6.1" in decision.reason
+
+
+@pytest.mark.parametrize(
+    "capabilities",
+    [((8, 6),), ((8, 6), (8, 6)), ((8, 6), (8, 9))],
+)
+def test_uniform_box_does_not_record_a_policy(monkeypatch: pytest.MonkeyPatch, capabilities: tuple) -> None:
+    """A policy is not recorded when every policy gives the cards the same build."""
+    _nvidia_detection(monkeypatch, (13, 3), _gpus(*capabilities))
+    decision = detect.describe_backend_selection()
+    assert decision.final_token == detect.CU132
+    assert decision.mixed_card_policy is None
+
+
+def test_apply_mixed_card_policy_does_not_probe_again(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A chosen policy is applied to the recorded inputs without a second nvidia-smi run."""
+    _nvidia_detection(monkeypatch, (13, 3), _gpus((6, 1), (12, 0)))
+    decision = detect.describe_backend_selection()
+
+    def _boom() -> detect.GpuQuery:
+        raise AssertionError("probed nvidia-smi again")
+
+    monkeypatch.setattr(detect, "_nvidia_gpu_query", _boom)
+    lowest = detect.apply_mixed_card_policy(decision, detect.MixedCardPolicy.LOWEST)
+    assert lowest.final_token == detect.CU126
+    assert lowest.mixed_card_policy is detect.MixedCardPolicy.LOWEST
+
+
+def test_cards_disagree_only_when_the_policies_pick_different_builds() -> None:
+    """A Blackwell card beside an Ada card disagrees only when the driver ceiling allows cu126 alone."""
+    assert detect.cards_disagree((12, 8), ((8, 9), (12, 0)))
+    assert not detect.cards_disagree((13, 3), ((8, 9), (12, 0)))
+    assert detect.cards_disagree((13, 3), ((6, 1), (7, 5)))
+    assert not detect.cards_disagree((13, 3), ((8, 6),))
+
+
+def _live(driver: tuple[int, int], *capabilities: tuple[int, int]) -> detect.BackendDecision:
+    """A live NVIDIA detection under the default policy."""
+    return detect._nvidia_decision(smi_path="nvidia-smi", driver=driver, capabilities=capabilities, policy=None)
+
+
+@pytest.mark.parametrize(
+    ("persisted", "live", "expected"),
+    [
+        (detect.CU126, _live((13, 3), (8, 9)), detect.CU132),  # the driver ceiling now allows cu132
+        (detect.CU126, _live((13, 0), (8, 9)), detect.CU130),
+        (detect.CU130, _live((12, 8), (8, 9)), detect.CU126),  # the driver no longer supports cu130
+        (detect.CU130, _live((0, 0), (8, 9)), detect.CU130),  # an unreadable ceiling does not move a token
+        (detect.CU130, _live((0, 0)), detect.CU130),
+        (detect.CU130, _live((12, 8), (12, 0)), detect.CU130),  # the arch floor still applies
+        (detect.CU132, _live((13, 3), (6, 1)), detect.CU126),  # and the arch ceiling
+        (detect.CPU, _live((13, 3), (8, 9)), detect.CPU),  # a non-CUDA token is not re-picked
+        (detect.CU126, detect.BackendDecision(stage="detect", final_token=detect.CPU, reason="no GPU"), detect.CU126),
+    ],
+)
+def test_repick_detected_build(persisted: str, live: detect.BackendDecision, expected: str) -> None:
+    """A detection-derived CUDA token follows the live pick unless the driver ceiling is unreadable."""
+    assert detect.repick_detected_build(persisted, live) == expected
+
+
+def test_explain_repick_reports_the_direction() -> None:
+    """The re-pick explanation states whether the ceiling allows a newer build or no longer supports the old one."""
+    assert "now allows cu132" in detect.explain_repick(detect.CU126, _live((13, 3), (8, 9)))
+    assert "no longer supports cu130" in detect.explain_repick(detect.CU130, _live((12, 8), (8, 9)))
 
 
 @pytest.mark.parametrize(
@@ -118,31 +257,43 @@ def test_reconcile_backend_for_gpu(
     expected: str,
 ) -> None:
     """A resolved CUDA token is re-clamped to the live GPU's arch window so an unrunnable build self-heals."""
-    monkeypatch.setattr(detect, "_nvidia_compute_cap", lambda: compute_cap)
+    monkeypatch.setattr(detect, "_nvidia_gpu_query", lambda: _gpus(compute_cap))
     assert detect.reconcile_backend_for_gpu(token) == expected
+
+
+@pytest.mark.parametrize(
+    ("token", "policy", "expected"),
+    [
+        (detect.CU132, None, detect.CU126),  # the all policy keeps cu126 for the Pascal card
+        (detect.CU132, detect.MixedCardPolicy.HIGHEST, detect.CU132),
+        (detect.CU126, detect.MixedCardPolicy.HIGHEST, detect.CU126),
+        (detect.CU132, detect.MixedCardPolicy.LOWEST, detect.CU126),
+    ],
+)
+def test_reconcile_applies_the_mixed_card_policy(
+    token: str,
+    policy: detect.MixedCardPolicy | None,
+    expected: str,
+) -> None:
+    """The reconcile clamps against the cards the policy covers, so it does not undo the policy's pick."""
+    assert detect.reconcile_backend_for_gpu(token, policy=policy, gpus=_gpus((6, 1), (7, 5))) == expected
 
 
 def test_describe_backend_selection_records_the_arch_floor(monkeypatch: pytest.MonkeyPatch) -> None:
     """A Blackwell card on an old driver yields a decision that names the ceiling, the clamp, and the reason."""
-    monkeypatch.setattr(detect, "_nvidia_present", lambda: True)
-    monkeypatch.setattr(detect, "_nvidia_smi_path", lambda: "/usr/bin/nvidia-smi")
-    monkeypatch.setattr(detect, "_nvidia_cuda_version", lambda: (12, 8))
-    monkeypatch.setattr(detect, "_nvidia_compute_cap", lambda: (12, 0))
+    _nvidia_detection(monkeypatch, (12, 8), _gpus((12, 0)))
     decision = detect.describe_backend_selection()
     assert decision.stage == "detect"
     assert decision.final_token == detect.CU130
     assert decision.driver_ceiling_build == detect.CU126  # driver ceiling before the arch clamp
     assert decision.clamp_action == detect.CLAMP_FLOORED
     assert decision.to_dict()["driver_cuda_version"] == "12.8"
-    assert decision.to_dict()["compute_capability"] == "12.0"
+    assert decision.to_dict()["compute_capabilities"] == ["12.0"]
 
 
 def test_describe_backend_selection_reports_unreadable_cap(monkeypatch: pytest.MonkeyPatch) -> None:
     """An unreadable compute capability keeps the driver-only pick and records the skipped clamp."""
-    monkeypatch.setattr(detect, "_nvidia_present", lambda: True)
-    monkeypatch.setattr(detect, "_nvidia_smi_path", lambda: None)
-    monkeypatch.setattr(detect, "_nvidia_cuda_version", lambda: (13, 2))
-    monkeypatch.setattr(detect, "_nvidia_compute_cap", lambda: (0, 0))
+    _nvidia_detection(monkeypatch, (13, 2), _gpus())
     decision = detect.describe_backend_selection()
     assert decision.final_token == detect.CU132
     assert decision.clamp_action == detect.CLAMP_SKIPPED
@@ -176,7 +327,7 @@ def test_describe_reconcile_records_clamp_action(
     expected_action: str,
 ) -> None:
     """A reconcile decision records the input token, the resolved token, and what the clamp did."""
-    monkeypatch.setattr(detect, "_nvidia_compute_cap", lambda: compute_cap)
+    monkeypatch.setattr(detect, "_nvidia_gpu_query", lambda: _gpus(compute_cap))
     decision = detect.describe_reconcile(token)
     assert decision.stage == "reconcile"
     assert decision.input_token == token
@@ -191,10 +342,10 @@ def test_reconcile_backend_leaves_non_cuda_tokens_untouched(
 ) -> None:
     """Non-CUDA tokens pass through unchanged and never trigger an nvidia-smi probe."""
 
-    def _boom() -> tuple[int, int]:
+    def _boom() -> detect.GpuQuery:
         raise AssertionError("probed nvidia-smi for a non-CUDA token")
 
-    monkeypatch.setattr(detect, "_nvidia_compute_cap", _boom)
+    monkeypatch.setattr(detect, "_nvidia_gpu_query", _boom)
     assert detect.reconcile_backend_for_gpu(token) == token
 
 
@@ -224,7 +375,7 @@ def test_detect_backend(
     """detect_backend maps hardware presence + CUDA version + GPU arch onto the right build token."""
     monkeypatch.setattr(detect, "_nvidia_present", lambda: nvidia)
     monkeypatch.setattr(detect, "_nvidia_cuda_version", lambda: cuda_version)
-    monkeypatch.setattr(detect, "_nvidia_compute_cap", lambda: compute_cap)
+    monkeypatch.setattr(detect, "_nvidia_gpu_query", lambda: _gpus(compute_cap))
     monkeypatch.setattr(detect, "_amd_present", lambda: amd)
     monkeypatch.setattr(detect, "_rocm_runtime_present", lambda: rocm)
     monkeypatch.setattr(detect, "_windows_amd_rocm_backend", lambda: None)

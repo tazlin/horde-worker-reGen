@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from worker_bootstrap import backend
+from worker_bootstrap import backend, detect
 
 
 @pytest.mark.parametrize(
@@ -90,19 +90,91 @@ def test_offer_cpu_no_prompt_when_already_cpu() -> None:
     assert token == "cpu"
 
 
-def test_resolve_precedence() -> None:
-    """CLI flag > env > file > detection > default, with the cu128 remap applied to the winner."""
-    assert backend.resolve_backend(cli_flag="cu130", env_value="cpu", file_value="cu126") == "cu130"
-    assert backend.resolve_backend(env_value="cpu", file_value="cu126", detected="cu130") == "cpu"
-    assert backend.resolve_backend(file_value="cu126", detected="cu130") == "cu126"
-    assert backend.resolve_backend(detected="cu130") == "cu130"
-    assert backend.resolve_backend() == "cu126"
-    assert backend.resolve_backend(file_value="cu128") == "cu126"  # stale persisted token is remapped
+_SOURCE = backend.BackendSource
+
+
+@pytest.mark.parametrize(
+    ("sources", "expected"),
+    [
+        (
+            {"cli_flag": "cu130", "env_value": "cpu", "file_value": "cu126", "detected": "cu132"},
+            backend.ResolvedBackend("cu130", _SOURCE.CLI),
+        ),
+        (
+            {"env_value": "cpu", "file_value": "cu126", "detected": "cu130"},
+            backend.ResolvedBackend("cpu", _SOURCE.ENV),
+        ),
+        ({"file_value": "cu126", "detected": "cu130"}, backend.ResolvedBackend("cu126", _SOURCE.FILE)),
+        ({"detected": "cu130"}, backend.ResolvedBackend("cu130", _SOURCE.DETECTED)),
+        ({}, backend.ResolvedBackend("cu126", _SOURCE.DEFAULT)),
+        # A stale persisted token is remapped and still reported as the file's.
+        ({"file_value": "cu128"}, backend.ResolvedBackend("cu126", _SOURCE.FILE)),
+    ],
+)
+def test_resolve_precedence(sources: dict[str, str], expected: backend.ResolvedBackend) -> None:
+    """The precedence is CLI flag > env > file > detection > default, and the winner is reported with the source."""
+    assert backend.resolve_backend(**sources) == expected
 
 
 def test_resolve_skips_blank_sources() -> None:
     """Empty/whitespace sources are ignored so a blank env var does not win over a real file value."""
-    assert backend.resolve_backend(cli_flag="", env_value="   ", file_value="cu130") == "cu130"
+    assert backend.resolve_backend(cli_flag="", env_value="   ", file_value="cu130") == backend.ResolvedBackend(
+        "cu130", _SOURCE.FILE
+    )
+
+
+@pytest.mark.parametrize(
+    ("token", "record", "expected"),
+    [
+        # A record for the token sets the token's provenance.
+        ("cu126", backend.InstallRecord("cu126", _SOURCE.DETECTED), _SOURCE.DETECTED),
+        ("cu126", backend.InstallRecord("cu126", _SOURCE.CLI), _SOURCE.CLI),
+        ("cpu", backend.InstallRecord("cpu", _SOURCE.INTERACTIVE), _SOURCE.INTERACTIVE),
+        # Without a record for the token, a CUDA token counts as detected and anything else as explicit.
+        ("cu126", None, _SOURCE.DETECTED),
+        ("cu132", backend.InstallRecord("cu126", _SOURCE.CLI), _SOURCE.DETECTED),
+        ("cpu", None, _SOURCE.FILE),
+        ("rocm", None, _SOURCE.FILE),
+    ],
+)
+def test_persisted_source(token: str, record: backend.InstallRecord | None, expected: backend.BackendSource) -> None:
+    """A persisted token's provenance comes from the matching record, else from the no-provenance rule."""
+    assert backend.persisted_source(token, record) == expected
+
+
+def test_install_record_roundtrip() -> None:
+    """An install record round-trips through the breadcrumb form, and a malformed entry parses as None."""
+    record = backend.InstallRecord("cu132", _SOURCE.DETECTED, replaced_token="cu126", reason="driver")
+    assert backend.InstallRecord.from_dict(record.to_dict()) == record
+    assert backend.InstallRecord.from_dict({"final_token": "cu132", "source": "guessed"}) is None
+    assert backend.InstallRecord.from_dict("cu132") is None
+
+
+@pytest.mark.parametrize(
+    ("answer", "expected"),
+    [
+        ("", detect.MixedCardPolicy.ALL),
+        ("a", detect.MixedCardPolicy.ALL),
+        ("h", detect.MixedCardPolicy.HIGHEST),
+        ("lowest", detect.MixedCardPolicy.LOWEST),
+        ("nonsense", detect.MixedCardPolicy.ALL),
+    ],
+)
+def test_choose_mixed_card_policy_interactively(answer: str, expected: detect.MixedCardPolicy) -> None:
+    """The alert lists each policy's build and the cards it leaves without kernels, then reads the choice."""
+    capabilities = ((6, 1), (12, 0))
+    emitted: list[str] = []
+    chosen = backend.choose_mixed_card_policy_interactively(
+        detect.mixed_card_builds((13, 3), capabilities),
+        capabilities,
+        prompt=lambda _: answer,
+        emit=emitted.append,
+    )
+    assert chosen is expected
+    text = "\n".join(emitted)
+    assert "6.1, 12.0" in text
+    assert "[L]owest card: installs cu126, no kernels for compute capability 12.0" in text
+    assert "[H]ighest card: installs cu132, no kernels for compute capability 6.1" in text
 
 
 def test_backend_file_roundtrip(tmp_path: Path) -> None:

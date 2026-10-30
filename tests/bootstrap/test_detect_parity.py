@@ -36,35 +36,48 @@ def _run_ps1_detector() -> str:
     return completed.stdout.strip()
 
 
+_UMD_HEADER = "| NVIDIA-SMI 610.88  KMD Version: 610.88  CUDA UMD Version: 13.3 |"
+
+
 @pytest.mark.parametrize(
-    ("cuda_header", "compute_cap", "expected"),
+    ("cuda_header", "compute_caps", "expected"),
     [
-        ("CUDA Version: 13.2", "8.6", "cu132"),
-        ("CUDA Version: 13.1", "8.6", "cu130"),
-        ("CUDA Version: 13.0", "8.6", "cu130"),
-        ("CUDA Version: 12.8", "8.6", "cu126"),
+        ("CUDA Version: 13.2", ["8.6"], "cu132"),
+        ("CUDA Version: 13.1", ["8.6"], "cu130"),
+        ("CUDA Version: 13.0", ["8.6"], "cu130"),
+        ("CUDA Version: 12.8", ["8.6"], "cu126"),
+        # Drivers that print "CUDA UMD Version" in place of "CUDA Version".
+        (_UMD_HEADER, ["8.9"], "cu132"),
         # Blackwell (sm_120) on a CUDA 12.x driver: the architecture floor lifts both detectors to cu130.
-        ("CUDA Version: 12.8", "12.0", "cu130"),
+        ("CUDA Version: 12.8", ["12.0"], "cu130"),
         # Pre-Turing (Pascal sm_61) on a CUDA 13.2 driver: the ceiling holds both detectors at cu126.
-        ("CUDA Version: 13.2", "6.1", "cu126"),
+        ("CUDA Version: 13.2", ["6.1"], "cu126"),
+        # Mixed cards take the non-interactive default, which is every card when one build covers them all ...
+        (_UMD_HEADER, ["6.1", "7.5"], "cu126"),
+        ("CUDA Version: 12.8", ["8.9", "12.0"], "cu130"),
+        # ... and the highest card when one build cannot cover them all.
+        (_UMD_HEADER, ["6.1", "12.0"], "cu132"),
     ],
 )
 def test_detect_parity_nvidia(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     cuda_header: str,
-    compute_cap: str,
+    compute_caps: list[str],
     expected: str,
 ) -> None:
     """With a stub nvidia-smi on PATH, both detectors return the same NVIDIA build token.
 
-    The stub answers the bare ``nvidia-smi`` call with the CUDA header and the
-    ``--query-gpu=compute_cap`` call (any args) with a compute-capability line, so both the
-    driver-version and architecture-floor paths are exercised identically by each detector.
+    The stub prints the CUDA header for the bare ``nvidia-smi`` call and, for the ``--query-gpu`` call (any
+    args) with one compute-capability line per card, so both the driver-version and architecture-clamp
+    paths are exercised identically by each detector.
     """
     stub = tmp_path / "nvidia-smi.bat"
+    # cmd.exe reads a bare "|" as a pipe, so the header's table borders are escaped.
+    header_line = cuda_header.replace("|", "^|")
+    cap_lines = "".join(f"echo {cap}\r\n" for cap in compute_caps)
     stub.write_text(
-        f'@echo off\r\nif "%~1"=="" (\r\necho {cuda_header}\r\n) else (\r\necho {compute_cap}\r\n)\r\n',
+        f'@echo off\r\nif "%~1"=="" (\r\necho {header_line}\r\n) else (\r\n{cap_lines})\r\n',
         encoding="ascii",
     )
     # Prepend the stub dir so both detectors resolve nvidia-smi to it rather than a real driver.

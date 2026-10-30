@@ -1,11 +1,15 @@
-"""Backend (torch build) selection: precedence, the legacy cu128 remap, and locked-extra validation."""
+"""Backend (torch build) selection: precedence, provenance, the legacy cu128 remap, and locked-extra validation."""
 
 from __future__ import annotations
 
 import re
 import tomllib
 from collections.abc import Callable
+from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
+
+from worker_bootstrap import detect
 
 _CPU_TOKEN = "cpu"
 
@@ -52,6 +56,35 @@ def write_backend_file(path: Path, token: str) -> None:
     path.write_text(token, encoding="utf-8")
 
 
+class BackendSource(StrEnum):
+    """Where a backend token came from."""
+
+    CLI = "cli"
+    """A ``--backend`` flag (or one of its shortcuts)."""
+    ENV = "env"
+    """The ``HORDE_WORKER_BACKEND`` environment variable."""
+    FILE = "file"
+    """The persisted ``bin/backend`` token."""
+    DETECTED = "detected"
+    """Hardware detection."""
+    DEFAULT = "default"
+    """The fallback build, used when every other source was empty."""
+    INTERACTIVE = "interactive"
+    """The operator's answer to the CPU-or-GPU prompt."""
+
+
+DETECTION_SOURCES: frozenset[BackendSource] = frozenset({BackendSource.DETECTED, BackendSource.DEFAULT})
+"""Sources whose persisted token a sync re-picks against the live driver and cards. Every other source is explicit."""
+
+
+@dataclass(frozen=True)
+class ResolvedBackend:
+    """Represents a resolved backend token and the source that won the precedence."""
+
+    token: str
+    source: BackendSource
+
+
 def resolve_backend(
     *,
     cli_flag: str | None = None,
@@ -59,19 +92,77 @@ def resolve_backend(
     file_value: str | None = None,
     detected: str | None = None,
     default: str = "cu126",
-) -> str:
+) -> ResolvedBackend:
     """Resolve the backend by precedence: CLI flag > env var > ``bin/backend`` > detection > default.
 
-    The first non-empty source wins, then the result is passed through :func:`remap_legacy` so a stale
+    The first non-empty source wins, then its token is passed through :func:`remap_legacy` so a stale
     cu128 becomes cu126. Detection is an optional input so a caller that cannot or should not probe
-    hardware can omit it (the default then applies). Note that a persisted ``file_value`` outranks
-    ``detected``: a stale token can still win here, so an install path should additionally reconcile the
-    result against the live GPU (see :func:`worker_bootstrap.detect.reconcile_backend_for_gpu`).
+    hardware can omit it (the default then applies). A persisted ``file_value`` outranks ``detected``, so
+    an install path re-picks a detection-derived file token itself and reconciles the result against the
+    live GPU (see :func:`worker_bootstrap.detect.reconcile_backend_for_gpu`).
     """
-    for candidate in (cli_flag, env_value, file_value, detected, default):
+    candidates = (
+        (cli_flag, BackendSource.CLI),
+        (env_value, BackendSource.ENV),
+        (file_value, BackendSource.FILE),
+        (detected, BackendSource.DETECTED),
+    )
+    for candidate, source in candidates:
         if candidate and candidate.strip():
-            return remap_legacy(candidate)
-    return default
+            return ResolvedBackend(token=remap_legacy(candidate), source=source)
+    return ResolvedBackend(token=default, source=BackendSource.DEFAULT)
+
+
+@dataclass(frozen=True)
+class InstallRecord:
+    """Represents the provenance of the persisted ``bin/backend`` token (the breadcrumb's ``install`` entry)."""
+
+    token: str
+    source: BackendSource
+    replaced_token: str | None = None
+    """The token this one replaced, when a reconcile or re-pick changed it."""
+    reason: str | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        """Return the JSON-serializable breadcrumb entry."""
+        return {
+            "stage": "install",
+            "final_token": self.token,
+            "source": str(self.source),
+            "replaced_token": self.replaced_token,
+            "reason": self.reason,
+        }
+
+    @classmethod
+    def from_dict(cls, entry: object) -> InstallRecord | None:
+        """Parse a breadcrumb entry, or return None when it is missing, malformed, or lists an unknown source."""
+        if not isinstance(entry, dict):
+            return None
+        token = entry.get("final_token")
+        source = entry.get("source")
+        if not isinstance(token, str) or not token or source not in set(BackendSource):
+            return None
+        replaced = entry.get("replaced_token")
+        reason = entry.get("reason")
+        return cls(
+            token=token,
+            source=BackendSource(source),
+            replaced_token=replaced if isinstance(replaced, str) else None,
+            reason=reason if isinstance(reason, str) else None,
+        )
+
+
+def persisted_source(token: str, record: InstallRecord | None) -> BackendSource:
+    """Return where a persisted ``bin/backend`` token came from.
+
+    The install record sets the source when it is for this token. A token with no matching record (an install
+    from before provenance was recorded, or one the graphical installer wrote) counts as detected when it
+    is a CUDA build and as an explicit file choice otherwise. The only choice the installer ever offered
+    was CPU versus GPU, so a persisted ``cpu`` beside a GPU was deliberate.
+    """
+    if record is not None and record.token == token:
+        return record.source
+    return BackendSource.DETECTED if token in detect.CUDA_BUILDS else BackendSource.FILE
 
 
 def choose_backend_interactively(
@@ -111,6 +202,52 @@ def choose_backend_interactively(
     if answer in ("c", "cpu"):
         return _CPU_TOKEN
     return detected_token
+
+
+def choose_mixed_card_policy_interactively(
+    builds: dict[detect.MixedCardPolicy, str],
+    capabilities: tuple[tuple[int, int], ...],
+    *,
+    prompt: Callable[[str], str] = input,
+    emit: Callable[[str], None] = print,
+) -> detect.MixedCardPolicy:
+    """Alert an interactive user that the cards need different builds and ask which policy to apply.
+
+    Args:
+        builds: The build each policy picks (see :func:`worker_bootstrap.detect.mixed_card_builds`).
+        capabilities: Every card's compute capability.
+        prompt: Input function (injectable for tests).
+        emit: Output function (injectable for tests).
+
+    Returns:
+        The chosen policy. An empty or unrecognised answer is ``all``, the non-interactive default.
+    """
+    cards = ", ".join(detect.format_capability(cap) for cap in sorted(set(capabilities)))
+    emit(
+        f"This machine has NVIDIA cards that need different PyTorch builds (compute capability {cards}). "
+        "A card the installed build has no kernels for cannot run jobs.",
+    )
+    labels = {
+        detect.MixedCardPolicy.ALL: "[A]ll cards",
+        detect.MixedCardPolicy.HIGHEST: "[H]ighest card",
+        detect.MixedCardPolicy.LOWEST: "[L]owest card",
+    }
+    for policy, label in labels.items():
+        build = builds[policy]
+        stranded = detect.cards_without_kernels(build, capabilities)
+        note = (
+            f", no kernels for compute capability {', '.join(detect.format_capability(cap) for cap in stranded)}"
+            if stranded
+            else ", runs every card"
+        )
+        emit(f"  {label}: installs {build}{note}")
+    answer = prompt("Install for [A]ll cards (recommended), the [H]ighest card or the [L]owest card? [A/h/l] ")
+    choice = answer.strip().lower()
+    if choice in ("h", "highest"):
+        return detect.MixedCardPolicy.HIGHEST
+    if choice in ("l", "lowest"):
+        return detect.MixedCardPolicy.LOWEST
+    return detect.MixedCardPolicy.ALL
 
 
 def locked_extras(pyproject_path: Path) -> list[str]:

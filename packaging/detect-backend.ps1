@@ -12,7 +12,8 @@
 #   cpu              no supported GPU found
 #
 # The CUDA build is the newest the driver's max supported CUDA version can run (nvidia-smi's "CUDA
-# Version" header). torch 2.12.0 (the locked line) has no cu128 wheel, so a CUDA 12.x driver gets cu126
+# Version" or "CUDA UMD Version" header field). torch 2.12.0 (the locked line) has no cu128 wheel, so a
+# CUDA 12.x driver gets cu126
 # -- a 12.6 build runs on any CUDA 12.6+ driver (and, via NVIDIA driver backward-compatibility, on CUDA
 # 13 drivers). A 13.2+ driver gets cu132, a 13.0/13.1 driver gets cu130. The pick is then floored by the
 # GPU's compute capability: the cu126 wheel carries kernels only through Hopper (sm_90), so a Blackwell
@@ -77,9 +78,9 @@ function Get-WindowsAmdRocmBackend {
 
 function Get-NvidiaCudaVersion {
     # The driver's max supported CUDA runtime version as a [version], parsed from nvidia-smi's header
-    # ("... CUDA Version: 13.2"). Returns $null when nvidia-smi is absent or the line cannot be read
-    # (e.g. a freshly installed driver that has not added nvidia-smi to PATH); callers treat $null as
-    # "assume the safe 12.6 build".
+    # ("... CUDA Version: 13.2", or "... CUDA UMD Version: 13.3" on drivers that renamed the field).
+    # Returns $null when nvidia-smi is absent or the line cannot be read (e.g. a freshly installed driver
+    # that has not added nvidia-smi to PATH), and callers treat $null as "assume the safe 12.6 build".
     $exe = $null
     $cmd = Get-Command nvidia-smi -ErrorAction SilentlyContinue
     if ($cmd) {
@@ -90,7 +91,7 @@ function Get-NvidiaCudaVersion {
     if (-not $exe) { return $null }
     try {
         $out = & $exe 2>$null | Out-String
-        $match = [regex]::Match($out, "CUDA Version:\s*(\d+)\.(\d+)")
+        $match = [regex]::Match($out, "CUDA(?: UMD)? Version\s*:\s*(\d+)\.(\d+)")
         if ($match.Success) {
             return [version]("{0}.{1}" -f $match.Groups[1].Value, $match.Groups[2].Value)
         }
@@ -98,11 +99,11 @@ function Get-NvidiaCudaVersion {
     return $null
 }
 
-function Get-NvidiaComputeCap {
-    # The GPU's compute capability (sm_<major><minor>) as a [version], from nvidia-smi's structured
+function Get-NvidiaComputeCaps {
+    # Every GPU's compute capability (sm_<major><minor>) as a [version], from nvidia-smi's structured
     # query. This is the GPU architecture, not the driver's CUDA ceiling: it decides whether a wheel
-    # actually has a kernel image for the card. Returns the highest across GPUs, or $null when the
-    # field is unreadable (old driver / nvidia-smi absent); callers then floor nothing.
+    # actually has a kernel image for the card. Returns an empty array when the field is unreadable
+    # (old driver / nvidia-smi absent), and callers then do not clamp the build.
     $exe = $null
     $cmd = Get-Command nvidia-smi -ErrorAction SilentlyContinue
     if ($cmd) {
@@ -110,19 +111,17 @@ function Get-NvidiaComputeCap {
     } elseif (Test-Path (Join-Path $env:SystemRoot "System32\nvidia-smi.exe")) {
         $exe = Join-Path $env:SystemRoot "System32\nvidia-smi.exe"
     }
-    if (-not $exe) { return $null }
+    $caps = @()
+    if (-not $exe) { return $caps }
     try {
         $out = & $exe --query-gpu=compute_cap --format=csv,noheader 2>$null | Out-String
-        $best = $null
-        # Whole-line only, mirroring worker_bootstrap.detect._COMPUTE_CAP_RE: an NVML failure prints the
+        # Whole-line only, mirroring worker_bootstrap.detect._GPU_QUERY_LINE_RE: an NVML failure prints the
         # driver version to stdout, which an unanchored match reads as a capability.
         foreach ($m in [regex]::Matches($out, "(?m)^\s*(\d{1,2})\.(\d)\s*$")) {
-            $v = [version]("{0}.{1}" -f $m.Groups[1].Value, $m.Groups[2].Value)
-            if (-not $best -or $v -gt $best) { $best = $v }
+            $caps += [version]("{0}.{1}" -f $m.Groups[1].Value, $m.Groups[2].Value)
         }
-        return $best
     } catch { }
-    return $null
+    return $caps
 }
 
 if (Test-NvidiaGpu) {
@@ -136,17 +135,28 @@ if (Test-NvidiaGpu) {
         $token = "cu126"
     }
     # Architecture window clamp (mirrors worker_bootstrap.detect._cuda_build). The driver pick can be
-    # outside the card's valid window: cu126 carries sm_50..sm_90, the CUDA 13 wheels carry sm_75..sm_120
-    # (pre-Turing dropped in CUDA 13). A build with no kernel image for the card dies at the first kernel
-    # launch, so clamp both ways. compute_cap $null (unreadable) leaves the driver pick untouched.
-    $cap = Get-NvidiaComputeCap
-    if ($cap) {
-        if ($cap -gt [version]"9.0" -and $token -eq "cu126") {
-            # Blackwell+: cu126 has no kernels, floor onto cu130.
-            $token = "cu130"
-        } elseif ($cap -lt [version]"7.5") {
-            # pre-Turing (Maxwell/Pascal/Volta): the CUDA 13 wheels dropped it, hold at cu126.
-            $token = "cu126"
+    # outside a card's valid window, since cu126 carries sm_50..sm_90 and the CUDA 13 wheels carry
+    # sm_75..sm_120 (pre-Turing dropped in CUDA 13). A build with no kernel image for a card dies at the
+    # first kernel launch, so clamp both ways for every card. When one card is pre-Turing and another is
+    # Blackwell or newer, a single build cannot run both, so the build for the highest card is used, which
+    # is the bootstrap's non-interactive default for mixed cards. Without a readable capability the driver
+    # pick is kept.
+    $caps = @(Get-NvidiaComputeCaps)
+    if ($caps.Count -gt 0) {
+        $sorted = @($caps | Sort-Object)
+        $lowest = $sorted[0]
+        $highest = $sorted[-1]
+        if ($lowest -lt [version]"7.5" -and $highest -gt [version]"9.0") {
+            $caps = @($highest)
+        }
+        foreach ($cap in $caps) {
+            if ($cap -gt [version]"9.0" -and $token -eq "cu126") {
+                # cu126 does not carry Blackwell or newer kernels, so floor onto cu130.
+                $token = "cu130"
+            } elseif ($cap -lt [version]"7.5") {
+                # The CUDA 13 wheels dropped pre-Turing (Maxwell/Pascal/Volta), so hold at cu126.
+                $token = "cu126"
+            }
         }
     }
 } elseif (Test-AmdGpu) {

@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import os
 import platform
-import re
 import shutil
 import subprocess
 import sys
@@ -190,9 +189,6 @@ def _windows_rotational(path: Path) -> bool | None:
     return _WINDOWS_MEDIA_TYPE_ROTATIONAL.get(completed.stdout.strip())
 
 
-_SMI_CUDA_RE = re.compile(r"CUDA Version:\s*(\d+\.\d+)")
-
-
 def nvidia_smi_summary() -> dict[str, Any] | None:
     """Return the NVIDIA driver's version, its CUDA ceiling, and per-GPU name + compute capability.
 
@@ -201,8 +197,11 @@ def nvidia_smi_summary() -> dict[str, Any] | None:
     each card's compute capability (which decides whether a wheel has kernels for it) -- even on an install
     whose backend-decision breadcrumb predates that feature. Returns None when nvidia-smi is absent or
     unreadable (no NVIDIA GPU, or the driver has not added it to PATH), so a non-NVIDIA host simply omits
-    the block.
+    the block. The CUDA ceiling is parsed with the installer's parser, so the report and the installer read the
+    same header field.
     """
+    from worker_bootstrap.detect import parse_cuda_version
+
     exe = shutil.which("nvidia-smi")
     if not exe and os.name == "nt":
         candidate = Path(os.environ.get("SYSTEMROOT", r"C:\Windows")) / "System32" / "nvidia-smi.exe"
@@ -213,8 +212,8 @@ def nvidia_smi_summary() -> dict[str, Any] | None:
     summary: dict[str, Any] = {}
     try:
         header = subprocess.run([exe], capture_output=True, text=True, timeout=20, check=False).stdout
-        match = _SMI_CUDA_RE.search(header or "")
-        summary["driver_max_cuda_version"] = match.group(1) if match else None
+        major, minor = parse_cuda_version(header or "")
+        summary["driver_max_cuda_version"] = None if (major, minor) == (0, 0) else f"{major}.{minor}"
         gpus = subprocess.run(
             [exe, "--query-gpu=name,compute_cap,driver_version", "--format=csv,noheader"],
             capture_output=True,

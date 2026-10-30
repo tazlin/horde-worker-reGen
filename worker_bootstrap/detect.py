@@ -7,9 +7,10 @@ consume. For NVIDIA it selects the newest CUDA build the driver's reported max C
 (13.2+ -> ``cu132``, 13.0/13.1 -> ``cu130``, anything older or unreadable -> the safe ``cu126``), then
 applies an architecture floor: a GPU whose compute capability exceeds what the ``cu126`` wheel carries
 kernels for (Hopper sm_90) gets at least ``cu130`` even on an older driver, because ``cu126`` has no
-kernel image for it and would die at the first kernel launch. See :func:`_cuda_build`. AMD Windows
-follows the current ComfyUI/AMD ROCm support matrices and routes recognized Radeon/Ryzen AI devices to
-the official ROCm Windows PyTorch stack.
+kernel image for it and would die at the first kernel launch. See :func:`_cuda_build`. A box whose cards
+need different builds is resolved by a :class:`MixedCardPolicy`. AMD Windows follows the current
+ComfyUI/AMD ROCm support matrices and routes recognized Radeon/Ryzen AI devices to the official ROCm
+Windows PyTorch stack.
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ import re
 import shutil
 import subprocess
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 
 CU126 = "cu126"
@@ -32,10 +34,16 @@ ROCM_GFX1151 = "rocm-gfx1151"
 ROCM_GFX120X = "rocm-gfx120x"
 CPU = "cpu"
 
-_CUDA_VERSION_RE = re.compile(r"CUDA Version:\s*(\d+)\.(\d+)")
+# Oldest first, so an index comparison orders two CUDA builds.
+CUDA_BUILDS: tuple[str, ...] = (CU126, CU130, CU132)
+
+# Drivers that print "CUDA UMD Version" in the bare nvidia-smi header no longer print "CUDA Version" there.
+# Both spellings carry the driver's CUDA ceiling, and `nvidia-smi -q` prints both as "Name : value".
+_CUDA_VERSION_RE = re.compile(r"CUDA(?: UMD)? Version\s*:\s*(\d+)\.(\d+)")
 # Whole-line only: when NVML fails, nvidia-smi prints a diagnostic carrying the driver version (e.g.
-# "NVML library version: 580.95") to stdout, which an unanchored match reads as a capability.
-_COMPUTE_CAP_RE = re.compile(r"^\s*(\d{1,2})\.(\d)\s*$", re.MULTILINE)
+# "NVML library version: 580.95") to stdout, which an unanchored match would parse as a capability. A line may
+# carry the driver version as a second CSV field (the query requests both fields).
+_GPU_QUERY_LINE_RE = re.compile(r"^\s*(\d{1,2})\.(\d)\s*(?:,\s*([^\s,]+)\s*)?$", re.MULTILINE)
 # The locked wheels cover overlapping but different architecture windows (verified against PyTorch's
 # CUDA build matrix and the NVIDIA CUDA 13 release notes):
 #   cu126 (CUDA 12.6): sm_50..sm_90  (Maxwell through Hopper; no Blackwell)
@@ -47,6 +55,27 @@ _CU126_MAX_COMPUTE_CAP = (9, 0)  # above this (Blackwell sm_100/sm_120), cu126 h
 _CUDA13_MIN_COMPUTE_CAP = (7, 5)  # below this (pre-Turing), cu130/cu132 have no kernels -> ceil cu126
 # Windows "Display adapters" device class; its subkeys carry a DriverDesc per adapter.
 _DISPLAY_CLASS_KEY = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
+
+
+class MixedCardPolicy(StrEnum):
+    """Which cards a CUDA build must carry kernels for when the cards need different builds."""
+
+    ALL = "all"
+    """Every card, or the highest card's build with a warning listing the rest if one build cannot cover all."""
+    HIGHEST = "highest"
+    """The card with the highest compute capability."""
+    LOWEST = "lowest"
+    """The card with the lowest compute capability."""
+
+
+@dataclass(frozen=True)
+class GpuQuery:
+    """Represents one ``nvidia-smi --query-gpu`` reading: each card's compute capability and the driver version."""
+
+    capabilities: tuple[tuple[int, int], ...]
+    """One ``(major, minor)`` per card, in nvidia-smi's order, or empty when unreadable."""
+    driver_version: str | None = None
+    """The driver version string (for example ``610.88``), or None when it was not reported."""
 
 
 def _is_windows() -> bool:
@@ -162,7 +191,11 @@ def _rocm_runtime_present() -> bool:
 
 
 def parse_cuda_version(smi_output: str) -> tuple[int, int]:
-    """Return the (major, minor) CUDA version parsed from nvidia-smi output, or (0, 0) when unreadable."""
+    """Parse the driver's (major, minor) CUDA ceiling from nvidia-smi output, or (0, 0) when unreadable.
+
+    Accepts the ``CUDA Version`` field and the ``CUDA UMD Version`` field that replaced it in the bare
+    header, in either the header or the ``nvidia-smi -q`` spelling.
+    """
     match = _CUDA_VERSION_RE.search(smi_output or "")
     if not match:
         return (0, 0)
@@ -185,38 +218,46 @@ def _nvidia_cuda_version() -> tuple[int, int]:
     return parse_cuda_version(out)
 
 
-def parse_compute_cap(smi_output: str) -> tuple[int, int]:
-    """Return the highest (major, minor) compute capability in --query-gpu=compute_cap output.
+def parse_compute_cap(smi_output: str) -> tuple[tuple[int, int], ...]:
+    """Parse every card's (major, minor) compute capability from ``--query-gpu`` output, in card order.
 
-    nvidia-smi prints one ``major.minor`` per GPU (e.g. ``12.0`` for Blackwell); the highest wins so a
-    mixed-GPU box is floored onto a build that can run its newest card. (0, 0) when nothing parses.
+    nvidia-smi prints one line per GPU (e.g. ``12.0`` for Blackwell, or ``12.0, 610.88`` when the driver
+    version is queried too). Only whole lines count. Returns an empty tuple when no line parses.
     """
-    caps = [(int(m.group(1)), int(m.group(2))) for m in _COMPUTE_CAP_RE.finditer(smi_output or "")]
-    return max(caps) if caps else (0, 0)
+    return tuple((int(m.group(1)), int(m.group(2))) for m in _GPU_QUERY_LINE_RE.finditer(smi_output or ""))
 
 
-def _nvidia_compute_cap() -> tuple[int, int]:
-    """Query the GPU's compute capability via nvidia-smi; (0, 0) when unreadable.
+def parse_gpu_query(smi_output: str) -> GpuQuery:
+    """Parse ``--query-gpu=compute_cap,driver_version`` output into a :class:`GpuQuery`."""
+    driver_versions = [m.group(3) for m in _GPU_QUERY_LINE_RE.finditer(smi_output or "") if m.group(3)]
+    return GpuQuery(
+        capabilities=parse_compute_cap(smi_output),
+        driver_version=driver_versions[0] if driver_versions else None,
+    )
 
-    This is the GPU's architecture (sm_<major><minor>), distinct from the driver's CUDA ceiling: it is
-    what decides whether a given wheel actually contains a kernel image for the card. (0, 0) (nvidia-smi
-    absent, an old driver without the query field, or a parse miss) leaves :func:`_cuda_build` to decide
-    purely from the driver's CUDA version, as before.
+
+def _nvidia_gpu_query() -> GpuQuery:
+    """Query every GPU's compute capability and the driver version via nvidia-smi.
+
+    The compute capability is the GPU's architecture (sm_<major><minor>), distinct from the driver's CUDA
+    ceiling, and it determines whether a given wheel contains a kernel image for the card. After an empty
+    reading (nvidia-smi absent, an old driver without the query field, or a parse miss) :func:`_cuda_build`
+    picks from the driver's CUDA version alone.
     """
     exe = _nvidia_smi_path()
     if not exe:
-        return (0, 0)
+        return GpuQuery(capabilities=())
     try:
         out = subprocess.run(
-            [exe, "--query-gpu=compute_cap", "--format=csv,noheader"],
+            [exe, "--query-gpu=compute_cap,driver_version", "--format=csv,noheader"],
             capture_output=True,
             text=True,
             timeout=20,
             check=False,
         ).stdout
     except (OSError, subprocess.SubprocessError):
-        return (0, 0)
-    return parse_compute_cap(out)
+        return GpuQuery(capabilities=())
+    return parse_gpu_query(out)
 
 
 def gpu_arch_supported(arch_list: list[str], capability: tuple[int, int]) -> bool:
@@ -249,7 +290,7 @@ def gpu_arch_supported(arch_list: list[str], capability: tuple[int, int]) -> boo
 
 
 def _clamp_build_to_arch(build: str, compute_cap: tuple[int, int]) -> str:
-    """Clamp a CUDA build token into the GPU's valid architecture window.
+    """Clamp a CUDA build token into one GPU's valid architecture window.
 
     A build token names a CUDA toolkit line but is not itself proof the wheel carries a kernel image for
     the installed card, whether the token came from the driver-version pick, a persisted ``bin/backend``,
@@ -264,7 +305,7 @@ def _clamp_build_to_arch(build: str, compute_cap: tuple[int, int]) -> str:
 
     A non-CUDA token (cpu/rocm) and an unreadable ``compute_cap`` of (0, 0) are returned unchanged.
     """
-    if compute_cap == (0, 0) or build not in (CU126, CU130, CU132):
+    if compute_cap == (0, 0) or build not in CUDA_BUILDS:
         return build
     if compute_cap > _CU126_MAX_COMPUTE_CAP:
         return CU130 if build == CU126 else build
@@ -273,13 +314,92 @@ def _clamp_build_to_arch(build: str, compute_cap: tuple[int, int]) -> str:
     return build
 
 
-def live_compute_capability() -> tuple[int, int]:
-    """Return the live GPU's highest compute capability via nvidia-smi, or (0, 0) when unreadable.
+def _cards_have_no_common_build(capabilities: tuple[tuple[int, int], ...]) -> bool:
+    """Whether one card needs cu126 (pre-Turing) while another needs a CUDA 13 build (Blackwell or newer)."""
+    return any(cap < _CUDA13_MIN_COMPUTE_CAP for cap in capabilities) and any(
+        cap > _CU126_MAX_COMPUTE_CAP for cap in capabilities
+    )
 
-    A public accessor for the post-install architecture check: it answers "what card is actually here?"
-    without importing torch, so the bootstrap can compare it against the installed wheel's arch list.
+
+def _windows_differ(capabilities: tuple[tuple[int, int], ...]) -> bool:
+    """Whether the cards fall in different architecture windows (pre-Turing, Turing to Hopper, Blackwell+)."""
+    windows = {(cap < _CUDA13_MIN_COMPUTE_CAP, cap > _CU126_MAX_COMPUTE_CAP) for cap in capabilities if cap != (0, 0)}
+    return len(windows) > 1
+
+
+def effective_policy(
+    capabilities: tuple[tuple[int, int], ...],
+    policy: MixedCardPolicy | None,
+) -> MixedCardPolicy:
+    """Return the policy that applies to ``capabilities``, where None is the non-interactive default (``all``).
+
+    ``all`` becomes ``highest`` when a single build cannot carry kernels for every card.
     """
-    return _nvidia_compute_cap()
+    requested = policy or MixedCardPolicy.ALL
+    if requested is MixedCardPolicy.ALL and _cards_have_no_common_build(capabilities):
+        return MixedCardPolicy.HIGHEST
+    return requested
+
+
+def governing_capabilities(
+    capabilities: tuple[tuple[int, int], ...],
+    policy: MixedCardPolicy | None,
+) -> tuple[tuple[int, int], ...]:
+    """Return the distinct capabilities a build must carry kernels for under ``policy``, lowest first."""
+    readable = tuple(sorted({cap for cap in capabilities if cap != (0, 0)}))
+    if not readable:
+        return ()
+    effective = effective_policy(readable, policy)
+    if effective is MixedCardPolicy.HIGHEST:
+        return (readable[-1],)
+    if effective is MixedCardPolicy.LOWEST:
+        return (readable[0],)
+    return readable
+
+
+def _clamp_build_to_cards(build: str, capabilities: tuple[tuple[int, int], ...]) -> str:
+    """Clamp ``build`` into the window every one of ``capabilities`` can run.
+
+    Callers pass :func:`governing_capabilities`, which never holds both a pre-Turing and a Blackwell card,
+    so the clamps do not conflict and their order does not matter.
+    """
+    for capability in capabilities:
+        build = _clamp_build_to_arch(build, capability)
+    return build
+
+
+def cards_without_kernels(build: str, capabilities: tuple[tuple[int, int], ...]) -> tuple[tuple[int, int], ...]:
+    """Return the distinct capabilities among ``capabilities`` that ``build`` does not carry kernels for."""
+    if build not in CUDA_BUILDS:
+        return ()
+    return tuple(sorted({cap for cap in capabilities if cap != (0, 0) and _clamp_build_to_arch(build, cap) != build}))
+
+
+def mixed_card_builds(
+    driver: tuple[int, int],
+    capabilities: tuple[tuple[int, int], ...],
+) -> dict[MixedCardPolicy, str]:
+    """Return the build each :class:`MixedCardPolicy` picks for this driver ceiling and these cards."""
+    ceiling = _driver_ceiling_build(driver)
+    return {
+        policy: _clamp_build_to_cards(ceiling, governing_capabilities(capabilities, policy))
+        for policy in MixedCardPolicy
+    }
+
+
+def cards_disagree(driver: tuple[int, int], capabilities: tuple[tuple[int, int], ...]) -> bool:
+    """Whether the policies pick different builds, so the choice of policy matters for this box."""
+    return len(set(mixed_card_builds(driver, capabilities).values())) > 1
+
+
+def format_capability(capability: tuple[int, int]) -> str:
+    """Return ``"major.minor"`` for a compute capability or CUDA version tuple."""
+    return f"{capability[0]}.{capability[1]}"
+
+
+def _format_capabilities(capabilities: tuple[tuple[int, int], ...]) -> str:
+    """Return a comma-separated ``"major.minor"`` list."""
+    return ", ".join(format_capability(cap) for cap in capabilities)
 
 
 # clamp_action values recorded on a BackendDecision, naming what the architecture clamp did to the
@@ -297,9 +417,10 @@ class BackendDecision:
 
     A build token on its own ("cu126") cannot explain *why* it was picked, which is exactly what a support
     bundle needs when the installed wheel turns out to have no kernels for the card. This records the
-    hardware signals read (driver CUDA ceiling, GPU compute capability), the intermediate driver-only pick,
-    what the architecture clamp did to it, and a human-readable reason, so a maintainer can tell a stale
-    persisted token apart from an unreadable ``nvidia-smi`` apart from an out-of-date selection table.
+    hardware signals read (driver CUDA ceiling, every GPU's compute capability), the intermediate
+    driver-only pick, the mixed-card policy, what the architecture clamp did to it, and a human-readable
+    reason, so a maintainer can tell a stale persisted token apart from an unreadable ``nvidia-smi`` apart
+    from an out-of-date selection table.
 
     ``stage`` is ``"detect"`` (a fresh hardware probe) or ``"reconcile"`` (re-clamping an already-resolved
     token against the live GPU). Fields that do not apply to a stage (a reconcile never reads the driver
@@ -313,17 +434,21 @@ class BackendDecision:
     amd_present: bool | None = None
     nvidia_smi_path: str | None = None
     driver_cuda_version: tuple[int, int] | None = None
-    compute_capability: tuple[int, int] | None = None
+    compute_capabilities: tuple[tuple[int, int], ...] | None = None
+    """Every card's compute capability, in nvidia-smi's order."""
+    mixed_card_policy: MixedCardPolicy | None = None
+    """The policy applied to the pick, or None unless the cards need different builds."""
     driver_ceiling_build: str | None = None
     input_token: str | None = None
     clamp_action: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-serializable view, rendering version tuples as ``"major.minor"`` strings."""
-
-        def _cap(value: tuple[int, int] | None) -> str | None:
-            return None if value is None else f"{value[0]}.{value[1]}"
-
+        capabilities = (
+            None
+            if self.compute_capabilities is None
+            else [format_capability(cap) for cap in self.compute_capabilities]
+        )
         return {
             "stage": self.stage,
             "final_token": self.final_token,
@@ -331,25 +456,28 @@ class BackendDecision:
             "nvidia_present": self.nvidia_present,
             "amd_present": self.amd_present,
             "nvidia_smi_path": self.nvidia_smi_path,
-            "driver_cuda_version": _cap(self.driver_cuda_version),
-            "compute_capability": _cap(self.compute_capability),
+            "driver_cuda_version": (
+                None if self.driver_cuda_version is None else format_capability(self.driver_cuda_version)
+            ),
+            "compute_capabilities": capabilities,
+            "mixed_card_policy": None if self.mixed_card_policy is None else str(self.mixed_card_policy),
             "driver_ceiling_build": self.driver_ceiling_build,
             "input_token": self.input_token,
             "clamp_action": self.clamp_action,
         }
 
 
-def _explain_clamp(pre_clamp: str, post_clamp: str, compute_cap: tuple[int, int]) -> tuple[str, str]:
-    """Return the ``(clamp_action, reason)`` describing what :func:`_clamp_build_to_arch` did and why."""
-    if pre_clamp not in (CU126, CU130, CU132):
+def _explain_clamp(pre_clamp: str, post_clamp: str, capabilities: tuple[tuple[int, int], ...]) -> tuple[str, str]:
+    """Return the ``(clamp_action, reason)`` describing what the architecture clamp did and why."""
+    if pre_clamp not in CUDA_BUILDS:
         return CLAMP_NOT_CUDA, f"{pre_clamp} is not a CUDA build; no architecture clamp applies"
-    if compute_cap == (0, 0):
+    if not capabilities:
         return (
             CLAMP_SKIPPED,
             f"kept the driver-ceiling build {pre_clamp}; the GPU compute capability could not be read, so "
             "no architecture clamp was applied",
         )
-    cap_tag = f"{compute_cap[0]}.{compute_cap[1]}"
+    cap_tag = _format_capabilities(capabilities)
     if post_clamp == pre_clamp:
         return CLAMP_NONE, f"{pre_clamp} carries kernels for compute capability {cap_tag}"
     if post_clamp == CU130 and pre_clamp == CU126:
@@ -362,6 +490,22 @@ def _explain_clamp(pre_clamp: str, post_clamp: str, compute_cap: tuple[int, int]
         CLAMP_CEILED,
         f"the CUDA 13 wheels dropped compute capability {cap_tag} (pre-Turing); held at cu126",
     )
+
+
+def _explain_mixed_cards(
+    capabilities: tuple[tuple[int, int], ...],
+    requested: MixedCardPolicy | None,
+    final_token: str,
+) -> str:
+    """Return the reason clause for a box whose cards need different builds."""
+    effective = effective_policy(capabilities, requested)
+    clause = f"cards {_format_capabilities(capabilities)} need different builds; the {effective} policy applies"
+    if requested in (None, MixedCardPolicy.ALL) and effective is not MixedCardPolicy.ALL:
+        clause += "; a single build cannot run every card, so the highest card's build is used"
+    stranded = cards_without_kernels(final_token, capabilities)
+    if stranded:
+        clause += f"; {final_token} has no kernels for compute capability {_format_capabilities(stranded)}"
+    return clause
 
 
 def _driver_ceiling_build(version: tuple[int, int]) -> str:
@@ -378,47 +522,110 @@ def _driver_ceiling_build(version: tuple[int, int]) -> str:
     return CU126
 
 
-def _cuda_build(version: tuple[int, int], compute_cap: tuple[int, int] = (0, 0)) -> str:
-    """Pick the newest locked CUDA build the driver allows, clamped to the GPU's valid arch window.
+def _cuda_build(
+    version: tuple[int, int],
+    capabilities: tuple[tuple[int, int], ...] = (),
+    policy: MixedCardPolicy | None = None,
+) -> str:
+    """Pick the newest locked CUDA build the driver allows, clamped to the cards' valid arch window.
 
     Two independent constraints decide the build, and the highest *valid* build is the newest one that
     satisfies both:
 
     * Driver ceiling: see :func:`_driver_ceiling_build`.
     * Architecture window: the driver version is only a ceiling, not proof the wheel has kernels for the
-      card, so the driver-based pick is clamped into the card's valid window (see
-      :func:`_clamp_build_to_arch`). ``compute_cap`` (0, 0) skips the clamp and keeps the driver-only
-      pick, preserving the prior behaviour.
+      card, so the driver-based pick is clamped into the window of the cards ``policy`` covers (see
+      :func:`governing_capabilities` and :func:`_clamp_build_to_arch`). Without a readable capability the
+      clamp is skipped and the driver-only pick is kept.
     """
-    return _clamp_build_to_arch(_driver_ceiling_build(version), compute_cap)
+    return _clamp_build_to_cards(_driver_ceiling_build(version), governing_capabilities(capabilities, policy))
 
 
-def describe_reconcile(token: str) -> BackendDecision:
-    """Re-clamp an already-resolved token to the live GPU's arch window, recording the full decision.
-
-    See :func:`reconcile_backend_for_gpu` for the behaviour; this variant returns a :class:`BackendDecision`
-    so an install path can persist *why* the token was (or was not) changed, not just the resulting token.
-    """
-    if token not in (CU126, CU130, CU132):
-        action, reason = _explain_clamp(token, token, (0, 0))
-        return BackendDecision(
-            stage="reconcile", final_token=token, input_token=token, clamp_action=action, reason=reason
-        )
-    compute_cap = _nvidia_compute_cap()
-    final = _clamp_build_to_arch(token, compute_cap)
-    action, reason = _explain_clamp(token, final, compute_cap)
+def _nvidia_decision(
+    *,
+    smi_path: str | None,
+    driver: tuple[int, int],
+    capabilities: tuple[tuple[int, int], ...],
+    policy: MixedCardPolicy | None,
+) -> BackendDecision:
+    """Build the NVIDIA detect-stage decision from the probed driver ceiling and cards."""
+    ceiling = _driver_ceiling_build(driver)
+    governing = governing_capabilities(capabilities, policy)
+    final = _clamp_build_to_cards(ceiling, governing)
+    action, clamp_reason = _explain_clamp(ceiling, final, governing)
+    driver_tag = format_capability(driver) if driver != (0, 0) else "unreadable"
+    reason = f"NVIDIA GPU; driver CUDA {driver_tag} -> {ceiling}; {clamp_reason}"
+    disagree = cards_disagree(driver, capabilities)
+    if disagree:
+        reason += f"; {_explain_mixed_cards(capabilities, policy, final)}"
     return BackendDecision(
-        stage="reconcile",
+        stage="detect",
         final_token=final,
-        input_token=token,
-        compute_capability=compute_cap,
+        nvidia_present=True,
+        nvidia_smi_path=smi_path,
+        driver_cuda_version=driver,
+        compute_capabilities=capabilities,
+        mixed_card_policy=effective_policy(capabilities, policy) if disagree else None,
+        driver_ceiling_build=ceiling,
         clamp_action=action,
         reason=reason,
     )
 
 
-def reconcile_backend_for_gpu(token: str) -> str:
-    """Re-clamp an already-resolved backend token to the live GPU's architecture window.
+def apply_mixed_card_policy(decision: BackendDecision, policy: MixedCardPolicy) -> BackendDecision:
+    """Return ``decision`` recomputed under ``policy`` from its recorded inputs, without probing again.
+
+    A decision with no recorded driver ceiling or capabilities (a non-NVIDIA detect) is returned unchanged.
+    """
+    if decision.driver_cuda_version is None or decision.compute_capabilities is None:
+        return decision
+    return _nvidia_decision(
+        smi_path=decision.nvidia_smi_path,
+        driver=decision.driver_cuda_version,
+        capabilities=decision.compute_capabilities,
+        policy=policy,
+    )
+
+
+def describe_reconcile(
+    token: str,
+    *,
+    policy: MixedCardPolicy | None = None,
+    gpus: GpuQuery | None = None,
+) -> BackendDecision:
+    """Re-clamp an already-resolved token to the live GPUs' arch window, recording the full decision.
+
+    See :func:`reconcile_backend_for_gpu` for the behaviour; this variant returns a :class:`BackendDecision`
+    so an install path can persist *why* the token was (or was not) changed, not just the resulting token.
+    ``gpus`` reuses a reading the caller already took, and None probes nvidia-smi.
+    """
+    if token not in CUDA_BUILDS:
+        action, reason = _explain_clamp(token, token, ())
+        return BackendDecision(
+            stage="reconcile", final_token=token, input_token=token, clamp_action=action, reason=reason
+        )
+    capabilities = (gpus or _nvidia_gpu_query()).capabilities
+    governing = governing_capabilities(capabilities, policy)
+    final = _clamp_build_to_cards(token, governing)
+    action, reason = _explain_clamp(token, final, governing)
+    return BackendDecision(
+        stage="reconcile",
+        final_token=final,
+        input_token=token,
+        compute_capabilities=capabilities,
+        mixed_card_policy=effective_policy(capabilities, policy) if _windows_differ(capabilities) else None,
+        clamp_action=action,
+        reason=reason,
+    )
+
+
+def reconcile_backend_for_gpu(
+    token: str,
+    *,
+    policy: MixedCardPolicy | None = None,
+    gpus: GpuQuery | None = None,
+) -> str:
+    """Re-clamp an already-resolved backend token to the live GPUs' architecture window.
 
     A persisted ``bin/backend`` token (or the cu126 default) can name a torch build with no kernel image
     for the installed GPU: a cu126 token kept from before a Blackwell card was installed, say, which the
@@ -429,34 +636,59 @@ def reconcile_backend_for_gpu(token: str) -> str:
     A non-CUDA token (cpu/rocm) is returned untouched and never triggers an nvidia-smi probe; an
     unreadable capability likewise returns the token unchanged.
     """
-    return describe_reconcile(token).final_token
+    return describe_reconcile(token, policy=policy, gpus=gpus).final_token
 
 
-def describe_backend_selection() -> BackendDecision:
+def live_gpu_query() -> GpuQuery:
+    """Return the live GPUs' compute capabilities and driver version via nvidia-smi.
+
+    A public accessor for the post-install architecture check. It reports which cards are present without
+    importing torch, so the bootstrap can compare them against the installed wheel's arch list.
+    """
+    return _nvidia_gpu_query()
+
+
+def repick_detected_build(persisted: str, live: BackendDecision) -> str:
+    """Return the build a detection-derived persisted token moves to under a live detection.
+
+    The live pick replaces ``persisted`` only when both are CUDA builds and the live driver ceiling was
+    read, since an unreadable ceiling (a freshly installed driver without nvidia-smi on PATH) would otherwise
+    move a CUDA 13 install down to cu126. The live pick is already clamped to the cards' window.
+    """
+    if persisted not in CUDA_BUILDS or live.final_token not in CUDA_BUILDS:
+        return persisted
+    if live.driver_cuda_version is None or live.driver_cuda_version == (0, 0):
+        return persisted
+    return live.final_token
+
+
+def explain_repick(persisted: str, live: BackendDecision) -> str:
+    """Return why :func:`repick_detected_build` moved ``persisted`` to the live pick, as a clause."""
+    driver_tag = format_capability(live.driver_cuda_version or (0, 0))
+    target = live.final_token
+    if CUDA_BUILDS.index(target) > CUDA_BUILDS.index(persisted):
+        return f"the driver's CUDA ceiling ({driver_tag}) now allows {target}"
+    if live.driver_ceiling_build is not None and CUDA_BUILDS.index(live.driver_ceiling_build) < CUDA_BUILDS.index(
+        persisted
+    ):
+        return f"the driver's CUDA ceiling ({driver_tag}) no longer supports {persisted}"
+    return f"{persisted} has no kernels for the cards this machine's policy covers"
+
+
+def describe_backend_selection(*, policy: MixedCardPolicy | None = None) -> BackendDecision:
     """Return the torch build token for this machine together with the full decision trail.
 
     See :func:`detect_backend` for the resolution rules; this variant returns a :class:`BackendDecision`
     so the install path can persist the hardware signals and the reasoning behind the pick (the breadcrumb
-    a support bundle reads to diagnose a wrong-build install).
+    a support bundle reads to diagnose a wrong-build install). ``policy`` applies to a box whose cards need
+    different builds, and None applies the non-interactive default (see :func:`effective_policy`).
     """
     if _nvidia_present():
-        smi = _nvidia_smi_path()
-        driver = _nvidia_cuda_version()
-        compute_cap = _nvidia_compute_cap()
-        ceiling = _driver_ceiling_build(driver)
-        final = _clamp_build_to_arch(ceiling, compute_cap)
-        action, clamp_reason = _explain_clamp(ceiling, final, compute_cap)
-        driver_tag = f"{driver[0]}.{driver[1]}" if driver != (0, 0) else "unreadable"
-        return BackendDecision(
-            stage="detect",
-            final_token=final,
-            nvidia_present=True,
-            nvidia_smi_path=smi,
-            driver_cuda_version=driver,
-            compute_capability=compute_cap,
-            driver_ceiling_build=ceiling,
-            clamp_action=action,
-            reason=f"NVIDIA GPU; driver CUDA {driver_tag} -> {ceiling}; {clamp_reason}",
+        return _nvidia_decision(
+            smi_path=_nvidia_smi_path(),
+            driver=_nvidia_cuda_version(),
+            capabilities=_nvidia_gpu_query().capabilities,
+            policy=policy,
         )
     if _amd_present():
         if windows_backend := _windows_amd_rocm_backend():
@@ -496,7 +728,7 @@ def detect_backend() -> str:
 
     Returns:
         ``cu132``/``cu130``/``cu126`` (NVIDIA: the newest build the driver's max CUDA version supports,
-        clamped to the GPU's valid architecture window, see :func:`_cuda_build`), ``rocm`` (AMD with a
+        clamped to the GPUs' valid architecture window, see :func:`_cuda_build`), ``rocm`` (AMD with a
         ROCm runtime on Linux), ``rocm-windows`` for
         supported AMD Windows Radeon/Ryzen AI devices, ``amd-unsupported`` for an AMD card with no known
         installable backend, or ``cpu``.

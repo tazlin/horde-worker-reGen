@@ -235,7 +235,14 @@ def _maybe_provision_utilities(uv: str, root: Path, token: str, options: _SyncOp
     print("The image-utilities environment is ready.")
 
 
-def _ensure_utilities_for_current_backend(uv: str, root: Path, *, cli_flag: str | None, options: _SyncOptions) -> None:
+def _ensure_utilities_for_current_backend(
+    uv: str,
+    root: Path,
+    gpus: detect.GpuQuery,
+    *,
+    cli_flag: str | None,
+    options: _SyncOptions,
+) -> None:
     """Ensure the utilities venv after a launch discovers an already-current worker venv.
 
     A developer can create ``.venv`` with ``uv sync`` directly, and a managed install can retain a
@@ -243,18 +250,25 @@ def _ensure_utilities_for_current_backend(uv: str, root: Path, *, cli_flag: str 
     :func:`_ensure_synced` correctly skips the main sync; it must not also skip the independent
     image-utilities environment.
 
+    The launch's GPU reading is reused for the reconcile, and hardware detection runs only when a flag,
+    environment variable or persisted token does not set the build, so a routine launch does not run
+    nvidia-smi again.
+
     Provisioning stays best-effort: resolution failures and install failures are reported by the normal
     bootstrap paths, while a worker that does not need the optional lane remains launchable.
     """
-    token = backend_mod.resolve_backend(
+    env_value = os.environ.get(_BACKEND_ENV)
+    persisted = backend_mod.read_backend_file(paths.backend_file(root))
+    named = any(value and value.strip() for value in (cli_flag, env_value, persisted))
+    resolved = backend_mod.resolve_backend(
         cli_flag=cli_flag,
-        env_value=os.environ.get(_BACKEND_ENV),
-        file_value=backend_mod.read_backend_file(paths.backend_file(root)),
-        detected=_detected_backend(root),
+        env_value=env_value,
+        file_value=persisted,
+        detected=None if named else _detected_decision(root, may_prompt=False).final_token,
     )
-    if token == detect.AMD_UNSUPPORTED:
+    if resolved.token == detect.AMD_UNSUPPORTED:
         return
-    token = _reconcile_backend(root, token)
+    token = _reconcile_backend(root, resolved, gpus=gpus)
     try:
         _maybe_provision_utilities(uv, root, token, options)
     except ValueError as error:
@@ -268,11 +282,35 @@ def _is_headless() -> bool:
     return consent.consent_env_var() is not None or not consent.is_interactive()
 
 
+SYNC_DECLINED_RC = 3
+"""Exit code of a sync the user declined at the download confirmation. The environment is unchanged.
+
+Distinct from a failure so a launch that offered a build switch can separate "keep the installed build
+and start" from "the install broke".
+"""
+
+
+def _is_build_switch(installed_torch: str | None, token: str) -> bool:
+    """Whether installing ``token`` replaces the installed torch wheel's CUDA build (its ``+cuNNN`` tag)."""
+    if (
+        installed_torch is None
+        or "+" not in installed_torch
+        or token not in (detect.CU126, detect.CU130, detect.CU132)
+    ):
+        return False
+    return installed_torch.rsplit("+", 1)[1] != token
+
+
 def _run_sync(uv: str, root: Path, token: str, feature_extras: tuple[str, ...], options: _SyncOptions) -> int:
     """Run the sync, first showing a download preview and honouring a hold/cancel when one applies.
 
     Falls back to the plain locked sync whenever the preview is disabled, there is no venv yet (nothing
     to limp along on), or the dry-run cannot be produced/parsed: the preview must never block an update.
+
+    A build switch (the installed torch carries a different ``+cuNNN`` tag than ``token``) cannot be
+    held, because the held override pins torch's public version and the new build's index would still
+    supply the new wheel. A hold would download the new build while reporting the old one as kept, so a
+    hold requested for a switch declines it (``SYNC_DECLINED_RC``) and the installed build stays.
     """
     if not options.preview or not paths.venv_dir(root).exists():
         return runner.uv_sync(uv, token, extras=feature_extras, root=root)
@@ -286,6 +324,7 @@ def _run_sync(uv: str, root: Path, token: str, feature_extras: tuple[str, ...], 
 
     overrides_path = paths.sync_overrides_file(root)
     installed = sync_plan.installed_versions(paths.venv_dir(root))
+    switching_build = _is_build_switch(installed.get("torch"), token)
     overrides_text = sync_plan.held_overrides_text(changes, installed)
     holdable = False
     if overrides_text is not None and _write_overrides(overrides_path, overrides_text):
@@ -320,7 +359,13 @@ def _run_sync(uv: str, root: Path, token: str, feature_extras: tuple[str, ...], 
     )
     if action == "abort":
         print("Sync cancelled. The current environment is unchanged.")
-        return 1
+        return SYNC_DECLINED_RC
+    if action == "hold" and switching_build:
+        print(
+            f"The installed torch build cannot be kept while switching to {token}, so the switch is declined and "
+            "the installed build stays. Run the update again and choose Upgrade to switch.",
+        )
+        return SYNC_DECLINED_RC
     if action == "hold":
         print("Keeping torch and torchvision at the installed version and updating everything else.")
         return runner.uv_sync_held(uv, token, overrides_path=overrides_path, extras=feature_extras, root=root)
@@ -337,24 +382,29 @@ def _write_overrides(path: Path, text: str) -> bool:
     return True
 
 
-def _write_decision(root: Path, decision: detect.BackendDecision) -> None:
-    """Persist a backend-selection decision to ``bin/backend-decision.json``, keyed by its stage.
+_INSTALL_ENTRY = "install"
+_MIXED_CARDS_ENTRY = "mixed_cards"
 
-    Merges into any existing file so the ``detect`` and ``reconcile`` stages of one install are both kept
-    (reconcile runs after detection on the sync path and would otherwise clobber it). Best-effort: a write
-    failure only costs the breadcrumb, never the install, so it is swallowed. The breadcrumb is the audit
-    trail a support bundle reads to see *why* a build was chosen when the installed wheel cannot run the GPU.
-    """
-    path = paths.backend_decision_file(root)
+
+def _read_breadcrumb(root: Path) -> dict[str, object]:
+    """Return the parsed ``bin/backend-decision.json``, or an empty mapping when absent or unreadable."""
     try:
-        existing = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(existing, dict):
-            existing = {}
+        existing = json.loads(paths.backend_decision_file(root).read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        existing = {}
-    entry = decision.to_dict()
-    entry["recorded_at"] = datetime.now().isoformat(timespec="seconds")
-    existing[decision.stage] = entry
+        return {}
+    return existing if isinstance(existing, dict) else {}
+
+
+def _write_breadcrumb_entry(root: Path, key: str, entry: dict[str, object]) -> None:
+    """Merge one entry into ``bin/backend-decision.json`` under ``key``, stamped with the time it was recorded.
+
+    The write is best-effort. A failure loses only the breadcrumb and does not fail the install, so it is
+    swallowed. A lost
+    ``install`` entry makes a later sync fall back to the rule for a token with no recorded provenance.
+    """
+    existing = _read_breadcrumb(root)
+    existing[key] = {**entry, "recorded_at": datetime.now().isoformat(timespec="seconds")}
+    path = paths.backend_decision_file(root)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
@@ -362,23 +412,138 @@ def _write_decision(root: Path, decision: detect.BackendDecision) -> None:
         pass
 
 
-def _detected_backend(root: Path) -> str:
-    """Detect the backend token, recording the full decision trail to the breadcrumb file."""
-    decision = detect.describe_backend_selection()
+def _write_decision(root: Path, decision: detect.BackendDecision) -> None:
+    """Persist a backend-selection decision to ``bin/backend-decision.json``, keyed by its stage.
+
+    Merges into any existing file so the ``detect``, ``reconcile`` and ``install`` entries of one install
+    are all kept. The breadcrumb is the audit trail in a support bundle that records *why* a build was
+    chosen when the installed wheel cannot run the GPU.
+    """
+    _write_breadcrumb_entry(root, decision.stage, decision.to_dict())
+
+
+def _read_install_record(root: Path) -> backend_mod.InstallRecord | None:
+    """Return the provenance recorded for the persisted ``bin/backend`` token, or None when absent."""
+    return backend_mod.InstallRecord.from_dict(_read_breadcrumb(root).get(_INSTALL_ENTRY))
+
+
+def _persist_backend(root: Path, record: backend_mod.InstallRecord) -> None:
+    """Write ``bin/backend`` and record where its token came from."""
+    backend_mod.write_backend_file(paths.backend_file(root), record.token)
+    _write_breadcrumb_entry(root, _INSTALL_ENTRY, record.to_dict())
+
+
+def _token_source(root: Path, resolved: backend_mod.ResolvedBackend) -> backend_mod.BackendSource:
+    """Return the provenance of a resolved token, reading the install record for a persisted one."""
+    if resolved.source is not backend_mod.BackendSource.FILE:
+        return resolved.source
+    return backend_mod.persisted_source(resolved.token, _read_install_record(root))
+
+
+def _read_mixed_card_policy(root: Path) -> detect.MixedCardPolicy | None:
+    """Return the mixed-card policy the operator chose, or None when a policy was not recorded."""
+    entry = _read_breadcrumb(root).get(_MIXED_CARDS_ENTRY)
+    if not isinstance(entry, dict):
+        return None
+    policy = entry.get("policy")
+    if policy not in set(detect.MixedCardPolicy):
+        return None
+    return detect.MixedCardPolicy(policy)
+
+
+def _warn_cards_without_kernels(
+    decision: detect.BackendDecision,
+    requested: detect.MixedCardPolicy | None,
+) -> None:
+    """Warn when the ``all`` policy could not cover every card and the build for the highest card was used."""
+    capabilities = decision.compute_capabilities or ()
+    if requested not in (None, detect.MixedCardPolicy.ALL):
+        return
+    if detect.effective_policy(capabilities, requested) is detect.MixedCardPolicy.ALL:
+        return
+    stranded = detect.cards_without_kernels(decision.final_token, capabilities)
+    if not stranded:
+        return
+    stranded_tag = ", ".join(detect.format_capability(cap) for cap in stranded)
+    print(
+        f"WARNING: a single PyTorch build cannot run every NVIDIA card in this machine. {decision.final_token} "
+        f"is installed for the highest card and has no kernels for compute capability {stranded_tag}, so "
+        f"that card cannot run jobs. Set {_BACKEND_ENV} or pass --backend to choose a different build.",
+        file=sys.stderr,
+    )
+
+
+def _detected_decision(root: Path, *, may_prompt: bool) -> detect.BackendDecision:
+    """Detect the backend, applying the recorded mixed-card policy, and record the decision trail.
+
+    When the cards need different builds, a policy has not been recorded and ``may_prompt`` is set on an
+    interactive run, the operator is asked once and the answer is recorded for later detections. Every
+    other run applies the recorded policy or the non-interactive default.
+    """
+    policy = _read_mixed_card_policy(root)
+    decision = detect.describe_backend_selection(policy=policy)
+    if may_prompt and policy is None and decision.mixed_card_policy is not None and not _is_headless():
+        capabilities = decision.compute_capabilities or ()
+        builds = detect.mixed_card_builds(decision.driver_cuda_version or (0, 0), capabilities)
+        policy = backend_mod.choose_mixed_card_policy_interactively(builds, capabilities)
+        _write_breadcrumb_entry(
+            root,
+            _MIXED_CARDS_ENTRY,
+            {
+                "policy": str(policy),
+                "compute_capabilities": [detect.format_capability(cap) for cap in capabilities],
+            },
+        )
+        decision = detect.apply_mixed_card_policy(decision, policy)
+    if may_prompt:
+        _warn_cards_without_kernels(decision, policy)
     _write_decision(root, decision)
-    return decision.final_token
+    return decision
 
 
-def _reconcile_backend(root: Path, token: str) -> str:
+def _repick(
+    root: Path,
+    resolved: backend_mod.ResolvedBackend,
+    detection: detect.BackendDecision,
+) -> backend_mod.InstallRecord | None:
+    """Return the record replacing a detection-derived persisted token with the live pick, or None.
+
+    Only a persisted token whose provenance is detection is re-picked. A token from a flag, the
+    environment, the CPU prompt or a hand-written file stays as chosen.
+    """
+    if resolved.source is not backend_mod.BackendSource.FILE:
+        return None
+    if _token_source(root, resolved) not in backend_mod.DETECTION_SOURCES:
+        return None
+    target = detect.repick_detected_build(resolved.token, detection)
+    if target == resolved.token:
+        return None
+    return backend_mod.InstallRecord(
+        token=target,
+        source=backend_mod.BackendSource.DETECTED,
+        replaced_token=resolved.token,
+        reason=detect.explain_repick(resolved.token, detection),
+    )
+
+
+def _reconcile_backend(
+    root: Path,
+    resolved: backend_mod.ResolvedBackend,
+    *,
+    gpus: detect.GpuQuery | None = None,
+) -> str:
     """Clamp the resolved token to the live GPU's arch window so an unrunnable build is never installed.
 
     A persisted ``bin/backend`` (or the cu126 default) can name a build with no kernel image for the
     card (a cu126 token on a Blackwell GPU, say), which torch only rejects at the first kernel launch
     ("no CUDA kernels for this GPU"). When the live capability says the token cannot run, swap to the
     build that can and re-persist it so the correction sticks across future syncs instead of reasserting
-    the broken token on every update. A non-CUDA token, or an unreadable capability, is left untouched.
+    the broken token on every update. The clamp applies the recorded mixed-card policy, and the corrected
+    token keeps the provenance of the token it replaced. A non-CUDA token, or an unreadable capability,
+    is left untouched.
     """
-    decision = detect.describe_reconcile(token)
+    token = resolved.token
+    decision = detect.describe_reconcile(token, policy=_read_mixed_card_policy(root), gpus=gpus)
     _write_decision(root, decision)
     reconciled = decision.final_token
     if reconciled == token:
@@ -389,7 +554,15 @@ def _reconcile_backend(root: Path, token: str) -> str:
         f"used. {reconciled} is installed and recorded for future updates.",
         file=sys.stderr,
     )
-    backend_mod.write_backend_file(paths.backend_file(root), reconciled)
+    _persist_backend(
+        root,
+        backend_mod.InstallRecord(
+            token=reconciled,
+            source=_token_source(root, resolved),
+            replaced_token=token,
+            reason=decision.reason,
+        ),
+    )
     return reconciled
 
 
@@ -409,9 +582,11 @@ def _verify_installed_torch_arch(uv: str, root: Path, token: str) -> None:
     arch_list = runner.query_torch_arch_list(uv, root=root)
     if not arch_list or not any(arch.startswith("sm_") for arch in arch_list):
         return  # torch absent, or a CPU/ROCm build whose arch tags do not apply
-    capability = detect.live_compute_capability()
-    if capability == (0, 0) or detect.gpu_arch_supported(arch_list, capability):
+    governing = detect.governing_capabilities(detect.live_gpu_query().capabilities, _read_mixed_card_policy(root))
+    unsupported = [capability for capability in governing if not detect.gpu_arch_supported(arch_list, capability)]
+    if not unsupported:
         return
+    capability = unsupported[0]
     cap_tag = f"sm_{capability[0]}{capability[1]}"
     print(
         f"WARNING: the torch build just installed ({token}) has no CUDA kernels for this GPU "
@@ -426,21 +601,33 @@ def _verify_installed_torch_arch(uv: str, root: Path, token: str) -> None:
 
 
 def _sync(uv: str, root: Path, *, cli_flag: str | None, options: _SyncOptions) -> int:
-    """Disclose, gain consent, ensure git, seed config, then run the sync (with preview) or ROCm path."""
-    token = backend_mod.resolve_backend(
+    """Disclose, gain consent, ensure git, seed config, then run the sync (with preview) or ROCm path.
+
+    A detection-derived persisted token is first replaced by the live pick when the driver ceiling or the
+    cards need a different build. The replacement installs through the same preview and confirmation as
+    any other sync, and is recorded only once that sync succeeds, so after a cancelled or failed switch
+    ``bin/backend`` still holds the installed build.
+    """
+    # Detect here as well as at install and detect time, because an absent bin/backend must pick the build
+    # this machine can actually run, and a detection-derived bin/backend is re-picked against it.
+    detection = _detected_decision(root, may_prompt=True)
+    resolved = backend_mod.resolve_backend(
         cli_flag=cli_flag,
         env_value=os.environ.get(_BACKEND_ENV),
         file_value=backend_mod.read_backend_file(paths.backend_file(root)),
-        # Detect here too (not only at install/detect time): an absent bin/backend must pick the build
-        # this machine can actually run rather than blindly defaulting to cu126.
-        detected=_detected_backend(root),
+        detected=detection.final_token,
     )
-    if token == detect.AMD_UNSUPPORTED:
+    if resolved.token == detect.AMD_UNSUPPORTED:
         _print_amd_unsupported()
         return 2
+    repick = _repick(root, resolved, detection)
+    installed_token = resolved.token
+    if repick is not None:
+        print(f"Changing the torch build from {repick.replaced_token} to {repick.token} because {repick.reason}.")
+        resolved = backend_mod.ResolvedBackend(token=repick.token, source=repick.source)
     # Belt-and-suspenders: detection can be bypassed by a stale persisted token or a forced override, so
     # cross-check whatever was resolved against the live GPU and clamp an unrunnable build before installing.
-    token = _reconcile_backend(root, token)
+    token = _reconcile_backend(root, resolved)
 
     # Disclose what is about to be installed (and from where) and gain consent before any heavy download.
     # The git line tells the user up front whether their existing git is used or a portable one is fetched.
@@ -480,7 +667,18 @@ def _sync(uv: str, root: Path, *, cli_flag: str | None, options: _SyncOptions) -
     features_note = ", ".join(feature_extras) if feature_extras else "none"
     print(f"Installing dependencies for GPU backend: {token} (features: {features_note})")
     rc = _run_sync(uv, root, token, feature_extras, options)
+    if rc == SYNC_DECLINED_RC and repick is not None:
+        # A declined switch is not a declined sync. The lockfile still has to be installed on the build that
+        # stays, or a launch after an update would run the worker ahead of its dependencies. The installed
+        # build runs the card, so that sync proceeds under the same hold and preview rules as any other.
+        token = installed_token
+        repick = None
+        print(f"Keeping the installed {token} build. Run update and choose Upgrade to switch later.")
+        feature_extras = backend_mod.desired_feature_extras(token, env_value=os.environ.get(_FEATURES_ENV))
+        rc = _run_sync(uv, root, token, feature_extras, options)
     if rc == 0:
+        if repick is not None and repick.token == token:
+            _persist_backend(root, repick)
         # Verify the prediction against ground truth now that torch is on disk: an arch mismatch here
         # means the build map is stale, which the user cannot fix by reinstalling the same build.
         _verify_installed_torch_arch(uv, root, token)
@@ -541,71 +739,123 @@ def _write_sync_stamp(root: Path) -> None:
         pass
 
 
-def _installed_torch_runs_gpu(uv: str, root: Path, capability: tuple[int, int]) -> bool:
-    """Whether the installed torch wheel has kernels for a GPU of ``capability``.
+def _installed_torch_runs_gpu(uv: str, root: Path, capabilities: tuple[tuple[int, int], ...]) -> bool:
+    """Whether the installed torch wheel has kernels for every GPU in ``capabilities``.
 
     Reads the installed wheel's own compiled arch list (cheap, no GPU context) and applies the same
     cubin/PTX compatibility rule the installer uses. Returns True (do not force a re-sync) whenever the
     answer cannot be established: torch absent, a non-CUDA build whose ``sm_`` tags do not apply, or an
-    arch list that could not be read. Only a wheel that provably cannot run the card returns False.
+    arch list that could not be read. Only a wheel that provably cannot run a card returns False.
     """
     arch_list = runner.query_torch_arch_list(uv, root=root)
     if not arch_list or not any(arch.startswith("sm_") for arch in arch_list):
         return True
-    return detect.gpu_arch_supported(arch_list, capability)
+    return all(detect.gpu_arch_supported(arch_list, capability) for capability in capabilities)
 
 
-def _gpu_check_token(root: Path, capability: tuple[int, int]) -> str:
-    """The stamp value pinning a torch-arch verification to one lock + one card (``<lock>:<cap>``)."""
-    return f"{_lock_fingerprint(root)}:{capability[0]}.{capability[1]}"
+def _gpu_check_token(root: Path, gpus: detect.GpuQuery) -> str:
+    """The stamp value pinning the launch checks to one lock, one set of cards and one driver.
+
+    Holds ``<lock>:<capabilities>:<driver version>``. The driver version is in the key because a driver
+    update can raise or lower the CUDA ceiling, and the ceiling sets whether a detection-derived build is
+    re-picked.
+    """
+    capabilities = ",".join(detect.format_capability(cap) for cap in gpus.capabilities)
+    return f"{_lock_fingerprint(root)}:{capabilities}:{gpus.driver_version or ''}"
 
 
-def _gpu_check_is_current(root: Path, capability: tuple[int, int]) -> bool:
-    """Whether the installed torch was already verified to run this exact lock + compute capability."""
+def _gpu_check_is_current(root: Path, gpus: detect.GpuQuery) -> bool:
+    """Whether the launch checks already passed for this exact lock, set of cards and driver."""
     try:
         recorded = paths.gpu_check_stamp_file(root).read_text(encoding="utf-8").strip()
     except OSError:
         return False
-    return recorded == _gpu_check_token(root, capability)
+    return recorded == _gpu_check_token(root, gpus)
 
 
-def _write_gpu_check_stamp(root: Path, capability: tuple[int, int]) -> None:
-    """Record that the installed torch runs ``capability`` under the current lock (best-effort)."""
+def _write_gpu_check_stamp(root: Path, gpus: detect.GpuQuery) -> None:
+    """Record that the launch checks passed for this lock, set of cards and driver (best-effort)."""
     stamp = paths.gpu_check_stamp_file(root)
     try:
         stamp.parent.mkdir(parents=True, exist_ok=True)
-        stamp.write_text(_gpu_check_token(root, capability), encoding="utf-8")
+        stamp.write_text(_gpu_check_token(root, gpus), encoding="utf-8")
     except OSError:
         pass
 
 
-def _ensure_torch_runs_gpu(uv: str, root: Path, *, cli_flag: str | None, options: _SyncOptions) -> int | None:
-    """Force a corrective sync when the installed torch cannot run the live GPU; else return None.
+def _repick_on_launch(uv: str, root: Path, *, cli_flag: str | None, options: _SyncOptions) -> int | None:
+    """Sync to the live pick when a detection-derived ``bin/backend`` is out of date; else return None.
+
+    A driver update can raise the CUDA ceiling without moving ``uv.lock``, so a launch that skips the sync
+    would keep the older build until the next release. The check reads the driver ceiling only when the
+    persisted token is detection-derived, and :func:`_sync` performs and records the switch.
+
+    A switch the user declines at the download confirmation (or holds, which a switch does not allow) is
+    not a failure, because :func:`_sync` then installs the lock on the build that stays and the launch
+    continues on it. The caller's GPU-check stamp then covers this lock, set of cards and driver, so the
+    offer returns on the next ``update`` or when any of those change, and later launches do not repeat it.
+    """
+    resolved = backend_mod.resolve_backend(
+        cli_flag=cli_flag,
+        env_value=os.environ.get(_BACKEND_ENV),
+        file_value=backend_mod.read_backend_file(paths.backend_file(root)),
+    )
+    if resolved.source is not backend_mod.BackendSource.FILE:
+        return None
+    if _token_source(root, resolved) not in backend_mod.DETECTION_SOURCES:
+        return None
+    if _repick(root, resolved, _detected_decision(root, may_prompt=False)) is None:
+        return None
+    return _sync(uv, root, cli_flag=cli_flag, options=options)
+
+
+def _ensure_torch_runs_gpu(
+    uv: str,
+    root: Path,
+    gpus: detect.GpuQuery,
+    *,
+    cli_flag: str | None,
+    options: _SyncOptions,
+) -> int | None:
+    """Force a corrective sync when the installed build is out of date or cannot run the live GPUs.
 
     A matching lock proves the right *versions* are installed, not that the installed torch has kernels for
-    the card actually present: a GPU swap, or a build persisted from a different machine, leaves torch
+    the cards actually present, since a GPU swap, or a build persisted from a different machine, leaves torch
     unable to launch a single kernel while ``uv.lock`` is untouched. The worker's runtime guard already
     fails fast on this, but on the pure-launch path nothing re-runs the installer, so the worker would
-    refuse every job on every relaunch forever. Verify the installed wheel against the live card (once per
-    lock+card, stamped so a healthy launch stays instant) and, when it cannot run and a different build
-    could, re-sync so the reconcile step installs the runnable build.
+    refuse every job on every relaunch forever. Verify the installed wheel against the live cards (once per
+    lock, set of cards and driver, stamped so a healthy launch stays instant) and, when it cannot run and a
+    different build could, re-sync so the reconcile step installs the runnable build. The same stamp gates
+    the re-pick of a detection-derived build (see :func:`_repick_on_launch`), so a routine launch reads
+    nvidia-smi once.
 
     Returns a sync exit code when a corrective sync ran, or None to let the caller start normally.
     """
-    capability = detect.live_compute_capability()
-    if capability == (0, 0):
+    if not gpus.capabilities:
         return None  # no readable NVIDIA GPU (non-NVIDIA, or nvidia-smi absent): nothing to verify
-    if _gpu_check_is_current(root, capability):
+    if _gpu_check_is_current(root, gpus):
         return None
-    if _installed_torch_runs_gpu(uv, root, capability):
-        _write_gpu_check_stamp(root, capability)
+    repick_rc = _repick_on_launch(uv, root, cli_flag=cli_flag, options=options)
+    if repick_rc is not None and repick_rc != 0:
+        return repick_rc
+    # A completed re-pick sync (accepted or declined) falls through to the kernel check, which stamps this
+    # lock, set of cards and driver so the next launch does not probe again or offer the switch again.
+    policy = _read_mixed_card_policy(root)
+    governing = detect.governing_capabilities(gpus.capabilities, policy)
+    if _installed_torch_runs_gpu(uv, root, governing):
+        _write_gpu_check_stamp(root, gpus)
         return None
+    cap_tag = ", ".join(detect.format_capability(cap) for cap in governing)
     persisted = backend_mod.read_backend_file(paths.backend_file(root))
-    would_install = detect.reconcile_backend_for_gpu(persisted) if persisted else detect.detect_backend()
+    would_install = (
+        detect.reconcile_backend_for_gpu(persisted, policy=policy, gpus=gpus)
+        if persisted
+        else detect.describe_backend_selection(policy=policy).final_token
+    )
     if persisted is None or would_install != persisted:
         print(
-            f"The installed PyTorch has no CUDA kernels for this GPU (compute capability "
-            f"{capability[0]}.{capability[1]}). Installing {would_install} before starting.",
+            f"The installed PyTorch has no CUDA kernels for this GPU (compute capability {cap_tag}). "
+            f"Installing {would_install} before starting.",
             file=sys.stderr,
         )
         return _sync(uv, root, cli_flag=cli_flag, options=options)
@@ -613,9 +863,9 @@ def _ensure_torch_runs_gpu(uv: str, root: Path, *, cli_flag: str | None, options
     # selection table (a worker bug), not something a reinstall of the same build fixes. Do not loop-resync;
     # start and let the worker's runtime guard surface the actionable, report-worthy specifics.
     print(
-        f"WARNING: the installed PyTorch ({persisted}) cannot run this GPU (compute capability "
-        f"{capability[0]}.{capability[1]}) and no alternative locked build is known for it. This is likely "
-        f"a worker or driver problem. The worker starts anyway, and its log has the details.",
+        f"WARNING: the installed PyTorch ({persisted}) cannot run this GPU (compute capability {cap_tag}) "
+        f"and no alternative locked build is known for it. This is likely a worker or driver problem. The "
+        f"worker starts anyway, and its log has the details.",
         file=sys.stderr,
     )
     return None
@@ -627,48 +877,53 @@ def _ensure_synced(uv: str, root: Path, *, cli_flag: str | None, options: _SyncO
     An in-place update overlays a new lockfile but preserves the existing venv, so a plain launch must
     notice the venv no longer matches the lock and re-sync; otherwise the worker code runs ahead of its
     installed dependencies (the cause of the post-update crash-loop). An unchanged install matches its
-    stamp and starts immediately, with no re-resolve, unless the installed torch turns out to have no
-    kernels for the live GPU (see :func:`_ensure_torch_runs_gpu`).
+    stamp and starts immediately, with no re-resolve, unless the installed build is out of date for the
+    driver or has no kernels for the live GPUs (see :func:`_ensure_torch_runs_gpu`).
     """
     if paths.venv_dir(root).exists() and _venv_matches_lock(root):
-        corrective_rc = _ensure_torch_runs_gpu(uv, root, cli_flag=cli_flag, options=options)
+        gpus = detect.live_gpu_query()
+        corrective_rc = _ensure_torch_runs_gpu(uv, root, gpus, cli_flag=cli_flag, options=options)
         if corrective_rc is not None:
             return corrective_rc
-        _ensure_utilities_for_current_backend(uv, root, cli_flag=cli_flag, options=options)
+        _ensure_utilities_for_current_backend(uv, root, gpus, cli_flag=cli_flag, options=options)
         return 0
     return _sync(uv, root, cli_flag=cli_flag, options=options)
 
 
-def _offer_cpu_mode(args: argparse.Namespace, token: str) -> str:
+def _offer_cpu_mode(args: argparse.Namespace, resolved: backend_mod.ResolvedBackend) -> backend_mod.ResolvedBackend:
     """Let an interactive user opt into CPU/alchemist-only mode when a GPU build was auto-detected.
 
     A backend chosen explicitly (a ``--backend`` flag or ``HORDE_WORKER_BACKEND``) is respected as-is; a
     non-interactive run never prompts. See :func:`worker_bootstrap.backend.choose_backend_interactively`.
+    A changed answer is reported with the ``interactive`` source.
     """
     explicitly_chosen = bool(args.backend) or bool(os.environ.get(_BACKEND_ENV))
-    return backend_mod.choose_backend_interactively(
-        token,
+    token = backend_mod.choose_backend_interactively(
+        resolved.token,
         explicitly_chosen=explicitly_chosen,
         interactive=consent.is_interactive(),
     )
+    if token == resolved.token:
+        return resolved
+    return backend_mod.ResolvedBackend(token=token, source=backend_mod.BackendSource.INTERACTIVE)
 
 
 def _cmd_detect(args: argparse.Namespace, root: Path, uv: str) -> int:  # noqa: ARG001  (uv unused here)
     """Detect (and optionally persist) the backend token, honouring a flag/env override."""
-    token = backend_mod.resolve_backend(
+    resolved = backend_mod.resolve_backend(
         cli_flag=args.backend,
         env_value=os.environ.get(_BACKEND_ENV),
-        detected=_detected_backend(root),
+        detected=_detected_decision(root, may_prompt=args.write).final_token,
     )
-    if token == detect.AMD_UNSUPPORTED:
+    if resolved.token == detect.AMD_UNSUPPORTED:
         _print_amd_unsupported()
         return 2
-    token = _offer_cpu_mode(args, token)
-    if token == detect.CPU:
+    resolved = _offer_cpu_mode(args, resolved)
+    if resolved.token == detect.CPU:
         _print_cpu_notice()
     if args.write:
-        backend_mod.write_backend_file(paths.backend_file(root), token)
-    print(token)
+        _persist_backend(root, backend_mod.InstallRecord(token=resolved.token, source=resolved.source))
+    print(resolved.token)
     return 0
 
 
@@ -925,21 +1180,23 @@ def _cmd_apply_bundle(args: argparse.Namespace, root: Path, uv: str) -> int:  # 
 
 
 def _cmd_install(args: argparse.Namespace, root: Path, uv: str) -> int:
-    """One-shot first run: detect + persist backend, sync, then launch the web dashboard."""
-    token = backend_mod.resolve_backend(
+    """One-shot first run: detect + persist backend with its provenance, sync, then launch the web dashboard."""
+    resolved = backend_mod.resolve_backend(
         cli_flag=args.backend,
         env_value=os.environ.get(_BACKEND_ENV),
-        detected=_detected_backend(root),
+        detected=_detected_decision(root, may_prompt=True).final_token,
     )
-    if token == detect.AMD_UNSUPPORTED:
+    if resolved.token == detect.AMD_UNSUPPORTED:
         _print_amd_unsupported()
         return 2
-    token = _offer_cpu_mode(args, token)
-    if token == detect.CPU:
+    resolved = _offer_cpu_mode(args, resolved)
+    if resolved.token == detect.CPU:
         _print_cpu_notice()
-    backend_mod.write_backend_file(paths.backend_file(root), token)
+    _persist_backend(root, backend_mod.InstallRecord(token=resolved.token, source=resolved.source))
     _apply_cache_mode_flag(args)
-    rc = _sync(uv, root, cli_flag=token, options=_sync_options(args))
+    # The sync resolves the same token from the flag, the environment or the bin/backend just written, and
+    # reads its provenance from there.
+    rc = _sync(uv, root, cli_flag=args.backend, options=_sync_options(args))
     if rc != 0 or args.no_launch:
         return rc
     return runner.uv_run(uv, _LAUNCH_COMMANDS["web"], root=root)

@@ -128,9 +128,11 @@ def backend_file(root: Path | None = None) -> Path:
 def backend_decision_file(root: Path | None = None) -> Path:
     """Return the path of the backend-selection audit breadcrumb (``bin/backend-decision.json``).
 
-    Records *why* the persisted backend token was chosen (the driver CUDA ceiling, the GPU compute
-    capability, and what the architecture clamp did), keyed by stage (``detect`` / ``reconcile``). Lives
-    beside ``bin/backend`` so an update overlay preserves it and the support bundle can collect it: the
+    Records *why* the persisted backend token was chosen (the driver CUDA ceiling, every GPU's compute
+    capability, the mixed-card policy, and what the architecture clamp did), keyed by stage (``detect`` /
+    ``reconcile``), plus where the persisted token came from (``install``) and the operator's mixed-card
+    choice (``mixed_cards``). A sync reads the ``install`` entry to check whether it may re-pick the token.
+    Lives beside ``bin/backend`` so an update overlay preserves it and the support bundle can collect it, since the
     logs otherwise show a wrong-build install only as a downstream runtime fault, never the selection
     inputs behind it.
     """
@@ -226,12 +228,14 @@ def sync_stamp_file(root: Path | None = None) -> Path:
 def gpu_check_stamp_file(root: Path | None = None) -> Path:
     """Return the stamp recording the installed torch was verified to run the live GPU (``.venv/.horde-gpu-check``).
 
-    Holds ``<lock-fingerprint>:<compute-capability>``. A matching lock does not prove the installed torch
-    has kernels for the card actually present (a GPU swap, or a build persisted from a different machine,
-    leaves torch unable to launch a kernel while the lock is untouched), so a launch verifies the wheel's
-    architecture list against the live card once and stamps the result here. It lives inside the venv so it
-    is discarded whenever the venv is recreated, and re-verifies whenever the lock or the card changes,
-    keeping a healthy launch from paying the torch-arch probe every time.
+    Holds ``<lock-fingerprint>:<compute-capabilities>:<driver-version>``. A matching lock does not prove the
+    installed torch has kernels for the cards actually present (a GPU swap, or a build persisted from a
+    different machine, leaves torch unable to launch a kernel while the lock is untouched), so a launch
+    verifies the wheel's architecture list against the live cards once and stamps the result here. The
+    driver version is in the key because a driver update can change which build a detection-derived token
+    re-picks. It lives inside the venv so it is discarded whenever the venv is recreated, and re-verifies
+    whenever the lock, the cards or the driver change, keeping a healthy launch from paying the torch-arch
+    probe and the driver-ceiling read every time.
     """
     return venv_dir(root) / ".horde-gpu-check"
 
