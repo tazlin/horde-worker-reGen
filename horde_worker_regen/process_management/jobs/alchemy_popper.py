@@ -1329,6 +1329,10 @@ class AlchemyCoordinator:
         lane is up, so such a form that outlives the deadline is one whose lane went away after the pop and has
         not returned. A lane-bound form popped while the image-utilities lane is down waits on a tighter bound
         (:meth:`_utilities_lane_fault_cause`).
+
+        An image-utilities lane takes one unit of work at a time from any sender, a form, a pre-annotation or a
+        background strip (:attr:`HordeProcessInfo.utilities_work_sent_at`), so the selection skips a lane holding
+        one. Forms behind it stay pending, and their dispatch deadline keeps running from the pop while they wait.
         """
         still_pending: deque[AlchemyFormSpec] = deque()
         now = time.monotonic()
@@ -1353,6 +1357,8 @@ class AlchemyCoordinator:
                     process_info.process_launch_identifier,
                 )
                 self._pending_form_deadlines.pop(spec.form_id, None)
+                if capability is WorkerCapability.IMAGE_UTILITIES:
+                    process_info.note_utilities_work_sent()
                 logger.debug(
                     f"Dispatched alchemy form {spec.form_id} ({spec.form}) to process {process_info.process_id}",
                 )

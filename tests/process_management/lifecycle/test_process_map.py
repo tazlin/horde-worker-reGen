@@ -19,7 +19,9 @@ from horde_worker_regen.process_management.ipc.messages import (
 from horde_worker_regen.process_management.lifecycle.horde_process import (
     DEFAULT_CAPABILITIES,
     HordeProcessType,
+    WorkerCapability,
 )
+from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from tests.process_management.conftest import make_job_pop_response, make_mock_process_info
 
@@ -688,3 +690,77 @@ class TestPreloadedSiblingVictims:
         process_map = ProcessMap({0: starting})
 
         assert process_map._get_first_inference_process_to_kill(preloaded_siblings_stoppable=True) is None
+
+
+_UTILITIES_LANE_ID = 7
+
+
+def _idle_utilities_lane() -> HordeProcessInfo:
+    return make_mock_process_info(
+        _UTILITIES_LANE_ID,
+        model_name=None,
+        state=HordeProcessState.WAITING_FOR_JOB,
+        process_type=HordeProcessType.UTILITIES,
+    )
+
+
+class TestUtilitiesLaneWorkMark:
+    """An image-utilities lane holding a unit of work from any sender is not selected until the work returns."""
+
+    def test_a_marked_lane_is_not_selected_and_cannot_accept_work(self) -> None:
+        """The mark holds out a lane still reporting idle, since a lane can report idle before it reads the message."""
+        lane = _idle_utilities_lane()
+        process_map = ProcessMap({_UTILITIES_LANE_ID: lane})
+        assert process_map.get_first_available(WorkerCapability.IMAGE_UTILITIES) is lane
+
+        lane.note_utilities_work_sent()
+
+        assert lane.last_process_state is HordeProcessState.WAITING_FOR_JOB
+        assert not lane.can_accept_job()
+        assert process_map.get_first_available(WorkerCapability.IMAGE_UTILITIES) is None
+
+    def test_a_result_clears_the_mark(self) -> None:
+        """Any result from the lane frees it for the next unit of work."""
+        lane = _idle_utilities_lane()
+        process_map = ProcessMap({_UTILITIES_LANE_ID: lane})
+        lane.note_utilities_work_sent()
+
+        process_map.on_utilities_work_result(_UTILITIES_LANE_ID)
+
+        assert not lane.holds_utilities_work()
+        assert process_map.get_first_available(WorkerCapability.IMAGE_UTILITIES) is lane
+
+    def test_a_result_for_an_absent_process_is_ignored(self) -> None:
+        """A result for a slot the map no longer holds is ignored."""
+        ProcessMap({}).on_utilities_work_result(_UTILITIES_LANE_ID)
+
+    def test_the_lane_ending_clears_the_mark(self) -> None:
+        """An ending lane does not read the pipe again, so the mark is cleared with the per-launch state."""
+        lane = _idle_utilities_lane()
+        process_map = ProcessMap({_UTILITIES_LANE_ID: lane})
+        lane.note_utilities_work_sent()
+
+        process_map.on_process_ending(_UTILITIES_LANE_ID)
+
+        assert not lane.holds_utilities_work()
+
+    def test_a_lane_replaced_mid_work_starts_unmarked(self) -> None:
+        """The replacement launch gets a new entry, so the old launch's work does not hold it out."""
+        lane = _idle_utilities_lane()
+        process_map = ProcessMap({_UTILITIES_LANE_ID: lane})
+        lane.note_utilities_work_sent()
+
+        replacement = _idle_utilities_lane()
+        process_map[_UTILITIES_LANE_ID] = replacement
+
+        assert not replacement.holds_utilities_work()
+        assert process_map.get_first_available(WorkerCapability.IMAGE_UTILITIES) is replacement
+
+    def test_a_dead_unreaped_lane_is_never_selected(self) -> None:
+        """A lane whose adapter stopped itself keeps its idle state until the reaper runs and is still skipped."""
+        lane = _idle_utilities_lane()
+        process_map = ProcessMap({_UTILITIES_LANE_ID: lane})
+        lane.mp_process.is_alive.return_value = False
+
+        assert lane.last_process_state is HordeProcessState.WAITING_FOR_JOB
+        assert process_map.get_first_available(WorkerCapability.IMAGE_UTILITIES) is None

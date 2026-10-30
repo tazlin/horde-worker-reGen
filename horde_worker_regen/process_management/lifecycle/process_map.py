@@ -372,6 +372,9 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         # A dead process's device weights go with it, so it can no longer be a retained resident the
         # retention static fit charges or the dispatch path evicts.
         self[process_id].clear_retained_resident()
+        # An ending lane does not read the pipe again, and a dead one is not selected, so the mark for the unit of
+        # work it held is no longer needed.
+        self[process_id].clear_utilities_work()
         self[process_id].batch_amount = 1
 
         # Drop this slot's last VRAM/RAM sample. A dead process reports nothing further, so its final
@@ -397,6 +400,20 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         self.reset_heartbeat_state(process_id)
 
         self[process_id].last_received_timestamp = time.time()
+
+    def on_utilities_work_result(self, process_id: int) -> None:
+        """Mutate the lane's entry to clear its unit of work when a result from its current launch arrives.
+
+        Each alchemy, annotation and strip result handler calls this before it handles the result.
+        A result for work the parent already wrote off still means the lane's control thread is reading again. A
+        result from any other lane type is a no-op, since only an image-utilities lane is marked.
+
+        Args:
+            process_id: The ID of the process whose result arrived, already matched to its current launch.
+        """
+        process_info = self.get(process_id)
+        if process_info is not None:
+            process_info.clear_utilities_work()
 
     def on_memory_report(
         self,
@@ -938,7 +955,10 @@ class ProcessMap(dict[int, HordeProcessInfo]):
     ) -> HordeProcessInfo | None:
         """Return the first process with the capability that can accept a job, or None.
 
-        Processes without a loaded model are preferred (cheapest to (re)target).
+        Processes without a loaded model are preferred (cheapest to (re)target). An image-utilities lane is
+        skipped while it holds a unit of work (:meth:`HordeProcessInfo.holds_utilities_work`) or once its process
+        is dead. The adapter of a lane that stopped itself does not read its pipe again, and its entry keeps the
+        last live state until the crash reaper runs, so a send to it would block the parent's main loop.
 
         Args:
             capability: The worker capability the process must have.
@@ -947,15 +967,19 @@ class ProcessMap(dict[int, HordeProcessInfo]):
                 can target a chosen card); when None, any card.
         """
         disallowed = disallowed_processes or []
+        requires_live_process = capability is WorkerCapability.IMAGE_UTILITIES
 
         for p in self.get_capable_processes(capability):
             if device_index is not None and p.device_index != device_index:
                 continue
             if self.is_reserved_for_disaggregation(p.process_id):
                 continue
+            if requires_live_process and not p.is_process_alive():
+                continue
             if (
                 p.last_process_state in (HordeProcessState.WAITING_FOR_JOB, HordeProcessState.PRELOADED_MODEL)
                 and p.loaded_horde_model_name is None
+                and not p.holds_utilities_work()
                 and p.process_id not in disallowed
             ):
                 return p
@@ -964,6 +988,8 @@ class ProcessMap(dict[int, HordeProcessInfo]):
             if device_index is not None and p.device_index != device_index:
                 continue
             if self.is_reserved_for_disaggregation(p.process_id):
+                continue
+            if requires_live_process and not p.is_process_alive():
                 continue
             if p.can_accept_job() and p.process_id not in disallowed:
                 return p

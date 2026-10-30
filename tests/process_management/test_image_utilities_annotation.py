@@ -42,7 +42,9 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeInferenceControlMessage,
     HordeInferenceResultMessage,
     HordePostProcessResultMessage,
+    HordeProcessMessage,
     HordeProcessState,
+    HordeProcessStateChangeMessage,
     HordeStartAnnotationControlMessage,
     HordeStartStripControlMessage,
     HordeStripResultMessage,
@@ -806,10 +808,15 @@ class TestStripBudgets:
         assert waiter.stage == JobStage.PENDING_SUBMIT
 
 
-def _strip_result(job_id: GenerationID, *, ok: bool = True) -> HordeStripResultMessage:
+def _strip_result(
+    job_id: GenerationID,
+    *,
+    ok: bool = True,
+    process_id: int = _UTILITIES_PROCESS_ID,
+) -> HordeStripResultMessage:
     """Build the utilities lane's result for one background strip, stripped images or a fault."""
     return HordeStripResultMessage(
-        process_id=_UTILITIES_PROCESS_ID,
+        process_id=process_id,
         process_launch_identifier=0,
         info="ok" if ok else "failed",
         job_id=job_id,
@@ -828,6 +835,157 @@ def _captured_messages() -> Iterator[list[str]]:
         yield messages
     finally:
         logger.remove(sink_id)
+
+
+async def _deliver(pm: HordeWorkerProcessManager, message: HordeProcessMessage) -> None:
+    """Hand one lane message to the manager's dispatcher, as the reader thread would."""
+    await pm._message_dispatcher._dispatch_buffered_message(message)
+
+
+def _annotation_result(job_id: GenerationID) -> HordeAnnotationResultMessage:
+    """Build the utilities lane's successful result for one pre-annotation."""
+    return HordeAnnotationResultMessage(
+        process_id=_UTILITIES_PROCESS_ID,
+        process_launch_identifier=0,
+        info="ok",
+        job_id=job_id,
+        control_map_bytes=b"derived-control-map",
+        state=GENERATION_STATE.ok,
+    )
+
+
+def _sent_types(process_info: HordeProcessInfo) -> list[type]:
+    return [type(call.args[0]) for call in _sent(process_info).call_args_list]
+
+
+class TestOneUnitOfWorkPerLane:
+    """A utilities lane takes one unit of work at a time, whichever of the three senders it comes from.
+
+    The adapter handles each message on the thread that reads the pipe, so a second image-bearing message to a busy
+    lane would block the parent's main loop until the first one's HTTP call returned.
+    """
+
+    async def test_an_annotation_and_a_strip_in_one_tick_do_not_share_a_lane(self) -> None:
+        """The strip waits for the annotation's result, then goes to the same lane."""
+        pm = make_testable_process_manager(enable_image_utilities=True)
+        util = _add_utilities_process(pm)
+        _mark_servable(pm, ["canny"])
+        controlnet_job = _make_controlnet_job()
+        assert controlnet_job.id_ is not None
+        await pm._job_tracker.record_popped_job(controlnet_job, time_popped=time.time())
+        strip_job = await _park_strip_job(pm)
+        assert strip_job.id_ is not None
+
+        pm._advance_pending_annotations()
+        await pm._advance_pending_strips()
+
+        assert _sent_types(util) == [HordeStartAnnotationControlMessage]
+        tracked_strip = pm._job_tracker.get_tracked_job(strip_job.id_)
+        assert tracked_strip is not None
+        assert tracked_strip.strip_process_id is None
+
+        await _deliver(pm, _annotation_result(controlnet_job.id_))
+        await pm._advance_pending_strips()
+
+        assert _sent_types(util) == [HordeStartAnnotationControlMessage, HordeStartStripControlMessage]
+        assert tracked_strip.strip_process_id == util.process_id
+
+    async def test_an_annotation_and_a_strip_in_one_tick_go_to_different_lanes(self) -> None:
+        """With two idle lanes the strip takes the lane the annotation left free."""
+        pm = make_testable_process_manager(enable_image_utilities=True)
+        first = _add_utilities_process(pm)
+        second = make_mock_process_info(
+            _UTILITIES_PROCESS_ID + 1,
+            model_name=None,
+            state=HordeProcessState.WAITING_FOR_JOB,
+            process_type=HordeProcessType.UTILITIES,
+        )
+        pm._process_map[second.process_id] = second
+        _mark_servable(pm, ["canny"])
+        controlnet_job = _make_controlnet_job()
+        await pm._job_tracker.record_popped_job(controlnet_job, time_popped=time.time())
+        await _park_strip_job(pm)
+
+        pm._advance_pending_annotations()
+        await pm._advance_pending_strips()
+
+        assert _sent_types(first) == [HordeStartAnnotationControlMessage]
+        assert _sent_types(second) == [HordeStartStripControlMessage]
+
+    async def test_a_form_after_an_annotation_waits_for_the_annotation_result(self) -> None:
+        """The alchemy dispatcher reads the same mark, so a form does not follow an annotation onto a busy lane."""
+        pm = make_testable_process_manager(enable_image_utilities=True)
+        util = _add_utilities_process(pm)
+        _mark_servable(pm, ["canny"])
+        controlnet_job = _make_controlnet_job()
+        assert controlnet_job.id_ is not None
+        await pm._job_tracker.record_popped_job(controlnet_job, time_popped=time.time())
+        pm._advance_pending_annotations()
+        coordinator = pm._alchemy_coordinator
+        spec = AlchemyFormSpec(form_id=str(uuid.uuid4()), form=_STRIP_FORM, source_image_bytes=b"source")
+        coordinator._queue_pending_form(spec)
+
+        coordinator.dispatch_pending_forms()
+        coordinator.dispatch_pending_forms()
+
+        assert _sent_types(util) == [HordeStartAnnotationControlMessage]
+        assert [pending.form_id for pending in coordinator._pending_forms] == [spec.form_id]
+
+        await _deliver(pm, _annotation_result(controlnet_job.id_))
+        coordinator.dispatch_pending_forms()
+
+        assert _sent_types(util) == [HordeStartAnnotationControlMessage, HordeAlchemyControlMessage]
+        assert len(coordinator._pending_forms) == 0
+        assert util.holds_utilities_work()
+
+    @pytest.mark.parametrize(
+        "result",
+        [
+            pytest.param(_annotation_result(GenerationID(str(uuid.uuid4()))), id="annotation"),
+            pytest.param(_strip_result(GenerationID(str(uuid.uuid4()))), id="strip"),
+            pytest.param(
+                HordeAlchemyResultMessage(
+                    process_id=_UTILITIES_PROCESS_ID,
+                    process_launch_identifier=0,
+                    info="ok",
+                    form_id="unknown-form",
+                    form=_STRIP_FORM,
+                    state=GENERATION_STATE.ok,
+                ),
+                id="alchemy",
+            ),
+        ],
+    )
+    async def test_every_result_clears_the_mark_even_for_work_no_longer_tracked(
+        self,
+        result: HordeProcessMessage,
+    ) -> None:
+        """Each result frees the lane, including one whose handler returns early because the work was dropped."""
+        pm = make_testable_process_manager(enable_image_utilities=True)
+        util = _add_utilities_process(pm)
+        util.note_utilities_work_sent()
+
+        await _deliver(pm, result)
+
+        assert not util.holds_utilities_work()
+
+    async def test_the_lane_ending_clears_the_mark(self) -> None:
+        """A lane that reports the end does not hold work afterwards."""
+        pm = make_testable_process_manager(enable_image_utilities=True)
+        util = _add_utilities_process(pm)
+        util.note_utilities_work_sent()
+
+        await _deliver(
+            pm,
+            HordeProcessStateChangeMessage(
+                process_id=_UTILITIES_PROCESS_ID,
+                process_launch_identifier=0,
+                info="ending",
+                process_state=HordeProcessState.PROCESS_ENDING,
+            ),
+        )
+
+        assert not util.holds_utilities_work()
 
 
 class TestStripHeadOfQueueClock:
@@ -1311,7 +1469,7 @@ class TestUtilitiesLaneOnDemandEnsemble:
             await pm._advance_pending_strips()
             for tracked in pm._job_tracker.jobs_pending_strip:
                 if tracked.strip_dispatched_at is not None:
-                    await pm._on_strip_result(_strip_result(tracked.job_id))
+                    await pm._on_strip_result(_strip_result(tracked.job_id, process_id=lane.process_id))
                     lane.last_process_state = HordeProcessState.WAITING_FOR_JOB
             _tick()
         assert len(constructed) == 1

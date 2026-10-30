@@ -225,6 +225,15 @@ class HordeProcessInfo:
     """The job that requested the current preload, which is not evidence that inference started."""
     inference_ownership: InferenceExecutionOwnership | None
     """The job attempt this exact process launch owns after successful dispatch."""
+    utilities_work_sent_at: float | None
+    """Epoch time the parent sent this image-utilities lane its current unit of work, or None between units.
+
+    The lane's adapter handles each control message on the thread that reads the pipe, so a message sent while
+    one runs is not read until that one's HTTP call returns, and a write larger than the pipe buffer blocks the
+    parent's main loop until then. Every sender (an alchemy form, a pre-annotation, a background strip) sets this
+    on send, and the work's result or the lane's end clears it, so the lane takes one unit of work at a time. The
+    reported state cannot carry this, because the adapter can queue an idle report before it reads the message. A
+    replacement launch gets a new entry, so it starts clear."""
     clearance_wait_entered_at: float | None
     """Wall-clock time the child last began waiting on its clearance permit, or None if it never has.
 
@@ -483,6 +492,7 @@ class HordeProcessInfo:
 
         self.preload_job_intent = None
         self.inference_ownership = None
+        self.utilities_work_sent_at = None
         self.clearance_wait_entered_at = None
         self.current_inference_started_at = None
         self.current_first_step_at = None
@@ -886,14 +896,29 @@ class HordeProcessInfo:
             f"loaded_horde_model_name={self.loaded_horde_model_name})"
         )
 
+    def note_utilities_work_sent(self) -> None:
+        """Mutate the entry to record that a unit of work was just sent to this image-utilities lane."""
+        self.utilities_work_sent_at = time.time()
+
+    def clear_utilities_work(self) -> None:
+        """Mutate the entry to record that this image-utilities lane does not hold a unit of work."""
+        self.utilities_work_sent_at = None
+
+    def holds_utilities_work(self) -> bool:
+        """Return whether this image-utilities lane holds a unit of work whose result has not arrived."""
+        return self.utilities_work_sent_at is not None
+
     def can_accept_job(self) -> bool:
         """Return true if the process can accept a job.
 
         A launch that owns an inference attempt accepts nothing, whatever state it last reported: a job
         dispatched alongside its preload leaves the child reporting the preload's states (``PRELOADED_MODEL``
-        among them) while the job is still queued behind it.
+        among them) while the job is still queued behind it. An image-utilities lane holding a unit of work does
+        not accept a job until the result arrives (:attr:`utilities_work_sent_at`).
         """
         if self.current_inference_job() is not None:
+            return False
+        if self.holds_utilities_work():
             return False
         return (
             self.last_process_state == HordeProcessState.WAITING_FOR_JOB

@@ -98,6 +98,7 @@ from horde_worker_regen.process_management.ipc.message_dispatcher import Message
 from horde_worker_regen.process_management.ipc.messages import (
     GENERATION_STATE,
     AlchemyFormSpec,
+    HordeAlchemyResultMessage,
     HordeAnnotationResultMessage,
     HordeAnnotatorAvailabilityMessage,
     HordeDownloadAvailabilityMessage,
@@ -2134,7 +2135,7 @@ class HordeWorkerProcessManager:
             model_availability=self._model_availability,
             utilities_lane_outlook_provider=self._utilities_lane_outlook,
         )
-        self._message_dispatcher.set_alchemy_result_handler(self._alchemy_coordinator.on_alchemy_result)
+        self._message_dispatcher.set_alchemy_result_handler(self._on_alchemy_result)
         self._message_dispatcher.set_annotation_result_handler(self._on_annotation_result)
         self._message_dispatcher.set_annotator_availability_handler(self._on_annotator_availability)
         self._message_dispatcher.set_strip_result_handler(self._on_strip_result)
@@ -5201,14 +5202,25 @@ class HordeWorkerProcessManager:
         self._kept_servable_control_types = self._servable_control_types()
         self._kept_servable_replacement_count = self._process_lifecycle.utilities_unintended_replacements
 
+    def _on_alchemy_result(self, message: HordeAlchemyResultMessage) -> None:
+        """Free the reporting image-utilities lane for its next unit of work, then hand the result to alchemy.
+
+        The lane is freed before the result reaches the coordinator, since the coordinator discards a result for a
+        form it has abandoned or does not track, and the lane is reading the pipe again either way.
+        """
+        self._process_map.on_utilities_work_result(message.process_id)
+        self._alchemy_coordinator.on_alchemy_result(message)
+
     def _on_annotation_result(self, message: HordeAnnotationResultMessage) -> None:
         """Release a parked job on an annotation result.
 
         On success the routing forks on the job's requested output: a ``return_control_map`` job's map *is*
         the deliverable, so it goes straight to safety in place of inference; every other controlnet job
         carries the map back into inference as its premade control map. On any fault both forms fall through
-        to in-graph annotation (a ``return_control_map`` job's in-graph path still produces the map).
+        to in-graph annotation (a ``return_control_map`` job's in-graph path still produces the map). The lane is
+        free for its next unit of work whatever happens to the result.
         """
+        self._process_map.on_utilities_work_result(message.process_id)
         subject = f"job:{str(message.job_id)[:8]}"
         tracked = self._job_tracker.get_tracked_job(message.job_id)
         map_bytes = message.control_map_bytes
@@ -5378,14 +5390,13 @@ class HordeWorkerProcessManager:
 
         A job is eligible when it is a controlnet generation with a source image (not already a control map,
         not a ``return_control_map`` request), has not already been offered to the lane (the anti-ping-pong
-        latch), and its control type is in the lane's servable set. At most one annotation is dispatched per
-        idle lane process per tick, so the single serial lane is paced and inference keeps being fed the
-        rest of the queue rather than every controlnet job being parked at once.
+        latch), and its control type is in the lane's servable set. A lane takes one unit of work at a time
+        from any sender, so an annotation goes only to a lane that is not holding one, and inference keeps being
+        fed the rest of the queue rather than every controlnet job being parked at once.
         """
         servable = self._servable_control_types()
         if not servable:
             return
-        used_process_ids: set[int] = set()
         for job in self._job_tracker.jobs_pending_inference:
             if job.id_ is None:
                 continue
@@ -5397,7 +5408,7 @@ class HordeWorkerProcessManager:
             control_type = _control_type_name(job.payload.control_type)
             if control_type is None or control_type not in servable:
                 continue
-            process_info = self._first_available_utilities_process(exclude=used_process_ids)
+            process_info = self._first_available_utilities_process()
             if process_info is None:
                 return
             source_image_bytes = _resolve_source_image_bytes(job)
@@ -5418,7 +5429,7 @@ class HordeWorkerProcessManager:
                 # rather than leaving it parked with no annotation coming.
                 self._job_tracker.resolve_annotation(job.id_, None)
                 continue
-            used_process_ids.add(process_info.process_id)
+            process_info.note_utilities_work_sent()
             self._run_metrics.record_decision(
                 decision_kind=DecisionKind.IMAGE_UTILITIES_ROUTING,
                 subject=f"job:{str(job.id_)[:8]}",
@@ -5427,17 +5438,16 @@ class HordeWorkerProcessManager:
                 inputs={"control_type": control_type, "process_id": process_info.process_id},
             )
 
-    def _first_available_utilities_process(self, *, exclude: set[int]) -> HordeProcessInfo | None:
-        """Return a live, idle image-utilities lane process not already used this tick, or None.
+    def _first_available_utilities_process(self) -> HordeProcessInfo | None:
+        """Return a live, idle image-utilities lane process that is not holding a unit of work, or None.
 
         Liveness is checked as well as readiness: a lane that has died still carries its last reported state,
         so readiness alone would hand work to a process that is on its way out of the map, which for a
-        re-queued strip means feeding it straight back to the lane it was just rescued from.
+        re-queued strip means feeding it straight back to the lane it was just rescued from. Readiness
+        (:meth:`HordeProcessInfo.can_accept_job`) excludes a lane any sender has already given work to.
         """
         for info in self._process_map.values():
             if info.process_type != HordeProcessType.UTILITIES:
-                continue
-            if info.process_id in exclude:
                 continue
             if info.can_accept_job() and info.is_process_alive():
                 return info
@@ -5483,7 +5493,9 @@ class HordeWorkerProcessManager:
         (the horde reissues the job) rather than a silent submit of un-stripped images, exactly as the
         post-processing lane treats a failed pass. A result for a job that has already left the stage is
         routed to :meth:`_adopt_late_strip_result`, which decides whether the finished work can still be used.
+        The lane is free for its next unit of work whatever happens to the result.
         """
+        self._process_map.on_utilities_work_result(message.process_id)
         tracked = self._job_tracker.get_tracked_job(message.job_id)
         if tracked is None or tracked.job_info is None:
             # The job is no longer tracked at all (finalized, or a duplicate result); nothing to do.
@@ -5698,19 +5710,18 @@ class HordeWorkerProcessManager:
         )
 
     def _dispatch_pending_strips(self) -> None:
-        """Dispatch each waiting job's background strip to an idle image-utilities lane (one per lane per tick).
+        """Dispatch each waiting job's background strip to an idle image-utilities lane not holding a unit of work.
 
-        Pacing one dispatch per idle lane per tick keeps the single serial lane from being flooded while the
-        rest of the pipeline keeps moving.
+        A lane takes one unit of work at a time from any sender, so the single serial lane is never flooded
+        while the rest of the pipeline keeps moving.
         """
-        used_process_ids: set[int] = set()
         for tracked in self._job_tracker.jobs_pending_strip:
             if tracked.strip_process_id is not None or tracked.job_info is None:
                 continue
             images_bytes = tracked.job_info.images_bytes
             if not images_bytes:
                 continue
-            process_info = self._first_available_utilities_process(exclude=used_process_ids)
+            process_info = self._first_available_utilities_process()
             if process_info is None:
                 return
             sent = process_info.safe_send_message(
@@ -5718,8 +5729,8 @@ class HordeWorkerProcessManager:
             )
             if not sent:
                 continue
+            process_info.note_utilities_work_sent()
             self._job_tracker.mark_strip_dispatched(tracked.job_id, process_id=process_info.process_id)
-            used_process_ids.add(process_info.process_id)
             self._run_metrics.record_decision(
                 decision_kind=DecisionKind.IMAGE_UTILITIES_ROUTING,
                 subject=f"job:{str(tracked.job_id)[:8]}",

@@ -261,8 +261,9 @@ dispatches `START_ANNOTATION` to an idle utilities lane process. A parked job is
 inference-eligible set until its control map arrives; the derived control map (PNG bytes) is then stored on
 the tracked job, the job returns to `PENDING_INFERENCE`, and the scheduler carries the bytes on the
 inference control message so the inference child injects them and hordelib runs the `none` preprocessor over
-them instead of re-annotating. At most one annotation is dispatched per idle lane process per control-loop
-tick, so the single serial lane is paced and the rest of the queue keeps feeding inference.
+them instead of re-annotating. An annotation goes only to a lane that does not hold another unit of work (see
+[Liveness and recovery](#liveness-and-recovery)), so the single serial lane is paced and the rest of the queue
+keeps feeding inference.
 
 Which control types are pre-annotated is **availability-driven**, not hardcoded. The utilities process
 cannot necessarily serve every control type: a detector whose heavy backend is not importable in the lane's

@@ -4,7 +4,7 @@ import time
 import uuid
 from collections import deque
 from io import BytesIO
-from typing import cast
+from typing import cast, override
 
 import PIL.Image
 import pytest
@@ -661,10 +661,17 @@ class _StubProcessInfo:
         self.process_launch_identifier = process_launch_identifier
         self.device_index = device_index
         self.sent_messages: list[HordeAlchemyControlMessage] = []
+        self.utilities_work_sent_at: float | None = None
 
     def safe_send_message(self, message: HordeAlchemyControlMessage) -> bool:
         self.sent_messages.append(message)
         return True
+
+    def note_utilities_work_sent(self) -> None:
+        self.utilities_work_sent_at = time.time()
+
+    def holds_utilities_work(self) -> bool:
+        return self.utilities_work_sent_at is not None
 
 
 class _StubProcessMap:
@@ -694,6 +701,11 @@ class _StubProcessMap:
         self.requested_capabilities.append(capability)
         process_info = self.available.get(capability)
         if process_info is None or (device_index is not None and process_info.device_index != device_index):
+            return None
+        if disallowed_processes is not None and process_info.process_id in disallowed_processes:
+            return None
+        # Mirrors ProcessMap, which skips a lane holding a unit of work from any sender.
+        if process_info.holds_utilities_work():
             return None
         return process_info
 
@@ -968,6 +980,142 @@ class TestLaneBoundFormDispatch:
         coordinator.dispatch_pending_forms()
 
         assert [spec.form_id for spec in coordinator._pending_forms] == ["form-1"]
+
+
+_UTILITIES_LANE_PROCESS_ID = 4
+
+
+class _LaneThatBlocksWhenBusy(_StubProcessInfo):
+    """An image-utilities lane whose send would block the caller while a form is still running on it.
+
+    The real send waits for the adapter's control thread, which reads the next message only once the running
+    form's HTTP call returns. Recording the call instead of blocking keeps a regression from hanging the suite.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(process_id=_UTILITIES_LANE_PROCESS_ID)
+        self.running_form_id: str | None = None
+        self.sends_while_busy = 0
+
+    @override
+    def safe_send_message(self, message: HordeAlchemyControlMessage) -> bool:
+        if self.running_form_id is not None:
+            self.sends_while_busy += 1
+        self.running_form_id = message.form.form_id
+        return super().safe_send_message(message)
+
+    def finish(self, coordinator: AlchemyCoordinator) -> None:
+        """Report the running form's result to the coordinator, freeing the lane.
+
+        The message dispatcher clears the lane's work mark before it hands the result to the coordinator, so the
+        stub clears it here in the same order.
+        """
+        assert self.running_form_id is not None
+        self.utilities_work_sent_at = None
+        coordinator.on_alchemy_result(
+            HordeAlchemyResultMessage(
+                process_id=self.process_id,
+                process_launch_identifier=self.process_launch_identifier,
+                info="test",
+                form_id=self.running_form_id,
+                form="strip_background",
+                state=GENERATION_STATE.ok,
+                image_bytes=_png_bytes(),
+            ),
+        )
+        self.running_form_id = None
+
+
+def _two_strip_forms_and_one_lane() -> tuple[AlchemyCoordinator, _StubProcessMap, _LaneThatBlocksWhenBusy]:
+    """Queue two strip forms popped together, with one loaded image-utilities lane available."""
+    lane = _LaneThatBlocksWhenBusy()
+    process_map = _StubProcessMap({WorkerCapability.IMAGE_UTILITIES: lane})
+    process_map.loaded_utilities_processes = 1
+    coordinator = _make_coordinator(process_map)
+    coordinator._utilities_lane_outlook_provider = lambda: UtilitiesLaneOutlook.WILL_SERVE
+    for form_id in ("form-1", "form-2"):
+        coordinator._queue_pending_form(
+            AlchemyFormSpec(form_id=form_id, form="strip_background", source_image_bytes=b"hi"),
+        )
+        coordinator._form_time_popped[form_id] = time.time()
+    return coordinator, process_map, lane
+
+
+def _sent_form_ids(process_info: _StubProcessInfo) -> list[str]:
+    return [message.form.form_id for message in process_info.sent_messages]
+
+
+class TestOneFormPerUtilitiesLane:
+    """An image-utilities lane holding a form is not sent another until the result arrives."""
+
+    def test_the_second_form_is_dispatched_only_after_the_first_result(self) -> None:
+        """The second form stays pending across ticks while the first runs, and is sent once it finishes."""
+        coordinator, _process_map, lane = _two_strip_forms_and_one_lane()
+
+        coordinator.dispatch_pending_forms()
+        coordinator.dispatch_pending_forms()
+
+        assert _sent_form_ids(lane) == ["form-1"]
+        assert [spec.form_id for spec in coordinator._pending_forms] == ["form-2"]
+
+        lane.finish(coordinator)
+        coordinator.dispatch_pending_forms()
+
+        assert _sent_form_ids(lane) == ["form-1", "form-2"]
+        assert coordinator._pending_forms == deque()
+
+    def test_a_tick_never_sends_to_a_lane_with_a_form_running(self) -> None:
+        """The send that would block the main loop on a busy lane is never made."""
+        coordinator, _process_map, lane = _two_strip_forms_and_one_lane()
+
+        for _ in range(3):
+            coordinator.dispatch_pending_forms()
+        lane.finish(coordinator)
+        for _ in range(3):
+            coordinator.dispatch_pending_forms()
+
+        assert lane.sends_while_busy == 0
+        assert _sent_form_ids(lane) == ["form-1", "form-2"]
+
+    def test_a_form_behind_a_busy_lane_is_not_faulted_by_the_lane_hold(self) -> None:
+        """A loaded lane busy with a form is not a lane that failed to come up, so the tighter bound does not apply."""
+        coordinator, _process_map, lane = _two_strip_forms_and_one_lane()
+        coordinator._form_time_popped["form-2"] = time.time() - (_LANE_HOLD_SECONDS + 1)
+
+        coordinator.dispatch_pending_forms()
+
+        assert _sent_form_ids(lane) == ["form-1"]
+        assert [spec.form_id for spec in coordinator._pending_forms] == ["form-2"]
+        assert len(coordinator._pending_submits) == 0
+
+    def test_a_form_whose_lane_is_gone_is_faulted_by_the_lane_bound(self) -> None:
+        """With the lane down and not coming back, a queued form is faulted at once, busy owner or not."""
+        coordinator, process_map, lane = _two_strip_forms_and_one_lane()
+        coordinator.dispatch_pending_forms()
+        assert _sent_form_ids(lane) == ["form-1"]
+
+        process_map.available.clear()
+        process_map.loaded_utilities_processes = 0
+        coordinator._utilities_lane_outlook_provider = lambda: UtilitiesLaneOutlook.UNAVAILABLE
+        coordinator.dispatch_pending_forms()
+
+        assert coordinator._pending_forms == deque()
+        assert [submit.form_id for submit in coordinator._pending_submits] == ["form-2"]
+        assert coordinator._pending_submits[0].result_message.state == GENERATION_STATE.faulted
+
+    def test_the_deadline_faults_a_form_that_waited_its_full_bound_behind_a_busy_lane(self) -> None:
+        """Waiting behind a busy lane does not stop the dispatch deadline, which runs from the pop."""
+        coordinator, _process_map, lane = _two_strip_forms_and_one_lane()
+        coordinator.dispatch_pending_forms()
+        coordinator._pending_form_deadlines["form-2"] = time.monotonic() - 1.0
+
+        coordinator.dispatch_pending_forms()
+
+        assert _sent_form_ids(lane) == ["form-1"]
+        assert coordinator._pending_forms == deque()
+        assert [submit.form_id for submit in coordinator._pending_submits] == ["form-2"]
+        assert coordinator._pending_submits[0].result_message.state == GENERATION_STATE.faulted
+        assert lane.sends_while_busy == 0
 
 
 class TestAnnotationTypesProvider:

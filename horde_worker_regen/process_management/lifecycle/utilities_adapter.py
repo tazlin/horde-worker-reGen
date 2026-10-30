@@ -27,6 +27,16 @@ memory message carries it as ``reported_os_pid``. The parent overwrites its hand
 that field, so per-PID telemetry (WDDM paging attribution, the owned-PID registry) attributes the utilities
 subprocess correctly. Teardown is still driven through the control pipe (``END_PROCESS``) and the handle's
 terminate/kill, both of which stop the subprocess.
+
+The control thread reads the next control message only after the current one is handled, and a form, annotation
+or background strip is handled by an HTTP call with a timeout of minutes. A parent write larger than the pipe
+buffer (each of these carries its images) waits for that read without a timeout, and after
+:meth:`UtilitiesProcessAdapter.stop` the pipe is not read at all. The sender is the parent's main loop, so a
+second unit of work sent to a busy lane, or any work sent to a stopped one, stalls the whole worker. The parent
+therefore sends a lane one unit of work at a time across every sender (the alchemy dispatcher, pre-annotation and
+the strip tail), recorded on the lane's process map entry until the result arrives or the lane ends. When the
+adapter stops an unresponsive service it reports ``PROCESS_ENDING`` and ``PROCESS_ENDED``, the process map keeps an
+ended lane ended, and dispatch selects only a lane whose process is alive.
 """
 
 from __future__ import annotations

@@ -10,6 +10,7 @@ deterministically and without a GPU.
 
 from __future__ import annotations
 
+import time
 from collections import deque
 
 import pytest
@@ -417,10 +418,14 @@ class _DispatchProcessInfo:
         self.device_index = device_index
         self.last_control_flag: HordeControlFlag | None = HordeControlFlag.UNLOAD_MODELS_FROM_RAM
         self.sent: list[object] = []
+        self.utilities_work_sent_at: float | None = None
 
     def safe_send_message(self, message: object) -> bool:
         self.sent.append(message)
         return True
+
+    def note_utilities_work_sent(self) -> None:
+        self.utilities_work_sent_at = time.time()
 
 
 class _LivenessProcessMap:
