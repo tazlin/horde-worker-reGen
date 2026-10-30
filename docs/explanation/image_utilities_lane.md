@@ -215,9 +215,20 @@ while the service answers. It reports `WAITING_FOR_JOB` when idle and healthy, a
 
 There is no bespoke silence watchdog for this lane. Instead, a service that stops answering health while its
 subprocess is still alive (an unresponsive-but-not-dead hang) is converted into a recoverable death: after a
-short grace window the adapter stops the subprocess outright. The handle then reports not-alive, and the
-lifecycle's existing crash reaper recovers the lane through the same end → delete → start replacement machine
-the post-processing lane uses. A subprocess that exits on its own is caught the same way.
+short grace window the adapter stops the subprocess outright and reports `PROCESS_ENDING` then `PROCESS_ENDED`,
+so the process map stops offering the lane at once. The handle then reports not-alive, and the lifecycle's
+crash reaper recovers the lane through the same end → delete → start replacement machine the
+post-processing lane uses. A subprocess that exits on its own is caught the same way. Dispatch to the lane
+(`ProcessMap.get_first_available` for `IMAGE_UTILITIES`, and the annotation and strip passes) also requires a live
+process, since a lane that died keeps its last reported state until the reaper runs.
+
+The adapter handles each control message on the thread that reads the control pipe, and a form, annotation or
+strip runs as an HTTP call with a timeout of minutes. A second image-bearing message sent meanwhile waits for that
+read, and the sender is the parent's main loop. The lane therefore takes one unit of work at a time across all
+three senders. Each sets `HordeProcessInfo.utilities_work_sent_at` on send, the result handler clears it
+(`ProcessMap.on_utilities_work_result`), and so does the lane's end. A lane holding work is not selected and
+`can_accept_job` is false for it. The mark does not follow the reported state, since the adapter can report idle
+before it reads the message.
 
 The capability service launcher exposes its subprocess pid, so this lane surfaces an OS pid the same way a
 spawned child does: the handle reports it, and every emitted state / heartbeat / memory / availability

@@ -22,6 +22,7 @@ from horde_worker_regen.process_management.fd_limits import (
     descriptor_headroom_fraction,
 )
 from horde_worker_regen.process_management.ipc.messages import (
+    TERMINAL_PROCESS_STATES,
     HeldComponentSnapshot,
     HordeControlFlag,
     HordeHeartbeatType,
@@ -123,8 +124,10 @@ _EXPECTED_PROCESS_STATE_SOURCES: dict[HordeProcessState, frozenset[HordeProcessS
 
 States absent from this table (idle/teardown states and download/unload starts) may be
 entered from anywhere; child processes are authoritative about their own state, so an
-unexpected transition is logged but never refused. Divergence here usually means the
-parent's optimistic bookkeeping and the child's reality have drifted apart.
+unexpected transition is logged and applied. Divergence here usually means the
+parent's optimistic bookkeeping and the child's reality have drifted apart. The one refusal
+is a live state reported after one of ``TERMINAL_PROCESS_STATES``, which
+:meth:`ProcessMap.on_process_state_change` drops.
 """
 
 _RETIRED_LAUNCH_TTL_SECONDS = 300.0
@@ -547,17 +550,31 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         self[process_id].cumulative_download_events.extend(events)
         self[process_id].last_received_timestamp = time.time()
 
-    def on_process_state_change(self, process_id: int, new_state: HordeProcessState) -> None:
+    def on_process_state_change(self, process_id: int, new_state: HordeProcessState) -> bool:
         """Update the process state for the given process ID.
 
         Unexpected transitions (per ``_EXPECTED_PROCESS_STATE_SOURCES``) are logged but
         still applied, since the reporting process is the source of truth for its own state.
 
+        A live state reported for an entry that is already ending or ended is refused, for every lane type. A
+        replacement is a new entry, so a live state there is stale, and applying it lets the ended launch count as
+        a loaded lane that is never deleted. The entry keeps the terminal state and timestamps.
+
         Args:
             process_id (int): The ID of the process to update.
             new_state (HordeProcessState): The new state of the process.
+
+        Returns:
+            True if the state was applied, False if it was refused.
         """
         old_state = self[process_id].last_process_state
+        if old_state in TERMINAL_PROCESS_STATES and new_state not in TERMINAL_PROCESS_STATES:
+            logger.warning(
+                f"Process {process_id} reported {new_state.name} after {old_state.name}. "
+                f"Dropped the stale state and kept {old_state.name}.",
+            )
+            return False
+
         expected_sources = _EXPECTED_PROCESS_STATE_SOURCES.get(new_state)
         if expected_sources is not None and old_state != new_state and old_state not in expected_sources:
             logger.warning(
@@ -577,6 +594,7 @@ class ProcessMap(dict[int, HordeProcessInfo]):
             or new_state == HordeProcessState.WAITING_FOR_JOB
         ):
             self.reset_heartbeat_state(process_id)
+        return True
 
     def note_liveness_report(self, process_id: int) -> None:
         """Record that a process reported in without telling the parent anything new.

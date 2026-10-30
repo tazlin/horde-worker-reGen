@@ -1615,10 +1615,13 @@ class MessageDispatcher:
         previous_state = self._process_map[message.process_id].last_process_state
         previous_state_started_at = self._process_map[message.process_id].last_process_state_started_at
 
-        self._process_map.on_process_state_change(
+        # A refused state is stale, so the reactions below must not fire on it. An idle report from an ended
+        # launch must not reap a lost result, and a sampling report from one must not mark a model in use.
+        if not self._process_map.on_process_state_change(
             process_id=message.process_id,
             new_state=message.process_state,
-        )
+        ):
+            return
 
         if message.process_state == HordeProcessState.PROCESS_ENDING:
             logger.info(f"Process {message.process_id} is ending")

@@ -11,15 +11,18 @@ from __future__ import annotations
 
 import multiprocessing
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from unittest.mock import Mock
 
 from horde_sdk.generation_parameters.alchemy.consts import KNOWN_MISC_POST_PROCESSORS
+from loguru import logger
 
 from horde_worker_regen.process_management.config.worker_state import WorkerState
 from horde_worker_regen.process_management.ipc.messages import HordeProcessState
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType, WorkerCapability
+from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.lifecycle.process_lifecycle import PauseOwner, ProcessLifecycleManager
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.scheduling.workload_flow import (
@@ -152,6 +155,17 @@ def _make_utilities_plm(
 
 
 _STRIP_FORM = KNOWN_MISC_POST_PROCESSORS.strip_background.value
+
+
+@contextmanager
+def _captured_error_messages() -> Iterator[list[str]]:
+    """Capture loguru ERROR+ messages emitted inside the block."""
+    messages: list[str] = []
+    sink_id = logger.add(lambda message: messages.append(message.record["message"]), level="ERROR")
+    try:
+        yield messages
+    finally:
+        logger.remove(sink_id)
 
 
 def _set_lane_form_waiting(plm: ProcessLifecycleManager, *, waiting: bool) -> None:
@@ -399,6 +413,52 @@ async def test_driver_restores_a_stranded_ladder_pause_only_with_demand() -> Non
     assert restored.started_for is UtilitiesLaneDemandReason.ALCHEMY_FORM_WAITING
     assert plm.is_utilities_gpu_paused is False
     assert len(constructed) == 2
+
+
+def _silence_past_the_process_timeout(process_info: HordeProcessInfo) -> None:
+    """Age a lane's last message and heartbeat past every silence timeout."""
+    process_info.last_received_timestamp = time.time() - 1000
+    process_info.last_heartbeat_timestamp = time.time() - 1000
+
+
+def test_a_lane_reporting_idle_after_its_end_is_replaced_once() -> None:
+    """A lane whose idle report follows its own end is drained and replaced once, with no stuck-idle loop.
+
+    The late idle report comes from the adapter's health probe returning after the shutdown landed. Applied, it would
+    count the ended lane as loaded, so the replacement would never delete it and the stuck-idle check would fire
+    on it again every ``process_timeout``, re-arming the recovery debounce that skips the hang checks for every
+    lane.
+    """
+    constructed: list[_FakeAdapter] = []
+    plm = _make_utilities_plm(constructed=constructed)
+    process_map = plm._process_map
+    assert plm.start_utilities_processes() is True
+    lane = process_map.get_capable_processes(WorkerCapability.IMAGE_UTILITIES)[0]
+    process_map.on_process_state_change(lane.process_id, HordeProcessState.WAITING_FOR_JOB)
+    _silence_past_the_process_timeout(lane)
+
+    ticks_that_armed_the_debounce = 0
+    end_reported = False
+    with _captured_error_messages() as messages:
+        for _ in range(6):
+            plm._recently_recovered = False
+            plm.replace_hung_processes()
+            if plm._recently_recovered:
+                ticks_that_armed_the_debounce += 1
+            if not end_reported and lane.last_process_state is HordeProcessState.PROCESS_ENDING:
+                # The adapter's END_PROCESS sequence, followed by the idle report from a probe that returned late.
+                process_map.on_process_state_change(lane.process_id, HordeProcessState.PROCESS_ENDED)
+                process_map.on_process_state_change(lane.process_id, HordeProcessState.WAITING_FOR_JOB)
+                _silence_past_the_process_timeout(lane)
+                end_reported = True
+            plm._replace_all_utilities_process()
+
+    assert end_reported is True
+    assert all(process_info is not lane for process_info in process_map.values()), "the ended lane is deleted"
+    assert process_map.num_utilities_processes() == 1
+    assert len(constructed) == 2, "replaced exactly once"
+    assert sum("stuck idle" in message for message in messages) == 1
+    assert ticks_that_armed_the_debounce == 1
 
 
 def test_crash_replacement_without_demand_leaves_the_lane_down_and_counts_the_recovery() -> None:

@@ -13,6 +13,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator, Mapping
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import override
 
 import pytest
 
@@ -20,7 +21,7 @@ try:
     from multiprocessing.connection import PipeConnection as Connection  # type: ignore
 except Exception:
     from multiprocessing.connection import Connection  # type: ignore
-from horde_image_utilities.client import HordeImageUtilitiesClient
+from horde_image_utilities.client import HordeImageUtilitiesClient, ShutdownAcknowledgement
 from horde_sdk.ai_horde_api import GENERATION_STATE
 from horde_sdk.ai_horde_api.fields import GenerationID
 
@@ -668,6 +669,32 @@ def test_unresponsive_but_alive_service_is_recycled(http_service: tuple[_Service
         parent_conn.close()
 
 
+def test_a_self_stopped_adapter_reports_both_terminal_states(http_service: tuple[_ServiceState, str]) -> None:
+    """Stopping an unresponsive service reports the lane ending and ended, so the parent does not send it more work.
+
+    The control loop exits with the stop, so without the terminal states the map would show the lane idle until
+    the crash reaper ran.
+    """
+    state, base_url = http_service
+    q: queue.Queue[object] = queue.Queue()
+    parent_conn, child_conn = multiprocessing.Pipe(duplex=True)
+    adapter, fake_server = _build_adapter(base_url, q, child_conn, health_failure_grace_seconds=0.2)
+
+    adapter.start()
+    try:
+        assert _wait_for(lambda: HordeProcessState.WAITING_FOR_JOB in _states(list(q.queue)))
+        state.health_ok = False
+        assert _wait_for(lambda: HordeProcessState.PROCESS_ENDED in _states(list(q.queue)), timeout=3.0)
+
+        assert fake_server.stop_called
+        states = _states(_drain(q))
+        assert states[-2:] == [HordeProcessState.PROCESS_ENDING, HordeProcessState.PROCESS_ENDED]
+        assert states.count(HordeProcessState.PROCESS_ENDED) == 1
+    finally:
+        adapter.stop()
+        parent_conn.close()
+
+
 def test_servable_excludes_cold_detectors_and_trusts_payloads_without_the_flag() -> None:
     """A detector the service reports cold (``warmed: false``) is withheld from the servable set.
 
@@ -683,3 +710,85 @@ def test_servable_excludes_cold_detectors_and_trusts_payloads_without_the_flag()
     ]
 
     assert UtilitiesProcessAdapter._servable_from_annotators(payload) == frozenset({"canny", "depth"})
+
+
+class _ShutdownHookClient(HordeImageUtilitiesClient):
+    """A real client whose shutdown first runs a hook, standing in for a cadence tick that lands mid-shutdown."""
+
+    def __init__(self, base_url: str, on_shutdown: Callable[[], None]) -> None:
+        super().__init__(base_url, timeout=5.0)
+        self._on_shutdown = on_shutdown
+
+    @override
+    def shutdown(self, *, timeout: float | None = None) -> ShutdownAcknowledgement:
+        self._on_shutdown()
+        return super().shutdown(timeout=timeout)
+
+
+class _ShutdownHookServer(_FakeServer):
+    """A fake launcher whose client runs a hook inside the shutdown request."""
+
+    def __init__(self, base_url: str) -> None:
+        super().__init__(base_url)
+        self.on_shutdown: Callable[[], None] = lambda: None
+
+    @property
+    @override
+    def client(self) -> HordeImageUtilitiesClient:
+        return _ShutdownHookClient(self.base_url, self.on_shutdown)
+
+
+def _idle_adapter_without_threads(
+    base_url: str,
+    q: queue.Queue[object],
+    child_conn: Connection,
+) -> tuple[UtilitiesProcessAdapter, _ShutdownHookServer]:
+    """An adapter past bring-up and reporting idle, driven by direct calls rather than its threads."""
+    server = _ShutdownHookServer(base_url)
+    adapter, _ = _build_adapter(base_url, q, child_conn, server=server)
+    adapter._handle.bringup_complete = True
+    adapter._mark_idle_if_ready()
+    return adapter, server
+
+
+def test_states_are_not_sent_after_stop_even_when_the_health_probe_succeeds(
+    http_service: tuple[_ServiceState, str],
+) -> None:
+    """A health probe that returns 200 after stop() does not put the lane back to idle."""
+    _state, base_url = http_service
+    q: queue.Queue[object] = queue.Queue()
+    parent_conn, child_conn = multiprocessing.Pipe(duplex=True)
+    adapter, _server = _idle_adapter_without_threads(base_url, q, child_conn)
+    try:
+        adapter._send_state(HordeProcessState.ALCHEMY_STARTING, "busy")
+        _drain(q)
+
+        adapter.stop()
+        assert adapter._poll_health() is True
+        adapter._mark_idle_if_ready()
+
+        assert _states(_drain(q)) == []
+    finally:
+        parent_conn.close()
+
+
+def test_end_process_does_not_emit_a_state_after_the_terminal_states(http_service: tuple[_ServiceState, str]) -> None:
+    """Idle reports during and after the shutdown request are not sent to the parent after the ending states."""
+    _state, base_url = http_service
+    q: queue.Queue[object] = queue.Queue()
+    parent_conn, child_conn = multiprocessing.Pipe(duplex=True)
+    adapter, server = _idle_adapter_without_threads(base_url, q, child_conn)
+    try:
+        server.on_shutdown = adapter._mark_idle_if_ready
+
+        adapter._handle_control_message(HordeControlMessage(control_flag=HordeControlFlag.END_PROCESS))
+        assert adapter._poll_health() is True
+        adapter._mark_idle_if_ready()
+
+        assert _states(_drain(q)) == [
+            HordeProcessState.WAITING_FOR_JOB,
+            HordeProcessState.PROCESS_ENDING,
+            HordeProcessState.PROCESS_ENDED,
+        ]
+    finally:
+        parent_conn.close()

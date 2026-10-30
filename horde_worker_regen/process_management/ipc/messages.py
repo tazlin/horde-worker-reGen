@@ -191,6 +191,16 @@ class HordeProcessState(enum.Enum):
     A transient signal: the child reports it once at startup, then proceeds to its normal idle state."""
 
 
+TERMINAL_PROCESS_STATES: frozenset[HordeProcessState] = frozenset(
+    {HordeProcessState.PROCESS_ENDING, HordeProcessState.PROCESS_ENDED},
+)
+"""States a process launch does not leave for a live state.
+
+A replacement is a new launch with a new map entry that starts in ``PROCESS_STARTING``, so an ending launch does not
+return to work. A live state reported after one of these is stale (a health probe that was in flight when the
+shutdown landed, for example) and is dropped."""
+
+
 class HordeProcessMessage(BaseModel):
     """Process messages are sent from the child processes to the main process."""
 

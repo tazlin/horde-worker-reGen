@@ -6,15 +6,20 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 
+import pytest
 from loguru import logger
 
 from horde_worker_regen.process_management._internal.util import reset_log_throttles
 from horde_worker_regen.process_management.ipc.messages import (
+    TERMINAL_PROCESS_STATES,
     HeldComponentSnapshot,
     HordeHeartbeatType,
     HordeProcessState,
 )
-from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
+from horde_worker_regen.process_management.lifecycle.horde_process import (
+    DEFAULT_CAPABILITIES,
+    HordeProcessType,
+)
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from tests.process_management.conftest import make_job_pop_response, make_mock_process_info
 
@@ -149,6 +154,52 @@ class TestProcessStateTransitions:
             process_map.on_process_state_change(0, HordeProcessState.PROCESS_ENDED)
 
         assert warnings == []
+
+    @pytest.mark.parametrize("process_type", list(DEFAULT_CAPABILITIES))
+    @pytest.mark.parametrize("terminal_state", sorted(TERMINAL_PROCESS_STATES, key=lambda state: state.name))
+    def test_live_state_after_a_terminal_state_is_dropped(
+        self,
+        process_type: HordeProcessType,
+        terminal_state: HordeProcessState,
+    ) -> None:
+        """An idle report after the end keeps the terminal state and its timestamps, for every lane type."""
+        proc = make_mock_process_info(0, model_name=None, state=terminal_state, process_type=process_type)
+        proc.last_process_state_started_at = 123.0
+        proc.last_received_timestamp = 456.0
+        process_map = ProcessMap({0: proc})
+
+        with _capture_warnings() as warnings:
+            applied = process_map.on_process_state_change(0, HordeProcessState.WAITING_FOR_JOB)
+
+        assert applied is False
+        assert proc.last_process_state is terminal_state
+        assert proc.last_process_state_started_at == 123.0
+        assert proc.last_received_timestamp == 456.0
+        assert len(warnings) == 1
+        assert "WAITING_FOR_JOB" in warnings[0] and terminal_state.name in warnings[0]
+
+    def test_ending_still_advances_to_ended(self) -> None:
+        """The terminal states follow one another, and only a live state after them is refused."""
+        proc = make_mock_process_info(0, state=HordeProcessState.PROCESS_ENDING)
+        process_map = ProcessMap({0: proc})
+
+        assert process_map.on_process_state_change(0, HordeProcessState.PROCESS_ENDED) is True
+        assert proc.last_process_state is HordeProcessState.PROCESS_ENDED
+
+    def test_ended_utilities_lane_reporting_idle_is_not_counted_loaded(self) -> None:
+        """An ended lane that reports idle afterwards stays out of the loaded count, so the replacement deletes it."""
+        lane = make_mock_process_info(
+            0,
+            model_name=None,
+            state=HordeProcessState.PROCESS_ENDED,
+            process_type=HordeProcessType.UTILITIES,
+        )
+        process_map = ProcessMap({0: lane})
+
+        process_map.on_process_state_change(0, HordeProcessState.WAITING_FOR_JOB)
+
+        assert process_map.num_utilities_processes() == 1
+        assert process_map.num_loaded_utilities_processes() == 0
 
 
 class TestSamplingProgressReset:

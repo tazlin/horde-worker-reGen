@@ -46,6 +46,7 @@ from loguru import logger
 
 from horde_worker_regen.process_management._internal._aliased_types import ProcessQueue
 from horde_worker_regen.process_management.ipc.messages import (
+    TERMINAL_PROCESS_STATES,
     HordeAlchemyControlMessage,
     HordeAlchemyResultMessage,
     HordeAnnotationResultMessage,
@@ -724,7 +725,11 @@ class UtilitiesProcessAdapter:
         logger.error(
             f"Image utilities service unresponsive for {elapsed:.0f}s; stopping it so the lane can be recovered",
         )
+        # The control loop exits with the stop and does not read the pipe again. The terminal states reach the
+        # parent at once, so it does not send work to the lane while it waits for the crash reaper.
+        self._send_state(HordeProcessState.PROCESS_ENDING, "Image utilities service unresponsive")
         self.stop()
+        self._send_state(HordeProcessState.PROCESS_ENDED, "Image utilities service stopped after going unresponsive")
 
     def _mark_idle_if_ready(self) -> None:
         """Emit ``WAITING_FOR_JOB`` when the lane is healthy, past bring-up, and not mid-annotation."""
@@ -741,19 +746,40 @@ class UtilitiesProcessAdapter:
             self._annotating = annotating
 
     def _send_state(self, state: HordeProcessState, info: str) -> None:
-        """Emit a process state-change message and record the current state."""
+        """Emit a process state-change message and record the current state.
+
+        Once :meth:`stop` is called or a terminal state is sent, only the remaining terminal states are emitted,
+        and ``PROCESS_ENDED`` is the last state emitted. The cadence thread's health probe can return 200 after the
+        shutdown lands, and an idle state sent then would make the parent treat the lane as live. The check and
+        the put share the lock, so a state that passes the check is queued before any terminal state sent after
+        it.
+        """
         with self._state_lock:
+            if not self._state_may_follow(state):
+                logger.debug(
+                    f"Image utilities lane {self._process_id} did not send {state.name} after "
+                    f"{self._current_state.name} (stop requested: {self._stop.is_set()})",
+                )
+                return
             self._current_state = state
-        self._process_message_queue.put(
-            HordeProcessStateChangeMessage(
-                process_id=self._process_id,
-                process_launch_identifier=self._process_launch_identifier,
-                reported_os_pid=self._server.pid,
-                info=info,
-                time_elapsed=None,
-                process_state=state,
-            ),
-        )
+            self._process_message_queue.put(
+                HordeProcessStateChangeMessage(
+                    process_id=self._process_id,
+                    process_launch_identifier=self._process_launch_identifier,
+                    reported_os_pid=self._server.pid,
+                    info=info,
+                    time_elapsed=None,
+                    process_state=state,
+                ),
+            )
+
+    def _state_may_follow(self, state: HordeProcessState) -> bool:
+        """Return whether ``state`` may be sent after the current one (caller holds ``_state_lock``)."""
+        if self._current_state == HordeProcessState.PROCESS_ENDED:
+            return False
+        if state in TERMINAL_PROCESS_STATES:
+            return True
+        return not self._stop.is_set() and self._current_state not in TERMINAL_PROCESS_STATES
 
     def _send_heartbeat(self) -> None:
         """Emit a liveness heartbeat for the lane."""
