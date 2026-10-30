@@ -26,7 +26,7 @@ docker pull ghcr.io/haidra-org/horde-worker-regen:latest   # newest main build
 
 One torch CUDA build cannot cover every GPU: `cu126` carries kernels for `sm_50`–`sm_90` (Maxwell
 through Hopper, incl. Ada/Ampere) but **not** Blackwell, while `cu130`/`cu132` cover `sm_75`–`sm_120`
-(Turing through Blackwell) but drop pre-Turing. A build with no kernel image for the host card crashes on
+(Turing through Blackwell) but drop pre-Turing. A build without a kernel image for the host card crashes on
 the first GPU model load, so each build is published as its own tag:
 
 | Tag | Torch build | GPUs |
@@ -40,7 +40,7 @@ The unsuffixed tags default to `cu130` because the common container case is curr
 hardware. If your card is **pre-Turing** (Maxwell/Pascal/Volta, e.g. GTX 10-series), pull the `-cu126`
 variant instead. `cu130`/`cu132` also require a **CUDA-13-capable NVIDIA driver** on the host; update the
 host driver if the container reports an incompatibility. The entrypoint runs a preflight that fails fast
-with the exact rebuild/pull instruction if the image's build has no kernels for the detected GPU, rather
+with the exact rebuild/pull instruction if the image's build does not carry kernels for the detected GPU, rather
 than crashing deep inside the first model load.
 
 Configure the worker entirely through `AIWORKER_*` environment variables (see

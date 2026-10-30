@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import sys
 
-# Above this compute capability, the cu126 wheel carries no kernel image (Blackwell sm_100/sm_120), so a
+# Above this compute capability, the cu126 wheel does not carry a kernel image (Blackwell sm_100/sm_120), so a
 # rebuild must move to a CUDA 13 build. Mirrors worker_bootstrap.detect._CU126_MAX_COMPUTE_CAP.
 _CU126_MAX_COMPUTE_CAP = (9, 0)
 
@@ -66,7 +66,7 @@ def incompatibility_message(
     build_desc = f"{torch_version}, CUDA {torch_build} build" if torch_build else torch_version
     backend = recommended_backend(capability)
     return (
-        f"FATAL: this image's PyTorch ({build_desc}) has no CUDA kernels for {device_name} "
+        f"FATAL: this image's PyTorch ({build_desc}) does not carry CUDA kernels for {device_name}"
         f"(compute capability {capability[0]}.{capability[1]}, {cap_tag}); the wheel was built for "
         f"{' '.join(arch_list)}. A Docker image is immutable and cannot switch torch builds at runtime, so "
         f"every GPU model load would crash (typically deep inside the first CLIP/checkpoint load). Rebuild "

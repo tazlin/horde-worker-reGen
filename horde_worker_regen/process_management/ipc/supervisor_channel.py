@@ -1674,7 +1674,7 @@ class WorkerStateSnapshot(BaseModel):
     too_many_consecutive_failed_jobs: bool = False
 
     gpu_torch_incompatible: bool = False
-    """The installed PyTorch has no CUDA kernels for this GPU's architecture, so the worker stopped popping.
+    """The installed PyTorch does not carry CUDA kernels for this GPU's architecture, so the worker stopped popping.
 
     Reported by a torch-bearing inference child at startup (the parent and TUI never import torch). A
     build/hardware mismatch: the wheel was compiled for a different set of GPU architectures than the

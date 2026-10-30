@@ -48,12 +48,14 @@ _GPU_QUERY_LINE_RE = re.compile(r"^\s*(\d{1,2})\.(\d)\s*(?:,\s*([^\s,]+)\s*)?$",
 # CUDA build matrix and the NVIDIA CUDA 13 release notes):
 #   cu126 (CUDA 12.6): sm_50..sm_90  (Maxwell through Hopper; no Blackwell)
 #   cu130/cu132 (CUDA 13.x): sm_75..sm_120  (Turing through Blackwell; pre-Turing dropped in CUDA 13)
-# A build has no kernel image for a card outside its window and dies at the first kernel launch
+# A build does not carry a kernel image for a card outside its window and dies at the first kernel launch
 # (cudaErrorNoKernelImageForDevice), so the build must be clamped into the card's valid window in
 # both directions, not just upward. See _cuda_build.
-_CU126_MAX_COMPUTE_CAP = (9, 0)  # above this (Blackwell sm_100/sm_120), cu126 has no kernels -> floor cu130
-_CUDA13_MIN_COMPUTE_CAP = (7, 5)  # below this (pre-Turing), cu130/cu132 have no kernels -> ceil cu126
-# Windows "Display adapters" device class; its subkeys carry a DriverDesc per adapter.
+# Above this (Blackwell sm_100/sm_120), cu126 does not carry kernels, so floor to cu130.
+_CU126_MAX_COMPUTE_CAP = (9, 0)
+# Below this (pre-Turing), cu130/cu132 do not carry kernels, so ceil to cu126.
+_CUDA13_MIN_COMPUTE_CAP = (7, 5)
+# Windows "Display adapters" device class, whose subkeys carry a DriverDesc per adapter.
 _DISPLAY_CLASS_KEY = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
 
 
@@ -295,7 +297,7 @@ def _clamp_build_to_arch(build: str, compute_cap: tuple[int, int]) -> str:
     A build token names a CUDA toolkit line but is not itself proof the wheel carries a kernel image for
     the installed card, whether the token came from the driver-version pick, a persisted ``bin/backend``,
     or a forced override. cu126 carries sm_50..sm_90; the CUDA 13 wheels carry sm_75..sm_120 (pre-Turing
-    was dropped in CUDA 13). A build outside the card's window has no kernel image and dies at the first
+    was dropped in CUDA 13). A build outside the card's window does not carry a kernel image and dies at the first
     kernel launch (cudaErrorNoKernelImageForDevice), so the token is clamped both ways:
 
     * a Blackwell+ card (> ``_CU126_MAX_COMPUTE_CAP``) is lifted off cu126 onto cu130; cu126 can never run
@@ -341,7 +343,7 @@ def effective_policy(
     return requested
 
 
-def governing_capabilities(
+def effective_capabilities(
     capabilities: tuple[tuple[int, int], ...],
     policy: MixedCardPolicy | None,
 ) -> tuple[tuple[int, int], ...]:
@@ -360,7 +362,7 @@ def governing_capabilities(
 def _clamp_build_to_cards(build: str, capabilities: tuple[tuple[int, int], ...]) -> str:
     """Clamp ``build`` into the window every one of ``capabilities`` can run.
 
-    Callers pass :func:`governing_capabilities`, which never holds both a pre-Turing and a Blackwell card,
+    Callers pass :func:`effective_capabilities`, which never holds both a pre-Turing and a Blackwell card,
     so the clamps do not conflict and their order does not matter.
     """
     for capability in capabilities:
@@ -382,7 +384,7 @@ def mixed_card_builds(
     """Return the build each :class:`MixedCardPolicy` picks for this driver ceiling and these cards."""
     ceiling = _driver_ceiling_build(driver)
     return {
-        policy: _clamp_build_to_cards(ceiling, governing_capabilities(capabilities, policy))
+        policy: _clamp_build_to_cards(ceiling, effective_capabilities(capabilities, policy))
         for policy in MixedCardPolicy
     }
 
@@ -404,8 +406,8 @@ def _format_capabilities(capabilities: tuple[tuple[int, int], ...]) -> str:
 
 # clamp_action values recorded on a BackendDecision, naming what the architecture clamp did to the
 # driver-ceiling (or persisted) build. These are stable strings a support bundle / test can key on.
-CLAMP_NONE = "in_window"  # the build already carries kernels for the card; unchanged
-CLAMP_FLOORED = "floored_to_cu130"  # a Blackwell+ card lifted off cu126 (which has no kernel image for it)
+CLAMP_NONE = "in_window"  # the build already carries kernels for the card and is unchanged
+CLAMP_FLOORED = "floored_to_cu130"  # a Blackwell+ card lifted off cu126 (which does not carry a kernel image for it)
 CLAMP_CEILED = "ceiled_to_cu126"  # a pre-Turing card held on cu126 (the CUDA 13 wheels dropped it)
 CLAMP_SKIPPED = "skipped_unreadable_cap"  # compute capability could not be read, so no clamp was applied
 CLAMP_NOT_CUDA = "not_cuda"  # a cpu/rocm token, never clamped
@@ -416,7 +418,7 @@ class BackendDecision:
     """The full audit trail behind a torch-build choice: the chosen token plus every input and step.
 
     A build token on its own ("cu126") cannot explain *why* it was picked, which is exactly what a support
-    bundle needs when the installed wheel turns out to have no kernels for the card. This records the
+    bundle needs when the installed wheel turns out not to carry kernels for the card. This records the
     hardware signals read (driver CUDA ceiling, every GPU's compute capability), the intermediate
     driver-only pick, the mixed-card policy, what the architecture clamp did to it, and a human-readable
     reason, so a maintainer can tell a stale persisted token apart from an unreadable ``nvidia-smi`` apart
@@ -470,11 +472,11 @@ class BackendDecision:
 def _explain_clamp(pre_clamp: str, post_clamp: str, capabilities: tuple[tuple[int, int], ...]) -> tuple[str, str]:
     """Return the ``(clamp_action, reason)`` describing what the architecture clamp did and why."""
     if pre_clamp not in CUDA_BUILDS:
-        return CLAMP_NOT_CUDA, f"{pre_clamp} is not a CUDA build; no architecture clamp applies"
+        return CLAMP_NOT_CUDA, f"{pre_clamp} is not a CUDA build. No architecture clamp applies"
     if not capabilities:
         return (
             CLAMP_SKIPPED,
-            f"kept the driver-ceiling build {pre_clamp}; the GPU compute capability could not be read, so "
+            f"Kept the driver-ceiling build {pre_clamp}. The GPU compute capability could not be read, so "
             "no architecture clamp was applied",
         )
     cap_tag = _format_capabilities(capabilities)
@@ -483,12 +485,12 @@ def _explain_clamp(pre_clamp: str, post_clamp: str, capabilities: tuple[tuple[in
     if post_clamp == CU130 and pre_clamp == CU126:
         return (
             CLAMP_FLOORED,
-            f"cu126 has no kernel image for compute capability {cap_tag} (Blackwell or newer); floored to "
+            f"cu126 does not carry a kernel image for compute capability {cap_tag} (Blackwell or newer). Floored to "
             "cu130 (a driver update may be required before it can load)",
         )
     return (
         CLAMP_CEILED,
-        f"the CUDA 13 wheels dropped compute capability {cap_tag} (pre-Turing); held at cu126",
+        f"The CUDA 13 wheels dropped compute capability {cap_tag} (pre-Turing). Held at cu126",
     )
 
 
@@ -499,12 +501,12 @@ def _explain_mixed_cards(
 ) -> str:
     """Return the reason clause for a box whose cards need different builds."""
     effective = effective_policy(capabilities, requested)
-    clause = f"cards {_format_capabilities(capabilities)} need different builds; the {effective} policy applies"
+    clause = f"Cards {_format_capabilities(capabilities)} need different builds. The {effective} policy applies"
     if requested in (None, MixedCardPolicy.ALL) and effective is not MixedCardPolicy.ALL:
-        clause += "; a single build cannot run every card, so the highest card's build is used"
+        clause += ". A single build cannot run every card, so the highest card's build is used"
     stranded = cards_without_kernels(final_token, capabilities)
     if stranded:
-        clause += f"; {final_token} has no kernels for compute capability {_format_capabilities(stranded)}"
+        clause += f". {final_token} does not carry kernels for compute capability {_format_capabilities(stranded)}"
     return clause
 
 
@@ -535,10 +537,10 @@ def _cuda_build(
     * Driver ceiling: see :func:`_driver_ceiling_build`.
     * Architecture window: the driver version is only a ceiling, not proof the wheel has kernels for the
       card, so the driver-based pick is clamped into the window of the cards ``policy`` covers (see
-      :func:`governing_capabilities` and :func:`_clamp_build_to_arch`). Without a readable capability the
+      :func:`effective_capabilities` and :func:`_clamp_build_to_arch`). Without a readable capability the
       clamp is skipped and the driver-only pick is kept.
     """
-    return _clamp_build_to_cards(_driver_ceiling_build(version), governing_capabilities(capabilities, policy))
+    return _clamp_build_to_cards(_driver_ceiling_build(version), effective_capabilities(capabilities, policy))
 
 
 def _nvidia_decision(
@@ -550,14 +552,14 @@ def _nvidia_decision(
 ) -> BackendDecision:
     """Build the NVIDIA detect-stage decision from the probed driver ceiling and cards."""
     ceiling = _driver_ceiling_build(driver)
-    governing = governing_capabilities(capabilities, policy)
-    final = _clamp_build_to_cards(ceiling, governing)
-    action, clamp_reason = _explain_clamp(ceiling, final, governing)
+    effective = effective_capabilities(capabilities, policy)
+    final = _clamp_build_to_cards(ceiling, effective)
+    action, clamp_reason = _explain_clamp(ceiling, final, effective)
     driver_tag = format_capability(driver) if driver != (0, 0) else "unreadable"
-    reason = f"NVIDIA GPU; driver CUDA {driver_tag} -> {ceiling}; {clamp_reason}"
+    reason = f"NVIDIA GPU. Driver CUDA {driver_tag} -> {ceiling}. {clamp_reason}"
     disagree = cards_disagree(driver, capabilities)
     if disagree:
-        reason += f"; {_explain_mixed_cards(capabilities, policy, final)}"
+        reason += f". {_explain_mixed_cards(capabilities, policy, final)}"
     return BackendDecision(
         stage="detect",
         final_token=final,
@@ -605,9 +607,9 @@ def describe_reconcile(
             stage="reconcile", final_token=token, input_token=token, clamp_action=action, reason=reason
         )
     capabilities = (gpus or _nvidia_gpu_query()).capabilities
-    governing = governing_capabilities(capabilities, policy)
-    final = _clamp_build_to_cards(token, governing)
-    action, reason = _explain_clamp(token, final, governing)
+    effective = effective_capabilities(capabilities, policy)
+    final = _clamp_build_to_cards(token, effective)
+    action, reason = _explain_clamp(token, final, effective)
     return BackendDecision(
         stage="reconcile",
         final_token=final,
@@ -630,7 +632,7 @@ def reconcile_backend_for_gpu(
     A persisted ``bin/backend`` token (or the cu126 default) can name a torch build with no kernel image
     for the installed GPU: a cu126 token kept from before a Blackwell card was installed, say, which the
     sync path would otherwise reinstall on every update, leaving torch unable to launch a single kernel
-    ("no CUDA kernels for this GPU"). Re-reading the live compute capability and re-applying the same
+    ("does not carry CUDA kernels for this GPU"). Re-reading the live compute capability and re-applying the same
     arch-window clamp :func:`_cuda_build` uses lets such a token self-heal at install time.
 
     A non-CUDA token (cpu/rocm) is returned untouched and never triggers an nvidia-smi probe; an
@@ -672,7 +674,7 @@ def explain_repick(persisted: str, live: BackendDecision) -> str:
         persisted
     ):
         return f"the driver's CUDA ceiling ({driver_tag}) no longer supports {persisted}"
-    return f"{persisted} has no kernels for the cards this machine's policy covers"
+    return f"{persisted} does not carry kernels for the cards this machine's policy covers"
 
 
 def describe_backend_selection(*, policy: MixedCardPolicy | None = None) -> BackendDecision:

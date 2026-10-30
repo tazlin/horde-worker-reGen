@@ -196,7 +196,7 @@ read. A build you chose is never re-picked. An install from before this record e
 detected and a `cpu` build as chosen.
 
 **Every sync clamps the build into your card's architecture window.** A resolved or hand-forced build
-that has no kernels for the card present is corrected before anything is installed, so an unrunnable
+that does not carry kernels for the card present is corrected before anything is installed, so an unrunnable
 wheel never reaches disk. This is why `HORDE_WORKER_BACKEND=cu126` on a Blackwell card installs `cu130`
 instead, with a note explaining the swap, and why a worker that recorded `cu126` before a Blackwell card
 was fitted moves itself to `cu130` on its next update. The corrected build is re-recorded, so the fix

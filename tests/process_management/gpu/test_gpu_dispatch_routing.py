@@ -1773,7 +1773,7 @@ class TestAWithheldDispatchDoesNotEndTheCycle:
 
 
 class TestEveryWithheldDispatchIsRecorded:
-    """A dispatch declined with no record is a stall nothing can explain, so each gate names itself."""
+    """A dispatch declined with no record is a stall nothing can explain, so each gate is recorded."""
 
     async def _decline_for(
         self,
@@ -1796,7 +1796,7 @@ class TestEveryWithheldDispatchIsRecorded:
             max_threads=2,
         )
 
-    async def test_the_head_priority_barrier_names_itself(self) -> None:
+    async def test_the_head_priority_barrier_is_recorded_as_the_hold_reason(self) -> None:
         """A dispatch withheld to drain the card for a starved head is recorded as the barrier's."""
         head_lane = _lane(0, device_index=0, model="model_a")
         scheduler = _make_scheduler(
@@ -1837,7 +1837,7 @@ class TestEveryWithheldDispatchIsRecorded:
         assert decline is not None
         assert decline.bucket is SlotDutyBucket.AUX_PREPARATION
 
-    async def test_a_degraded_retry_names_itself(self) -> None:
+    async def test_a_degraded_retry_is_recorded_as_the_hold_reason(self) -> None:
         """An isolated retry waiting for its card to clear is recorded as the isolation wait it is."""
         retry_lane = _lane(0, device_index=0, model="model_a")
         sibling_lane = _lane(1, device_index=0, model="model_b")
@@ -1857,7 +1857,7 @@ class TestEveryWithheldDispatchIsRecorded:
 
         assert decline.bucket is SlotDutyBucket.DEGRADED_ISOLATION_PENDING
 
-    async def test_a_whole_card_prestage_names_itself(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_a_whole_card_prestage_is_recorded_as_the_hold_reason(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A pre-staged head waiting for sole residency is recorded as the convergence wait."""
         scheduler = self._one_card_scheduler((0, "model_a"))
         scheduler.begin_scheduling_cycle()
@@ -1868,7 +1868,9 @@ class TestEveryWithheldDispatchIsRecorded:
 
         assert decline.bucket is SlotDutyBucket.WHOLE_CARD_CONVERGENCE
 
-    async def test_a_post_processing_defer_names_itself(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_a_post_processing_defer_is_recorded_as_the_hold_reason(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """A head deferred behind a post-processing chain is recorded as that defer."""
         scheduler = self._one_card_scheduler((0, "model_a"))
         scheduler.begin_scheduling_cycle()
@@ -1879,7 +1881,9 @@ class TestEveryWithheldDispatchIsRecorded:
 
         assert decline.bucket is SlotDutyBucket.POST_PROCESSING_DEFER
 
-    async def test_a_residency_reconciliation_hold_names_itself(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_a_residency_reconciliation_hold_is_recorded_as_the_hold_reason(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """A head whose materialisation would over-commit the card is recorded as the reconciliation wait."""
         scheduler = self._one_card_scheduler((0, "model_a"))
         scheduler.begin_scheduling_cycle()
@@ -1890,7 +1894,9 @@ class TestEveryWithheldDispatchIsRecorded:
 
         assert decline.bucket is SlotDutyBucket.RESIDENCY_RECONCILIATION
 
-    async def test_a_retained_resident_hold_names_itself(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_a_retained_resident_hold_is_recorded_as_the_hold_reason(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """A head waiting for a sibling's retained weights is recorded in the same reconciliation bucket."""
         scheduler = self._one_card_scheduler((0, "model_a"))
         scheduler.begin_scheduling_cycle()
@@ -1901,7 +1907,7 @@ class TestEveryWithheldDispatchIsRecorded:
 
         assert decline.bucket is SlotDutyBucket.RESIDENCY_RECONCILIATION
 
-    async def test_the_stall_explainer_names_the_gate_that_withheld_the_head(
+    async def test_the_stall_explainer_reports_the_gate_that_withheld_the_head(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:

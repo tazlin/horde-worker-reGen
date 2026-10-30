@@ -343,7 +343,7 @@ class WorkerState:
     rung count (which skips baselines the worker has no model for) at pop time."""
 
     gpu_torch_incompatible: bool = False
-    """Session-latched: an inference child reported the installed PyTorch has no CUDA kernels for this GPU.
+    """Session-latched: an inference child reported the installed PyTorch does not carry CUDA kernels for this GPU.
 
     Set from the child's ``TORCH_GPU_INCOMPATIBLE`` report (the child is the only process that touches
     torch; the parent learns of the mismatch through that torch-free signal). The wheel's compiled

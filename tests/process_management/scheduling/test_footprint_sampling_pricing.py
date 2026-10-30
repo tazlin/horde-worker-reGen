@@ -653,7 +653,7 @@ class TestMeasuredLoweringPricing:
 class TestJobClassPricing:
     """A job is priced from the measured window of its own class, its batch size and hires-fix pass.
 
-    The failure this encodes: one SAMPLE window per resolution band held every class's peaks. Once batched
+    This row encodes the failure in which one SAMPLE window per resolution band held every class's peaks. Once batched
     jobs were in the window its second-highest job was a batched decode peak, and every single-image job in the
     band was priced at it. On a 24 GB card that priced a batch-1 SDXL job at about 13 GB against the 7 GB it
     used, so a second SDXL job never cleared beside a running one.

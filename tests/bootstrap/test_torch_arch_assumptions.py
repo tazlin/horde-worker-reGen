@@ -54,7 +54,7 @@ def test_installed_wheel_matches_detect_table(installed_arch: tuple[list[str], l
     lowest = min(caps)
 
     if cuda_major <= 12:
-        # The cu126 floor rule ("Blackwell+ has no kernels here, lift to cu130") rests on this ceiling.
+        # The cu126 floor rule ("Blackwell+ does not carry kernels here, lift to cu130") rests on this ceiling.
         assert highest == detect._CU126_MAX_COMPUTE_CAP, (
             f"cu12x wheel now tops out at sm_{highest[0]}{highest[1]}, not "
             f"sm_{detect._CU126_MAX_COMPUTE_CAP[0]}{detect._CU126_MAX_COMPUTE_CAP[1]}; update "

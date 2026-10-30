@@ -268,8 +268,8 @@ async def test_a_defect_reinjection_an_unsatisfiable_gate_reuploads_every_job(
 async def test_b_diverse_traffic_earns_almost_no_retention_and_makes_no_pressure() -> None:
     """A rotation that never repeats within the window on a slot is granted nothing and holds nothing.
 
-    The failure this encodes: retention granted on card health alone treats a wide offer exactly as it treats a
-    locked pool. Every dispatch leaves weights behind, the next dispatch for a different model is priced
+    This row encodes the failure in which retention granted on card health alone treats a wide offer exactly as
+    it treats a locked pool. Every dispatch leaves weights behind, the next dispatch for a different model is priced
     against them, and they are handed back unused: the card accumulates copies nothing will come back for and
     the worker manufactures the pressure its own reclaim ladder then has to resolve. Over hours of a diverse
     mix that is a recurring saturation the traffic never called for.
@@ -406,7 +406,7 @@ async def _hold_pressure(world: _DispatchWorld, seconds: float) -> None:
 async def test_d_sustained_pressure_revokes_the_hold_nothing_came_back_for() -> None:
     """A card under lasting pressure gives up a retained copy that has gone unused, and keeps one still in use.
 
-    The failure this encodes: a grant is a prediction, and before this nothing ever revisited one. Only an
+    This row encodes the failure in which a grant is a prediction, and before this nothing ever revisited one. Only an
     eviction actuation could end a retention, so a hold taken in a healthy moment outlived every change in what
     the slot was being asked to run, and a card under pressure carried copies whose successors were never
     coming while the reclaim ladder worked around them.

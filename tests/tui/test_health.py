@@ -178,7 +178,7 @@ def test_degraded_on_consecutive_failures() -> None:
 
 def test_gpu_torch_incompatible_is_degraded_error_and_names_the_reason() -> None:
     """An incompatible-PyTorch worker surfaces as a prominent DEGRADED/ERROR report carrying the reason."""
-    reason = "PyTorch has no CUDA kernels for NVIDIA GeForce RTX 5070 (compute capability sm_120)."
+    reason = "PyTorch does not carry CUDA kernels for NVIDIA GeForce RTX 5070 (compute capability sm_120)."
     report = derive(
         _snapshot(
             processes=[_process("WAITING_FOR_JOB")],

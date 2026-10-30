@@ -312,7 +312,7 @@ class TestReceiveAndHandleProcessMessages:
         msg.process_id = 0
         msg.process_launch_identifier = 0
         msg.process_state = HordeProcessState.TORCH_GPU_INCOMPATIBLE
-        msg.info = "PyTorch has no CUDA kernels for NVIDIA GeForce RTX 5070 (compute capability sm_120)."
+        msg.info = "PyTorch does not carry CUDA kernels for NVIDIA GeForce RTX 5070 (compute capability sm_120)."
         msg.time_elapsed = None
 
         assert state.gpu_torch_incompatible is False

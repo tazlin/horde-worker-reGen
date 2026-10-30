@@ -174,7 +174,7 @@ def test_sync_warns_when_installed_wheel_lacks_kernels(
     monkeypatch.setattr(cli.detect, "_nvidia_gpu_query", lambda: _gpus((12, 0)))
     assert cli.main(["sync"]) == 0  # the install still succeeded; the warning never fails it
     err = capsys.readouterr().err
-    assert "no CUDA kernels for this GPU" in err
+    assert "does not carry CUDA kernels for this GPU" in err
     assert "sm_120" in err
     assert "worker bug" in err
     assert calls == [("sync", "cu130")]  # the floor upgraded cu126 -> cu130 before the post-check ran
@@ -188,7 +188,7 @@ def test_sync_silent_when_installed_wheel_supports_gpu(
     monkeypatch.setattr(cli.runner, "query_torch_arch_list", lambda uv, **kw: ["sm_90", "sm_100", "sm_120"])
     monkeypatch.setattr(cli.detect, "_nvidia_gpu_query", lambda: _gpus((12, 0)))
     assert cli.main(["sync"]) == 0
-    assert "no CUDA kernels" not in capsys.readouterr().err
+    assert "does not carry CUDA kernels" not in capsys.readouterr().err
 
 
 def test_sync_post_check_skips_non_cuda_wheel(
@@ -205,7 +205,7 @@ def test_sync_post_check_skips_non_cuda_wheel(
     # post-sync check must return on the missing sm_ tags before it ever evaluates compatibility.
     monkeypatch.setattr(cli.detect, "gpu_arch_supported", _boom)
     assert cli.main(["sync"]) == 0
-    assert "no CUDA kernels" not in capsys.readouterr().err
+    assert "does not carry CUDA kernels" not in capsys.readouterr().err
 
 
 def test_launch_web_passthrough(env: tuple[Path, list]) -> None:
@@ -284,7 +284,7 @@ def _in_sync_venv(root: Path) -> None:
 def test_launch_forces_resync_when_installed_torch_cannot_run_gpu(
     env: tuple[Path, list], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """A lock-matching venv whose torch has no kernels for the live GPU is re-synced before starting.
+    """A lock-matching venv whose torch does not carry kernels for the live GPU is re-synced before starting.
 
     This is the launch-path backstop for a persisted build that cannot run the card actually present (a
     cu126 install on a Blackwell GPU): the runtime guard alone would refuse every job on every relaunch
@@ -300,7 +300,7 @@ def test_launch_forces_resync_when_installed_torch_cannot_run_gpu(
     # The forced sync reconciles cu126 -> cu130 (the runnable build) before the worker starts.
     assert calls == [("sync", "cu130"), ("run", ["horde-worker"])]
     assert backend.read_backend_file(root / "bin" / "backend") == "cu130"
-    assert "no CUDA kernels for this GPU" in capsys.readouterr().err
+    assert "does not carry CUDA kernels for this GPU" in capsys.readouterr().err
 
 
 def test_launch_stamps_healthy_torch_and_skips_reprobe(
@@ -341,7 +341,7 @@ def test_launch_warns_but_starts_when_no_corrective_build_exists(
     monkeypatch.setattr(cli.runner, "query_torch_arch_list", lambda uv, **kw: ["sm_80", "sm_90"])
     assert cli.main(["launch", "terminal"]) == 0
     assert calls == [("run", ["horde-worker"])]  # started, never re-synced
-    assert "no alternative locked build is known" in capsys.readouterr().err
+    assert "the locked builds do not include one known to run it" in capsys.readouterr().err
 
 
 def test_detect_records_decision_breadcrumb(env: tuple[Path, list], monkeypatch: pytest.MonkeyPatch) -> None:

@@ -471,8 +471,8 @@ def _assert_streak_drained(world: _DispatchWorld, jobs: list[ImageGenerateJobPop
 async def test_a_same_model_streak_is_served_from_one_retained_copy() -> None:
     """A streak of jobs for one model uploads its weights once and samples the rest from the retained copy.
 
-    The failure this encodes: retention decisions reached the dispatch message but no byte of the grant ever
-    survived on the card, so every successor in a streak paid a full host-to-device weight upload for a
+    This row encodes the failure in which retention decisions reached the dispatch message but no byte of the grant
+    ever survived on the card, so every successor in a streak paid a full host-to-device weight upload for a
     checkpoint the device had been holding moments earlier. On a megapixel SDXL job that upload is comparable
     to the sampling it precedes, so the loss is a large fraction of the card's earning time and it grows with
     the length of the streak.
@@ -778,8 +778,8 @@ def _blind_children_to_device_truth(monkeypatch: pytest.MonkeyPatch) -> None:
 async def test_d_a_retention_streak_fits_the_card_on_device_truth() -> None:
     """A streak whose true footprint nearly fills the card stays off the paging cliff and keeps earning.
 
-    The failure this encodes: retention leaves a footprint standing across job boundaries, and the last thing
-    between that footprint and the device is the child's own shortfall arithmetic. Computed against the
+    This row encodes the failure in which retention leaves a footprint standing across job boundaries, and the last
+    thing between that footprint and the device is the child's own shortfall arithmetic. Computed against the
     process-local view, which runs ahead of the card, the shortfall comes out too small; the child gives
     nothing back, allocates anyway, and free VRAM collapses to the paging cliff, where the governor saturates
     and the worker starts relieving the card by taking its own capacity down.
@@ -957,7 +957,7 @@ async def _drive_rotation(
 async def test_e_a_rotation_serves_retained_copies_before_loading_a_cold_head_over_them() -> None:
     """A rotation wider than the lane pool serves what slots retain, where doing so costs the head nothing.
 
-    The failure this encodes: retention held weights across the job boundary exactly as designed, and the
+    This row encodes the failure in which retention held weights across the job boundary exactly as designed, and the
     placement order threw them away. The cold head is preloaded first and its target is whichever slot is free,
     so it lands on a slot retaining a model still in the queue; that model's next job then re-uploads onto the
     other slot, whose retained copy the following head evicts in turn. Two models trade lanes for the rest of
@@ -1143,8 +1143,8 @@ far above what a stalled selection leaves."""
 async def test_f_a_rotation_drains_when_no_placement_preference_reorders_it() -> None:
     """A rotation over turned-over lanes keeps dispatching with the placement preference taken out.
 
-    The failure this encodes: selection may cache the job-and-lane pair it chose, so a cycle's look-ahead and
-    its dispatch cannot disagree, and the cached pair's validity rests on the lane still holding that job's
+    This row encodes the failure in which selection may cache the job-and-lane pair it chose, so a cycle's look-ahead
+    and its dispatch cannot disagree, and the cached pair's validity rests on the lane still holding that job's
     model. Applying the children's reports between cycles is what invalidates it: the lane gives its weights
     back, the pair becomes undispatchable, and while it is held every gate below it refuses the dispatch, so
     nothing clears the cache. Selection is then pinned to a job no lane can serve and never offers the head
@@ -1512,8 +1512,8 @@ async def test_g_a_slow_release_is_not_graded_a_failed_rung(
 ) -> None:
     """A reclaim rung whose memory lands seconds later is verified rather than escalated past, on any card.
 
-    The failure this encodes: no rung frees synchronously. An unload is a message the child services between
-    its own allocations, and the driver returns a checkpoint-sized block over the seconds that follow; a lane
+    This row encodes the failure in which no rung frees synchronously. An unload is a message the child services
+    between its own allocations, and the driver returns a checkpoint-sized block over the seconds that follow; a lane
     pause returns nothing until the OS has torn the process down. An engine that grades a rung on a fixed
     number of governor samples therefore reads every working release as having freed nothing, records a
     shortfall against the tenant it named, and escalates. On a control loop that samples faster than the driver
@@ -1609,7 +1609,7 @@ def _safety_cycle_gaps(world: _DispatchWorld) -> list[float]:
 async def test_h_recurring_pressure_cycles_safety_at_most_once_per_dwell(monkeypatch: pytest.MonkeyPatch) -> None:
     """A card under recurring pressure moves safety off the GPU at most once per cooldown, and readmits it slowly.
 
-    The failure this encodes: moving safety off the card ends the safety process, and the placement policy
+    This row encodes the failure in which moving safety off the card ends the safety process, and the placement policy
     rebuilds it once the card fits it again, so the rung and its restore together are a full process cycle that
     stalls result submission while the rebuild runs. Nothing bounded how often that could be spent: every
     pressure episode reached the rung again within seconds, and every restore was taken on the first cycle the
@@ -1721,8 +1721,8 @@ async def test_h_defect_reinjection_an_undwelt_safety_rung_thrashes_the_process(
 async def test_i_a_rotation_restages_the_model_whose_lane_was_loaded_over(max_threads: int) -> None:
     """A rotation whose lanes are loaded over each other keeps staging the displaced models and drains.
 
-    The failure this encodes: residency is recorded twice, once on the lane and once in a model-keyed map, and
-    loading a lane over rewrites only the first. The displaced model's map entry survives naming a lane that
+    This row encodes the failure in which residency is recorded twice, once on the lane and once in a model-keyed map,
+    and loading a lane over rewrites only the first. The displaced model's map entry survives naming a lane that
     holds something else, the preload pass counts that map in its already-loaded set, and the displaced
     model's pending job is therefore treated as served and never staged onto a free lane. What is left
     dispatchable is a job some lane does hold, which is not the head; the head-protection hold correctly
@@ -1895,7 +1895,7 @@ async def _drive_held_component_head(world: _DispatchWorld) -> ImageGenerateJobP
 async def test_j_a_head_is_let_onto_a_card_packed_with_idle_held_components() -> None:
     """A head that cannot materialise over idle device-warm components gets them reclaimed, not waited on.
 
-    The failure this encodes: two idle lanes held their component cache on the device, the queue head's
+    This row encodes the failure in which two idle lanes held their component cache on the device, the queue head's
     materialisation did not fit, and the dispatch residency-reconciliation hold found nothing it would evict.
     The hold's only release is the arbiter verdicting a fit, and nothing was producing one: both lanes sat
     idle holding most of the card while the head re-asked every pass, until the run ended on the deadlock
@@ -1986,7 +1986,7 @@ def _silent_eviction_world(*, child_evicts_granted_resident: bool) -> _DispatchW
 async def test_k_a_child_side_eviction_is_reconciled_rather_than_left_as_a_resident() -> None:
     """When the child frees weights a grant covered, the parent's record follows the device, not the grant.
 
-    The failure this encodes: retention was granted, the dispatch was priced for it, and ComfyUI freed the
+    This row encodes the failure in which retention was granted, the dispatch was priced for it, and ComfyUI freed the
     checkpoint during the run anyway to fund an allocation, because the grant suppresses the worker's own
     end-of-job evictor and nothing else. The parent settled the grant into its retained-resident record all
     the same, and from then on three paths acted on weights that were not there: the retention fit charged
@@ -2118,7 +2118,7 @@ async def _drive_refused_unload_head(world: _DispatchWorld) -> ImageGenerateJobP
 async def test_l_an_unload_the_device_refused_is_not_recorded_as_room() -> None:
     """A slot that could not give its weights back keeps reading as VRAM-resident, and the head still moves.
 
-    The failure this encodes: an unload was issued, the backend freed one component out of nearly nine
+    This row encodes the failure in which an unload was issued, the backend freed one component out of nearly nine
     gigabytes and left the rest loaded behind a live reference, and the child reported the model moved to
     host RAM because that is what the command had asked for. The parent booked the whole footprint as room
     it had recovered, and for the rest of the session admitted against gigabytes the card was still holding;
@@ -2276,7 +2276,7 @@ async def _drive_pinned_sampler_scenario(world: _DispatchWorld) -> tuple[ImageGe
 async def test_m_a_whole_card_teardown_spares_the_lane_a_pinned_sampler_owns() -> None:
     """A residency's teardown leaves a slot that owns a dispatched job alone, and still collapses the pool.
 
-    The failure this encodes: a disaggregated sampler is pinned to its slot and granted execution ownership
+    This row encodes the failure in which a disaggregated sampler is pinned to its slot and granted execution ownership
     before the sample stage is sent, so it sits reporting ``WAITING_FOR_JOB`` for the whole encode window. A
     teardown that reads idleness off child state alone sees a free lane, ends it, and takes the job with it.
 
@@ -2399,7 +2399,7 @@ async def _drive_prestage_target_scenario(world: _DispatchWorld) -> int:
 async def test_n_a_reprice_spares_the_slot_a_whole_card_head_is_pre_staging_into() -> None:
     """A tightened residency target does not take the slot its own head is being loaded into.
 
-    The failure this encodes: a pre-staged head carries its model on no lane until its load lands, so the
+    This row encodes the failure in which a pre-staged head carries its model on no lane until its load lands, so the
     model-name protection every residency shrink relies on cannot reach the slot the pre-stage chose. A
     reprice that tightens the target in that window is a shrink with nothing protecting its own target, and
     the slot the residency is loading into is the first idle lane it finds.
@@ -2554,8 +2554,8 @@ def _assert_the_deferral_was_in_force(world: _DispatchWorld) -> None:
 async def test_o_a_governor_deferred_head_lets_the_work_behind_it_run() -> None:
     """A head whose whole-card establishment is governor-deferred stops reserving the card from the queue.
 
-    The failure this encodes: the churn governor deferred a whole-card head's establishment, which is a brake
-    on how fast the card may be rotated and explicitly not a finding that the head cannot be served. Normal
+    This row encodes the failure in which the churn governor deferred a whole-card head's establishment, which is a
+    brake on how fast the card may be rotated and explicitly not a finding that the head cannot be served. Normal
     scheduling is meant to continue around such a head. Head protection went on pricing that head's whole
     fifteen-gigabyte demand anyway, so every smaller ready job behind it was withheld to keep room for a
     demand nobody was making, and the card sat empty for the length of the deferral with fitting work on a
@@ -2710,8 +2710,8 @@ async def _drive_ineligible_card_head(
 async def test_p_a_head_gets_its_own_copy_when_the_resident_card_cannot_serve_it() -> None:
     """A model resident only on a card that cannot serve the head is loaded again onto one that can.
 
-    The failure this encodes: residency was judged card-blind while dispatch was judged per card. The head's
-    model was resident, on a card whose resolution ceiling excluded this job, so dispatch found nothing to
+    This row encodes the failure in which residency was judged card-blind while dispatch was judged per card. The
+    head's model was resident, on a card whose resolution ceiling excluded this job, so dispatch found nothing to
     dispatch to and the preload pass called the model already loaded. Neither lane could move the head:
     dispatch had no eligible copy and no pass would fund one, and both cards idled against a full queue until
     save-our-ship rebuilt the pools. Dispatch also read the empty per-card lookup as a stale residency record
@@ -2925,7 +2925,7 @@ def _price_the_peak_worker_wide(
 async def test_q_safety_stays_on_a_card_committed_only_to_the_work_it_serves() -> None:
     """A card serving its own light work keeps its safety process while a sibling card carries the heavy peak.
 
-    The failure this encodes: safety's placement was judged against a worker-wide sampling peak. On a
+    This row encodes the failure in which safety's placement was judged against a worker-wide sampling peak. On a
     multi-card pool the heaviest queued job is routinely one this card can never be given (its effective
     config excludes the resolution outright), and the card holds no weights for that job's model either, so the
     whole of that peak read as memory this card still had to find. Measured free never covered it, the demotion
@@ -3215,8 +3215,8 @@ async def _drive_lone_staged_waiter(world: _DispatchWorld) -> ImageGenerateJobPo
 async def test_r_a_staged_waiter_is_cleared_into_the_room_the_card_already_has() -> None:
     """A lone staged job is settled by clearance within a few ticks, not once its lease has run out.
 
-    The failure this encodes: dispatch under the lease books the job an encode-only staging reservation, and the
-    clearance re-price charged the job's full peak against measured free net of every outstanding reservation,
+    This row encodes the failure in which dispatch under the lease books the job an encode-only staging reservation,
+    and the clearance re-price charged the job's full peak against measured free net of every outstanding reservation,
     its own staging entry included, so the waiter read as short by its own encode charge. Nothing on the card
     changes while a lone waiter waits, so no eviction and no completion could release it: the hold stood until
     the child sampled through its bounded lease-acquire timeout, and every job of that shape paid a full minute
@@ -3300,9 +3300,9 @@ def _partial_seat_world() -> _DispatchWorld:
 async def test_r_an_extra_large_checkpoint_over_the_ceiling_clears_at_its_partial_load_seat() -> None:
     """Every Krea2 job on a 16 GB card is cleared by clearance, none by its lease-acquire timeout.
 
-    The failure this encodes: the job's whole sampling peak sits above what the emptied card offers, so clearance
-    refused it as impossible unless it took the ceiling trigger's one real load. That load is spent per job and
-    card. A job retried after a sampling fault that was not a resource failure had already spent it, so it was
+    This row encodes the failure in which the job's whole sampling peak sits above what the emptied card offers, so
+    clearance refused it as impossible unless it took the ceiling trigger's one real load. That load is spent per job
+    and card. A job retried after a sampling fault that was not a resource failure had already spent it, so it was
     denied and held until its child sampled unpriced at the lease-acquire timeout, where ComfyUI loaded the
     checkpoint partially and served it anyway. Each such job left the card dark for the whole timeout.
 
@@ -3364,7 +3364,7 @@ _LANE_RUNG_TICK_SECONDS = 0.5
 async def test_r_a_head_starved_by_three_lanes_waits_one_grace_not_three() -> None:
     """A staged head short by three service lanes waits out the grace once and then takes each lane as it exits.
 
-    The failure this encodes: applying a lane rung stopped the waiter's clearance clock and the next hold
+    This row encodes the failure in which applying a lane rung stopped the waiter's clearance clock and the next hold
     restarted it, so each rung waited a fresh teardown grace though each lane's process exited within a fraction
     of a second. A head that needed the post-processing lane, safety and the utilities lane off the card sat
     on an idle card for three graces.
@@ -3478,9 +3478,9 @@ async def _drive_residency_safety_job(*, lora: bool) -> tuple[_DispatchWorld, Im
 async def test_r_a_residency_moves_safety_only_for_a_job_clearance_cannot_seat_beside_it(lora: bool) -> None:
     """A residency moves safety off at once for a job that cannot be seated beside it, and keeps it otherwise.
 
-    The failure this encodes: with safety held on the GPU by configuration, a residency moved safety off only when
-    its model's weights could not fit beside it. Clearance prices the job's whole need. A LoRA job of a large model
-    cannot be seated partially, so one whose weights fit beside safety and whose need did not was held at
+    This row encodes the failure in which, with safety held on the GPU by configuration, a residency moved safety off
+    only when its model's weights could not fit beside it. Clearance prices the job's whole need. A LoRA job of a large
+    model cannot be seated partially, so one whose weights fit beside safety and whose need did not was held at
     clearance on an idle card until the runtime placement's sustained-pressure dwell moved safety anyway.
 
     Read as one statement: the residency moves safety when clearance could not seat its job beside it. Its
@@ -3603,10 +3603,10 @@ async def _drive_unseen_tenant_waiter(world: _DispatchWorld) -> tuple[ImageGener
 async def test_r_a_waiter_nothing_can_help_is_probed_one_delay_after_its_last_rung(arrival: str) -> None:
     """A staged waiter short by a tenant no reclaim can free is probed a probe delay after its ladder is spent.
 
-    The failure this encodes: a staged waiter the ladder could not seat waited the diagnostic horizon before its
-    one measured load, clamped to a deadline read on its starved clock. The horizon gives reclaim a window before a
-    load goes into a tenant the ledger cannot see. The child makes that same load unpriced at its lease-acquire
-    timeout, so for a staged waiter the horizon only idled the card. A lane rung also restarts the
+    This row encodes the failure in which a staged waiter the ladder could not seat waited the diagnostic horizon
+    before its one measured load, clamped to a deadline read on its starved clock. The horizon gives reclaim a window
+    before a load goes into a tenant the ledger cannot see. The child makes that same load unpriced at its
+    lease-acquire timeout, so for a staged waiter the horizon only idled the card. A lane rung also restarts the
     starved clock, so a waiter still short after its rungs reached its timeout first. On a 24 GB card a large
     model short by 871 MB of an idle lane's residue held the card idle for its whole 60 s timeout.
 
@@ -3709,7 +3709,7 @@ available, short of the head, and nothing on the card changes while two staged l
 async def test_r_a_primed_sibling_behind_the_clearance_head_is_charged_what_it_holds() -> None:
     """A light sibling staged behind the clearance head does not hold the head off with its unused staging charge.
 
-    The failure this encodes: a staged waiter's dispatch books the flat encode staging charge, and the head
+    This row encodes the failure in which a staged waiter's dispatch books the flat encode staging charge, and the head
     was priced against that charge for every other staged waiter. A sibling whose encode is done holds only
     what the device-free reading already shows, so the rest of its charge described nothing on the card, and
     the head read short by it. Slot order keeps the sibling from clearing first and nothing frees room while
@@ -3858,7 +3858,7 @@ async def test_z_a_lone_staged_waiter_is_priced_before_its_lease_runs_out(
 ) -> None:
     """A staged job nothing else on the card can help earns its one measured load before its lease times out.
 
-    The failure this encodes: a staged waiter's measured-load probe was timed by the head-starvation clock,
+    This row encodes the failure in which a staged waiter's measured-load probe was timed by the head-starvation clock,
     which a preload send cleared and which only the preload pass restarted. A job whose model was preloaded had
     no clock once staged and never earned the probe, so it waited out its lease-acquire timeout and loaded
     unpriced; a job whose model needed no preload kept the clock it started at pop and earned it. Past the
@@ -3954,8 +3954,8 @@ def _sampled_count(world: _DispatchWorld, jobs: list[ImageGenerateJobPopResponse
 async def test_s_card_sized_child_peaks_do_not_price_the_next_job_at_the_card() -> None:
     """A child whose allocator high-water is the whole card must not teach the parent that its job costs that.
 
-    The failure this encodes: the parent learns each job's sampling peak from the child's allocator high-water
-    since its last report, keyed by baseline and resolution band. That counter is the process's, not the
+    This row encodes the failure in which the parent learns each job's sampling peak from the child's allocator
+    high-water since its last report, keyed by baseline and resolution band. That counter is the process's, not the
     job's: a process that overflowed on WDDM, or that kept another checkpoint cached beside the job, reports
     the size of the card. The learned watermark only rises and is persisted, so one such report priced every
     later job of that key at the whole card. On a card that was nine-tenths free, every preload was deferred
@@ -4045,8 +4045,8 @@ async def _drive_job_class_mix() -> _DispatchWorld:
 async def test_s_single_images_are_priced_apart_from_their_bands_batched_jobs() -> None:
     """Two single-image SDXL jobs the card holds at once sample together beside batched traffic in their band.
 
-    The failure this encodes: the learned sampling price was one window per baseline and resolution band, priced
-    at its second-highest job. Batched jobs peak gigabytes above a single image when they decode, so once two
+    This row encodes the failure in which the learned sampling price was one window per baseline and resolution band,
+    priced at its second-highest job. Batched jobs peak gigabytes above a single image when they decode, so once two
     were in the window every single-image job in the band was priced at a batched peak. On a 24 GB card that
     priced a batch-1 SDXL job near 13 GB against the 7 GB it used. The overlap gate never had confirmed room and
     clearance never seated a second job beside a running one, so two lanes took turns on a card that held both.
@@ -4112,8 +4112,8 @@ def _staged_heavy_world() -> _DispatchWorld:
 async def test_t_a_checkpoint_staged_in_host_ram_is_not_measured_as_resident() -> None:
     """An idle lane holding its checkpoint in host RAM teaches the parent nothing about the checkpoint's cost.
 
-    The failure this encodes: under the clearance lease a lane keeps its checkpoint in host RAM between jobs
-    and names it as loaded, while its allocator holds a context and a text encoder. The resident-footprint
+    This row encodes the failure in which under the clearance lease a lane keeps its checkpoint in host RAM between
+    jobs and names it as loaded, while its allocator holds a context and a text encoder. The resident-footprint
     observer read the slot as idle and model-loaded and recorded that allocation, report after report, as what
     the checkpoint costs the card at rest. Hundreds of those readings made a whole-card model measure at a
     tenth of its weights, which retired its whole-card claim and admitted it beside siblings it could not fit
@@ -4181,8 +4181,8 @@ async def test_u_a_staged_job_is_not_credited_with_weights_it_has_not_loaded(
 ) -> None:
     """A job staged under the lease is priced at its full peak at clearance, not at its activation alone.
 
-    The failure this encodes: dispatch under the lease stages a job with its weights in host RAM, and the child
-    marks the model in use as soon as it takes the job. The clearance re-price read that state as the weights
+    This row encodes the failure in which dispatch under the lease stages a job with its weights in host RAM, and the
+    child marks the model in use as soon as it takes the job. The clearance re-price read that state as the weights
     being resident, credited them out of the candidate, and priced a whole-card model at its activation only.
     Against a card holding a sibling checkpoint that was room to spare, so the grant went out and the load ran
     the card out of memory.
@@ -4339,7 +4339,7 @@ def _assert_the_whole_pool_was_used(world: _DispatchWorld, concurrency: list[int
 async def test_s_a_head_parked_on_its_own_cards_cap_does_not_hold_the_other_cards() -> None:
     """Four cards each holding a queued model all sample, though the head's card is at its cap throughout.
 
-    The failure this encodes: dispatch selection took only the placement-order head, scoped the concurrency
+    This row encodes the failure in which dispatch selection took only the placement-order head, scoped the concurrency
     cap to that head's card, and returned nothing when the card was full. Nothing else was ever tried, so one
     busy card stopped the whole worker: on an eight-card host fourteen lanes idled with jobs pending whose
     models were already resident on them, and the pop queue drained through a single card's throughput.
@@ -4504,7 +4504,7 @@ def _assert_the_cards_away_from_the_lane_kept_serving(world: _DispatchWorld, *, 
 async def test_t_a_staged_model_does_not_stop_the_cards_that_were_ready_to_sample() -> None:
     """Three cards keep sampling through a run of model changes, while the fourth owes its lane a backlog.
 
-    The failure this encodes: a sent preload ended the whole scheduling cycle. A preload stages one model
+    This row encodes the failure in which a sent preload ended the whole scheduling cycle. A preload stages one model
     onto one slot of one card, and every other lane in the pool is idle while it does, so on each model
     change the fleet's ready lanes sat out a control-loop tick for a load that concerned none of them. The
     queue here keeps a class resident nowhere at its front, so the pool is loading throughout.
@@ -4567,8 +4567,8 @@ def _make_a_hold_end_the_dispatch_loop(monkeypatch: pytest.MonkeyPatch) -> None:
 async def test_t2_a_staged_model_does_not_stop_the_cards_that_were_ready_to_sample() -> None:
     """At two sampling slots per card, a gate holding one lane leaves every other card free to sample.
 
-    The failure this encodes: a dispatch gate that withheld the selected job ended the cycle's dispatch loop
-    for the whole worker. The head is chosen worker-wide, so its hold is decided against one card, and the
+    This row encodes the failure in which a dispatch gate that withheld the selected job ended the cycle's dispatch
+    loop for the whole worker. The head is chosen worker-wide, so its hold is decided against one card, and the
     loop then read that one card's answer as "nothing more can start". Every other card's already-resident,
     already-seatable work sat out the cycle behind it, with no line logged and nothing in the queue to explain
     it.
@@ -4739,7 +4739,7 @@ def _assert_no_load_went_where_it_cannot_run(world: _DispatchWorld, *, context: 
 async def test_v_a_second_copy_goes_to_a_card_that_can_run_it() -> None:
     """A burst of one class reaches the idle cards instead of stacking on the card already running it.
 
-    The failure this encodes: preload placement preferred a card already holding the model, which is right
+    This row encodes the failure in which preload placement preferred a card already holding the model, which is right
     while that card can start another copy and wrong the moment it cannot. Under ``max_threads`` of one the
     serving card's second lane can never sample until the running job ends, so every duplicate the queue
     earned was loaded onto a lane that then sat idle. Worse, that idle copy reads as an available resident
@@ -5033,7 +5033,7 @@ def _assert_the_followers_stopped_waiting_on_one_card(
 async def test_w_a_follower_takes_room_from_a_model_nothing_is_asking_for() -> None:
     """A queue of one class reaches idle cards though every lane in the pool is affinity-protected.
 
-    The failure this encodes: model->process affinity protects the last copy of every wanted model, and a
+    This row encodes the failure in which model->process affinity protects the last copy of every wanted model, and a
     resident model counts as wanted, so a pool holding a distinct model on every lane protects every lane. A
     job whose own model is resident only where it is busy then finds no preload target at all. The queue head
     escapes that through its own room fallback; a follower has none, and a burst is made of followers. Measured
@@ -6769,8 +6769,8 @@ async def _learned_chain_stretch_ticks(estimate_mb: float | None) -> int:
 async def test_pp_chain_a_learned_chain_price_serves_the_stream_as_its_true_peak_does() -> None:
     """Once the store has seen the chains, post-processed jobs flow as if the parent knew each chain's true peak.
 
-    The failure this encodes: a chain was booked at hordelib's static estimate, which for a 4096-pixel face-fix
-    and upscale chain sat gigabytes above what the lane grew by. The booking decays only as the lane's
+    This row encodes the failure in which a chain was booked at hordelib's static estimate, which for a 4096-pixel
+    face-fix and upscale chain sat gigabytes above what the lane grew by. The booking decays only as the lane's
     reservation grows, so its unreached part stood for the whole chain, and the next job was held off a card
     that held it beside the chain. On a 24 GB card that held an SDXL job that fit the device-free reading by
     several gigabytes.
@@ -6812,7 +6812,7 @@ def _grant_tick(world: _DispatchWorld, job: ImageGenerateJobPopResponse) -> int 
 async def test_pp_chain_a_chain_dispatched_in_a_clearance_pass_is_priced_by_that_clearance() -> None:
     """A staged job is not cleared onto a card a just-dispatched chain will fill, and is cleared once it releases.
 
-    The failure this encodes: a finished job's chain was booked only as a flat reserve, which the arbiter's
+    This row encodes the failure in which a finished job's chain was booked only as a flat reserve, which the arbiter's
     admission identity does not subtract, and its allocations reach the device-free reading seconds after its
     dispatch. A staged job cleared in the same control-loop pass was priced against a reading with the chain's
     room still in it; its load and the chain's upscale then shared a card that holds either alone, the card
@@ -7401,8 +7401,8 @@ def _assert_no_lane_sampled_unpriced(world: _DispatchWorld, *, context: str) -> 
 async def test_z_the_next_jobs_weights_load_while_one_samples_and_its_denoise_follows_the_release() -> None:
     """On a 24 GB card, each successor's weights load inside the running sample and its denoise follows it at once.
 
-    The failure this encodes: one clearance permit covered both the weight upload and the denoise loop, so the
-    clearance priced the successor's whole sampling peak. The second peak does not fit beside the running one, so
+    This row encodes the failure in which one clearance permit covered both the weight upload and the denoise loop, so
+    the clearance priced the successor's whole sampling peak. The second peak does not fit beside the running one, so
     the successor waited for the running sample to end and then loaded its weights while the card idled: one
     weight upload of dead card time on every handoff.
 
@@ -8032,8 +8032,8 @@ def _chains_taken_while_the_head_waited(run: _ChainBacklogRun) -> list[_PostProc
 async def test_z_a_held_head_takes_the_turn_after_the_running_chain() -> None:
     """A job held for a running chain is dispatched when that chain ends, ahead of the chains still pending.
 
-    The failure this encodes: the lane took each pending chain the moment the last one released, so a job that
-    could not share the card with a chain waited for the whole backlog while its lane sat idle. The row asserts
+    This row encodes the failure in which the lane took each pending chain the moment the last one released, so a job
+    that could not share the card with a chain waited for the whole backlog while its lane sat idle. The row asserts
     the lane takes no chain between the head's first hold and its dispatch, that every chain still runs, and
     that nothing is faulted or sampled unpriced.
     """
@@ -8168,8 +8168,8 @@ def _followers_sampling_before(run: _ChainFillRun, instant: float) -> list[str]:
 async def test_z_jobs_that_fit_beside_a_chain_run_behind_a_head_held_for_it() -> None:
     """Jobs that fit beside a running chain load and sample while the head ahead of them is held for it.
 
-    The failure this encodes: a head held for a chain kept its model on a free lane, which the preload pass read
-    as a head about to dispatch and so loaded nothing else, and the dispatch pass offered nothing behind a
+    This row encodes the failure in which a head held for a chain kept its model on a free lane, which the preload pass
+    read as a head about to dispatch and so loaded nothing else, and the dispatch pass offered nothing behind a
     withheld head on the same card. Every lane idled for the length of the hold. The row asserts both followers
     sample before the chain releases and the head still dispatches.
     """
@@ -8311,8 +8311,8 @@ def _describe_safety_checks(world: _DispatchWorld) -> str:
 async def test_z_a_safety_check_keeps_its_room_from_a_sampler_cleared_beside_it() -> None:
     """A safety check's growth is booked when it is sent, so a sampler cleared in the same pass waits for it.
 
-    The failure this encodes: an on-GPU safety process holds its weights at rest and needs more for the length
-    of a check. Nothing reserved the difference, and a check's allocations reach the card after it is sent, so
+    This row encodes the failure in which an on-GPU safety process holds its weights at rest and needs more for the
+    length of a check. Nothing reserved the difference, and a check's allocations reach the card after it is sent, so
     a sampler cleared in the same pass was priced against room the check was about to take. The check then
     found the card full. The row asserts no check's growth lands on a card with less free memory than that,
     every job is submitted, the card is never committed past its total, and every check runs on the device.
@@ -8484,8 +8484,8 @@ async def drive_run_copy_behind_cold_head(*, ticks: int = _RUN_COPY_TICKS) -> Ru
 async def test_r_run_jobs_pass_a_cold_head_whose_room_the_runs_copy_holds() -> None:
     """A cold head declined by the preload budget waits while the run's queued jobs sample on the run's copy.
 
-    The failure this encodes: a rung-1 run's copy is spared while the run has queued jobs, and a cold head of
-    another model whose preload only that copy's eviction could seat was declined. The run's jobs could pass the
+    This row encodes the failure in which a rung-1 run's copy is spared while the run has queued jobs, and a cold head
+    of another model whose preload only that copy's eviction could seat was declined. The run's jobs could pass the
     head only within its affinity skip budget, which earlier run jobs had spent, so nothing dispatched and the
     card idled until the anti-starvation bound ended the run.
 
@@ -8595,8 +8595,8 @@ async def drive_seat_below_recommended_card(*, ticks: int = _BELOW_RECOMMENDED_C
 async def test_r_a_seat_below_the_recommended_card_dispatches_instead_of_faulting() -> None:
     """A Moss job on a card below the baseline's recommended minimum card loads and samples by its seat.
 
-    The failure this encodes: the offer advertised the model by its partial-load seat, which an 8 GB card holds,
-    and the preload gate faulted the popped job by the recommended minimum card, which the card is below.
+    This row encodes the failure in which the offer advertised the model by its partial-load seat, which an 8 GB card
+    holds, and the preload gate faulted the popped job by the recommended minimum card, which the card is below.
     """
     row = await drive_seat_below_recommended_card()
     world = row.world

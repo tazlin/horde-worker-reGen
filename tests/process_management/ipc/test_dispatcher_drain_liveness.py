@@ -192,7 +192,7 @@ def _gpu_incompatible_state_change(process_id: int, launch_identifier: int) -> H
         process_id=process_id,
         process_launch_identifier=launch_identifier,
         process_state=HordeProcessState.TORCH_GPU_INCOMPATIBLE,
-        info="installed torch has no kernels for this GPU",
+        info="installed torch does not carry kernels for this GPU",
     )
 
 

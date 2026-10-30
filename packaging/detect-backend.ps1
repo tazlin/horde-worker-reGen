@@ -17,7 +17,7 @@
 # -- a 12.6 build runs on any CUDA 12.6+ driver (and, via NVIDIA driver backward-compatibility, on CUDA
 # 13 drivers). A 13.2+ driver gets cu132, a 13.0/13.1 driver gets cu130. The pick is then floored by the
 # GPU's compute capability: the cu126 wheel carries kernels only through Hopper (sm_90), so a Blackwell
-# card (sm_120/sm_100) -- which has no kernel image in cu126 and would die at the first kernel launch --
+# card (sm_120/sm_100) -- which does not carry a kernel image in cu126 and would die at the first kernel launch --
 # is floored onto cu130 even on a CUDA 12.x driver. This mirrors worker_bootstrap.detect
 # (tests/bootstrap/test_detect_parity.py guards that the two stay in step).
 #
@@ -136,7 +136,7 @@ if (Test-NvidiaGpu) {
     }
     # Architecture window clamp (mirrors worker_bootstrap.detect._cuda_build). The driver pick can be
     # outside a card's valid window, since cu126 carries sm_50..sm_90 and the CUDA 13 wheels carry
-    # sm_75..sm_120 (pre-Turing dropped in CUDA 13). A build with no kernel image for a card dies at the
+    # sm_75..sm_120 (pre-Turing dropped in CUDA 13). A build without a kernel image for a card dies at the
     # first kernel launch, so clamp both ways for every card. When one card is pre-Turing and another is
     # Blackwell or newer, a single build cannot run both, so the build for the highest card is used, which
     # is the bootstrap's non-interactive default for mixed cards. Without a readable capability the driver

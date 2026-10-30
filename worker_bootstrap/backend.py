@@ -225,7 +225,7 @@ def choose_mixed_card_policy_interactively(
     cards = ", ".join(detect.format_capability(cap) for cap in sorted(set(capabilities)))
     emit(
         f"This machine has NVIDIA cards that need different PyTorch builds (compute capability {cards}). "
-        "A card the installed build has no kernels for cannot run jobs.",
+        "A card the installed build does not carry kernels for cannot run jobs.",
     )
     labels = {
         detect.MixedCardPolicy.ALL: "[A]ll cards",

@@ -1028,9 +1028,9 @@ def _add_idle_siblings_holding_host_ram_checkpoints(scheduler: InferenceSchedule
 async def test_idle_siblings_holding_host_ram_checkpoints_do_not_hold_off_the_seat() -> None:
     """Checkpoints parked in host RAM return no VRAM, so the card still reads converged-empty for the seat.
 
-    The failure this encodes: every idle lane holding a component cache entry counted as card tenancy the head
-    could still reclaim, so the seat was refused on a card whose idle lanes held nothing on the device, and the
-    child waited out its lease-acquire timeout to make the same partial load unpriced.
+    This row encodes the failure in which every idle lane holding a component cache entry counted as card tenancy
+    the head could still reclaim, so the seat was refused on a card whose idle lanes held nothing on the device, and
+    the child waited out its lease-acquire timeout to make the same partial load unpriced.
     """
     scheduler, _job, _waiter = await _krea2_staged_waiter()
     _add_idle_siblings_holding_host_ram_checkpoints(scheduler)
@@ -1281,7 +1281,7 @@ def _clearance_records(sink: Mock) -> list[dict[str, object]]:
 async def test_a_clearance_hold_records_the_figures_and_clocks_it_was_held_on() -> None:
     """A held waiter's record carries its price, the reading, both clocks and their limits.
 
-    The failure this encodes: a large model was held at clearance for its whole lease-acquire timeout with
+    This row encodes the failure in which a large model was held at clearance for its whole lease-acquire timeout with
     nothing sampling, and the stats stream carried no record of the hold, so a bundle could not say which of the
     price, the starved clock, the deadline or the card's convergence had held it.
     """

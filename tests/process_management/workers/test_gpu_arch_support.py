@@ -18,7 +18,7 @@ _CU130_ARCH = ["sm_75", "sm_80", "sm_86", "sm_90", "sm_100", "sm_120"]
 @pytest.mark.parametrize(
     ("arch_list", "capability", "expected"),
     [
-        # cu126 covers Ampere/Hopper but has no kernel image for Blackwell sm_120 -> unsupported.
+        # cu126 covers Ampere/Hopper but does not carry a kernel image for Blackwell sm_120 -> unsupported.
         (_CU126_ARCH, (8, 6), True),
         (_CU126_ARCH, (9, 0), True),
         (_CU126_ARCH, (12, 0), False),  # the RTX 50-series failure from the logs

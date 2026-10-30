@@ -453,7 +453,7 @@ GATE_REGISTRY: tuple[GateEntry, ...] = (
         surface=GateSurface.POP_GATE,
         kind=GateKind.HOLD,
         subsystem="process_management.jobs.job_popper",
-        engaged_by="the installed torch build has no kernels for this GPU, or is CPU-only",
+        engaged_by="the installed torch build does not carry kernels for this GPU, or is CPU-only",
         released_by=(
             "nothing at runtime: this is a build or hardware fact and is deliberately sticky for the session, "
             "since every popped job would fail at its first kernel launch"

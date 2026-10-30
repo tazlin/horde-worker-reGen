@@ -195,9 +195,9 @@ class TestProbeDelay:
     def test_a_staged_waiters_lease_wait_brings_the_probe_by_its_deadline(self) -> None:
         """A waiter whose starved clock a reclaim restarted still probes once its lease wait reaches the deadline.
 
-        The failure this encodes: the deadline was read on the starved clock, which each reclaim rung restarts,
-        while the child's lease-acquire timeout counts from the start of its wait. A rung applied after about ten
-        seconds pushed the probe past the timeout, and the child loaded unpriced on an idle card.
+        This row encodes the failure in which the deadline was read on the starved clock, which each reclaim rung
+        restarts, while the child's lease-acquire timeout counts from the start of its wait. A rung applied after
+        about ten seconds pushed the probe past the timeout, and the child loaded unpriced on an idle card.
         """
         slow_probe = _STARVATION_DIAGNOSTIC_SECONDS + 10.0
         deadline = self._DEADLINE_SECONDS

@@ -502,7 +502,7 @@ class HordeInferenceProcess(HordeProcess):
         )
 
     def _verify_torch_supports_gpu(self) -> None:
-        """Fail fast (with an actionable message) when the installed torch has no kernels for this GPU.
+        """Fail fast (with an actionable message) when the installed torch does not carry kernels for this GPU.
 
         A torch wheel built for the wrong CUDA architecture set (e.g. a cu126 build on a Blackwell card,
         or a CUDA 13 build on a pre-Turing card) raises ``cudaErrorNoKernelImageForDevice`` at the first
@@ -544,7 +544,7 @@ class HordeInferenceProcess(HordeProcess):
         cap_tag = f"sm_{capability[0]}{capability[1]}"
         build_tag = f"CUDA {torch_build}" if torch_build else "an unknown CUDA"
         logger.critical(
-            f"The installed PyTorch ({torch_version}, {build_tag} build) has no CUDA kernels for this GPU. "
+            f"The installed PyTorch ({torch_version}, {build_tag} build) does not carry CUDA kernels for this GPU."
             f"{device_name} is compute capability {capability[0]}.{capability[1]} ({cap_tag}), but this "
             f"torch build only supports {' '.join(arch_list)}. Every job would fail at the first kernel "
             f"launch with 'no kernel image is available for execution on the device'. Reinstall the worker "
@@ -556,7 +556,7 @@ class HordeInferenceProcess(HordeProcess):
         self.send_process_state_change_message(
             process_state=HordeProcessState.TORCH_GPU_INCOMPATIBLE,
             info=(
-                f"The installed PyTorch ({build_tag} build) has no CUDA kernels for {device_name} "
+                f"The installed PyTorch ({build_tag} build) does not carry CUDA kernels for {device_name}"
                 f"(compute capability {cap_tag}). Reinstall the worker to get the matching CUDA backend, "
                 f"and update your NVIDIA driver if asked. The worker will not pop jobs until this is fixed."
             ),

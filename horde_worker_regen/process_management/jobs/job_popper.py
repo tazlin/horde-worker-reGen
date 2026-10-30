@@ -2057,7 +2057,7 @@ class JobPopper:
         self._state.last_pop_skipped_reasons.pop("ram_pressure", None)
 
         if self._state.gpu_torch_incompatible:
-            # The installed PyTorch has no kernels for this GPU: every job would fail at the first kernel
+            # The installed PyTorch does not carry kernels for this GPU: every job would fail at the first kernel
             # launch, so never pop. Sticky for the session (a build/hardware mismatch); fixed by reinstalling.
             self._state.last_pop_no_jobs_available = False
             self._note_pop_gate(PopGate.TORCH_UNUSABLE)

@@ -103,7 +103,7 @@ def test_session_end_is_written_at_most_once(
     assert len([event for event in _exported_events(tmp_path) if event["event"] == "session_end"]) == 1
 
 
-def test_an_abort_names_itself_as_the_reason(
+def test_an_abort_is_recorded_as_the_reason(
     exporting_manager: HordeWorkerProcessManager,
     tmp_path: Path,
 ) -> None:

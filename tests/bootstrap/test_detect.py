@@ -81,7 +81,7 @@ def test_parse_gpu_query_reads_driver_version() -> None:
 @pytest.mark.parametrize(
     ("version", "compute_cap", "expected"),
     [
-        # Floor: Blackwell (sm_120 / sm_100) has no kernel image in cu126, so lift to cu130.
+        # Floor: Blackwell (sm_120 / sm_100) does not carry a kernel image in cu126, so lift to cu130.
         ((12, 8), (12, 0), detect.CU130),  # old CUDA 12.x driver, known Blackwell card
         ((0, 0), (12, 0), detect.CU130),  # driver CUDA unreadable but the card is known Blackwell
         ((10, 0), (10, 0), detect.CU130),  # sm_100 datacenter Blackwell, same floor
@@ -163,7 +163,7 @@ def test_detection_records_every_card_and_the_fallback(monkeypatch: pytest.Monke
     assert decision.mixed_card_policy is detect.MixedCardPolicy.HIGHEST
     assert decision.to_dict()["compute_capabilities"] == ["6.1", "12.0"]
     assert decision.to_dict()["mixed_card_policy"] == "highest"
-    assert "a single build cannot run every card" in decision.reason
+    assert "A single build cannot run every card" in decision.reason
     assert "6.1" in decision.reason
 
 

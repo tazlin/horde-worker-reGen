@@ -325,7 +325,7 @@ async def _residency_with_queued_job(
 class TestResidencySafetyMoveReadsTheJobsNeed:
     """A residency moves safety off when its job's priced need, not its weights, cannot fit beside safety.
 
-    The failure this encodes: the move tested the residency's weights against the room beside safety, while
+    This row encodes the failure in which the move tested the residency's weights against the room beside safety, while
     clearance prices the job's whole sampling need. A large model whose weights fit beside safety kept safety on
     the card, clearance then held its job for the room safety took, and the card stood idle until the runtime
     placement's sustained-pressure dwell moved safety anyway.

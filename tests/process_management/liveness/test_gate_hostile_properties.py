@@ -154,7 +154,7 @@ class TestWholeCardGraceBudget:
     def test_a_burst_reusing_one_residency_never_spends_the_allowance(self) -> None:
         """A job's own prior asks must not spend the allowance that excuses the next establishment.
 
-        The failure this encodes: every job for the model a card already holds re-asked for the residency,
+        This row encodes the failure in which every job for the model a card already holds re-asked for the residency,
         each ask charged a fresh grace window, and the allowance sized for physical teardown churn was spent
         by jobs that caused none.
         """

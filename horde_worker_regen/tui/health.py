@@ -291,7 +291,7 @@ def _derive_phase(
         )
     if snapshot.gpu_torch_incompatible:
         reason = snapshot.gpu_torch_incompatible_reason or (
-            "The installed PyTorch has no CUDA kernels for this GPU, so no job can run."
+            "The installed PyTorch does not carry CUDA kernels for this GPU, so no job can run."
         )
         return HealthReport(
             WorkerPhase.DEGRADED,
@@ -621,7 +621,7 @@ def _build_checks(
             HealthCheck(
                 "PyTorch/GPU",
                 HealthStatus.ERROR,
-                snapshot.gpu_torch_incompatible_reason or "Installed PyTorch has no kernels for this GPU.",
+                snapshot.gpu_torch_incompatible_reason or "Installed PyTorch does not carry kernels for this GPU.",
             )
         )
     if snapshot.accelerator_unusable:

@@ -467,7 +467,7 @@ def _warn_cards_without_kernels(
     stranded_tag = ", ".join(detect.format_capability(cap) for cap in stranded)
     print(
         f"WARNING: a single PyTorch build cannot run every NVIDIA card in this machine. {decision.final_token} "
-        f"is installed for the highest card and has no kernels for compute capability {stranded_tag}, so "
+        f"is installed for the highest card and does not carry kernels for compute capability {stranded_tag}, so "
         f"that card cannot run jobs. Set {_BACKEND_ENV} or pass --backend to choose a different build.",
         file=sys.stderr,
     )
@@ -534,9 +534,9 @@ def _reconcile_backend(
 ) -> str:
     """Clamp the resolved token to the live GPU's arch window so an unrunnable build is never installed.
 
-    A persisted ``bin/backend`` (or the cu126 default) can name a build with no kernel image for the
+    A persisted ``bin/backend`` (or the cu126 default) can name a build without a kernel image for the
     card (a cu126 token on a Blackwell GPU, say), which torch only rejects at the first kernel launch
-    ("no CUDA kernels for this GPU"). When the live capability says the token cannot run, swap to the
+    ("does not carry CUDA kernels for this GPU"). When the live capability says the token cannot run, swap to the
     build that can and re-persist it so the correction sticks across future syncs instead of reasserting
     the broken token on every update. The clamp applies the recorded mixed-card policy, and the corrected
     token keeps the provenance of the token it replaced. A non-CUDA token, or an unreadable capability,
@@ -549,9 +549,9 @@ def _reconcile_backend(
     if reconciled == token:
         return token
     print(
-        f"Changing the torch build from {token} to {reconciled}. The {token} build has no kernel image for "
-        f"this GPU's compute capability, so it would install and then fail the first time the GPU is "
-        f"used. {reconciled} is installed and recorded for future updates.",
+        f"Changing the torch build from {token} to {reconciled}. The {token} build does not carry a kernel "
+        f"image for this GPU's compute capability, so it would install and then fail the first time the GPU "
+        f"is used. {reconciled} is installed and recorded for future updates.",
         file=sys.stderr,
     )
     _persist_backend(
@@ -582,14 +582,14 @@ def _verify_installed_torch_arch(uv: str, root: Path, token: str) -> None:
     arch_list = runner.query_torch_arch_list(uv, root=root)
     if not arch_list or not any(arch.startswith("sm_") for arch in arch_list):
         return  # torch absent, or a CPU/ROCm build whose arch tags do not apply
-    governing = detect.governing_capabilities(detect.live_gpu_query().capabilities, _read_mixed_card_policy(root))
-    unsupported = [capability for capability in governing if not detect.gpu_arch_supported(arch_list, capability)]
+    effective = detect.effective_capabilities(detect.live_gpu_query().capabilities, _read_mixed_card_policy(root))
+    unsupported = [capability for capability in effective if not detect.gpu_arch_supported(arch_list, capability)]
     if not unsupported:
         return
     capability = unsupported[0]
     cap_tag = f"sm_{capability[0]}{capability[1]}"
     print(
-        f"WARNING: the torch build just installed ({token}) has no CUDA kernels for this GPU "
+        f"WARNING: the torch build just installed ({token}) does not carry CUDA kernels for this GPU "
         f"(compute capability {capability[0]}.{capability[1]}, {cap_tag}). The wheel was built for "
         f"{' '.join(arch_list)}. The installer chose this build expecting it to run this GPU, so this is "
         f"most likely a worker bug. The build-selection table in worker_bootstrap.detect is out of date "
@@ -841,11 +841,11 @@ def _ensure_torch_runs_gpu(
     # A completed re-pick sync (accepted or declined) falls through to the kernel check, which stamps this
     # lock, set of cards and driver so the next launch does not probe again or offer the switch again.
     policy = _read_mixed_card_policy(root)
-    governing = detect.governing_capabilities(gpus.capabilities, policy)
-    if _installed_torch_runs_gpu(uv, root, governing):
+    effective = detect.effective_capabilities(gpus.capabilities, policy)
+    if _installed_torch_runs_gpu(uv, root, effective):
         _write_gpu_check_stamp(root, gpus)
         return None
-    cap_tag = ", ".join(detect.format_capability(cap) for cap in governing)
+    cap_tag = ", ".join(detect.format_capability(cap) for cap in effective)
     persisted = backend_mod.read_backend_file(paths.backend_file(root))
     would_install = (
         detect.reconcile_backend_for_gpu(persisted, policy=policy, gpus=gpus)
@@ -854,7 +854,7 @@ def _ensure_torch_runs_gpu(
     )
     if persisted is None or would_install != persisted:
         print(
-            f"The installed PyTorch has no CUDA kernels for this GPU (compute capability {cap_tag}). "
+            f"The installed PyTorch does not carry CUDA kernels for this GPU (compute capability {cap_tag}). "
             f"Installing {would_install} before starting.",
             file=sys.stderr,
         )
@@ -864,7 +864,7 @@ def _ensure_torch_runs_gpu(
     # start and let the worker's runtime guard surface the actionable, report-worthy specifics.
     print(
         f"WARNING: the installed PyTorch ({persisted}) cannot run this GPU (compute capability {cap_tag}) "
-        f"and no alternative locked build is known for it. This is likely a worker or driver problem. The "
+        f"and the locked builds do not include one known to run it. This is likely a worker or driver problem. The "
         f"worker starts anyway, and its log has the details.",
         file=sys.stderr,
     )
@@ -878,7 +878,7 @@ def _ensure_synced(uv: str, root: Path, *, cli_flag: str | None, options: _SyncO
     notice the venv no longer matches the lock and re-sync; otherwise the worker code runs ahead of its
     installed dependencies (the cause of the post-update crash-loop). An unchanged install matches its
     stamp and starts immediately, with no re-resolve, unless the installed build is out of date for the
-    driver or has no kernels for the live GPUs (see :func:`_ensure_torch_runs_gpu`).
+    driver or does not carry kernels for the live GPUs (see :func:`_ensure_torch_runs_gpu`).
     """
     if paths.venv_dir(root).exists() and _venv_matches_lock(root):
         gpus = detect.live_gpu_query()

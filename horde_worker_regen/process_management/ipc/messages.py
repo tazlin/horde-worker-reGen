@@ -159,7 +159,7 @@ class HordeProcessState(enum.Enum):
     """The process has failed evaluating safety."""
 
     TORCH_GPU_INCOMPATIBLE = auto()
-    """The installed PyTorch has no CUDA kernels for this GPU's architecture (reported by an inference child).
+    """The installed PyTorch does not carry CUDA kernels for this GPU's architecture (reported by an inference child).
 
     A non-retryable hardware/build mismatch detected at inference-process start, once torch is loaded: the
     wheel's compiled architectures do not include the device's compute capability, so every job would die at

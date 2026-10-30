@@ -92,7 +92,7 @@ def _fault_reason_for(lifecycle: object, job: object) -> str | None:
 class TestSoftResetFaultAttribution:
     """A job faulted by a deliberate replacement is attributed to the replacement, not to a crash."""
 
-    async def test_deliberate_replacement_names_itself_in_the_job_fault(self) -> None:
+    async def test_a_deliberate_replacement_is_recorded_in_the_job_fault(self) -> None:
         """The reason the lifecycle replaced the slot rides along as the job's fault attribution."""
         pm = make_testable_process_manager()
         lifecycle, (job, slot) = await _slot_running_its_last_attempt(pm)
@@ -104,7 +104,7 @@ class TestSoftResetFaultAttribution:
         assert "soft reset: queue deadlock" in reason
         assert "deliberate" in reason
 
-    async def test_reclaim_cycle_names_itself_in_the_job_fault(self) -> None:
+    async def test_a_reclaim_cycle_is_recorded_in_the_job_fault(self) -> None:
         """A RAM-reclaim cycle is deliberate too, and is attributed as such."""
         pm = make_testable_process_manager()
         lifecycle, (job, slot) = await _slot_running_its_last_attempt(pm)
