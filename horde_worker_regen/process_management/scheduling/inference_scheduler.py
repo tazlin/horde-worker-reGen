@@ -6146,19 +6146,28 @@ class InferenceScheduler:
             return ledger_footprint_mb
         return sum(process_used_mb[pid] for pid in listed_worker_pids)
 
-    def achievable_ceiling_mb(self, device_index: int | None) -> float | None:
+    def achievable_ceiling_mb(
+        self,
+        device_index: int | None,
+        *,
+        include_foreign_floor: bool = True,
+    ) -> float | None:
         """Return a card's current achievable VRAM ceiling (MB): total net of noise and the standing foreign floor.
 
         The most VRAM this card could offer one load right now, read live so a conditional ceiling hold can lift
         the moment the foreign floor recedes. None when the card's total is unknown (no GPU child has reported
         yet). Reads the foreign floor through :meth:`current_foreign_floor_mb`, without recording a fresh
-        sample, so a ceiling read never perturbs the observation window.
+        sample, so a ceiling read never perturbs the observation window. With ``include_foreign_floor`` False the
+        ceiling is the total net of the admission margin only, the room a load has when the foreign tenancy is
+        at its least.
         """
         total_vram_mb = self._process_map.get_reported_total_vram_mb(device_index=device_index)
         if total_vram_mb is None:
             return None
-        foreign_floor_mb = self.current_foreign_floor_mb(device_index)
-        return total_vram_mb - self._admission_margin_mb(device_index, total_vram_mb) - (foreign_floor_mb or 0.0)
+        ceiling_mb = total_vram_mb - self._admission_margin_mb(device_index, total_vram_mb)
+        if not include_foreign_floor:
+            return ceiling_mb
+        return ceiling_mb - (self.current_foreign_floor_mb(device_index) or 0.0)
 
     def current_foreign_floor_mb(self, device_index: int | None) -> float | None:
         """Return a card's standing foreign floor (MB) without recording a sample, or None when nothing is known.
@@ -6196,21 +6205,41 @@ class InferenceScheduler:
         log(f"Dominance verdict for device {device_key}: {dominance.describe()}")
         return dominance
 
-    def whole_card_seat(self, model: str, device_index: int | None) -> WholeCardSeat | None:
+    def whole_card_seat(
+        self,
+        model: str,
+        device_index: int | None,
+        *,
+        include_foreign_floor: bool = True,
+    ) -> WholeCardSeat | None:
         """Return the partial-load seat a rung-2 or pinned model needs on a card and the card's achievable ceiling.
 
-        None when the model is neither, when its seat cannot be priced (a paging card, a model outside the
-        extra-large tier) or when the card is not yet sized, so the serviceability verdict keeps its other rules.
-        The offer reads this. A job accepted before the ceiling moved is never faulted by it.
+        None when the model is neither (a model outside the extra-large tier does not have a seat) or when the card
+        is not yet sized, so the serviceability verdict keeps its other rules. A rung-2 or pinned model whose seat
+        cannot be priced (a paging card) is returned unpriced, so the offer withholds it and the gate passes it.
+        The offer reads this with the foreign floor in the ceiling. The preload gate reads it without the floor
+        (:meth:`_preload_gate_whole_card_seat`), so a job accepted before the floor rose is never faulted by it.
         """
         dominance = self.card_dominance(device_index)
-        if dominance is None:
+        if dominance is None or model not in dominance.seats_mb:
             return None
-        seat_mb = dominance.seats_mb.get(model)
-        ceiling_mb = self.achievable_ceiling_mb(device_index)
-        if seat_mb is None or ceiling_mb is None:
+        seat_mb = dominance.seats_mb[model]
+        # A None seat means either that the seat cannot be priced while the card pages, or that the model has
+        # no partial-load seat at all (below the extra-large tier, or a LoRA job), in which case the verdict's
+        # other rules apply. Only an extra-large model's seat under paging is an unpriced seat, which withholds
+        # the model from the offer and lets the preload gate recognise a job popped before paging began.
+        if seat_mb is None and not (
+            self._retention.wddm_paging_active and self._model_size_tier(model) >= ModelSizeTier.EXTRA_LARGE
+        ):
+            return None
+        ceiling_mb = self.achievable_ceiling_mb(device_index, include_foreign_floor=include_foreign_floor)
+        if ceiling_mb is None:
             return None
         return WholeCardSeat(seat_mb=seat_mb, ceiling_mb=ceiling_mb)
+
+    def _preload_gate_whole_card_seat(self, model: str, device_index: int | None) -> WholeCardSeat | None:
+        """Return a rung-2 or pinned model's seat for the preload gate, with a ceiling that leaves out the floor."""
+        return self.whole_card_seat(model, device_index, include_foreign_floor=False)
 
     def _dominance_inputs(self, device_index: int | None) -> pricing.DominanceInputs | None:
         """Return the figures the card's dominance verdict depends on, or None while the card is unsized."""
@@ -10804,11 +10833,16 @@ class InferenceScheduler:
     def _unserviceable_job_reason(self, job: ImageGenerateJobPopResponse) -> str | None:
         """Return a fault reason when no serving card can ever host this job's model minimum.
 
-        Judged by the verdicts the pop offer runs, so the gate faults only what the offer would not have
+        Checked with the verdict function the pop offer runs, so the gate faults only what the offer would not have
         advertised (a stale job popped before a card shrank, or one accepted under a promise this worker cannot
-        keep); a job the offer admits passes here. The one input the offer reads and this gate does not is a
-        rung-2 model's partial-load seat against the achievable ceiling. The ceiling moves with the foreign floor,
-        and a job accepted before the floor rose is owed its one real load instead of a fault.
+        keep). A job the offer admits passes here. A rung-2 or pinned model is checked by the same partial-load
+        seat the offer reads, against the card's total net of the admission margin only. The offer's ceiling also
+        subtracts the learned foreign floor, which moves, and a job accepted before the floor rose is owed its one
+        real load instead of a fault. A rung-2 or pinned whole-card model whose seat cannot be priced (a card under
+        WDDM demand paging) passes instead of falling to the recommended-minimum rule, since the offer may have priced
+        the seat before paging began and the popped job is owed its load. Core weights over the card's weight
+        budget fault in every case, and a model below the extra-large tier does not have a seat and keeps the
+        resident rule.
         """
         if job.model is None or not self._card_runtimes:
             return None
@@ -10818,8 +10852,13 @@ class InferenceScheduler:
             model_metadata=self._model_metadata,
             admission_baseline_provider=self.serviceability_baseline_mb,
             max_pixels=None,
+            whole_card_seat_provider=self._preload_gate_whole_card_seat,
         )
         if not verdicts or any(verdict.serviceable for _, verdict in verdicts):
+            return None
+        if any(
+            verdict.whole_card_seat is not None and not verdict.whole_card_seat.priced for _card, verdict in verdicts
+        ):
             return None
         return f"model minimum footprint cannot fit any serving card; {serviceability_arithmetic(verdicts)}"
 

@@ -297,9 +297,15 @@ the reduced size the co-fit would allow.
 A model the card's dominance verdict places on rung 2 (it cannot sample beside one context with the foreign
 floor charged), or one the operator pins, is judged by its partial-load seat against the card's achievable
 ceiling instead, since after the teardown that seat is how the card serves it (see
-[The partial-load seat](vram_arbiter.md#the-partial-load-seat)). The ceiling carries the learned foreign floor,
-so such a model leaves the offer while a tenant leaves no room for its seat and returns when the tenant goes.
-The offer follows the card's tenancy by design. A job accepted before the floor rose is never faulted for it.
+[The partial-load seat](vram_arbiter.md#the-partial-load-seat)). This holds whatever the recommended minimum
+card says, so a card below that recommendation still serves a model whose seat fits. For the offer the ceiling
+carries the learned foreign floor, so such a model leaves the offer while a tenant does not leave room for the seat,
+and returns when the tenant goes. The preload gate checks the same seat against the total net of the admission
+margin only, so a job accepted before the floor rose is not faulted for it. Where an extra-large model's seat cannot
+be priced (a card under WDDM demand paging), the offer withholds the model, since it advertises only what it can
+price, and the preload gate lets a job already popped through, since the offer priced the seat before paging began
+and the popped job is owed its load. Core weights over the card's weight budget still fault at the gate in every
+case.
 
 ### Dominance verdict
 
@@ -312,6 +318,17 @@ and the service lanes off the card until the pool regrows. The same checkpoint c
 cards, or on one card before and after its tenant arrives or its measured peak moves, though a held rung moves
 only once a figure crosses its threshold by more than one 256 MB bucket. The size tier names the models the
 offer narrowings above treat as large. The verdict decides the teardown and which pairings may sample together.
+
+The verdict is cached per card and recomputed only when one of its inputs changes: the offered set and pins,
+the total, the context constants, the admission margin, the foreign floor's bucket and the observation counts of
+the offered baselines' sampling keys. WDDM demand paging is not one of them, though the partial-load seats are
+priced with the paging state current at compute time, and seats are not priced on a paging card. A verdict computed during
+a paging episode therefore keeps a rung-2 model's seat unpriced after paging clears, and one computed outside an
+episode keeps the seat priced through the next, until another input moves. For that span the offer holds the
+model back or advertises it on a stale reading. The preload gate does not fault a job the offer advertised in
+either state, since an unpriced seat passes it and a priced one is checked without the floor, so the cost is
+limited to offer accuracy. Keying the verdict on paging would recompute it on each paging edge, which on a small
+card follows most jobs.
 
 The horde's pop carries one `max_pixels` for every model in it, so a constrained model cannot share a pop
 with the others without capping them all. The popper lanes it instead

@@ -169,6 +169,10 @@ The failures encoded here:
   loaded its weights while the card idled. Two-phase clearance grants the weights alone while the running job
   samples, priced against measured free net of every outstanding reservation, and starts the denoise when the
   running peak releases. That is the ``two-phase clearance`` scenario, and its reinjection refuses every stage.
+- **The preload gate refused what the offer advertised.** The pop offer checked a rung-2 model by its partial-load
+  seat, and the preload gate checked it against its recommended minimum card. On a card below that recommendation whose
+  seat still fits, the offer advertised the model and the gate faulted every job for it before any child loaded
+  it. That is the ``seat below the recommended card`` scenario, and its reinjection takes the seat from the gate.
 
 The last scenario is not one failure but all of them at once: the ``bundle-shaped fleet`` row runs the
 multi-card rules together over the workload shape they were diagnosed from, eight cards of two lanes serving
@@ -282,6 +286,7 @@ from horde_worker_regen.process_management.scheduling.workload_flow import POST_
 from horde_worker_regen.process_management.workers import post_process_orchestrator
 from tests.process_management.conftest import make_job_pop_response
 from tests.process_management.liveness._dispatch_world import (
+    _CARD_8GB,
     _CARD_10GB,
     _CARD_16GB,
     _CARD_24GB,
@@ -8545,4 +8550,77 @@ async def test_r_defect_reinjection_run_jobs_left_behind_a_cold_head_idle_the_ca
     ]
     assert not started_within_budget, (
         f"without the seat no run job may sample within the skip budget. {run.world.state_dump()}"
+    )
+
+
+_BELOW_RECOMMENDED_CARD_TICKS = 40
+"""Ticks the row runs after the pop, which is enough for the head's load, whole-card residency and sample."""
+
+
+@dataclass
+class SeatBelowRecommendedCard:
+    """The finished world of one Moss job popped on an 8 GB card, below the baseline's recommended minimum."""
+
+    world: _DispatchWorld
+    job: ImageGenerateJobPopResponse
+
+    @property
+    def faults(self) -> list[str]:
+        """Every fault reason the tracker recorded for the job."""
+        assert self.job.id_ is not None
+        return [str(fault.ref) for fault in self.world.scheduler._job_tracker.job_faults.get(self.job.id_, [])]
+
+
+async def drive_seat_below_recommended_card(*, ticks: int = _BELOW_RECOMMENDED_CARD_TICKS) -> SeatBelowRecommendedCard:
+    """Pop one Moss job on an 8 GB card that runs the preload gate over per-card runtimes."""
+    world = _DispatchWorld(
+        card=_CARD_8GB,
+        lane_count=1,
+        max_threads=1,
+        queue_depth=1,
+        whole_card_enabled=True,
+        closed_loop=True,
+        tick_seconds=_TICK_SECONDS,
+        extra_model_classes=(_MOSS,),
+        card_max_pixels={0: 4_194_304},
+    )
+    await world.step()
+    job = make_job_pop_response(_MOSS.name, width=1024, height=1024, ddim_steps=20)
+    await world.pop(job)
+    for _ in range(ticks):
+        await world.step()
+    return SeatBelowRecommendedCard(world=world, job=job)
+
+
+async def test_r_a_seat_below_the_recommended_card_dispatches_instead_of_faulting() -> None:
+    """A Moss job on a card below the baseline's recommended minimum card loads and samples by its seat.
+
+    The failure this encodes: the offer advertised the model by its partial-load seat, which an 8 GB card holds,
+    and the preload gate faulted the popped job by the recommended minimum card, which the card is below.
+    """
+    row = await drive_seat_below_recommended_card()
+    world = row.world
+    context = "seat below the recommended card"
+    dominance = world.scheduler.card_dominance(0)
+    assert dominance is not None and dominance.seats_mb.get(_MOSS.name) is not None, (
+        f"precondition: Moss is on rung 2 with a priced seat. {world.state_dump()}"
+    )
+
+    assert row.faults == [], f"{context}: the job was faulted ({row.faults}). {world.state_dump()}"
+    window = world.job_windows.get(str(row.job.id_))
+    assert window is not None and window.sample_from is not None, (
+        f"{context}: the job never sampled. {world.state_dump()}"
+    )
+
+
+async def test_r_defect_reinjection_a_gate_without_the_seat_faults_the_job(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without the seat the gate checks the recommended minimum card and faults the job before any load."""
+    monkeypatch.setattr(InferenceScheduler, "_preload_gate_whole_card_seat", lambda _self, _model, _device: None)
+    row = await drive_seat_below_recommended_card()
+
+    assert any("recommended minimum card" in fault for fault in row.faults), (
+        f"without the seat the job must fault by the recommended minimum card ({row.faults}). {row.world.state_dump()}"
+    )
+    assert str(row.job.id_) not in row.world.job_windows, (
+        f"without the seat the job must never dispatch. {row.world.state_dump()}"
     )

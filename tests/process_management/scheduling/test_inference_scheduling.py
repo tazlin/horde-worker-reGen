@@ -26,6 +26,7 @@ from horde_worker_regen.process_management.ipc.messages import (
 )
 from horde_worker_regen.process_management.ipc.supervisor_channel import WorkerEventKind
 from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
+from horde_worker_regen.process_management.jobs.job_popper import _serviceability_held_back_models
 from horde_worker_regen.process_management.jobs.job_tracker import JobStage, JobTracker
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
@@ -42,7 +43,11 @@ from horde_worker_regen.process_management.models.model_metadata import ModelMet
 from horde_worker_regen.process_management.resources.reclaim_ladder import VerifiedReclaimLadder
 from horde_worker_regen.process_management.resources.resource_budget import StreamForecast
 from horde_worker_regen.process_management.resources.vram_arbiter import VramArbiter
-from horde_worker_regen.process_management.resources.vram_footprints import ResolutionBucket
+from horde_worker_regen.process_management.resources.vram_footprints import (
+    _MIN_OBSERVATIONS_FOR_MEASURED,
+    LearnedFootprintStore,
+    ResolutionBucket,
+)
 from horde_worker_regen.process_management.scheduling import inference_scheduler as _sched_mod
 from horde_worker_regen.process_management.scheduling.admission import preload, pricing
 from horde_worker_regen.process_management.scheduling.admission.commands import FaultCause, FaultJob
@@ -248,6 +253,140 @@ class TestModelServiceabilityAdmission:
         assert plan.admits and plan.commands == ()
         assert plan.target_process_id == 0
         assert scheduler._job_tracker.get_stage(job.id_) is JobStage.PENDING_INFERENCE
+
+
+_MOSS = "moss_model"
+_SMALL_CARD_TOTAL_MB = 8188.0
+_REGISTRY_BASELINES = tuple(
+    baseline for baseline in KNOWN_IMAGE_GENERATION_BASELINE if baseline is not KNOWN_IMAGE_GENERATION_BASELINE.infer
+)
+
+
+def _small_card_scheduler(models: dict[str, KNOWN_IMAGE_GENERATION_BASELINE]) -> InferenceScheduler:
+    """Build a scheduler serving ``models`` on one 8188 MB card, priced from hordelib's seeds and an empty store."""
+    bridge_data = make_mock_bridge_data(image_models_to_load=list(models))
+    reference = {
+        model: make_mock_model_reference_record(model, baseline=baseline) for model, baseline in models.items()
+    }
+    process_info = make_mock_process_info(0, model_name=None)
+    process_info.total_vram_mb = int(_SMALL_CARD_TOTAL_MB)
+    scheduler = _make_inference_scheduler(
+        bridge_data=bridge_data,
+        model_metadata=make_test_model_metadata(reference),
+        process_map=ProcessMap({0: process_info}),
+        card_runtimes=make_test_card_runtimes(config=bridge_data, total_vram_mb=_SMALL_CARD_TOTAL_MB),
+        platform="win32",
+    )
+    scheduler.set_footprint_store(LearnedFootprintStore())
+    return scheduler
+
+
+class TestPreloadGateChecksTheSeatWithoutTheFloor:
+    """The preload gate checks a rung-2 model's seat from the offer against the total net of the margin only.
+
+    The ``moss_image`` seed recommends a 10 GB card while its core weights pass an 8 GB card's weight budget,
+    so on an 8188 MB card the recommended-minimum rule refuses what the partial-load seat serves.
+    """
+
+    def test_a_seat_that_fits_without_the_floor_passes_though_the_floor_would_refuse_it(self) -> None:
+        """A floor that pushes the offer's ceiling under the seat does not fault a job already accepted."""
+        scheduler = _small_card_scheduler({_MOSS: KNOWN_IMAGE_GENERATION_BASELINE.moss_image})
+        seat = scheduler.whole_card_seat(_MOSS, 0)
+        no_floor_ceiling_mb = scheduler.achievable_ceiling_mb(0, include_foreign_floor=False)
+        assert seat is not None
+        assert no_floor_ceiling_mb is not None
+        assert seat.seat_mb < no_floor_ceiling_mb
+
+        floor_mb = no_floor_ceiling_mb - seat.seat_mb + 256.0
+        scheduler.current_foreign_floor_mb = lambda _device_index: floor_mb  # type: ignore[method-assign]
+
+        offer_seat = scheduler.whole_card_seat(_MOSS, 0)
+        assert offer_seat is not None
+        assert offer_seat.fits is False
+        assert scheduler._unserviceable_job_reason(make_job_pop_response(_MOSS)) is None
+
+    def test_a_seat_above_the_ceiling_without_the_floor_faults(self) -> None:
+        """A margin that does not leave room for the seat, even without a tenant, faults the job by the seat."""
+        scheduler = _small_card_scheduler({_MOSS: KNOWN_IMAGE_GENERATION_BASELINE.moss_image})
+        seat = scheduler.whole_card_seat(_MOSS, 0)
+        assert seat is not None
+
+        scheduler._runtime_config.bridge_data.vram_admission_noise_mb = int(  # type: ignore[attr-defined]
+            _SMALL_CARD_TOTAL_MB - seat.seat_mb + 256.0,
+        )
+
+        gate_seat = scheduler._preload_gate_whole_card_seat(_MOSS, 0)
+        assert gate_seat is not None
+        assert gate_seat.seat_mb == seat.seat_mb
+        assert gate_seat.fits is False
+        reason = scheduler._unserviceable_job_reason(make_job_pop_response(_MOSS))
+        assert reason is not None
+        assert "partial-load seat" in reason
+
+    def test_an_unpriceable_seat_passes(self) -> None:
+        """Under WDDM paging the seat cannot be priced, so the offer withholds the model and the popped job passes."""
+        scheduler = _small_card_scheduler({_MOSS: KNOWN_IMAGE_GENERATION_BASELINE.moss_image})
+        scheduler.note_wddm_paging({100001: 512.0}, active=True)
+
+        seat = scheduler.whole_card_seat(_MOSS, 0)
+        assert seat is not None
+        assert seat.priced is False
+        assert seat.fits is False
+        assert scheduler._unserviceable_job_reason(make_job_pop_response(_MOSS)) is None
+
+    def test_a_whole_card_model_off_rung_two_faults_by_the_recommended_minimum_card(self) -> None:
+        """A measured peak that seats the model beside a context leaves it to the recommended-minimum rule."""
+        scheduler = _small_card_scheduler({_MOSS: KNOWN_IMAGE_GENERATION_BASELINE.moss_image})
+        store = LearnedFootprintStore()
+        for band in ResolutionBucket:
+            for _ in range(_MIN_OBSERVATIONS_FOR_MEASURED):
+                store.observe_peak(pricing.pooled_sample_key("moss_image", band), 1500.0)
+        scheduler.set_footprint_store(store)
+
+        dominance = scheduler.card_dominance(0)
+        assert dominance is not None
+        assert dominance.verdicts[_MOSS].rung is not DominanceRung.CANNOT_CO_RESIDE
+        assert _MOSS not in dominance.seats_mb
+        reason = scheduler._unserviceable_job_reason(make_job_pop_response(_MOSS))
+        assert reason is not None
+        assert "recommended minimum card" in reason
+
+    @pytest.mark.parametrize("card_state", ["zero_floor", "raised_floor", "paging"])
+    def test_every_model_the_offer_advertises_passes_the_gate(self, card_state: str) -> None:
+        """The offer and the preload gate agree on every registry baseline on an 8 GB card.
+
+        Whatever the card's tenancy and paging state, a job for a model the pop advertised is never faulted as
+        unserviceable when it reaches the preload gate.
+        """
+        models = {f"{baseline.value}_model": baseline for baseline in _REGISTRY_BASELINES}
+        scheduler = _small_card_scheduler(models)
+        if card_state == "raised_floor":
+            scheduler.current_foreign_floor_mb = lambda _device_index: 4000.0  # type: ignore[method-assign]
+        elif card_state == "paging":
+            scheduler.note_wddm_paging({100001: 512.0}, active=True)
+
+        held_back = _serviceability_held_back_models(
+            set(models),
+            card_runtimes=scheduler._card_runtimes,
+            model_metadata=scheduler._model_metadata,
+            admission_baseline_provider=scheduler.serviceability_baseline_mb,
+            serviceability_logged=None,
+            whole_card_seat_provider=scheduler.whole_card_seat,
+        )
+        advertised = set(models) - held_back
+
+        assert advertised
+        if card_state == "zero_floor":
+            assert "moss_image_model" in advertised
+        elif card_state == "paging":
+            # The seat cannot be priced while the card pages, so the offer withholds the rung-2 model.
+            assert "moss_image_model" not in advertised
+        faulted = {
+            model: reason
+            for model in sorted(advertised)
+            if (reason := scheduler._unserviceable_job_reason(make_job_pop_response(model))) is not None
+        }
+        assert faulted == {}
 
 
 class TestWddmPagingVictimAccessor:

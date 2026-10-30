@@ -496,6 +496,49 @@ class TestModelServiceabilityVerdicts:
         assert [verdict.tier for _, verdict in verdicts] == [ModelServiceabilityTier.SERVICEABLE]
         assert verdicts[0][1].whole_card_seat is None
 
+    @pytest.mark.parametrize(
+        ("seat", "expected"),
+        [
+            (WholeCardSeat(seat_mb=4173.0, ceiling_mb=7676.0), ModelServiceabilityTier.SERVICEABLE),
+            (WholeCardSeat(seat_mb=None, ceiling_mb=7676.0), ModelServiceabilityTier.UNSERVICEABLE),
+            (None, ModelServiceabilityTier.UNSERVICEABLE),
+        ],
+        ids=["seat_supplied", "seat_unpriced", "no_seat"],
+    )
+    def test_a_fitting_seat_serves_a_card_below_the_recommended_minimum(
+        self,
+        seat: WholeCardSeat | None,
+        expected: ModelServiceabilityTier,
+    ) -> None:
+        """A whole-card model whose weights pass an 8 GB budget is checked by the seat when one is supplied.
+
+        The ``moss_image`` seed recommends a 10 GB card, above the 8188 MB total, while its core weights pass the
+        card's weight budget and a plain job's seat fits the ceiling. The seat rule is the more lenient of the
+        two here, so a caller that supplies the seat and one that does not reach opposite verdicts.
+        """
+        model = "moss_model"
+        config = make_mock_bridge_data(image_models_to_load=[model])
+        metadata = make_test_model_metadata(
+            {model: make_mock_model_reference_record(model, baseline=KNOWN_IMAGE_GENERATION_BASELINE.moss_image)},
+        )
+        cards = make_test_card_runtimes(config=config, total_vram_mb=8188.0)
+
+        verdicts = model_serviceability_verdicts(
+            model,
+            card_runtimes=cards,
+            model_metadata=metadata,
+            admission_baseline_provider=None,
+            max_pixels=None,
+            whole_card_seat_provider=lambda _model, _device: seat,
+        )
+
+        figures = verdicts[0][1].figures
+        assert figures is not None
+        assert figures.min_recommended_card_mb > 8188.0
+        assert verdicts[0][1].whole_card is True
+        assert verdicts[0][1].over_weight_budget is False
+        assert [verdict.tier for _, verdict in verdicts] == [expected]
+
     def test_no_serving_card_yields_no_verdict(self) -> None:
         """A model no card offers has nothing to judge."""
         cards, metadata = self._flux_card(16384.0)
