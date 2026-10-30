@@ -1183,7 +1183,7 @@ wheels = [
 
 [[package]]
 name = "horde-engine"
-version = "7.13.1"
+version = "7.13.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "accelerate" },
@@ -1251,9 +1251,9 @@ dependencies = [
     { name = "yapf" },
     { name = "yarl" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/30/cb/785651946a5a6220732946eef0dfceaca7efe52a10062c8c804618b5e5be/horde_engine-7.13.1.tar.gz", hash = "sha256:50d36e4976da9e9349960d18286802ee4995efa4c04c79ed695e0ca3fb4c4dee", size = 657108, upload-time = "2026-10-29T15:42:54.401Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/e8/5c/ad0fce7d684be4204cbb5d7bfa87cf20c04022d27cf9274d542d8a50fff4/horde_engine-7.13.2.tar.gz", hash = "sha256:955122dfd8ad2047856458684b5785b2ca386210bfa00770d6c2a402a1a063fe", size = 657855, upload-time = "2026-10-30T18:28:20.577Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/d2/9f/09f8de1c63e99cf36e450ceea72023461c3d9dc39a6fc8f734eea1b4bb94/horde_engine-7.13.1-py3-none-any.whl", hash = "sha256:c7b1a41361a04c45ca788707bb65322a4b77e20c2033ce0c6ea2bff8025a895f", size = 805343, upload-time = "2026-10-29T15:42:52.681Z" },
+    { url = "https://files.pythonhosted.org/packages/c3/3b/c74711bde883e89a17e4a966b123c0100df9e74922455ad48615fa569815/horde_engine-7.13.2-py3-none-any.whl", hash = "sha256:bb674cb9c50de94b16531669e239ef3e81ba3eaea11454f24d8c1874f0180b45", size = 806138, upload-time = "2026-10-30T18:28:18.386Z" },
 ]
 
 [package.optional-dependencies]
@@ -1470,7 +1470,7 @@ requires-dist = [
     { name = "blurhash", specifier = ">=1.1.5" },
     { name = "certifi" },
     { name = "horde-engine", extras = ["controlnet"], marker = "extra == 'controlnet'" },
-    { name = "horde-engine", extras = ["layerdiffuse", "upscale-extra"], specifier = ">=7.13.1,<8.0.0" },
+    { name = "horde-engine", extras = ["layerdiffuse", "upscale-extra"], specifier = ">=7.13.2,<8.0.0" },
     { name = "horde-engine", extras = ["rembg"], marker = "extra == 'post-processing'" },
     { name = "horde-image-utilities", specifier = "~=0.3.2" },
     { name = "horde-model-reference", specifier = ">=8.7.0,<9.0.0" },
