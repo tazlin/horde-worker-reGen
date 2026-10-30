@@ -1814,14 +1814,14 @@ class TestEveryWithheldDispatchIsRecorded:
         assert decline.bucket is SlotDutyBucket.HEAD_PRIORITY_BARRIER
         assert decline.device_index == 0
 
-    async def test_an_unprepared_aux_job_names_itself(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_a_refused_aux_gate_is_recorded_as_the_hold_reason(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The terminal aux gate records its refusal, so a lane held for a prefetch is never unexplained.
 
         Selection reads the same preparation flag and skips an unprepared job, so the gate is reachable only
-        by a job whose files went missing between the walk that chose it and the gate that asks again. The
-        pair is therefore selected first and the flag set afterwards, and the gate ladder is asked directly:
-        a whole pass cannot be driven into this state, because selection would refuse the job before the
-        terminal gate ever saw it.
+        by a job whose readiness lapsed between the walk that chose it and the confirmation the gate re-runs.
+        The pair is therefore selected first and the confirmation made to refuse afterwards, and the gate
+        ladder is called directly. A whole pass cannot be driven into this state, because selection would
+        refuse the job before it reached the terminal gate.
         """
         scheduler = self._one_card_scheduler((0, "model_a"))
         scheduler.begin_scheduling_cycle()
@@ -1830,7 +1830,7 @@ class TestEveryWithheldDispatchIsRecorded:
         assert selection is not None
         assert selection.next_job is head
         assert selection.line_skip is None
-        monkeypatch.setattr(scheduler._job_tracker, "job_requires_aux_preparation", lambda job: job is head)
+        monkeypatch.setattr(scheduler._job_tracker, "confirm_aux_preparation_at_dispatch", lambda job: job is not head)
 
         decline = scheduler._dispatch_withheld_by(selection)
 

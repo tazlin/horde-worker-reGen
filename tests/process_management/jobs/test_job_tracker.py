@@ -7,10 +7,11 @@ from unittest.mock import Mock
 from horde_sdk.ai_horde_api import GENERATION_STATE
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse, LorasPayloadEntry
 
-from horde_worker_regen.process_management.ipc.messages import HordeImageResult
+from horde_worker_regen.process_management.ipc.messages import AuxModelKind, AuxModelRef, HordeImageResult
 from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
 from horde_worker_regen.process_management.jobs.job_tracker import InferenceFailureResolution, JobStage, JobTracker
 from tests.process_management.conftest import (
+    FakeClock,
     make_job_pop_response,
     make_mock_job,
     mark_job_aux_prepared,
@@ -441,6 +442,88 @@ class TestDispatchConditionStamps:
         job_tracker.mark_aux_skipped("rejected_ref", is_version=False, is_ti=False)
 
         assert job_tracker.mark_job_aux_prepared_if_ready(job.id_) is True
+
+
+class TestAuxReadinessAtDispatch:
+    """Dispatch re-runs aux readiness, so the skip list the child receives is the readiness decision's."""
+
+    async def test_lapsed_skip_withdraws_preparation_at_dispatch(self) -> None:
+        """A skip that lapses after preparation sends the job back to preparation instead of dispatching it."""
+        clock = FakeClock(now=1000.0)
+        job_tracker = JobTracker(clock=clock)
+        job = await track_popped_job_async(
+            job_tracker,
+            make_job_pop_response(loras=[LorasPayloadEntry(name="3317200", is_version=True)]),
+        )
+        assert job.id_ is not None
+        job_tracker.mark_aux_skipped("3317200", is_version=True, is_ti=False, expires_at=1900.0)
+        assert job_tracker.mark_job_aux_prepared_if_ready(job.id_) is True
+
+        clock.advance(901.0)
+
+        assert job_tracker.confirm_aux_preparation_at_dispatch(job) is False
+        assert job_tracker.are_job_aux_models_prepared(job) is False
+        assert job_tracker.job_requires_aux_preparation(job) is True
+        tracked = job_tracker.get_tracked_job(job.id_)
+        assert tracked is not None
+        assert tracked.aux_models_prepared_at is None
+
+    async def test_live_skip_dispatches_with_the_skipped_file_listed(self) -> None:
+        """A skip still in force passes the dispatch check, and the skip list carries the file."""
+        clock = FakeClock(now=1000.0)
+        job_tracker = JobTracker(clock=clock)
+        job = await track_popped_job_async(
+            job_tracker,
+            make_job_pop_response(loras=[LorasPayloadEntry(name="3317200", is_version=True)]),
+        )
+        assert job.id_ is not None
+        job_tracker.mark_aux_skipped("3317200", is_version=True, is_ti=False, expires_at=1900.0)
+        assert job_tracker.mark_job_aux_prepared_if_ready(job.id_) is True
+
+        clock.advance(899.0)
+
+        assert job_tracker.confirm_aux_preparation_at_dispatch(job) is True
+        assert job_tracker.skipped_aux_for_job(job) == [
+            AuxModelRef(kind=AuxModelKind.LORA, name="3317200", is_version=True),
+        ]
+
+    async def test_skip_list_matches_the_confirmed_decision_when_the_skip_lapses_before_the_send(self) -> None:
+        """A skip that lapses between the dispatch check and the send stays in the skip list the child receives."""
+        clock = FakeClock(now=1000.0)
+        job_tracker = JobTracker(clock=clock)
+        job = await track_popped_job_async(
+            job_tracker,
+            make_job_pop_response(loras=[LorasPayloadEntry(name="3317200", is_version=True)]),
+        )
+        assert job.id_ is not None
+        job_tracker.mark_aux_skipped("3317200", is_version=True, is_ti=False, expires_at=1900.0)
+        assert job_tracker.mark_job_aux_prepared_if_ready(job.id_) is True
+        clock.advance(899.0)
+        assert job_tracker.confirm_aux_preparation_at_dispatch(job) is True
+
+        clock.advance(2.0)
+
+        assert job_tracker.skipped_aux_for_job(job) == [
+            AuxModelRef(kind=AuxModelKind.LORA, name="3317200", is_version=True),
+        ]
+
+    async def test_unrelated_lapse_does_not_touch_a_prepared_job(self) -> None:
+        """A lapsed skip for a LoRA the job does not reference leaves the job prepared, with an empty skip list."""
+        clock = FakeClock(now=1000.0)
+        job_tracker = JobTracker(clock=clock)
+        job = await track_popped_job_async(
+            job_tracker,
+            make_job_pop_response(loras=[LorasPayloadEntry(name="present_ref", is_version=False)]),
+        )
+        assert job.id_ is not None
+        mark_job_aux_prepared(job_tracker, job)
+        job_tracker.mark_aux_skipped("3431066", is_version=True, is_ti=False, expires_at=1900.0)
+
+        clock.advance(901.0)
+
+        assert job_tracker.confirm_aux_preparation_at_dispatch(job) is True
+        assert job_tracker.are_job_aux_models_prepared(job) is True
+        assert job_tracker.skipped_aux_for_job(job) == []
 
 
 class TestFaultCounting:

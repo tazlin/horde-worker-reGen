@@ -14059,11 +14059,13 @@ class InferenceScheduler:
                 "and the starved head reaches its best-effort admit",
             )
 
-        if next_job_and_process.line_skip is None and self._job_tracker.job_requires_aux_preparation(next_job):
+        if not self._job_tracker.confirm_aux_preparation_at_dispatch(next_job):
             # An unprepared aux job is not dispatchable: it holds no lane and no VRAM reservation while the
             # pop-time prefetch pipeline places its LoRAs/TIs on disk and clears its preparation gate. It is
             # already skipped by dispatch selection and preload admission, so a fitting sibling flows past it;
-            # this remains as the terminal gate so such a job can never seize a lane by any path.
+            # this remains as the terminal gate so such a job can never seize a lane by any path. Readiness is
+            # re-run here, line skips included, because the skip list sent with the job is read from the same
+            # decision, and a skip that lapsed since the job was prepared sends the job back to preparation.
             return withheld(
                 SlotDutyBucket.AUX_PREPARATION,
                 "its auxiliary models are still being placed on disk, so it holds no lane and cannot sample",

@@ -282,7 +282,12 @@ scheduler re-dispatching the job into the same failure. Because the requeue is f
 coordinator measures that job's prefetch budget from its pop rather than from each
 re-request. Once the budget is spent the job is served with the references skipped, so a
 file the download process keeps reporting present while the child cannot read it does not
-cycle the job forever. The coordinator also
+cycle the job forever. A job prepared on an incident-scoped skip is checked again at dispatch,
+where the dispatch gate re-runs the readiness rule. If a skip lapsed while the job waited for a
+lane, the gate withdraws the job's prepared state and keeps the presence reports, so the reconcile
+sweep requests the file again instead of the child being sent a skip list without it. The skip list the child
+receives is every file not reported present for the job, which the gate has just found under a live
+skip, so it cannot drift from the gate's decision. The coordinator also
 pushes a pins-only eviction update whenever the set of still-referenced auxiliary files
 changes (for example when a job completes), coalesced so an unchanged set is never re-sent.
 

@@ -484,7 +484,8 @@ class TrackedJob:
     reservation. Its checkpoint may still preload into a wholly empty slot when no runnable job competes.
     Withdrawn (see :meth:`JobTracker.invalidate_job_aux_preparation`) when an inference child later fails
     to resolve one of the files, so the prefetch is re-armed instead of the job being re-dispatched into
-    the same failure.
+    the same failure. Also withdrawn at dispatch when a skip verdict the readiness relied on has lapsed
+    (:meth:`JobTracker.confirm_aux_preparation_at_dispatch`).
     """
     aux_models_prepared_at: float | None = None
     """Epoch time :attr:`aux_models_prepared` last became true, or None while the job is still gated.
@@ -2163,20 +2164,27 @@ class JobTracker:
         expires_at = skips[key]
         return expires_at is None or self._clock() < expires_at
 
+    def _unreported_aux_refs(self, tracked: TrackedJob) -> list[AuxModelRef]:
+        """The job's LoRAs and TIs the download process has not reported present for it."""
+        payload = tracked.sdk_api_job_info.payload
+        refs = [
+            AuxModelRef(kind=AuxModelKind.LORA, name=lora.name, is_version=bool(lora.is_version))
+            for lora in payload.loras or []
+            if self._lora_cache_key(lora) not in tracked.aux_present_lora_keys
+        ]
+        refs.extend(
+            AuxModelRef(kind=AuxModelKind.TI, name=ti.name)
+            for ti in payload.tis or []
+            if self._ti_cache_key(ti.name) not in tracked.aux_present_ti_keys
+        )
+        return refs
+
     def _is_job_aux_set_ready(self, tracked: TrackedJob) -> bool:
         """Whether every LoRA and TI the job references is reported present for it or under a live skip verdict."""
-        payload = tracked.sdk_api_job_info.payload
-        loras_ready = all(
-            self._lora_cache_key(lora) in tracked.aux_present_lora_keys
-            or self._skip_live(self._skipped_lora_keys, self._lora_cache_key(lora))
-            for lora in payload.loras or []
+        return all(
+            self.is_aux_skipped(ref.name, is_version=ref.is_version, is_ti=ref.kind is AuxModelKind.TI)
+            for ref in self._unreported_aux_refs(tracked)
         )
-        tis_ready = all(
-            self._ti_cache_key(ti.name) in tracked.aux_present_ti_keys
-            or self._skip_live(self._skipped_ti_keys, self._ti_cache_key(ti.name))
-            for ti in payload.tis or []
-        )
-        return loras_ready and tis_ready
 
     def is_lora_present_for_job(self, job: ImageGenerateJobPopResponse, lora: LorasPayloadEntry) -> bool:
         """Whether the download process reported this LoRA present for this job (see ``aux_present_lora_keys``)."""
@@ -2208,15 +2216,43 @@ class JobTracker:
         return self._skip_live(self._skipped_lora_keys, self._lora_name_key(name, is_version))
 
     def skipped_aux_for_job(self, job: ImageGenerateJobPopResponse) -> list[AuxModelRef]:
-        """The job's auxiliary refs under a live skip verdict, for the inference child to tolerate missing."""
-        refs: list[AuxModelRef] = []
-        for lora in job.payload.loras or []:
-            if self._skip_live(self._skipped_lora_keys, self._lora_cache_key(lora)):
-                refs.append(AuxModelRef(kind=AuxModelKind.LORA, name=lora.name, is_version=bool(lora.is_version)))
-        for ti in job.payload.tis or []:
-            if self._skip_live(self._skipped_ti_keys, self._ti_cache_key(ti.name)):
-                refs.append(AuxModelRef(kind=AuxModelKind.TI, name=ti.name))
-        return refs
+        """The auxiliary refs a dispatching job runs without, for the inference child to tolerate missing.
+
+        These are the refs not reported present for the job. A job reaches the send only after
+        :meth:`confirm_aux_preparation_at_dispatch` found every such ref under a live skip, so the list is that
+        decision's skip set. It is read from presence rather than from the skip table so a skip that lapses
+        between the confirmation and the send does not change the list the child receives.
+        """
+        tracked = self._tracked_for(job)
+        return self._unreported_aux_refs(tracked) if tracked is not None else []
+
+    def confirm_aux_preparation_at_dispatch(self, job: ImageGenerateJobPopResponse) -> bool:
+        """Re-run a prepared job's aux readiness at dispatch, and withdraw the prepared flag if it no longer holds.
+
+        Readiness counts a file under an incident-scoped skip as ready, and that skip can lapse while the job
+        waits for a lane. Dispatching then would send the child a skip list without the file, and the child
+        faults on the missing file. Withdrawing the flag returns the job to the prefetch reconcile sweep, which
+        requests the file again as it would for a fresh pop. Presence reports are kept, since the files they list
+        are still pinned for the job.
+
+        Returns:
+            True when the job may dispatch, which is when it does not carry auxiliary files or is prepared and
+            still ready.
+        """
+        if not (job.payload.loras or job.payload.tis):
+            return True
+        tracked = self._tracked_for(job)
+        if tracked is None or not tracked.aux_models_prepared:
+            return False
+        if self._is_job_aux_set_ready(tracked):
+            return True
+        tracked.aux_models_prepared = False
+        tracked.aux_models_prepared_at = None
+        logger.info(
+            f"Job {str(tracked.job_id)[:8]} was aux-prepared under a skip that has since lapsed. "
+            "Holding its dispatch and requesting the file again.",
+        )
+        return False
 
     @staticmethod
     def _ti_cache_key(name: str) -> str:

@@ -23,7 +23,14 @@ from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse, LorasPayloadEntry
 
 from horde_worker_regen.process_management.config.worker_state import WorkerState
-from horde_worker_regen.process_management.ipc.messages import HordeControlFlag, HordeProcessState, ModelLoadState
+from horde_worker_regen.process_management.ipc.messages import (
+    AuxModelKind,
+    AuxModelRef,
+    HordeControlFlag,
+    HordeInferenceControlMessage,
+    HordeProcessState,
+    ModelLoadState,
+)
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
@@ -32,6 +39,7 @@ from horde_worker_regen.process_management.models.lru_cache import LRUCache
 from horde_worker_regen.process_management.resources.reclaim_ladder import VerifiedReclaimLadder
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from tests.process_management.conftest import (
+    FakeClock,
     device_wide_reading_provider,
     make_job_pop_response,
     make_mock_bridge_data,
@@ -370,3 +378,84 @@ class TestAuxPreparationControls:
         assert await scheduler.start_inference() is True
         assert head in tracker.jobs_in_progress
         assert head_process.last_control_flag is HordeControlFlag.START_INFERENCE
+
+
+async def _skip_prepared_head_setup(
+    *,
+    head_lora: str,
+    skipped_lora: str,
+) -> tuple[InferenceScheduler, JobTracker, FakeClock, ImageGenerateJobPopResponse, HordeProcessInfo]:
+    """A resident head prepared on a 900 s incident skip for ``skipped_lora``, with the clock at the skip's arming."""
+    clock = FakeClock(now=1000.0)
+    tracker = JobTracker(clock=clock)
+    head = _job(_HEAD_MODEL, lora=head_lora)
+    head_process = make_mock_process_info(0, model_name=_HEAD_MODEL, state=HordeProcessState.PRELOADED_MODEL)
+    head_process.total_vram_mb = 16_375
+    head_process.process_reserved_mb = 1_372
+    model_map = HordeModelMap(root={})
+    model_map.update_entry(_HEAD_MODEL, load_state=ModelLoadState.LOADED_IN_RAM, process_id=0)
+    await track_popped_job_async(tracker, head)
+    if head_lora != skipped_lora:
+        mark_job_aux_prepared(tracker, head)
+    tracker.mark_aux_skipped(skipped_lora, is_version=True, is_ti=False, expires_at=clock() + 900.0)
+    assert head.id_ is not None
+    assert tracker.mark_job_aux_prepared_if_ready(head.id_) is (head_lora == skipped_lora)
+    assert tracker.are_job_aux_models_prepared(head)
+    scheduler = _scheduler(ProcessMap({0: head_process}), tracker, model_map, device_free_mb=24_000.0)
+    return scheduler, tracker, clock, head, head_process
+
+
+def _sent_skip_list(process: HordeProcessInfo) -> list[AuxModelRef]:
+    """The skip list carried by the START_INFERENCE message sent to ``process``."""
+    send = process.pipe_connection.send
+    assert isinstance(send, Mock)
+    message = send.call_args.args[0]
+    assert isinstance(message, HordeInferenceControlMessage)
+    assert message.control_flag is HordeControlFlag.START_INFERENCE
+    return message.skipped_aux_models
+
+
+class TestAuxReadinessAtDispatch:
+    """Dispatch re-runs aux readiness, so a file that readiness skipped is always in the child's skip list."""
+
+    async def test_skip_lapsed_before_dispatch_returns_the_job_to_preparation(self) -> None:
+        """A head prepared on a skip that lapsed before dispatch is withheld and unprepared instead of being sent.
+
+        Sending it would carry an empty skip list for a file that is not on disk, which the child faults as
+        ``aux-resolve-failed``. Once unprepared, the job goes back to the prefetch reconcile sweep.
+        """
+        scheduler, tracker, clock, head, head_process = await _skip_prepared_head_setup(
+            head_lora="3317200",
+            skipped_lora="3317200",
+        )
+        clock.advance(901.0)
+
+        assert await scheduler.start_inference() is False
+        assert head in tracker.jobs_pending_inference
+        assert head not in tracker.jobs_in_progress
+        assert head_process.last_control_flag is not HordeControlFlag.START_INFERENCE
+        assert tracker.job_requires_aux_preparation(head) is True
+
+    async def test_skip_in_force_at_dispatch_sends_the_skipped_file(self) -> None:
+        """A head whose skip still holds dispatches with the file in the skip list the child receives."""
+        scheduler, tracker, clock, head, head_process = await _skip_prepared_head_setup(
+            head_lora="3317200",
+            skipped_lora="3317200",
+        )
+        clock.advance(899.0)
+
+        assert await scheduler.start_inference() is True
+        assert head in tracker.jobs_in_progress
+        assert _sent_skip_list(head_process) == [AuxModelRef(kind=AuxModelKind.LORA, name="3317200", is_version=True)]
+
+    async def test_unrelated_skip_lapse_leaves_the_job_dispatchable(self) -> None:
+        """A lapsed skip for a LoRA the head does not reference does not withhold it or change its skip list."""
+        scheduler, tracker, clock, head, head_process = await _skip_prepared_head_setup(
+            head_lora="present-head-lora",
+            skipped_lora="3431066",
+        )
+        clock.advance(901.0)
+
+        assert await scheduler.start_inference() is True
+        assert head in tracker.jobs_in_progress
+        assert _sent_skip_list(head_process) == []
