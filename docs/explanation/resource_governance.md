@@ -616,7 +616,9 @@ has five ends, and the first to arrive wins:
 
 The claim engages only where it cannot do harm. A residency is per-card, so on a host driving more than one
 card the claim is skipped entirely: holding the whole worker's intake to one card's model would starve the
-others. Setting the maximum hold to zero disables the claim along with the cap that bounds it. The short
+others. The maximum hold still caps retention there. A residency held through lulls in a steady stream lets go
+once it has passed the hold and its work has drained, and a terminal fault of the resident model also ends its
+retention. Setting the maximum hold to zero disables the claim along with the cap that bounds it. The short
 post-release withholding of very large models from the offer is unchanged and sits beneath all of this, so a
 released residency does not immediately re-establish.
 

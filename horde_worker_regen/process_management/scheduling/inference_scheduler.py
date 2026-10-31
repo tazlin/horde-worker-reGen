@@ -3592,7 +3592,8 @@ class InferenceScheduler:
         release turns out to have changed nothing, so the supervisor is never told to ignore a wedge for free.
         """
         now = self._clock()
-        max_hold_seconds = 0.0 if self._multi_gpu_routing_active else self._whole_card_max_hold_seconds()
+        # The cap applies on every host. A multi-card host skips only the pop claim, in _standing_pop_claim.
+        max_hold_seconds = self._whole_card_max_hold_seconds()
         active_models = {j.model for j in self._job_tracker.jobs_in_progress}
         active_models.update(j.model for j in self._job_tracker.jobs_pending_inference)
         for device_index, state in self._whole_card_ledger.held():

@@ -8919,6 +8919,45 @@ async def test_mixed_cards_a_residency_whose_model_runs_on_the_other_card_is_rel
     assert not unserved, f"SD 1.5 job(s) {unserved} never ran on the small card. {world.state_dump()}"
 
 
+async def test_mixed_cards_a_residency_past_the_maximum_hold_is_not_retained_by_its_cooldown() -> None:
+    """A residency held past the maximum hold lets go once its work has drained, though its cooldown still stands.
+
+    A multi-card host skips the pop claim, and the maximum hold still caps retention there. Without the cap a
+    residency kept through short lulls in a steady stream would keep its card torn down for as long as the
+    stream lasts.
+    """
+    row = await drive_heavy_head_on_mixed_cards(
+        head_model=_FLUX, small_card_busy=False, footprint_store=_large_card_flux_store()
+    )
+    world = row.world
+    scheduler = world.scheduler
+    assert not world._job_tracker.jobs_pending_inference and not world._job_tracker.jobs_in_progress, (
+        f"precondition: every job must have finished. {world.state_dump()}"
+    )
+    max_hold_seconds = scheduler._whole_card_max_hold_seconds()
+    assert max_hold_seconds > 0.0, "precondition: the configured maximum hold is positive"
+    ledger = scheduler._whole_card_ledger
+    for device_index, _state in ledger.held():
+        ledger.state_for(device_index).model = None
+    now = scheduler._clock()
+    ledger.record_grant(
+        0,
+        model=_FLUX.name,
+        forecast=None,
+        cooldown_until=now + 10 * max_hold_seconds,
+        now=now - 2 * max_hold_seconds,
+    )
+    assert ledger.holds_model_on_card(_FLUX.name, 0), "precondition: card 0 holds the Flux residency"
+
+    scheduler._restore_siblings_after_whole_card()
+
+    assert not ledger.holds_model_on_card(_FLUX.name, 0), (
+        f"card 0 kept a Flux residency established {2 * max_hold_seconds:.0f}s ago, past the "
+        f"{max_hold_seconds:.0f}s maximum hold, with no Flux work left, because its cooldown still stood. "
+        f"{world.state_dump()}"
+    )
+
+
 _SMALL_CARD_RESOLUTION_LIMIT_PIXELS = {0: 4_194_304, 1: 512 * 512}
 """The large card takes any resolution these rows generate, and the small card takes the 512px SD 1.5 jobs only."""
 
