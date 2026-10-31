@@ -1,12 +1,20 @@
 """The head-of-queue admission ledger, stated directly: every clock is bounded and every step is reproducible.
 
 The scheduler's own tests cover the log lines, ledger events and actuations these steps drive; these rows pin the
-state transitions themselves, so a change to a bound or a reset rule is caught where it lives.
+state transitions themselves, so a change to a bound or a reset rule is caught where it lives. The one scheduler
+class here pins the card inputs the scheduler feeds the starvation clock.
 """
 
 from __future__ import annotations
 
+import pytest
+from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
+
+from horde_worker_regen.process_management.ipc.messages import HordeProcessState
+from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
+from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.scheduling.governance.preload_admission import AdmissionDecision
+from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from horde_worker_regen.process_management.scheduling.ledgers.head_admission import (
     DISPATCH_STALL_LOG_INTERVAL_SECONDS,
     HEAD_RAM_DEFER_BARRIER_CAP_SECONDS,
@@ -18,7 +26,17 @@ from horde_worker_regen.process_management.scheduling.ledgers.head_admission imp
     SafetyRecoveryHoldStep,
     StagingDeferReason,
     format_staging_defer_tally,
+    head_waits_behind_work,
 )
+from tests.process_management.conftest import (
+    make_job_pop_response,
+    make_mock_bridge_data,
+    make_mock_process_info,
+    make_test_card_runtimes,
+    mark_job_in_progress_async,
+    track_popped_job_async,
+)
+from tests.process_management.scheduling.test_inference_scheduling import _make_inference_scheduler
 
 
 class _Clock:
@@ -80,6 +98,132 @@ class TestHeadStarvation:
         assert ledger.reconcile_head_starvation({"other"}) is True
         assert ledger.starvation_job_id is None and ledger.starvation_since == 0.0
         assert ledger.reconcile_head_starvation(set()) is False
+
+    @pytest.mark.parametrize(
+        ("eligible", "with_work", "waits"),
+        [
+            ({0, 1}, {0}, False),
+            ({0, 1}, {1}, False),
+            ({0, 1}, {0, 1}, True),
+            ({0}, {0}, True),
+            ({0}, set(), False),
+            (set(), set(), True),
+        ],
+    )
+    def test_a_head_waits_behind_work_only_when_every_card_it_may_use_runs_a_job(
+        self,
+        eligible: set[int],
+        with_work: set[int],
+        waits: bool,
+    ) -> None:
+        """An idle card the head may use leaves its clock running; a busy card it may not use does not."""
+        assert head_waits_behind_work(eligible, with_work) is waits
+
+
+class TestSchedulerStarvationCards:
+    """The scheduler stops the clock per card on a multi-GPU worker and worker-wide on one card."""
+
+    @staticmethod
+    async def _scheduler(
+        *,
+        card_count: int,
+        busy_cards: tuple[int, ...],
+        unowned_job_in_progress: bool = False,
+    ) -> tuple[InferenceScheduler, ImageGenerateJobPopResponse]:
+        """One idle lane per card, a job sampling on each of ``busy_cards``, and a queued head."""
+        bridge_data = make_mock_bridge_data()
+        tracker = JobTracker()
+        slots: dict[int, object] = {}
+        running: list[tuple[object, ImageGenerateJobPopResponse]] = []
+        for card in range(card_count):
+            busy = card in busy_cards
+            lane = make_mock_process_info(
+                card,
+                model_name="sd",
+                device_index=card,
+                state=HordeProcessState.INFERENCE_STARTING if busy else HordeProcessState.WAITING_FOR_JOB,
+            )
+            slots[card] = lane
+            if busy:
+                job = make_job_pop_response(model="sd")
+                await track_popped_job_async(tracker, job)
+                await mark_job_in_progress_async(tracker, job)
+                running.append((lane, job))
+        if unowned_job_in_progress:
+            job = make_job_pop_response(model="sd")
+            await track_popped_job_async(tracker, job)
+            await mark_job_in_progress_async(tracker, job)
+        head = make_job_pop_response(model="flux")
+        await track_popped_job_async(tracker, head)
+        scheduler = _make_inference_scheduler(
+            process_map=ProcessMap(slots),  # type: ignore[arg-type]
+            job_tracker=tracker,
+            bridge_data=bridge_data,
+            max_inference=card_count,
+            card_runtimes=make_test_card_runtimes(device_indices=tuple(range(card_count)), config=bridge_data),
+        )
+        for lane, job in running:
+            lane.record_inference_ownership(job, attempt_ordinal=0)  # type: ignore[attr-defined]
+        return scheduler, head
+
+    @staticmethod
+    def _clock_runs(scheduler: InferenceScheduler, head: ImageGenerateJobPopResponse) -> bool:
+        scheduler._update_head_starvation_timer(head)
+        return scheduler.head_admission.starvation_job_id == str(head.id_)
+
+    @pytest.mark.parametrize("busy_card", [0, 1])
+    async def test_a_head_eligible_on_both_cards_starts_its_clock_when_either_card_is_idle(
+        self,
+        busy_card: int,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A job on one card frees no room on the other, so the head is starved while that card idles."""
+        scheduler, head = await self._scheduler(card_count=2, busy_cards=(busy_card,))
+        monkeypatch.setattr(scheduler, "_eligible_card_indices", lambda _job: {0, 1})
+
+        assert self._clock_runs(scheduler, head) is True
+
+    async def test_a_head_eligible_on_both_cards_waits_while_both_run_jobs(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """With every card it may use busy, the head is queued behind work that can free room."""
+        scheduler, head = await self._scheduler(card_count=2, busy_cards=(0, 1))
+        monkeypatch.setattr(scheduler, "_eligible_card_indices", lambda _job: {0, 1})
+
+        assert self._clock_runs(scheduler, head) is False
+
+    async def test_a_head_eligible_only_on_the_busy_card_does_not_start_its_clock(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An idle card the head may not use does not make its wait a starvation."""
+        scheduler, head = await self._scheduler(card_count=2, busy_cards=(0,))
+        monkeypatch.setattr(scheduler, "_eligible_card_indices", lambda _job: {0})
+
+        assert self._clock_runs(scheduler, head) is False
+
+    async def test_one_card_starts_the_clock_only_with_no_job_in_progress(self) -> None:
+        """The single-card rule is the worker-wide one, read straight off the tracker."""
+        idle, idle_head = await self._scheduler(card_count=1, busy_cards=())
+        busy, busy_head = await self._scheduler(card_count=1, busy_cards=(0,))
+
+        assert self._clock_runs(idle, idle_head) is True
+        assert self._clock_runs(busy, busy_head) is False
+
+    async def test_one_card_counts_an_in_progress_job_with_no_identified_lane(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Defect reinjection: the per-card rule on one card would run the clock beside this job.
+
+        The per-card count omits a job whose running lane cannot be identified, so applying it on one card would
+        start the clock while the tracker still holds work in progress.
+        """
+        scheduler, head = await self._scheduler(card_count=1, busy_cards=(), unowned_job_in_progress=True)
+        monkeypatch.setattr(scheduler, "_eligible_card_indices", lambda _job: {0})
+
+        assert self._clock_runs(scheduler, head) is False
 
 
 class TestRamDeferBarrier:

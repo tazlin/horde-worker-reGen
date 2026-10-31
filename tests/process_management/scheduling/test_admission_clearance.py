@@ -465,6 +465,41 @@ async def test_a_dispatched_job_is_never_timed_by_the_head_clock() -> None:
     assert head_admission.starvation_job_id is None
 
 
+async def test_a_request_for_a_card_running_a_job_reads_no_starvation_on_a_multi_card_worker() -> None:
+    """The head's clock reads 0.0 for a card that runs a job, and its full age for an idle card.
+
+    On a multi-card worker the clock runs while any card the head may use is idle. The lane rungs and the
+    live-context reduction act on the reading, so a request for the busy card must not take the idle card's age.
+    """
+    scheduler, job, _waiter = await _staged_waiter(device_free_mb=100.0)
+    job_id = str(job.id_)
+    head_admission = scheduler.head_admission
+    head_admission.track_head_starvation(job_id, work_in_progress=False)
+    snapshot = scheduler.snapshot()
+    pending = replace(
+        snapshot,
+        now=head_admission.starvation_since + 30.0,
+        queue=replace(snapshot.queue, jobs={job_id: replace(snapshot.queue.jobs[job_id], in_progress=False)}),
+    )
+    busy_slot = next(iter(pending.slots.values()))
+    running_job_id = "job-running-on-card-0"
+    multi_card = replace(
+        pending,
+        multi_gpu_routing_active=True,
+        slots={
+            **pending.slots,
+            busy_slot.process_id: replace(busy_slot, device_index=0, current_job_id=running_job_id),
+        },
+        queue=replace(pending.queue, in_progress=(running_job_id,)),
+    )
+
+    assert head_starved_seconds(multi_card, job_id, device_index=0) == 0.0
+    assert head_starved_seconds(multi_card, job_id, device_index=1) == 30.0
+    assert head_starved_seconds(pending, job_id, device_index=0) == 30.0, (
+        "a single-card worker reads the head's age whatever card the request names"
+    )
+
+
 async def test_a_job_awaits_admission_until_its_sample_finishes() -> None:
     """A lane pause's beneficiary reads as waiting until its inference result lands, sampling included.
 

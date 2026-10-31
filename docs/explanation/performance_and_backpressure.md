@@ -594,7 +594,8 @@ only prefetch-gated work it cannot dispatch.
 
 A card can idle behind a main-model download or an empty queue: the head is parked on a device with a free
 sibling but its checkpoint is not yet resident. The head-starvation clock runs while nothing is sampling or
-conservatively unclassified as in-progress. Mapped jobs that are only downloading auxiliary files do not
+conservatively unclassified as in-progress. On a multi-GPU worker it runs while a card eligible for the head has
+no job in progress, whatever the other cards run. Mapped jobs that are only downloading auxiliary files do not
 suppress it because they occupy concurrency without feeding the GPU; any actual sampler still resets it.
 The clock holds a job only while that job is queued and not in progress. The control loop reconciles it
 against the queue on every iteration, since a scheduling cycle runs only while the queue holds work. A timed
@@ -1694,8 +1695,8 @@ job holding memory anywhere on the card*. That gate is exactly right for a genui
 it leaves a gap: a head-of-queue preload whose system-RAM verdict keeps failing while a **sibling job is in
 progress** can never reach the escape on its own. Reclaim frees nothing (the idle residents are gone, or are
 other queued jobs' models), a sibling holds the memory the head needs, and the head defers every cycle. The
-head-starvation clock cannot see this either, because it is forced to zero whenever any job is in progress, so
-without help the head waits until the horde faults its job.
+head-starvation clock cannot see this either. It is forced to zero while every card the head may use has a job
+in progress, so without help the head waits until the horde faults its job.
 
 The **head-priority dispatch barrier** resolves it without blind over-admission. When a head-of-queue preload
 has been continuously RAM-deferred behind live work past `_HEAD_RAM_DEFER_BARRIER_SECONDS` (60s) with reclaim

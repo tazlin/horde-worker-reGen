@@ -72,16 +72,28 @@ class StagedWaiterTerms:
     """The share of the checkpoint's weights a partial-load seat must hold (:func:`pricing.partial_seat_mb`)."""
 
 
-def head_starved_seconds(snapshot: SchedulingSnapshot, job_id: str) -> float:
-    """Seconds the job has been the idle-device head, or 0.0 when it is not the timed head.
+def head_starved_seconds(snapshot: SchedulingSnapshot, job_id: str, *, device_index: int | None = None) -> float:
+    """Return the seconds the job has been the idle-device head, or 0.0 when it is not the timed head.
 
-    A job already in progress is never the timed head: a staged waiter's wait is clearance's clock.
+    A job already in progress is not the timed head, because a staged waiter's wait is clearance's clock. On a
+    multi-card worker the head's clock runs while any card it may use is idle, so a request for a card that is
+    running a job reads 0.0. The lane rungs and the live-context reduction act on that reading, and the job
+    running on that card returns its own memory when it ends.
     """
     view = snapshot.ledgers.head_admission
     if view.starvation_job_id != job_id or view.starvation_since == 0.0:
         return 0.0
     job = snapshot.queue.jobs.get(job_id)
     if job is not None and job.in_progress:
+        return 0.0
+    if (
+        snapshot.multi_gpu_routing_active
+        and device_index is not None
+        and pricing.active_jobs_on_card(
+            snapshot,
+            device_index,
+        )
+    ):
         return 0.0
     return snapshot.now - view.starvation_since
 
@@ -234,7 +246,9 @@ def build_materialization_request(
         measured_attempt_already_spent=device_index in job.measured_attempt_spent_devices,
         head_outstanding_mb=head_outstanding_mb,
         starved_seconds=(
-            staged_waiter.starved_seconds if staged_waiter is not None else head_starved_seconds(snapshot, job_id)
+            staged_waiter.starved_seconds
+            if staged_waiter is not None
+            else head_starved_seconds(snapshot, job_id, device_index=device_index)
         ),
         probe_after_seconds=float(config.measured_load_probe_seconds),
         attempt_deadline_seconds=staged_waiter.attempt_deadline_seconds if staged_waiter is not None else None,

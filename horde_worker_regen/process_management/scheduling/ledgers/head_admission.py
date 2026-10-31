@@ -1,6 +1,6 @@
 """What the scheduler remembers about the head of the queue's admission across scheduling cycles.
 
-The head of the queue is the job every gate is judged against: how long it has sat on an idle device, whether
+The head of the queue is the job every gate is judged against: how long it has sat with an idle card, whether
 its preload is being deferred behind live work, whether a crash-looping safety pool is holding admissions off
 its card, what the last admission decision said, and why dispatch is stalled. Each of those is a clock or a
 record that only means something over several cycles, and each has a bound so an intent cannot outlive the
@@ -98,6 +98,16 @@ def format_staging_defer_tally(defers: Mapping[StagingDeferReason, int]) -> str 
     return f"staging deferred: {total} ({shares})"
 
 
+def head_waits_behind_work(eligible_cards: AbstractSet[int], cards_with_work: AbstractSet[int]) -> bool:
+    """Return whether every card the head may use has a job in progress, the state that stops its starvation clock.
+
+    On a multi-GPU worker a job on one card does not free room on another, so an idle card the head may use
+    leaves the head waiting on its own admission there. A head with no eligible card waits for one, and is not
+    starved either.
+    """
+    return eligible_cards <= cards_with_work
+
+
 @dataclass(frozen=True)
 class LatestPreloadAdmission:
     """Operator-facing record of the most recent preload-admission decision."""
@@ -147,7 +157,7 @@ class HeadAdmissionLedger:
         """Track head-of-queue admission state against ``clock``."""
         self._clock = clock
         self.starvation_job_id: str | None = None
-        """The head whose idle-device wait is being timed, or None while a live job holds the device."""
+        """The head whose idle-card wait is being timed, or None while every card it may use runs a job."""
         self.starvation_since: float = 0.0
         """When that wait began; 0.0 while nothing is timed."""
         self.ram_defer_job_id: str | None = None
@@ -181,10 +191,11 @@ class HeadAdmissionLedger:
     # ---- head starvation
 
     def track_head_starvation(self, head_id: str | None, *, work_in_progress: bool) -> None:
-        """Time how long the current head has sat on an otherwise idle device.
+        """Time how long the current head has sat with a card it may use idle.
 
-        The clock runs only while no live job holds the device: a head waiting behind such work is queued, not
-        starved. It restarts when a different job reaches the front so it measures this head's wait, not the
+        ``work_in_progress`` is whether every card the head may use has a job in progress (see
+        :func:`head_waits_behind_work`). A head waiting behind such work is queued, not starved, so the clock
+        stops. It restarts when a different job reaches the front so it measures this head's wait, not the
         queue's age.
         """
         if head_id is None or work_in_progress:

@@ -191,6 +191,7 @@ charge the card for checkpoints idle lanes hold in RAM.
 from __future__ import annotations
 
 import itertools
+import math
 import random
 import statistics
 import sys
@@ -8965,19 +8966,14 @@ async def test_mixed_cards_the_small_card_runs_its_queue_while_a_head_above_its_
     _assert_heavy_head_served_on_the_large_card(row, context="head above the small card's resolution limit")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "the head starvation clock runs only while no job is in progress on any card, so a head held on its idle "
-        "card for a near-fit measured load waits for the other card's job to end before the probe delay starts"
-    ),
-)
 async def test_mixed_cards_a_head_staged_onto_an_unmeasured_card_still_reaches_the_card_that_frees() -> None:
     """A Flux head reaches sampling promptly on whichever card frees first, and the small card records a figure.
 
     The store holds only the large card's Flux figures, which include the resident text encoder and exceed the
     small card's ceiling. Learned figures are keyed by card size, so the small card prices Flux from the seed and
     may serve it with the encoder offloaded. A Flux job that samples there feeds a figure keyed to the small card.
+    The seed misses the small card's free room by less than the measured-attempt band, so the bound allows the
+    card's measured-load probe delay before the one real load.
     """
     row = await drive_heavy_head_on_mixed_cards(
         head_model=_FLUX, small_card_busy=True, footprint_store=_large_card_flux_store(), learned_footprints=True
@@ -9004,9 +9000,14 @@ async def test_mixed_cards_a_head_staged_onto_an_unmeasured_card_still_reaches_t
         f"{context}: the Flux head never sampled, though a card was free from about tick {first_free_tick}. "
         f"{world.state_dump()}"
     )
-    assert dispatch_tick <= first_free_tick + _MIXED_CARD_TICK_CEILING, (
-        f"{context}: the Flux head reached sampling on tick {dispatch_tick}, more than {_MIXED_CARD_TICK_CEILING} "
-        f"ticks after the first card freed on tick {first_free_tick}. {world.state_dump()}"
+    probe_ticks = math.ceil(
+        world.scheduler.snapshot().config_for(1).measured_load_probe_seconds / world.tick_seconds,
+    )
+    bound_ticks = probe_ticks + _MIXED_CARD_TICK_CEILING
+    assert dispatch_tick <= first_free_tick + bound_ticks, (
+        f"{context}: the Flux head reached sampling on tick {dispatch_tick}, more than {bound_ticks} ticks (the "
+        f"{probe_ticks}-tick probe delay and {_MIXED_CARD_TICK_CEILING} more) after the first card freed on tick "
+        f"{first_free_tick}. {world.state_dump()}"
     )
     unserved = [str(job.id_)[:8] for job in row.small_jobs if world.dispatch_tick(job) is None]
     assert not unserved, (

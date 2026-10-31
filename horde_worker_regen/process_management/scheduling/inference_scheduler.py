@@ -262,6 +262,7 @@ from horde_worker_regen.process_management.scheduling.ledgers.head_admission imp
     HeadRamDeferStep,
     SafetyRecoveryHoldStep,
     StagingDeferReason,
+    head_waits_behind_work,
 )
 from horde_worker_regen.process_management.scheduling.ledgers.ram_reclaim import (
     FRESH_INFERENCE_CHILD_BASELINE_MB,
@@ -4337,18 +4338,21 @@ class InferenceScheduler:
         return self._head_admission
 
     def _update_head_starvation_timer(self, head_job: ImageGenerateJobPopResponse | None) -> None:
-        """Track how long the current head-of-queue job has been stuck on an otherwise-idle device.
+        """Track how long the current head-of-queue job has been stuck with a card it may use idle.
 
-        The clock only runs while no live job is sampling or otherwise using an unclassified in-progress
-        slot: a head waiting behind such work is legitimately queued, not starved. It resets whenever the
-        head changes (a different job reached the front) so the backstop measures *this* head's wait, not
-        the queue's age.
+        On one card the clock runs only while no job is in progress, including one whose slot is unclassified.
+        On a multi-GPU worker it runs while a card eligible for the head has no job in progress, since a job on
+        another card frees no room on that one. It resets whenever the head changes, so it measures this head's
+        wait, not the queue's age.
         """
         head_id = str(head_job.id_) if head_job is not None and head_job.id_ is not None else None
-        self._head_admission.track_head_starvation(
-            head_id,
-            work_in_progress=len(self._job_tracker.jobs_in_progress) > 0,
-        )
+        if head_job is None or not self._multi_gpu_routing_active:
+            work_in_progress = len(self._job_tracker.jobs_in_progress) > 0
+        else:
+            eligible_cards = self._eligible_card_indices(head_job)
+            cards_with_work = {card for card in eligible_cards if self._jobs_in_progress_on_card(card)}
+            work_in_progress = head_waits_behind_work(eligible_cards, cards_with_work)
+        self._head_admission.track_head_starvation(head_id, work_in_progress=work_in_progress)
 
     def _head_starved_seconds(self, job: ImageGenerateJobPopResponse) -> float:
         """Seconds this job has been the idle-device head, or 0.0 when it is not the tracked head."""
@@ -4406,8 +4410,8 @@ class InferenceScheduler:
         """Arm or disarm the idle-fill breaker from the head-starvation clock and free-sibling availability.
 
         Arms when a queue head has sat on an idle device past ``idle_fill_threshold_seconds`` while an inference
-        sibling is free to run a fill job. The clock is zero whenever any job is in progress or the timed job has
-        left the queue, so this is inert in steady state.
+        sibling is free to run a fill job. The clock is zero while every card the head may use has a job in
+        progress or the timed job has left the queue, so this is inert in steady state.
         """
         threshold = bridge_data.idle_fill_threshold_seconds
         starvation_since = self._head_admission.starvation_since

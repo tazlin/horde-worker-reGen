@@ -1156,6 +1156,11 @@ The room is also what the other frames read, so they cannot disagree with the ve
   the worker reads as empty is likelier a tenant the ledger cannot see (a child whose unload returned nothing, a
   foreign process) than arithmetic, and a load into it is the one way this path can produce an out-of-memory. A
   spent probe is re-armed when the process that carried it goes away.
+- **The head-starvation clock runs while a card the head may use is idle.** On one card that is while no job is in
+  progress. On a multi-GPU worker it is while a card eligible for the head (`_eligible_card_indices`) has no job
+  in progress, since a job on another card does not free room on that one. A head eligible only on busy cards is
+  queued, not starved. The probe delay, the lane rungs, the context teardown, head protection's release, the
+  idle-fill arm and the dispatch-stall and starvation diagnostics all read this clock.
 - **A staged waiter is timed by clearance.** The head-starvation clock times a job's wait for dispatch and
   never answers for a job in progress. At clearance the probe reads the scheduler's clearance clock instead:
   seconds the waiter has been held while waiting could not help. A sampler or any other lane past its own
