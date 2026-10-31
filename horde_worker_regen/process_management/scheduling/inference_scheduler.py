@@ -9045,8 +9045,17 @@ class InferenceScheduler:
         scheduling continues around it by design), so reserving its whole-card demand against smaller ready
         work would idle the card against a claim nobody is making. Once the deferral clears, or its record
         outlives the rate limiter's window, the head's normal charge applies again.
+
+        It does not apply on a card the head is not eligible for. Dispatch does not place the head there, so
+        room held for it on that card stays empty.
         """
         if displaced_head.model is None:
+            return None
+        if (
+            self._multi_gpu_routing_active
+            and device_index is not None
+            and device_index not in self._card_eligibility(displaced_head).eligible_card_indices
+        ):
             return None
         if self._whole_card_ledger.governor_deferred_head(device_index, now=self._clock()) == displaced_head.model:
             self._note_head_protection_governor_deferred(displaced_head)

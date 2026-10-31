@@ -299,7 +299,6 @@ from tests.process_management.liveness._dispatch_world import (
     _KREA2,
     _MODEL_CLASSES,
     _POST_PROCESS_LANE_ID,
-    _QWEN_IMAGE,
     _ROTATION_MODEL_CLASSES,
     _SAFETY_PROCESS_ID,
     _SAME_BASELINE_MODEL_CLASSES,
@@ -2942,8 +2941,12 @@ async def test_q_safety_stays_on_a_card_committed_only_to_the_work_it_serves() -
     is not this card's pressure. Its consequences are that the placement policy never demotes safety, that
     neither card's governor leaves HEALTHY and no reclaim rung is spent, that each card keeps the resident it
     was serving from, and that both cards go on earning while all of that holds.
+
+    The row pins safety's residency as not fixed, since a fixed residency on a two-card worker bypasses the
+    placement policy's per-card pricing that the row exercises.
     """
     world = _two_card_safety_world()
+    world._lifecycle.safety_residency_fixed = False
 
     pressured_ticks = await _drive_two_card_traffic(world)
 
@@ -2998,7 +3001,6 @@ async def test_q_fixed_safety_residency_yields_its_card_to_a_deep_backlog(
     job dispatches on card 1.
     """
     world = _two_card_safety_world()
-    world._lifecycle.safety_residency_fixed = True
     assert world._card_runtimes is not None
     world._card_runtimes[0].config.image_models_to_load = [_SD15_OTHER.name]
     world._card_runtimes[1].config.image_models_to_load = [_SD15.name]
@@ -3098,10 +3100,12 @@ async def test_q_defect_reinjection_a_worker_wide_peak_evicts_safety_from_a_heal
     untouched, and the only difference is that the heaviest peak any job carries is charged to every card. The
     card hosting safety is then judged unable to find memory it was never going to be asked for, and because
     the restore forecast reads the same phantom, what comes back is the pre-fix signature in full: one demotion
-    the worker never undoes.
+    the worker never undoes. The row pins safety's residency as not fixed, since a fixed residency on a two-card
+    worker bypasses the placement policy's per-card pricing that the row exercises.
     """
     monkeypatch.setattr(InferenceScheduler, "_sampling_peak_jobs_for_card", _price_the_peak_worker_wide)
     world = _two_card_safety_world()
+    world._lifecycle.safety_residency_fixed = False
 
     pressured_ticks = await _drive_two_card_traffic(world)
 
@@ -8723,6 +8727,7 @@ async def drive_heavy_head_on_mixed_cards(
     follow_on_heads: bool = False,
     ticks: int = _MIXED_CARD_TICKS,
     learned_footprints: bool = False,
+    card_max_pixels: dict[int, int] | None = None,
 ) -> MixedCardRow:
     """Queue a heavy head while the large card runs a long job, then run the row out.
 
@@ -8733,6 +8738,7 @@ async def drive_heavy_head_on_mixed_cards(
     ``ticks`` is how many steps the row runs once the queue is filled. With ``follow_on_heads`` another job for
     the head's model is popped whenever none is queued, so the model always has work waiting. With
     ``learned_footprints`` the children's memory reports feed ``footprint_store`` as the row runs.
+    ``card_max_pixels`` replaces each card's resolution limit, which is ``_MIXED_CARD_PIXELS`` when None.
     """
     long_job = make_job_pop_response(_SDXL.name, width=1024, height=1024, ddim_steps=30)
     head = make_job_pop_response(head_model.name, width=1024, height=1024, ddim_steps=4)
@@ -8748,7 +8754,7 @@ async def drive_heavy_head_on_mixed_cards(
         whole_card_enabled=True,
         closed_loop=True,
         tick_seconds=1.0,
-        card_max_pixels=_MIXED_CARD_PIXELS,
+        card_max_pixels=_MIXED_CARD_PIXELS if card_max_pixels is None else card_max_pixels,
         card_total_mb=_MIXED_CARD_TOTALS,
         service_contexts=True,
         safety_card_index=0,
@@ -8908,33 +8914,55 @@ async def test_mixed_cards_a_residency_whose_model_runs_on_the_other_card_is_rel
     assert not unserved, f"SD 1.5 job(s) {unserved} never ran on the small card. {world.state_dump()}"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "the head-protection hold applies the head's demand on every card, so the small card holds its queued "
-        "jobs back for a head it cannot seat"
-    ),
-)
-async def test_mixed_cards_a_head_is_not_staged_onto_a_card_whose_seat_it_exceeds() -> None:
-    """A Qwen Image head is served by the large card while the small card keeps serving its own queue.
+_SMALL_CARD_RESOLUTION_LIMIT_PIXELS = {0: 4_194_304, 1: 512 * 512}
+"""The large card takes any resolution these rows generate, and the small card takes the 512px SD 1.5 jobs only."""
 
-    The small card has a job running and a spare lane, so the head could be pre-staged into that lane's RAM while
-    the job finishes. Qwen Image's core weights alone exceed the small card's total, and dispatch eligibility
-    keeps the copy off that card. The row also checks that the head's demand does not hold back work on a card
-    the head cannot be placed on.
+
+async def test_mixed_cards_the_small_card_runs_its_queue_while_a_head_above_its_resolution_limit_waits() -> None:
+    """The small card runs its SD 1.5 jobs while a 1024px Flux head waits for the large card to free.
+
+    The head's resolution is above the small card's limit, so dispatch does not place it there and head protection
+    does not keep room on that card for it. The small card's queue runs before the large card's long job ends, and
+    the head is not staged on the small card.
     """
-    row = await drive_heavy_head_on_mixed_cards(head_model=_QWEN_IMAGE, small_card_busy=True, footprint_store=None)
+    row = await drive_heavy_head_on_mixed_cards(
+        head_model=_FLUX,
+        small_card_busy=True,
+        footprint_store=None,
+        card_max_pixels=_SMALL_CARD_RESOLUTION_LIMIT_PIXELS,
+    )
+    world = row.world
 
+    eligible_cards = world.scheduler._card_eligibility(row.head).eligible_card_indices
+    assert set(eligible_cards) == {0}, (
+        f"precondition: only the large card may serve the 1024px Flux head, not card(s) {sorted(eligible_cards)}. "
+        f"{world.state_dump()}"
+    )
     staged_on_small_card = [
         (tick, lane)
-        for tick, lane, model in row.world.preloads_commanded
-        if model == _QWEN_IMAGE.name and row.world._card_of(lane) == 1
+        for tick, lane, model in world.preloads_commanded
+        if model == _FLUX.name and world._card_of(lane) == 1
     ]
     assert not staged_on_small_card, (
-        f"pre-stage onto an unseatable card: Qwen Image was preloaded onto small-card lane(s) "
-        f"{staged_on_small_card}, a card whose total its core weights exceed. {row.world.state_dump()}"
+        f"Flux was preloaded onto small-card lane(s) {staged_on_small_card}, a card whose resolution limit the "
+        f"head exceeds. {world.state_dump()}"
     )
-    _assert_heavy_head_served_on_the_large_card(row, context="pre-stage onto an unseatable card")
+    long_window = world.job_windows.get(str(row.long_job.id_))
+    assert long_window is not None and long_window.sample_until is not None, (
+        f"precondition: the large card's long job must finish. {world.state_dump()}"
+    )
+    run_started_at = world.now - world.tick * world.tick_seconds
+    large_card_free_tick = int((long_window.sample_until - run_started_at) / world.tick_seconds)
+    late = {
+        str(job.id_)[:8]: world.dispatch_tick(job)
+        for job in row.small_jobs
+        if world.dispatch_tick(job) is None or world.dispatch_tick(job) >= large_card_free_tick
+    }
+    assert not late, (
+        f"SD 1.5 job(s) {late} did not start on the small card before the large card freed on tick "
+        f"{large_card_free_tick}, so the small card held its queue for a head it cannot take. {world.state_dump()}"
+    )
+    _assert_heavy_head_served_on_the_large_card(row, context="head above the small card's resolution limit")
 
 
 @pytest.mark.xfail(

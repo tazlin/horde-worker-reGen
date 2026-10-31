@@ -604,6 +604,11 @@ keeps the protection, as does a head with no lane on the card. The head keeps it
 which is dispatch order: a skipper staged first is cleared first, so where both full jobs do not fit the head
 waits behind the skipper's sample.
 
+On a worker with more than one card, protection does not apply on a card the head is not eligible for
+(`_card_eligibility`, the weight-budget, resolution and feature checks dispatch routing uses). Dispatch does not
+place the head there, so room held for it would stay empty while that card's own queue waits. A card held off
+only for the safety backlog stays eligible, because the head can return to it once the backlog drains.
+
 Protection is released the same way, and immediately, while the establish-rate limiter is deferring that
 head's whole-card establishment on the target card (see
 [Bounding residency churn](resource_governance.md#bounding-residency-churn)). For the length of that deferral

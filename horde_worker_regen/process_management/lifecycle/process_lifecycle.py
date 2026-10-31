@@ -9,7 +9,7 @@ import multiprocessing.queues
 import os
 import sys
 import time
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from multiprocessing.context import BaseContext
 from multiprocessing.process import BaseProcess
@@ -600,6 +600,21 @@ def _status_queue_writer_lock(status_queue: object) -> Lock_MultiProcessing | No
     if not isinstance(status_queue, multiprocessing.queues.Queue):
         return None
     return status_queue._wlock  # pyrefly: ignore[missing-attribute] - the stdlib keeps the writer lock private
+
+
+def safety_residency_is_fixed(card_runtimes: Mapping[int, CardRuntime], safety_card_index: int | None) -> bool:
+    """Return whether safety's place on its card is fixed, so memory pressure does not move it off the card.
+
+    True only on a worker driving more than one card while safety is on a card whose effective config permits it.
+    The lifecycle manager and the dispatch-world simulator both read this rule.
+
+    Args:
+        card_runtimes: The driven cards keyed by stable device index.
+        safety_card_index: The card the on-GPU safety process occupies, or None while it is off the GPU.
+    """
+    if len(card_runtimes) <= 1:
+        return False
+    return safety_card_index is not None and safety_card_index in safety_permitted_card_indices(card_runtimes)
 
 
 class ProcessLifecycleManager:
@@ -4375,12 +4390,10 @@ class ProcessLifecycleManager:
 
         The permission term is what keeps a config reload's withdrawal actionable
         (:meth:`demote_safety_from_unpermitted_card`): a card that no longer permits safety does not hold a
-        fixed residency, so that path can still get the process off it.
+        fixed residency, so that path can still get the process off it. The rule is
+        :func:`safety_residency_is_fixed`.
         """
-        if len(self._card_runtimes) <= 1:
-            return False
-        pinned_card = self.safety_gpu_card_index()
-        return pinned_card is not None and pinned_card in self.safety_permitted_card_indices
+        return safety_residency_is_fixed(self._card_runtimes, self.safety_gpu_card_index())
 
     def demote_safety_from_unpermitted_card(self) -> bool:
         """Move safety off-GPU when the card hosting it no longer permits an on-GPU safety process.

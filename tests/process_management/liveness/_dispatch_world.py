@@ -86,6 +86,7 @@ from horde_worker_regen.process_management.lifecycle.process_lifecycle import (
     SAFETY_READINESS_LATENCY_FLOOR_SECONDS,
     PauseOwner,
     ProcessLifecycleManager,
+    safety_residency_is_fixed,
 )
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.component_residency_map import CHECKPOINT_KIND
@@ -277,14 +278,10 @@ is still on a lane, in its pages, or on disk."""
 # krea2_turbo: 12600 MB core weights, EXTRA_LARGE by tier, and a static sampling peak above a 16 GB card's
 # achievable ceiling, so on that card it is served only by a partial load.
 _KREA2 = _ModelClass("krea2", "Krea2-Turbo_fp8", KNOWN_IMAGE_GENERATION_BASELINE.krea2_turbo, 12600.0)
-# qwen_image: 19500 MB core weights, EXTRA_LARGE by tier. The weights alone exceed a 16 GB card's total, so a
-# 16 GB card cannot seat it whatever figure the store holds, while a 24 GB card can.
-_QWEN_IMAGE = _ModelClass("qwen_image", "Qwen-Image_fp8", KNOWN_IMAGE_GENERATION_BASELINE.qwen_image, 19500.0)
 
 _KNOWN_MODEL_CLASSES = (
     *_MODEL_CLASSES,
     _KREA2,
-    _QWEN_IMAGE,
     *_FILLER_MODEL_CLASSES,
     *_ROTATION_MODEL_CLASSES,
     *_SAME_BASELINE_MODEL_CLASSES,
@@ -5879,6 +5876,19 @@ def _make_mock_lifecycle(world: _DispatchWorld) -> Mock:
     # evidence decides the flip, so a pool of several cards judged by a stand-in that never says which one
     # would be judging safety's placement against a card it does not sit on.
     lifecycle.safety_gpu_card_index = lambda: None if world.safety_is_off_gpu() else world.safety_card_index()
+    # Production's rule over the world's cards, read on every access as the manager's property is. A row may
+    # still pin a value by assignment. Mock gives each instance its own class, so the property stays on this one.
+    pinned_residency_fixed: list[bool] = []
+
+    def read_safety_residency_fixed(_mock: Mock) -> bool:
+        if pinned_residency_fixed:
+            return pinned_residency_fixed[-1]
+        return safety_residency_is_fixed(world._card_runtimes or {}, lifecycle.safety_gpu_card_index())
+
+    def pin_safety_residency_fixed(_mock: Mock, value: bool) -> None:
+        pinned_residency_fixed.append(value)
+
+    type(lifecycle).safety_residency_fixed = property(read_safety_residency_fixed, pin_safety_residency_fixed)
     lifecycle.safety_readiness_latency_seconds = world.safety_readiness_latency_seconds
     lifecycle.is_post_process_gpu_paused = False
     lifecycle.post_process_processes_should_be_replaced = False
