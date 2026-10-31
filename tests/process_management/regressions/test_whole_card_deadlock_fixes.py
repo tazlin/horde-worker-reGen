@@ -700,7 +700,7 @@ class TestPrestagedHeadProgressesWithRamOnlyModel:
             job_tracker,
             make_job_pop_response(_FLUX_MODEL, width=1216, height=1216),
         )
-        not_ready = scheduler._prestaged_whole_card_not_ready(flux_head)
+        not_ready = scheduler._prestaged_whole_card_not_ready(flux_head, flux_holder)
         assert not_ready is False, (
             "a pre-staged whole-card head whose teardown is exhausted must be ready to dispatch, "
             "even if its model is only in RAM (the model will be loaded into VRAM at sampling time)"
@@ -832,7 +832,7 @@ class TestFullDeadlockScenario:
 
         # The Flux head must be ready to dispatch.
         flux_head = job_tracker.jobs_pending_inference[0]
-        not_ready = scheduler._prestaged_whole_card_not_ready(flux_head)
+        not_ready = scheduler._prestaged_whole_card_not_ready(flux_head, flux_holder)
         assert not_ready is False, "Flux head must be ready to dispatch after convergence"
 
         # The non-head SDXL must NOT hold the whole-card residency.

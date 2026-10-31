@@ -3265,15 +3265,24 @@ class InferenceScheduler:
         """
         return residency_has_holder(self._process_map.values(), model, device_index)
 
-    def _prestaged_whole_card_not_ready(self, job: ImageGenerateJobPopResponse) -> bool:
+    def _prestaged_whole_card_not_ready(
+        self,
+        job: ImageGenerateJobPopResponse,
+        process_with_model: HordeProcessInfo,
+    ) -> bool:
         """Whether ``job`` must wait for its in-progress whole-card residency to claim the card before sampling.
 
         Dispatching a pre-staged head before convergence would commit its weights beside sibling contexts and
         force the first step to stream. The residency's stored forecast is preferred for the readiness check,
-        since it carries the target and fits-alone guarantee captured at establishment.
+        since it carries the target and fits-alone guarantee captured at establishment. Only the residency on the
+        card of ``process_with_model`` holds the job, because the job samples there. A residency for the same
+        model on another card tears down a card the job does not use.
         """
-        found, device_index = self._whole_card_ledger.holder_for_model(job.model)
-        if not found or self._whole_card_ledger.state_for(device_index).rung is not DominanceRung.CANNOT_CO_RESIDE:
+        device_index = self._routing_device_index(process_with_model)
+        if (
+            not self._whole_card_ledger.holds_model_on_card(job.model, device_index)
+            or self._whole_card_ledger.state_for(device_index).rung is not DominanceRung.CANNOT_CO_RESIDE
+        ):
             return False
         # Re-use the residency's stored forecast for the readiness check rather than re-deriving from the
         # current (possibly degraded) state: it carries the stable weight footprint, the budget-relative target,
@@ -3481,24 +3490,68 @@ class InferenceScheduler:
             return False
         if self._horde_model_map.is_model_loading(model):
             return False
-        prestage_process_id = state.prestage_process_id
-        if prestage_process_id is not None:
-            # The pre-stage target is remembered for the life of the residency, so its mere existence says
-            # nothing; only a slot still mid-load is a route to a holder.
-            prestage_process = self._process_map.get(prestage_process_id)
-            if (
-                prestage_process is not None
-                and prestage_process.is_process_alive()
-                and prestage_process.last_process_state
-                in (HordeProcessState.PRELOADING_MODEL, HordeProcessState.DOWNLOADING_MODEL)
-            ):
-                return False
+        if self._residency_prestage_in_flight(state):
+            return False
         # Only a job actually sampling keeps the residency: a pending exclusive admit for this model is exactly
         # the work that has no route to a holder, and its own claim on the card is what bars every other head.
         if self._job_tracker.has_exclusive_job_running(device_index):
             return False
         head = self._job_tracker.undispatched_head()
         return not (head is not None and head.model == model)
+
+    def _residency_prestage_in_flight(self, state: WholeCardResidency) -> bool:
+        """Return whether the residency's pre-stage slot is alive and still loading the model.
+
+        The residency keeps the pre-stage slot's id for its whole life, so the id alone does not show a load in
+        progress. Only a slot that is still loading leads to a holder on the card.
+        """
+        prestage_process_id = state.prestage_process_id
+        if prestage_process_id is None:
+            return False
+        prestage_process = self._process_map.get(prestage_process_id)
+        return (
+            prestage_process is not None
+            and prestage_process.is_process_alive()
+            and prestage_process.last_process_state
+            in (HordeProcessState.PRELOADING_MODEL, HordeProcessState.DOWNLOADING_MODEL)
+        )
+
+    def _residency_model_placed_on_another_card(
+        self,
+        device_index: int | None,
+        state: WholeCardResidency,
+        *,
+        now: float,
+    ) -> bool:
+        """Return whether the residency's model is loading or resident on another card and not held on this one.
+
+        The teardown makes room only on the residency's card, and the model's queued jobs dispatch to the copy on
+        the other card. Those jobs keep the model active, so the serving test alone would keep this card torn down
+        while the model has work anywhere. Past the establish grace the residency is released through the normal
+        restore path.
+        """
+        model = state.model
+        if model is None or device_index is None:
+            return False
+        if state.established_at == 0.0 or (now - state.established_at) < WHOLE_CARD_ESTABLISH_GRACE_SECONDS:
+            return False
+        if self._whole_card_residency_has_holder(model, device_index):
+            return False
+        if self._residency_prestage_in_flight(state):
+            return False
+        if any(
+            process_info.process_type is HordeProcessType.INFERENCE
+            and process_info.loaded_horde_model_name == model
+            and process_info.device_index != device_index
+            for process_info in self._process_map.values()
+        ):
+            return True
+        entry = self._horde_model_map.root.get(model)
+        # An unload leaves the entry ON_DISK with the last process id, and that process does not hold the model.
+        if entry is None or entry.horde_model_load_state == ModelLoadState.ON_DISK:
+            return False
+        entry_process = self._process_map.get(entry.process_id)
+        return entry_process is not None and entry_process.device_index != device_index
 
     def _restore_siblings_after_whole_card(self) -> None:
         """Restore inference concurrency and the lanes after a whole-card residency has drained.
@@ -3559,7 +3612,11 @@ class InferenceScheduler:
                 )
                 continue
             serving = model in active_models or self._job_tracker.has_exclusive_job_in_progress(device_index)
-            never_converges = serving and self._residency_can_never_converge(device_index, state, now=now)
+            # Checked separately from ``serving``, because the model's pending jobs keep it serving while they
+            # dispatch to the copy on the other card.
+            never_converges = self._residency_model_placed_on_another_card(device_index, state, now=now) or (
+                serving and self._residency_can_never_converge(device_index, state, now=now)
+            )
             if serving and not never_converges:
                 # Still serving the residency; keep it (refresh the cooldown so it survives the lull between
                 # back-to-back heavy jobs).
@@ -4699,8 +4756,8 @@ class InferenceScheduler:
         # collapsed the pool, and the head will be deferred until the recovery supervisor soft-resets. Name
         # that specific state rather than reporting a gate-less "scheduler stall", so the post-mortem points at
         # the residency teardown rather than the dispatch path.
-        found_residency, residency_device = self._whole_card_ledger.holder_for_model(head.model)
-        if found_residency and self._prestaged_whole_card_not_ready(head):
+        residency_device = self._routing_device_index(process)
+        if self._prestaged_whole_card_not_ready(head, process):
             blockers = self._whole_card_convergence_blockers(process, residency_device)
             lanes = self._whole_card_lane_blockers(residency_device)
             if blockers or lanes:
@@ -10321,21 +10378,24 @@ class InferenceScheduler:
         return {
             process.process_id: job.model
             for job, process in self._retention_affinity_candidates(head_job)
-            if job.model is not None and self._whole_card_ledger.holder_for_model(job.model)[0]
+            if job.model is not None
+            and self._whole_card_ledger.holds_model_on_card(job.model, self._routing_device_index(process))
         }
 
     def _residency_reorder_resident(self, job: ImageGenerateJobPopResponse) -> HordeProcessInfo | None:
         """The free slot on a held whole-card residency's card that holds ``job``'s model, or None.
 
-        None unless a residency is held for ``job``'s model, so only that model's own queued jobs qualify.
+        None unless the card of the resident slot holds a residency for the model of ``job``, so only that model's
+        queued jobs qualify.
         """
-        found, residency_device = self._whole_card_ledger.holder_for_model(job.model)
-        if not found:
+        # A residency for the model on any card is a precondition for one on the resident's card. Checking it first
+        # skips the resident lookup for every job whose model has no residency.
+        if not self._whole_card_ledger.holder_for_model(job.model)[0]:
             return None
         resident = self.resident_process_for_job(job, include_reserved=True)
         if resident is None or not resident.can_accept_job():
             return None
-        if residency_device is not None and resident.device_index != residency_device:
+        if not self._whole_card_ledger.holds_model_on_card(job.model, self._routing_device_index(resident)):
             return None
         return resident
 
@@ -10601,18 +10661,24 @@ class InferenceScheduler:
         for candidate_job in candidates:
             if candidate_job is head_job or candidate_job.model is None or candidate_job.model == head_job.model:
                 continue
-            found, holder_device = self._whole_card_ledger.holder_for_model(candidate_job.model)
-            if (
-                not found
-                or self._whole_card_ledger.state_for(holder_device).rung is not DominanceRung.CANNOT_CO_SAMPLE
-            ):
-                continue
-            if holder_device is not None and head_device_index is not None and holder_device != head_device_index:
+            # A run of the model on any card is a precondition for one on the candidate's card. Checking it first
+            # skips the resident lookup for every candidate whose model has no run.
+            if not self._whole_card_ledger.holder_for_model(candidate_job.model)[0]:
                 continue
             if self._job_tracker.is_degraded_dispatch_pending(candidate_job):
                 continue
             candidate_process = self._seatable_resident_process(candidate_job)
             if candidate_process is None:
+                continue
+            # Only the run on the card the job would sample on can seat it, because a run of the same model on
+            # another card does not hold this card's weights.
+            run_device = self._routing_device_index(candidate_process)
+            if (
+                not self._whole_card_ledger.holds_model_on_card(candidate_job.model, run_device)
+                or self._whole_card_ledger.state_for(run_device).rung is not DominanceRung.CANNOT_CO_SAMPLE
+            ):
+                continue
+            if run_device is not None and head_device_index is not None and run_device != head_device_index:
                 continue
             if not self._multi_gpu_routing_active and len(
                 self._job_tracker.jobs_in_progress,
@@ -11790,10 +11856,7 @@ class InferenceScheduler:
                 RetentionDenialReason.GOVERNOR_STATE,
                 f"governor: card {governor_state.value} (the reclaim ladder holds priority over new residents)",
             )
-        held, holder_device = self._whole_card_ledger.holder_for_model(model)
-        residency_names_model = held and (
-            holder_device is None or device_index is None or holder_device == device_index
-        )
+        residency_names_model = self._whole_card_ledger.holds_model_on_card(model, device_index)
         # A held residency advertises this model alone, so the slot's next job is this model by construction:
         # that is the repeat evidence, from the first job. The static fit still applies, since a checkpoint
         # whose encoders and weights together exceed the card is not helped by keeping its weights: the
@@ -14092,7 +14155,7 @@ class InferenceScheduler:
                 "its next dispatch must run degraded/isolated and is waiting for the card to clear of other work",
             )
 
-        if self._prestaged_whole_card_not_ready(next_job):
+        if self._prestaged_whole_card_not_ready(next_job, process_with_model):
             # The head was pre-staged into RAM while another job held the device; sampling commits its
             # weights to VRAM, so it must wait for the residency to finish collapsing to sole residency
             # (idle siblings stopped, safety off-GPU, the card drained) before it starts. Otherwise a

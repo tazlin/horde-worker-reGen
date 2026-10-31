@@ -451,6 +451,17 @@ class WholeCardResidencyLedger:
                 return (True, device_index)
         return (False, None)
 
+    def holds_model_on_card(self, model: str | None, device_index: int | None) -> bool:
+        """Return whether the residency on card ``device_index`` is held for ``model``.
+
+        A model can hold a residency on each of two cards, and the teardown on one card does not make room on the
+        other, so a caller with a process passes that process's card.
+        """
+        if model is None:
+            return False
+        state = self._residencies.get(device_index)
+        return state is not None and state.model == model
+
     def record_grant(
         self,
         device_index: int | None,
@@ -686,6 +697,8 @@ class WholeCardResidencyLedger:
         Returns:
             True when this fault released a standing claim, so the caller can name the end once.
         """
+        # The fault report carries only the model, and the pop claim narrows the offer for the whole worker, so this
+        # lookup uses the model alone.
         found, device_index = self.holder_for_model(model)
         if not found:
             return False

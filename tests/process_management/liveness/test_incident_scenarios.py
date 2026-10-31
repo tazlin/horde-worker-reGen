@@ -242,6 +242,7 @@ from horde_worker_regen.process_management.resources.vram_footprints import (
     FootprintKey,
     FootprintStage,
     LearnedFootprintStore,
+    ResolutionBucket,
     plausible_activation_ceiling_mb,
     sampling_footprint_key,
 )
@@ -295,7 +296,9 @@ from tests.process_management.liveness._dispatch_world import (
     _FILLER_MODEL_CLASSES,
     _FLUX,
     _KREA2,
+    _MODEL_CLASSES,
     _POST_PROCESS_LANE_ID,
+    _QWEN_IMAGE,
     _ROTATION_MODEL_CLASSES,
     _SAFETY_PROCESS_ID,
     _SAME_BASELINE_MODEL_CLASSES,
@@ -8624,3 +8627,318 @@ async def test_r_defect_reinjection_a_gate_without_the_seat_faults_the_job(monke
     assert str(row.job.id_) not in row.world.job_windows, (
         f"without the seat the job must never dispatch. {row.world.state_dump()}"
     )
+
+
+# --------------------------------------------------------------------------------------------------------
+# Mixed card sizes: a heavy head waits only on a card that can seat it
+# --------------------------------------------------------------------------------------------------------
+
+_MIXED_CARD_PIXELS = {0: 4_194_304, 1: 4_194_304}
+"""Both cards take any resolution these rows generate, so card size alone separates them."""
+
+_MIXED_CARD_TOTALS = {0: 24576.0, 1: 16275.0}
+"""Device totals of a 24 GB card and a 16 GB card as the driver reports them."""
+
+_MIXED_CARD_LONG_SAMPLE_SECONDS = 25.0
+"""How long the large card's running job samples before the large card can take the heavy head."""
+
+_MIXED_CARD_TICK_CEILING = 8
+"""Ticks the heavy head may take to reach sampling once the large card's running job has finished.
+
+A preload is sent, reported and staged over a few ticks before the head dispatches. A head held for a
+residency on the other card does not clear at all, so it fails this bound."""
+
+_MIXED_CARD_TICKS = 120
+"""Ticks each row runs: the long job, the head's load and sample on the large card, and the small card's queue."""
+
+_FLUX_STORE_MB = {
+    FootprintStage.RESIDENT: 16520.0,
+    FootprintStage.SAMPLE: 18120.0,
+    FootprintStage.SAMPLE_ACTIVATION: 1842.0,
+}
+"""Flux figures as a 24 GB card learns them, with the text encoder resident beside the weights.
+
+ComfyUI keeps the encoder on a card with room for it, so these figures include it. Priced on the 16 GB card
+they exceed the achievable ceiling, although that card runs Flux with the encoder offloaded."""
+
+
+def _large_card_flux_store() -> LearnedFootprintStore:
+    """Return a store holding the large card's Flux figures under the keys a 1024px job prices from."""
+    store = LearnedFootprintStore()
+    baseline = KNOWN_IMAGE_GENERATION_BASELINE.flux_1.value
+    keys = [
+        (
+            FootprintKey(
+                model_baseline=baseline,
+                resolution_bucket=None,
+                platform="win32",
+                stage=FootprintStage.RESIDENT,
+                checkpoint=_FLUX.name,
+            ),
+            _FLUX_STORE_MB[FootprintStage.RESIDENT],
+        ),
+    ]
+    for stage in (FootprintStage.SAMPLE, FootprintStage.SAMPLE_ACTIVATION):
+        pooled = FootprintKey(
+            model_baseline=baseline,
+            resolution_bucket=ResolutionBucket.LE_1024,
+            platform="win32",
+            stage=stage,
+        )
+        keys.append((pooled, _FLUX_STORE_MB[stage]))
+        keys.append((pooled.for_job_class(batch=1, hires_fix=False), _FLUX_STORE_MB[stage]))
+    for key, figure_mb in keys:
+        for _ in range(_MIN_OBSERVATIONS_FOR_MEASURED * 4):
+            store.observe_peak(key, figure_mb)
+    return store
+
+
+@dataclass
+class MixedCardRow:
+    """The finished world after a heavy head arrives on a host with a large card and a small card."""
+
+    world: _DispatchWorld
+    head_model: _ModelClass
+    long_job: ImageGenerateJobPopResponse
+    head: ImageGenerateJobPopResponse
+    small_jobs: list[ImageGenerateJobPopResponse]
+
+
+async def drive_heavy_head_on_mixed_cards(
+    *,
+    head_model: _ModelClass,
+    small_card_busy: bool,
+    footprint_store: LearnedFootprintStore | None,
+    follow_on_heads: bool = False,
+    ticks: int = _MIXED_CARD_TICKS,
+) -> MixedCardRow:
+    """Queue a heavy head while the large card runs a long job, then run the row out.
+
+    The small card holds an SD 1.5 lane and the post-processing lane, and safety sits on the large card. With
+    ``small_card_busy`` the small card runs a job of its own when the head arrives and has a spare lane, so the
+    head can be pre-staged there. Without it the small card is idle and holds only the resident SD 1.5 model.
+    ``footprint_store`` is the parent's learned store at startup, and None prices the head from the static seeds.
+    ``ticks`` is how many steps the row runs once the queue is filled. With ``follow_on_heads`` another job for
+    the head's model is popped whenever none is queued, so the model always has work waiting.
+    """
+    long_job = make_job_pop_response(_SDXL.name, width=1024, height=1024, ddim_steps=30)
+    head = make_job_pop_response(head_model.name, width=1024, height=1024, ddim_steps=4)
+    small_jobs = [make_job_pop_response(_SD15.name, width=512, height=512, ddim_steps=20) for _ in range(3)]
+    sample_seconds = {str(long_job.id_): _MIXED_CARD_LONG_SAMPLE_SECONDS}
+    if small_card_busy:
+        sample_seconds[str(small_jobs[0].id_)] = 8.0
+    world = _DispatchWorld(
+        card=_CARD_24GB,
+        lane_count=4 if small_card_busy else 2,
+        max_threads=1,
+        queue_depth=5,
+        whole_card_enabled=True,
+        closed_loop=True,
+        tick_seconds=1.0,
+        card_max_pixels=_MIXED_CARD_PIXELS,
+        card_total_mb=_MIXED_CARD_TOTALS,
+        service_contexts=True,
+        safety_card_index=0,
+        post_process_card_index=1,
+        sample_seconds_by_job=sample_seconds,
+        footprint_store=footprint_store,
+        extra_model_classes=() if head_model in _MODEL_CLASSES else (head_model,),
+    )
+    assert world.card_of_lane(0) == 0 and world.card_of_lane(1) == 1, "precondition: one lane per card first"
+    world.seed_resident(0, _SDXL, in_vram=True)
+    world.seed_resident(1, _SD15, in_vram=True)
+    await world.pop(long_job)
+    if small_card_busy:
+        await world.pop(small_jobs[0])
+    for _ in range(2):
+        await world.step()
+    await world.pop(head)
+    for job in small_jobs[1 if small_card_busy else 0 :]:
+        await world.pop(job)
+    for _ in range(ticks):
+        if follow_on_heads:
+            in_progress = world._job_tracker.jobs_in_progress
+            queued_heads = [
+                job
+                for job in world._job_tracker.jobs_pending_inference
+                if job.model == head_model.name and job not in in_progress
+            ]
+            if not queued_heads:
+                await world.pop(make_job_pop_response(head_model.name, width=1024, height=1024, ddim_steps=4))
+        await world.step()
+    return MixedCardRow(world=world, head_model=head_model, long_job=long_job, head=head, small_jobs=small_jobs)
+
+
+def _assert_heavy_head_served_on_the_large_card(row: MixedCardRow, *, context: str) -> None:
+    """The head samples on the large card soon after it frees, and the small card serves its own queue."""
+    world = row.world
+    assert not world.structural_queue_wedges, (
+        f"{context}: the queue-deadlock detector reported a wedge past the horizon on tick(s) "
+        f"{world.structural_queue_wedges[:6]}, which makes save-our-ship rebuild the pools and drop the queue. "
+        f"{world.state_dump()}"
+    )
+    long_window = world.job_windows.get(str(row.long_job.id_))
+    assert long_window is not None and long_window.sample_until is not None, (
+        f"{context}: precondition: the large card's long job must finish. {world.state_dump()}"
+    )
+    run_started_at = world.now - world.tick * world.tick_seconds
+    large_card_free_tick = int((long_window.sample_until - run_started_at) / world.tick_seconds)
+    head_label = row.head_model.label
+    dispatch_tick = world.dispatch_tick(row.head)
+    assert dispatch_tick is not None, (
+        f"{context}: the {head_label} head never sampled, though the large card was free from about tick "
+        f"{large_card_free_tick} and is the only card whose ceiling covers it. {world.state_dump()}"
+    )
+    head_lanes = [lane for model, lane in world.dispatch_lanes if model == row.head_model.name]
+    assert head_lanes and all(world._card_of(lane) == 0 for lane in head_lanes), (
+        f"{context}: the {head_label} head was dispatched to lane(s) {head_lanes}, not on the large card. "
+        f"{world.state_dump()}"
+    )
+    assert dispatch_tick <= large_card_free_tick + _MIXED_CARD_TICK_CEILING, (
+        f"{context}: the {head_label} head reached sampling on tick {dispatch_tick}, more than "
+        f"{_MIXED_CARD_TICK_CEILING} ticks after the large card freed. {world.state_dump()}"
+    )
+    unserved = [str(job.id_)[:8] for job in row.small_jobs if world.dispatch_tick(job) is None]
+    assert not unserved, (
+        f"{context}: SD 1.5 job(s) {unserved} never ran, though the small card holds SD 1.5 and has room for it. "
+        f"{world.state_dump()}"
+    )
+    assert_never_idle_with_fitting_work(world, context=context)
+
+
+async def test_mixed_cards_a_residency_on_a_card_that_cannot_seat_the_model_does_not_hold_its_head() -> None:
+    """A Flux head with a residency on the small card samples on the large card once that card frees.
+
+    A Flux head that arrives while the large card is busy is priced against the idle small card and gets a
+    whole-card residency there. Flux then loads on the large card when it frees. The dispatch gate checks the
+    residency on the card the head samples on, so the small card's residency does not hold the head, and the
+    small card keeps serving SD 1.5.
+    """
+    row = await drive_heavy_head_on_mixed_cards(
+        head_model=_FLUX, small_card_busy=False, footprint_store=_large_card_flux_store()
+    )
+
+    _assert_heavy_head_served_on_the_large_card(row, context="residency on an unseatable card")
+
+
+async def test_mixed_cards_a_residency_on_the_heads_own_card_holds_it_until_convergence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Flux residency on the large card holds a Flux head resident there until that card converges.
+
+    The dispatch gate checks the residency on the card the head would sample on. A residency for the same model on
+    the small card does not hold the head. A residency on the head's card holds it until the teardown reaches sole
+    residency.
+    """
+    row = await drive_heavy_head_on_mixed_cards(
+        head_model=_FLUX, small_card_busy=False, footprint_store=_large_card_flux_store(), ticks=0
+    )
+    scheduler = row.world.scheduler
+    ledger = scheduler._whole_card_ledger
+    for _device_index, state in ledger.held():
+        state.model = None
+    monkeypatch.setattr(
+        scheduler,
+        "_whole_card_teardown_exhausted",
+        lambda _forecast, device_index=None: False,
+    )
+    large_card_lane = scheduler._process_map[0]
+    assert large_card_lane.device_index == 0, "precondition: process 0 is the large card's lane"
+
+    ledger.state_for(1).model = _FLUX.name
+    assert not scheduler._prestaged_whole_card_not_ready(row.head, large_card_lane), (
+        "a Flux residency on the small card held a head resident on the large card, a card it does not tear down"
+    )
+
+    ledger.state_for(0).model = _FLUX.name
+    assert scheduler._prestaged_whole_card_not_ready(row.head, large_card_lane), (
+        "a Flux residency on the large card did not hold the head resident there before that card converged"
+    )
+
+
+_MIXED_CARD_STREAM_TICKS = 260
+"""Ticks the follow-on row runs: past the establish grace and the cooldown after it, with room to regrow."""
+
+
+async def test_mixed_cards_a_residency_whose_model_runs_on_the_other_card_is_released_while_its_model_has_work() -> (
+    None
+):
+    """The small card's Flux residency ends while Flux keeps arriving and runs on the large card.
+
+    Nothing on the small card holds Flux, and every Flux job dispatches to the copy on the large card. A steady
+    supply of Flux jobs keeps the model active. If pending work alone kept the residency, the small card would stay
+    torn down with its lanes paused for as long as Flux jobs arrive.
+    """
+    row = await drive_heavy_head_on_mixed_cards(
+        head_model=_FLUX,
+        small_card_busy=False,
+        footprint_store=_large_card_flux_store(),
+        follow_on_heads=True,
+        ticks=_MIXED_CARD_STREAM_TICKS,
+    )
+    world = row.world
+
+    assert world.dispatch_tick(row.head) is not None, (
+        f"precondition: the Flux head must sample on the large card. {world.state_dump()}"
+    )
+    flux_lanes = {lane for model, lane in world.dispatch_lanes if model == _FLUX.name}
+    assert flux_lanes and all(world._card_of(lane) == 0 for lane in flux_lanes), (
+        f"precondition: every Flux job must sample on the large card, not lane(s) {sorted(flux_lanes)}. "
+        f"{world.state_dump()}"
+    )
+    assert not world.scheduler._whole_card_ledger.holds_model_on_card(_FLUX.name, 1), (
+        f"the small card still holds a Flux residency after {_MIXED_CARD_STREAM_TICKS} ticks, past the establish "
+        f"grace, with no Flux holder or loading pre-stage on that card. {world.state_dump()}"
+    )
+    unserved = [str(job.id_)[:8] for job in row.small_jobs if world.dispatch_tick(job) is None]
+    assert not unserved, f"SD 1.5 job(s) {unserved} never ran on the small card. {world.state_dump()}"
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "the head-protection hold applies the head's demand on every card, so the small card holds its queued "
+        "jobs back for a head it cannot seat"
+    ),
+)
+async def test_mixed_cards_a_head_is_not_staged_onto_a_card_whose_seat_it_exceeds() -> None:
+    """A Qwen Image head is served by the large card while the small card keeps serving its own queue.
+
+    The small card has a job running and a spare lane, so the head could be pre-staged into that lane's RAM while
+    the job finishes. Qwen Image's core weights alone exceed the small card's total, and dispatch eligibility
+    keeps the copy off that card. The row also checks that the head's demand does not hold back work on a card
+    the head cannot be placed on.
+    """
+    row = await drive_heavy_head_on_mixed_cards(head_model=_QWEN_IMAGE, small_card_busy=True, footprint_store=None)
+
+    staged_on_small_card = [
+        (tick, lane)
+        for tick, lane, model in row.world.preloads_commanded
+        if model == _QWEN_IMAGE.name and row.world._card_of(lane) == 1
+    ]
+    assert not staged_on_small_card, (
+        f"pre-stage onto an unseatable card: Qwen Image was preloaded onto small-card lane(s) "
+        f"{staged_on_small_card}, a card whose total its core weights exceed. {row.world.state_dump()}"
+    )
+    _assert_heavy_head_served_on_the_large_card(row, context="pre-stage onto an unseatable card")
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "learned figures do not carry the card they were measured on, so the large card's sampling peak prices "
+        "the head on the small card and the arbiter returns a structural DENY for the copy staged there"
+    ),
+)
+async def test_mixed_cards_a_head_staged_onto_an_unmeasured_card_still_reaches_the_card_that_frees() -> None:
+    """A Flux head staged onto the small card still samples on the large card once that card frees.
+
+    The store holds only the large card's Flux figures, which include the resident text encoder and exceed the
+    small card's ceiling. The small card runs Flux with the encoder offloaded, so staging there is acceptable.
+    Dispatch must not hold the head on a copy the arbiter refuses while the large card is free.
+    """
+    row = await drive_heavy_head_on_mixed_cards(
+        head_model=_FLUX, small_card_busy=True, footprint_store=_large_card_flux_store()
+    )
+
+    _assert_heavy_head_served_on_the_large_card(row, context="head held on a copy the arbiter refuses")

@@ -276,10 +276,14 @@ is still on a lane, in its pages, or on disk."""
 # krea2_turbo: 12600 MB core weights, EXTRA_LARGE by tier, and a static sampling peak above a 16 GB card's
 # achievable ceiling, so on that card it is served only by a partial load.
 _KREA2 = _ModelClass("krea2", "Krea2-Turbo_fp8", KNOWN_IMAGE_GENERATION_BASELINE.krea2_turbo, 12600.0)
+# qwen_image: 19500 MB core weights, EXTRA_LARGE by tier. The weights alone exceed a 16 GB card's total, so a
+# 16 GB card cannot seat it whatever figure the store holds, while a 24 GB card can.
+_QWEN_IMAGE = _ModelClass("qwen_image", "Qwen-Image_fp8", KNOWN_IMAGE_GENERATION_BASELINE.qwen_image, 19500.0)
 
 _KNOWN_MODEL_CLASSES = (
     *_MODEL_CLASSES,
     _KREA2,
+    _QWEN_IMAGE,
     *_FILLER_MODEL_CLASSES,
     *_ROTATION_MODEL_CLASSES,
     *_SAME_BASELINE_MODEL_CLASSES,
@@ -902,6 +906,7 @@ class _DispatchWorld:
         preload_latency_seconds: float = 0.0,
         disaggregated_encode_seconds: float = 0.0,
         card_max_pixels: dict[int, int] | None = None,
+        card_total_mb: Mapping[int, float] | None = None,
         safety_card_index: int = 0,
         post_process_card_index: int = 0,
         post_processing_chain_ticks: int = 0,
@@ -1136,6 +1141,10 @@ class _DispatchWorld:
                 independent memory domains: every card carries its own total, its own committed tenants and its
                 own measured free reading. None keeps the single card every other row runs on, where routing is
                 a strict no-op and the ledger holds one entry.
+            card_total_mb: Per-card device totals for a multi-card pool of mixed sizes, keyed by device index. A
+                card listed here carries that total in the ledger, the runtime and the admission margin, which
+                production sizes per card from the card's total. A card left out keeps the total of ``card``.
+                The keys must be cards that ``card_max_pixels`` lists.
             safety_card_index: The card the on-GPU safety process is pinned to, which is the card its charge
                 lands on and the card its placement policy reasons about. The lowest index is the historical
                 fixed pin and what every single-card row runs on.
@@ -1587,7 +1596,11 @@ class _DispatchWorld:
         The truthful reading clamps at zero, so a card committed past its total reads exactly as a full one; this
         is where the difference, which a driver pays for by paging, is kept."""
         card_indices = sorted(card_max_pixels) if card_max_pixels else [0]
-        self._card_totals: dict[int, float] = dict.fromkeys(card_indices, card.total_mb)
+        if card_total_mb is not None and not set(card_total_mb) <= set(card_indices):
+            raise ValueError("card_total_mb lists a card that card_max_pixels does not list")
+        self._card_totals: dict[int, float] = {
+            index: (card_total_mb or {}).get(index, card.total_mb) for index in card_indices
+        }
         """The conserved ledger, one entry per card: what that card's total is, and therefore what its free
         reading is once the tenants charged to it are taken off. Cards are independent memory domains, so
         every figure derived from the ledger is derived per index; a single-card row holds one entry and every
@@ -1689,13 +1702,19 @@ class _DispatchWorld:
         card_runtimes: dict[int, CardRuntime] = {}
         if card_max_pixels:
             for device_index, max_pixels in sorted(card_max_pixels.items()):
+                card_total = self._card_totals[device_index]
                 card_config = make_mock_bridge_data(
                     max_threads=max_threads,
                     queue_size=queue_depth,
                     image_models_to_load=[model.name for model in self._model_classes],
                     max_pixels=max_pixels,
-                    # Keep a routed card on the same explicit virtual-card physics as the global config.
-                    vram_admission_noise_mb=noise_mb,
+                    # Keep a routed card on the same explicit virtual-card physics as the global config. A card with
+                    # a different total carries the margin that production sizes from that total.
+                    vram_admission_noise_mb=(
+                        noise_mb
+                        if admission_noise_mb is not None or card_total == card.total_mb
+                        else admission_noise_buffer_mb(card_total)
+                    ),
                     # safety_on_gpu is a per-card permission read off the effective card config, so a card
                     # here carries the same answer the global config gives (no per-card delta in this world).
                     safety_on_gpu=service_contexts,
@@ -1708,7 +1727,7 @@ class _DispatchWorld:
                     make_test_card_runtimes(
                         device_indices=(device_index,),
                         config=card_config,
-                        total_vram_mb=card.total_mb,
+                        total_vram_mb=card_total,
                         target_process_count=max(1, lanes_on_card),
                         max_concurrent_inference=max_threads,
                     ),

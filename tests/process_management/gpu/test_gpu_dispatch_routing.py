@@ -1862,7 +1862,7 @@ class TestEveryWithheldDispatchIsRecorded:
         scheduler = self._one_card_scheduler((0, "model_a"))
         scheduler.begin_scheduling_cycle()
         (head,) = await _queue(scheduler, "model_a")
-        monkeypatch.setattr(scheduler, "_prestaged_whole_card_not_ready", lambda _job: True)
+        monkeypatch.setattr(scheduler, "_prestaged_whole_card_not_ready", lambda _job, _process: True)
 
         decline = await self._decline_for(scheduler, head)
 
