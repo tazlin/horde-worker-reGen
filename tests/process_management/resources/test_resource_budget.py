@@ -1437,6 +1437,7 @@ class TestSchedulerDominanceVerdict:
             resolution_bucket=ResolutionBucket.LE_1024,
             platform=sys.platform,
             stage=FootprintStage.SAMPLE,
+            card_total_gb=16,
         )
         for _ in range(count):
             store.observe_peak(key, peak_mb)

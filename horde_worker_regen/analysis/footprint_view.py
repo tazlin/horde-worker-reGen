@@ -8,6 +8,7 @@ figure through the store's own estimate methods, so the view moves with the prod
 - :func:`learned_sampling_footprints`: one row per sampling key with its two pricing terms, the resident
   figures for its baseline and the activation watermark for its band.
 - :func:`render_learned_sampling_footprints`: the terminal rendering.
+- :func:`card_blind_entries_dropped`: how many entries of a file written before keys carried a card were dropped.
 - :func:`default_footprint_store_path`: the bundle's copy beside a bundle's ``stats/``, else the worker's store.
 """
 
@@ -56,6 +57,8 @@ class SamplingFootprintRow:
     baseline: str
     resolution_bucket: str | None
     stage: str
+    card_total_gb: int
+    """The card-size class (GiB) of the card the figures were measured on."""
     job_class: str
     """``all`` for the pooled key, else ``b<batch>`` with `` hires`` appended for a hires-fix pass. A chain's
     operations for a post-processing key."""
@@ -87,7 +90,7 @@ def default_footprint_store_path(stats_dir: Path | None) -> Path:
     return default_app_state_dir() / FOOTPRINT_STORE_FILENAME
 
 
-def learned_sampling_footprints(path: Path) -> list[SamplingFootprintRow]:
+def learned_sampling_footprints(path: Path, *, card_gb: int | None = None) -> list[SamplingFootprintRow]:
     """Load the footprint store at ``path`` and return one row per sampling key, read-only.
 
     The store loads the file exactly as the worker does, so a key a worker would discard (another schema
@@ -95,12 +98,14 @@ def learned_sampling_footprints(path: Path) -> list[SamplingFootprintRow]:
 
     Args:
         path: A ``vram_footprints.json`` file.
+        card_gb: The card-size class (GiB) of the one card that wrote a file whose keys carry no card. Without
+            it such a file's entries are dropped, as a worker driving several cards drops them.
 
     Returns:
-        Sampling rows sorted by baseline, band and stage. Empty for a missing or unreadable file.
+        Sampling rows sorted by baseline, band, card and stage. Empty for a missing or unreadable file.
     """
-    store = LearnedFootprintStore(path=path)
-    keys = [key for key in _persisted_keys(path) if store.get_observation(key) is not None]
+    store = _open_store(path, card_gb)
+    keys = [key for key in _persisted_keys(path, card_gb) if store.get_observation(key) is not None]
     rows: list[SamplingFootprintRow] = []
     for key in keys:
         if key.stage not in _LISTED_STAGES:
@@ -113,6 +118,7 @@ def learned_sampling_footprints(path: Path) -> list[SamplingFootprintRow]:
                 baseline=key.model_baseline,
                 resolution_bucket=None if key.resolution_bucket is None else key.resolution_bucket.value,
                 stage=key.stage.value,
+                card_total_gb=key.card_total_gb,
                 job_class=_job_class_label(key),
                 platform=key.platform,
                 observation_count=observation.observation_count,
@@ -123,8 +129,26 @@ def learned_sampling_footprints(path: Path) -> list[SamplingFootprintRow]:
                 residents=_residents_for(store, keys, key),
             ),
         )
-    rows.sort(key=lambda row: (row.baseline, row.resolution_bucket or "", row.stage, row.job_class))
+    rows.sort(
+        key=lambda row: (row.baseline, row.resolution_bucket or "", row.card_total_gb, row.stage, row.job_class),
+    )
     return rows
+
+
+def card_blind_entries_dropped(path: Path, *, card_gb: int | None = None) -> int:
+    """Return how many entries of a file whose keys carry no card the load drops, zero for a current file.
+
+    Args:
+        path: A ``vram_footprints.json`` file.
+        card_gb: The card-size class (GiB) of the one card that wrote the file, as :func:`learned_sampling_footprints`
+            takes it.
+    """
+    return _open_store(path, card_gb).card_blind_entries_dropped
+
+
+def _open_store(path: Path, card_gb: int | None) -> LearnedFootprintStore:
+    """Open the store as a worker driving the one card ``card_gb`` would, or as one whose cards are unknown."""
+    return LearnedFootprintStore(path=path, driven_card_totals_gb=None if card_gb is None else [card_gb])
 
 
 def _job_class_label(key: FootprintKey) -> str:
@@ -135,10 +159,24 @@ def _job_class_label(key: FootprintKey) -> str:
     return f"b{key.batch}{' hires' if key.hires_fix else ''}"
 
 
-def render_learned_sampling_footprints(path: Path, rows: list[SamplingFootprintRow]) -> str:
-    """Render the sampling rows for terminal output, figures only."""
+def render_learned_sampling_footprints(
+    path: Path, rows: list[SamplingFootprintRow], *, card_gb: int | None = None
+) -> str:
+    """Render the sampling rows for terminal output, figures only.
+
+    For a file whose keys carry no card, the output reports how many entries were dropped and why, so an empty
+    view of an older bundle is not mistaken for an empty store.
+    """
+    dropped = card_blind_entries_dropped(path, card_gb=card_gb)
+    dropped_line = (
+        f"   older figures left out: {dropped}. They were recorded before figures carried their card, and the card "
+        "that measured them is not known. Pass the card size to read them."
+        if dropped > 0
+        else None
+    )
     if not rows:
-        return f"== Learned footprints ({path}) ==\n   no sampling entries"
+        lines = [f"== Learned footprints ({path}) ==", "   no sampling entries"]
+        return "\n".join([*lines, *([dropped_line] if dropped_line is not None else [])])
     out = [
         f"== Learned footprints ({path}) ==",
         "   watermark: the highest VRAM use recorded for this kind of job.",
@@ -146,6 +184,8 @@ def render_learned_sampling_footprints(path: Path, rows: list[SamplingFootprintR
         "A job is budgeted at this figure when it is the lower of the two.",
         "   activation watermark: the highest VRAM use recorded beyond the model weights.",
         "   resident: the VRAM a loaded model holds while idle, without the per-process CUDA context.",
+        "   Every figure belongs to the card size it was measured on.",
+        *([dropped_line] if dropped_line is not None else []),
     ]
     for row in rows:
         measured = (
@@ -155,7 +195,8 @@ def render_learned_sampling_footprints(path: Path, rows: list[SamplingFootprintR
         )
         activation = "n/a" if row.activation_watermark_mb is None else f"{row.activation_watermark_mb:.0f}MB"
         out.append(
-            f"   {row.baseline} {row.resolution_bucket or '-'} {row.stage} [{row.job_class}]: "
+            f"   {row.baseline} {row.resolution_bucket or '-'} {row.card_total_gb}GB card {row.stage} "
+            f"[{row.job_class}]: "
             f"watermark {row.watermark_mb:.0f}MB, "
             f"{measured} ({_count_text(row.observation_count, 'observation')}), "
             f"activation watermark {activation}, resident {_render_residents(row.residents)}"
@@ -168,8 +209,11 @@ def _count_text(count: int, singular: str) -> str:
     return f"{count} {singular}" if count == 1 else f"{count} {singular}s"
 
 
-def _persisted_keys(path: Path) -> list[FootprintKey]:
-    """Return the keys named in the file; the store holds no public key listing, the numbers come from it."""
+def _persisted_keys(path: Path, card_gb: int | None) -> list[FootprintKey]:
+    """Return the keys listed in the file, read directly because the store does not list its keys.
+
+    A key without a card is read under ``card_gb``, the same way the store re-keys it on load.
+    """
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -181,8 +225,11 @@ def _persisted_keys(path: Path) -> list[FootprintKey]:
     for entry in entries:
         if not isinstance(entry, dict):
             continue
+        key_data = entry.get("key")
+        if isinstance(key_data, dict) and "card_total_gb" not in key_data and card_gb is not None:
+            key_data = {**key_data, "card_total_gb": card_gb}
         try:
-            keys.append(FootprintKey.model_validate(entry.get("key")))
+            keys.append(FootprintKey.model_validate(key_data))
         except ValueError:
             continue
     return keys
@@ -211,6 +258,7 @@ def _residents_for(
         if key.stage is FootprintStage.RESIDENT
         and key.model_baseline == sampling_key.model_baseline
         and key.platform == sampling_key.platform
+        and key.card_total_gb == sampling_key.card_total_gb
     ]
     residents.sort(key=lambda resident: resident.resident_mb, reverse=True)
     return residents
@@ -227,6 +275,7 @@ def _render_residents(residents: list[ResidentFootprint]) -> str:
 __all__ = [
     "ResidentFootprint",
     "SamplingFootprintRow",
+    "card_blind_entries_dropped",
     "default_footprint_store_path",
     "learned_sampling_footprints",
     "render_learned_sampling_footprints",

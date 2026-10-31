@@ -126,6 +126,7 @@ from horde_worker_regen.process_management.resources.vram_footprints import (
     FootprintKey,
     FootprintStage,
     LearnedFootprintStore,
+    card_total_gb,
     learned_post_process_vram_mb,
 )
 from horde_worker_regen.process_management.scheduling.admission.pricing import staging_charge_mb
@@ -1818,6 +1819,7 @@ class _DispatchWorld:
                     model_baseline=SAFETY_PROCESS_BASELINE,
                     resolution_bucket=None,
                     platform=sys.platform,
+                    card_total_gb=self._card_gb(self._safety_card_index),
                     stage=FootprintStage.SAFETY_CHECK,
                 ),
                 SAFETY_GPU_LOAD_CHARGE_MB + self.safety_check_growth_mb,
@@ -1983,6 +1985,13 @@ class _DispatchWorld:
         if process is not None:
             return process.device_index
         return self._lane_cards.get(process_id, self._safety_card_index)
+
+    def _card_gb(self, device_index: int | None) -> int:
+        """The card-size class learned figures on ``device_index`` are keyed under, as the card's lanes report it."""
+        total_mb = self._card_totals.get(device_index if device_index is not None else self._safety_card_index)
+        card_gb = card_total_gb(total_mb if total_mb is not None else self.card.total_mb)
+        assert card_gb is not None
+        return card_gb
 
     def _context_charge_mb(self, device_index: int) -> float:
         """One card's total context cost: the one-time runtime, each further context, and safety's weights.
@@ -3582,6 +3591,7 @@ class _DispatchWorld:
                         self.footprint_store,
                         job_info.sdk_api_job_info,
                         self.post_process_chain_estimate_mb,
+                        card_total_gb=self._card_gb(lane.device_index),
                     )
                     or 0.0
                 )

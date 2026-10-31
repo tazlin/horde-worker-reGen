@@ -46,6 +46,7 @@ from horde_worker_regen.process_management.resources.vram_arbiter import (
 )
 from horde_worker_regen.process_management.resources.vram_footprints import (
     LearnedFootprintStore,
+    card_total_gb,
     learned_post_process_vram_mb,
 )
 from horde_worker_regen.process_management.scheduling.workload_flow import POST_PROCESS_RESERVE_FLOW
@@ -345,8 +346,10 @@ class PostProcessOrchestrator:
             ),
         )
 
-    def _estimate_post_processing_vram_mb(self, completed_job_info: HordeJobInfo) -> float:
-        """Return the committed VRAM reserve for this post-processing unit."""
+    def _estimate_post_processing_vram_mb(
+        self, completed_job_info: HordeJobInfo, post_process_process: HordeProcessInfo
+    ) -> float:
+        """Return the committed VRAM reserve for this post-processing unit on the lane's card."""
         sdk_job = completed_job_info.sdk_api_job_info
         baseline = self._model_metadata.get_baseline(sdk_job.model) if sdk_job.model is not None else None
         baseline_name = str(getattr(baseline, "value", baseline)) if baseline is not None else None
@@ -354,6 +357,7 @@ class PostProcessOrchestrator:
             self._footprint_store,
             sdk_job,
             predict_job_post_processing_vram_mb(sdk_job, baseline_name),
+            card_total_gb=card_total_gb(post_process_process.total_vram_mb),
         )
         if estimate is None:
             return 0.0
@@ -784,7 +788,7 @@ class PostProcessOrchestrator:
                 await self._fault_and_abandon(completed_job_info, post_process_process)
                 continue
 
-            reserve_vram_mb = self._estimate_post_processing_vram_mb(completed_job_info)
+            reserve_vram_mb = self._estimate_post_processing_vram_mb(completed_job_info, post_process_process)
             if await self._fault_if_exceeds_lane_cap(
                 completed_job_info=completed_job_info,
                 post_process_process=post_process_process,

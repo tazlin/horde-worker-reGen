@@ -462,7 +462,7 @@ def test_concurrent_sampling_gate_is_wired_to_the_shared_arbiter() -> None:
 
     # The peak estimator runs against the real manager without error (returns a float or None).
     job_info = SimpleNamespace(sdk_api_job_info=make_job_pop_response(model=_MODEL))
-    _peak = pm._inference_scheduler.estimate_disaggregated_sampling_peak_mb(job_info)  # type: ignore[arg-type]
+    _peak = pm._inference_scheduler.estimate_disaggregated_sampling_peak_mb(job_info, None)  # type: ignore[arg-type]
 
     # No cycle snapshot has been frozen on the arbiter, so the gate admits on missing telemetry.
     assert orchestrator._admit_concurrent_sampling(8260.0) is True

@@ -52,6 +52,7 @@ from horde_worker_regen.process_management.resources.vram_footprints import (
     FootprintStage,
     LearnedFootprintStore,
     ResolutionBucket,
+    card_total_gb,
 )
 from horde_worker_regen.run_root import AbortSentinelKind, abort_sentinel_path
 from horde_worker_regen.runtime_version import HORDELIB_DISTRIBUTION
@@ -297,7 +298,10 @@ def _opened_footprint_store(path: Path) -> LearnedFootprintStore | None:
     judges are whatever a previous run left behind; nothing writes them while the report is built.
     """
     try:
-        return LearnedFootprintStore(path=path)
+        return LearnedFootprintStore(
+            path=path,
+            driven_card_totals_gb=[card_total_gb(vram_mb) for _name, vram_mb, _kind in _probed_accelerators()],
+        )
     except Exception as error:  # noqa: BLE001 - an unreadable store is an unmeasured machine, not a crash
         logger.debug(f"Could not open the learned footprint store at {path}: {type(error).__name__} {error}")
         return None
@@ -499,8 +503,8 @@ def _check_cuda(probes: Probes) -> PreflightCheck:
     return PreflightCheck(name="cuda", severity="ok", detail="; ".join(devices))
 
 
-def _measured_need_mb(probes: Probes, model: str) -> float | None:
-    """What this machine has measured a model to cost the card, or None when it has never measured it.
+def _measured_need_mb(probes: Probes, model: str, card_gb: int) -> float | None:
+    """What this machine has measured a model to cost a card of ``card_gb``, or None when it has never measured it.
 
     The store keeps two quantities apart: the checkpoint's resident weights, keyed to the file, and the
     whole-job sampling peak of its baseline, keyed to the resolution band. The sampling peak already holds
@@ -517,6 +521,7 @@ def _measured_need_mb(probes: Probes, model: str) -> float | None:
             model_baseline=baseline,
             resolution_bucket=None,
             platform=sys.platform,
+            card_total_gb=card_gb,
             stage=FootprintStage.RESIDENT,
             checkpoint=model,
         ),
@@ -530,6 +535,7 @@ def _measured_need_mb(probes: Probes, model: str) -> float | None:
                     model_baseline=baseline,
                     resolution_bucket=bucket,
                     platform=sys.platform,
+                    card_total_gb=card_gb,
                     stage=FootprintStage.SAMPLE,
                     checkpoint=None,
                 ),
@@ -560,7 +566,8 @@ def _check_vram(probes: Probes, tier: str, models: list[str]) -> PreflightCheck:
             fix="install a GPU torch build in the worker venv (see docs/how-to/choose-a-pytorch-build.md)",
         )
 
-    needs = {model: _measured_need_mb(probes, model) for model in models}
+    card_gb = card_total_gb(vram_mb)
+    needs = {model: _measured_need_mb(probes, model, card_gb) if card_gb is not None else None for model in models}
     overruns = sorted(
         ((need, model) for model, need in needs.items() if need is not None and need > vram_mb),
         reverse=True,

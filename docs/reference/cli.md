@@ -217,7 +217,9 @@ Four more views read what a support bundle carries:
   its job class (`[b4]`, `[b1 hires]`), and each learned post-processing chain, tagged with its operations, with
   the two terms admission prices it from: the raise-only watermark and the margined measured figure net of the context charge (`n/a` until the
   key's window holds enough jobs), beside the `sample_activation` watermark for the same band and the
-  resident figures of the baseline's checkpoints. The text report prints figures only; the JSON output
+  resident figures of the baseline's checkpoints, each row showing the card size its figures were measured on.
+  The report does not list the entries of a store written before figures carried their card, and gives how
+  many it left out. The text report prints figures only; the JSON output
   carries the sampling concurrency, the clearance holds and the idle attribution (`idle_attribution`: totals,
   per-segment seconds and every bucket; the per-stretch rows are left out), not the footprints.
 
@@ -616,7 +618,7 @@ The `vram` check judges the card only against what this machine has already meas
 model's components on and off the card, so a checkpoint larger than the card still runs and its size
 predicts nothing; the check reads the learned footprint store
 (`.horde_worker_regen/vram_footprints.json`) for each of the tier's models and reports the highest peak
-measured for it against the card. The row never fails: a peak above the card is paging on a demand-paging
+measured for it on a card of the largest visible card's size against that card. The row never fails. A peak above the card is paging on a demand-paging
 driver or a failed job, and only a run tells which, so it is a `WARN` naming the model. Where a model has
 never been measured here the row is also `WARN`: it names the unverified models and the largest checkpoint
 on disk, and asks for the tier's one-model smoke first rather than refusing a run that may well work. The `civitai token`

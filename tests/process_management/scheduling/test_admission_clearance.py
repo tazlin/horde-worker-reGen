@@ -33,7 +33,9 @@ from horde_worker_regen.process_management.resources.vram_footprints import (
     FootprintKey,
     FootprintStage,
     LearnedFootprintStore,
+    card_total_gb,
     job_class_key,
+    plausible_sampling_peak_mb,
     sampling_footprint_key,
 )
 from horde_worker_regen.process_management.scheduling.admission import clearance as clearance_module
@@ -984,7 +986,7 @@ def _expected_seat_mb(
 
     snapshot = scheduler.snapshot()
     weights_mb = predict_job_weight_mb(job, str(_KREA2_BASELINE))
-    activation_mb = pricing.partial_seat_activation_mb(snapshot, job, str(_KREA2_BASELINE))
+    activation_mb = pricing.partial_seat_activation_mb(snapshot, job, str(_KREA2_BASELINE), device_index=None)
     assert weights_mb is not None and activation_mb is not None
     return weight_fraction * weights_mb + max(activation_mb, effective_inference_reserve_mb(_SIXTEEN_GB_MB, 0.0))
 
@@ -1115,7 +1117,9 @@ def _expected_sampling_reserve_mb(scheduler: InferenceScheduler, job: ImageGener
     """The seat's non-weight term, the larger of the job's activation and ComfyUI's inference reserve."""
     from horde_worker_regen.process_management.resources.resource_budget import effective_inference_reserve_mb
 
-    activation_mb = pricing.partial_seat_activation_mb(scheduler.snapshot(), job, str(_KREA2_BASELINE))
+    activation_mb = pricing.partial_seat_activation_mb(
+        scheduler.snapshot(), job, str(_KREA2_BASELINE), device_index=None
+    )
     assert activation_mb is not None
     return max(activation_mb, effective_inference_reserve_mb(_SIXTEEN_GB_MB, 0.0))
 
@@ -1169,7 +1173,12 @@ def _seed_activation_window(
 ) -> tuple[LearnedFootprintStore, FootprintKey, FootprintKey]:
     """Give the scheduler a store whose activation keys for ``job`` have seen ``readings_mb``, oldest first."""
     store = LearnedFootprintStore()
-    key = sampling_footprint_key(job, str(_KREA2_BASELINE), stage=FootprintStage.SAMPLE_ACTIVATION)
+    key = sampling_footprint_key(
+        job,
+        str(_KREA2_BASELINE),
+        stage=FootprintStage.SAMPLE_ACTIVATION,
+        card_total_gb=card_total_gb(_SIXTEEN_GB_MB),
+    )
     assert key is not None
     class_key = job_class_key(key, job)
     for reading_mb in readings_mb:
@@ -1179,10 +1188,10 @@ def _seed_activation_window(
 
 
 async def test_the_activation_prices_from_the_measured_window_not_the_watermark() -> None:
-    """A card-sized reading keeps the watermark at 16 GB, yet the window of 1 to 3 GB jobs sets the reserve.
+    """A card-sized reading keeps the watermark near the whole card, yet the window of 1 to 3 GB jobs sets the reserve.
 
     The grant carries the reserve as room the child's load leaves free, so pricing it at the watermark would
-    force every later load of the key to be partial.
+    force every later load of the key to be partial. The store clamps the reading to its key's card on attach.
     """
     scheduler, job, waiter = await _krea2_staged_waiter()
     window_mb = [1000.0 + 100.0 * index for index in range(20)]
@@ -1190,11 +1199,14 @@ async def test_the_activation_prices_from_the_measured_window_not_the_watermark(
     snapshot = scheduler.snapshot()
     baseline = str(_KREA2_BASELINE)
     observation = store.get_observation(class_key)
-    assert observation is not None and observation.watermark_mb == _CARD_SIZED_ACTIVATION_MB
+    card_bound_mb = plausible_sampling_peak_mb(class_key, class_key.card_total_gb * 1024.0)
+    assert card_bound_mb is not None
+    assert observation is not None
+    assert observation.watermark_mb == pytest.approx(min(_CARD_SIZED_ACTIVATION_MB, card_bound_mb))
     measured_mb = store.measured_job_estimate_net_of_context_mb(key, class_key)
     assert measured_mb is not None
 
-    activation_mb = pricing.partial_seat_activation_mb(snapshot, job, baseline)
+    activation_mb = pricing.partial_seat_activation_mb(snapshot, job, baseline, device_index=None)
     reserve_mb = pricing.sampling_reserve_mb(snapshot, job, baseline, device_index=waiter.device_index)
 
     assert measured_mb < observation.watermark_mb / 2
@@ -1213,7 +1225,7 @@ async def test_an_under_observed_activation_prices_at_the_static_seed() -> None:
     sampler_only_mb = predict_job_sampler_only_vram_mb(job, baseline)
     assert weights_mb is not None and sampler_only_mb is not None
 
-    activation_mb = pricing.partial_seat_activation_mb(scheduler.snapshot(), job, baseline)
+    activation_mb = pricing.partial_seat_activation_mb(scheduler.snapshot(), job, baseline, device_index=None)
 
     assert activation_mb == pytest.approx(max(0.0, sampler_only_mb - weights_mb))
 
@@ -1227,7 +1239,7 @@ async def test_a_measured_activation_below_comfys_inference_reserve_is_raised_to
     snapshot = scheduler.snapshot()
     baseline = str(_KREA2_BASELINE)
     comfy_reserve_mb = effective_inference_reserve_mb(_SIXTEEN_GB_MB, 0.0)
-    activation_mb = pricing.partial_seat_activation_mb(snapshot, job, baseline)
+    activation_mb = pricing.partial_seat_activation_mb(snapshot, job, baseline, device_index=None)
     assert activation_mb is not None and activation_mb < comfy_reserve_mb
 
     reserve_mb = pricing.sampling_reserve_mb(snapshot, job, baseline, device_index=waiter.device_index)

@@ -117,13 +117,13 @@ def _job(*, post_processing: list[str] | None = None) -> HordeJobInfo:
 
 
 class _PeakStub:
-    """A per-job sampling-peak estimator: returns a fixed MB per job id, else a default (or None)."""
+    """A per-job sampling-peak estimator: returns a fixed MB per job id, else a default (or None), on any card."""
 
     def __init__(self, *, default_mb: float | None = None, by_job_id: dict[object, float] | None = None) -> None:
         self.default_mb = default_mb
         self.by_job_id = by_job_id or {}
 
-    def __call__(self, job_info: HordeJobInfo) -> float | None:
+    def __call__(self, job_info: HordeJobInfo, _device_index: int | None) -> float | None:
         return self.by_job_id.get(job_info.sdk_api_job_info.id_, self.default_mb)
 
 
@@ -202,7 +202,9 @@ def _make_harness(
     released: list[int] = []
     virtual_now = [0.0]
 
-    peak_callable = estimate_sampling_peak_mb if estimate_sampling_peak_mb is not None else (lambda _job_info: None)
+    peak_callable = (
+        estimate_sampling_peak_mb if estimate_sampling_peak_mb is not None else (lambda _job_info, _device_index: None)
+    )
     decode_callable = estimate_decode_spike_mb if estimate_decode_spike_mb is not None else (lambda _job_info: None)
 
     def _record_bind(job_info: object, process: _FakeProcess) -> None:

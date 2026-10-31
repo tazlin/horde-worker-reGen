@@ -312,9 +312,13 @@ class DisaggregationOrchestrator:
         encode_lane_paused: Callable[[], bool] = lambda: False,
         image_lane_paused: Callable[[], bool] = lambda: False,
         image_lane_pause_owner: Callable[[], PauseOwner | None] = lambda: None,
-        estimate_sampling_peak_mb: Callable[[HordeJobInfo], float | None] = lambda _job_info: None,
+        estimate_sampling_peak_mb: Callable[[HordeJobInfo, int | None], float | None] = (
+            lambda _job_info, _device_index: None
+        ),
         estimate_decode_spike_mb: Callable[[HordeJobInfo], float | None] = lambda _job_info: None,
-        observe_sampling_peak: Callable[[HordeJobInfo, float], None] = lambda _job_info, _peak_mb: None,
+        observe_sampling_peak: Callable[[HordeJobInfo, float, int | None], None] = (
+            lambda _job_info, _peak_mb, _device_index: None
+        ),
         measured_device_free_mb: Callable[[int | None], float | None] = lambda _device_index: None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -363,16 +367,17 @@ class DisaggregationOrchestrator:
                 sampling to a monolithic reroute; a :attr:`PauseOwner.WHOLE_CARD` pause (or an unknown or absent
                 owner while paused) lasts a heavy model's whole residency and reroutes at once, as before.
             estimate_sampling_peak_mb: Returns a job's estimated sampling-phase activation peak (MB, a whole-
-                process weights-plus-activation figure), or None when no estimate is available. Consulted by the
+                process weights-plus-activation figure) on the pinned sampler's card, or None when no estimate
+                is available. Consulted by the
                 concurrent-sampling gate; a None estimate never blocks a dispatch.
             estimate_decode_spike_mb: Returns a job's estimated VAE tiled-decode activation spike (MB), or
                 None when unavailable. Charged by the arbiter's decode gate; None
                 prices the decode as unpriced, so the gate then only withholds a decode onto an already
                 over-committed card.
-            observe_sampling_peak: Called with a job and the pinned sampler process's measured peak reserved
-                (MB) when its sample stage completes successfully, so the learned-footprint store records the
-                disaggregated sampling peak the monolithic observation seam cannot attribute. A no-op by default
-                (standalone tests) and never called with a non-positive peak.
+            observe_sampling_peak: Called with a job, the pinned sampler process's measured peak reserved
+                (MB) and the sampler's card when its sample stage completes successfully, so the learned-footprint
+                store records the disaggregated sampling peak the monolithic observation seam cannot attribute.
+                A no-op by default (standalone tests) and never called with a non-positive peak.
             measured_device_free_mb: Returns the parent's measured device-level free VRAM (MB) for a card, or
                 None when unread. Put on a sample dispatch so the sampler clamps its own free view with it, the
                 same reading a monolithic dispatch carries; a sampler loads the UNet and holds the job's whole
@@ -1017,7 +1022,7 @@ class DisaggregationOrchestrator:
         # activation peaks never over-commit the card and drive it into WDDM demand-paging. Checked here, after
         # the inputs are ready and the sampler resolved (a real sampler is waiting), so a deferral is genuine
         # backpressure rather than a missing role.
-        peak_mb = self._estimate_sampling_peak_mb(state.job_info)
+        peak_mb = self._estimate_sampling_peak_mb(state.job_info, sampler.device_index)
         if not self._admit_concurrent_sampling(peak_mb):
             logger.debug(
                 f"Disaggregation: deferring sample for {self._key(state.job_info)} "
@@ -1315,7 +1320,11 @@ class DisaggregationOrchestrator:
             # so the pinned pid is still resolvable; the store ignores a non-positive or absent reading.
             sampler_process = self._find_process_by_id(message.process_id)
             if sampler_process is not None and sampler_process.process_peak_reserved_mb is not None:
-                self._observe_sampling_peak(state.job_info, float(sampler_process.process_peak_reserved_mb))
+                self._observe_sampling_peak(
+                    state.job_info,
+                    float(sampler_process.process_peak_reserved_mb),
+                    sampler_process.device_index,
+                )
             # Sampling is done: release the sampler slot so the scheduler can admit the next job onto it (the
             # pipeline-overlap win), while this job stays in-flight through decode. Done here, on the result,
             # rather than at sample dispatch (would double-book the running slot) or at completion (would

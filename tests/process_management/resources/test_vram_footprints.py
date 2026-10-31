@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 
 import pytest
+from loguru import logger
 
 from horde_worker_regen.process_management.resources.resource_budget import platform_context_constant_mb
 from horde_worker_regen.process_management.resources.vram_footprints import (
@@ -22,11 +23,22 @@ from horde_worker_regen.process_management.resources.vram_footprints import (
     FootprintStage,
     LearnedFootprintStore,
     ResolutionBucket,
+    card_total_gb,
     learned_post_process_vram_mb,
     plausible_activation_ceiling_mb,
     plausible_sampling_peak_mb,
     post_process_footprint_key,
 )
+
+_CARD_GB = 24
+"""The card-size class the tests' keys are measured on."""
+
+
+def _card_blind_dump(key: FootprintKey) -> dict[str, object]:
+    """Return ``key`` as a file written before keys carried a card stores it."""
+    dumped = key.model_dump(mode="json")
+    del dumped["card_total_gb"]
+    return dumped
 
 
 @dataclasses.dataclass(frozen=True)
@@ -54,8 +66,15 @@ def _key(
     bucket: ResolutionBucket = ResolutionBucket.LE_1024,
     platform: str = "linux",
     stage: FootprintStage = FootprintStage.SAMPLE,
+    card_total_gb: int = _CARD_GB,
 ) -> FootprintKey:
-    return FootprintKey(model_baseline=baseline, resolution_bucket=bucket, platform=platform, stage=stage)
+    return FootprintKey(
+        model_baseline=baseline,
+        resolution_bucket=bucket,
+        platform=platform,
+        stage=stage,
+        card_total_gb=card_total_gb,
+    )
 
 
 def _resident_key(*, checkpoint: str = "checkpoint-a", platform: str = "linux") -> FootprintKey:
@@ -66,6 +85,7 @@ def _resident_key(*, checkpoint: str = "checkpoint-a", platform: str = "linux") 
         platform=platform,
         stage=FootprintStage.RESIDENT,
         checkpoint=checkpoint,
+        card_total_gb=_CARD_GB,
     )
 
 
@@ -76,6 +96,7 @@ def _safety_key(*, platform: str = "linux") -> FootprintKey:
         resolution_bucket=None,
         platform=platform,
         stage=FootprintStage.SAFETY,
+        card_total_gb=_CARD_GB,
     )
 
 
@@ -220,6 +241,7 @@ class TestFootprintKeyIdentity:
                 platform="linux",
                 stage=FootprintStage.SAMPLE,
                 checkpoint=None,
+                card_total_gb=_CARD_GB,
             ),
             9000.0,
         )
@@ -293,6 +315,7 @@ class TestJobFootprintRecording:
             baseline=None,
             platform="linux",
             context_constant_mb=144.0,
+            card_total_gb=_CARD_GB,
         )
 
         assert [key.stage for key in written] == [FootprintStage.RESIDENT]
@@ -306,6 +329,7 @@ class TestJobFootprintRecording:
             resolution_bucket=ResolutionBucket.LE_1024,
             platform="linux",
             stage=FootprintStage.SAMPLE,
+            card_total_gb=_CARD_GB,
         )
         assert store.get_observation(sample) is None
 
@@ -316,6 +340,7 @@ class TestJobFootprintRecording:
             _Footprint(peak_device_used_mb=9000.0, stage="sample_stage"),
             baseline=None,
             platform="linux",
+            card_total_gb=_CARD_GB,
         )
 
         assert written == []
@@ -328,6 +353,7 @@ class TestJobFootprintRecording:
             _Footprint(resident_weights_after_job_mb=6000.0),
             baseline=None,
             platform="linux",
+            card_total_gb=_CARD_GB,
         )
         assert [key.stage for key in written] == [FootprintStage.RESIDENT]
 
@@ -338,18 +364,25 @@ class TestJobFootprintRecording:
             _Footprint(peak_resident_weights_mb=9000.0, baseline=None),
             baseline="flux_1",
             platform="linux",
+            card_total_gb=_CARD_GB,
         )
         assert [key.model_baseline for key in written] == ["flux_1"]
 
     def test_unkeyable_footprints_are_dropped(self) -> None:
         """No baseline at all, or no positive resident figure, records nothing."""
         store = LearnedFootprintStore()
-        assert store.observe_job_footprint(_Footprint(baseline=None), baseline=None, platform="linux") == []
+        assert (
+            store.observe_job_footprint(
+                _Footprint(baseline=None), baseline=None, platform="linux", card_total_gb=_CARD_GB
+            )
+            == []
+        )
         assert (
             store.observe_job_footprint(
                 _Footprint(peak_device_used_mb=9000.0, resident_weights_after_job_mb=0.0),
                 baseline=None,
                 platform="linux",
+                card_total_gb=_CARD_GB,
             )
             == []
         )
@@ -553,7 +586,7 @@ class TestPersistence:
                     "schema_version": schema_version,
                     "observations": [
                         {
-                            "key": pooled.model_dump(mode="json"),
+                            "key": _card_blind_dump(pooled),
                             "observation": {
                                 "ewma_mb": 10000.0,
                                 "watermark_mb": 12500.0,
@@ -567,7 +600,7 @@ class TestPersistence:
             encoding="utf-8",
         )
 
-        store = LearnedFootprintStore(path=path)
+        store = LearnedFootprintStore(path=path, driven_card_totals_gb=[_CARD_GB])
 
         loaded = store.get_observation(pooled)
         assert loaded is not None
@@ -600,7 +633,7 @@ class TestPersistence:
 
         def _entry(key: FootprintKey) -> dict[str, object]:
             return {
-                "key": key.model_dump(mode="json"),
+                "key": _card_blind_dump(key),
                 "observation": {
                     "ewma_mb": 9500.0,
                     "watermark_mb": 13500.0,
@@ -616,7 +649,7 @@ class TestPersistence:
             encoding="utf-8",
         )
 
-        store = LearnedFootprintStore(path=path)
+        store = LearnedFootprintStore(path=path, driven_card_totals_gb=[_CARD_GB])
 
         for key in dropped:
             assert store.get_observation(key) is None
@@ -694,6 +727,7 @@ class TestPlausibilityBounds:
             baseline=None,
             platform="linux",
             resident_floor_mb=19500.0,
+            card_total_gb=_CARD_GB,
         )
         assert written == []
         assert len(store) == 0
@@ -819,8 +853,10 @@ class TestPostProcessChainPricing:
 
     def test_the_key_is_the_lane_operations_in_any_order(self) -> None:
         """The same operations in another order are the same chain, and background removal runs on another lane."""
-        one = post_process_footprint_key(self._job(["RealESRGAN_x4plus", "GFPGAN"]))
-        other = post_process_footprint_key(self._job(["GFPGAN", "RealESRGAN_x4plus", "strip_background"]))
+        one = post_process_footprint_key(self._job(["RealESRGAN_x4plus", "GFPGAN"]), card_total_gb=_CARD_GB)
+        other = post_process_footprint_key(
+            self._job(["GFPGAN", "RealESRGAN_x4plus", "strip_background"]), card_total_gb=_CARD_GB
+        )
         assert one is not None and one == other
         assert one.stage is FootprintStage.POST_PROCESS
         assert one.checkpoint == "GFPGAN+RealESRGAN_x4plus"
@@ -828,39 +864,232 @@ class TestPostProcessChainPricing:
 
     def test_a_job_the_lane_runs_nothing_for_has_no_key(self) -> None:
         """No lane operation, no chain to price."""
-        assert post_process_footprint_key(self._job([])) is None
-        assert post_process_footprint_key(self._job(["strip_background"])) is None
+        assert post_process_footprint_key(self._job([]), card_total_gb=_CARD_GB) is None
+        assert post_process_footprint_key(self._job(["strip_background"]), card_total_gb=_CARD_GB) is None
 
     def test_a_cold_chain_keeps_the_static_estimate(self) -> None:
         """Below the measured minimum the chain is booked at the static estimate."""
         store = LearnedFootprintStore()
         job = self._job(["GFPGAN", "RealESRGAN_x4plus"])
-        key = post_process_footprint_key(job)
+        key = post_process_footprint_key(job, card_total_gb=_CARD_GB)
         assert key is not None
         store.observe_peak(key, 1500.0)
-        assert learned_post_process_vram_mb(store, job, 6400.0) == pytest.approx(6400.0)
+        assert learned_post_process_vram_mb(store, job, 6400.0, card_total_gb=_CARD_GB) == pytest.approx(6400.0)
 
     def test_a_measured_chain_lowers_the_static_estimate(self) -> None:
         """Five chains price the next one at the margined second-highest growth, net of the context charge."""
         store = LearnedFootprintStore()
         job = self._job(["GFPGAN", "RealESRGAN_x4plus"])
-        key = post_process_footprint_key(job)
+        key = post_process_footprint_key(job, card_total_gb=_CARD_GB)
         assert key is not None
         for growth_mb in (1400.0, 1500.0, 1450.0, 1500.0, 1300.0):
             store.observe_peak(key, growth_mb)
-        assert learned_post_process_vram_mb(store, job, 6400.0) == pytest.approx(1500.0 * _MEASURED_ESTIMATE_MARGIN)
+        assert learned_post_process_vram_mb(store, job, 6400.0, card_total_gb=_CARD_GB) == pytest.approx(
+            1500.0 * _MEASURED_ESTIMATE_MARGIN
+        )
 
     def test_a_chain_above_its_estimate_is_raised_by_its_watermark(self) -> None:
         """A chain that grew the lane past the estimate is never booked below what it was seen to use."""
         store = LearnedFootprintStore()
         job = self._job(["GFPGAN", "RealESRGAN_x4plus"])
-        key = post_process_footprint_key(job)
+        key = post_process_footprint_key(job, card_total_gb=_CARD_GB)
         assert key is not None
         store.observe_peak(key, 7000.0)
-        assert learned_post_process_vram_mb(store, job, 6400.0) == pytest.approx(7000.0)
+        assert learned_post_process_vram_mb(store, job, 6400.0, card_total_gb=_CARD_GB) == pytest.approx(7000.0)
 
     def test_without_a_store_the_estimate_stands(self) -> None:
         """A parent with no store books the static estimate, None included."""
         job = self._job(["GFPGAN"])
-        assert learned_post_process_vram_mb(None, job, 6400.0) == 6400.0
-        assert learned_post_process_vram_mb(None, job, None) is None
+        assert learned_post_process_vram_mb(None, job, 6400.0, card_total_gb=_CARD_GB) == 6400.0
+        assert learned_post_process_vram_mb(None, job, None, card_total_gb=_CARD_GB) is None
+
+    def test_an_unknown_lane_card_does_not_key_the_chain(self) -> None:
+        """A lane whose card total is unreported does not key the chain, so the chain keeps the static estimate."""
+        store = LearnedFootprintStore()
+        job = self._job(["GFPGAN"])
+        assert post_process_footprint_key(job, card_total_gb=None) is None
+        assert learned_post_process_vram_mb(store, job, 6400.0, card_total_gb=None) == 6400.0
+
+
+class TestCardKeyedFigures:
+    """A learned figure describes the card it was measured on and does not price another card's lookup."""
+
+    @pytest.mark.parametrize(
+        ("total_vram_mb", "expected"),
+        [(16275.0, 16), (16384.0, 16), (24576.0, 24), (24564.0, 24), (8188.0, 8), (12282.0, 12)],
+    )
+    def test_the_card_class_is_the_total_rounded_to_the_nearest_gib(self, total_vram_mb: float, expected: int) -> None:
+        """A card's reported total and its marketed size land in one class."""
+        assert card_total_gb(total_vram_mb) == expected
+
+    @pytest.mark.parametrize("total_vram_mb", [None, 0.0, -1.0])
+    def test_an_unknown_card_total_returns_none(self, total_vram_mb: float | None) -> None:
+        """An unreported total does not map to a card class."""
+        assert card_total_gb(total_vram_mb) is None
+
+    def test_a_24_gb_watermark_does_not_price_a_16_gb_lookup(self) -> None:
+        """A larger card's peak, taken with components left resident because they fit, never prices a smaller card."""
+        store = LearnedFootprintStore()
+        large = _key(baseline="flux_1", card_total_gb=24)
+        small = _key(baseline="flux_1", card_total_gb=16)
+        for _ in range(_MIN_OBSERVATIONS_FOR_MEASURED):
+            store.observe_peak(large, 18920.0)
+
+        assert store.estimate_mb(large, static_seed_mb=15743.0) == pytest.approx(18920.0)
+        assert store.estimate_mb(small, static_seed_mb=15743.0) == pytest.approx(15743.0)
+        assert store.measured_estimate_mb(small) is None
+        assert store.get_observation(small) is None
+
+    def test_has_measurement_needs_the_measured_minimum_on_the_card_itself(self) -> None:
+        """A card-local key is measured once its window holds the minimum, whatever another card holds."""
+        store = LearnedFootprintStore()
+        large = _key(card_total_gb=24)
+        small = _key(card_total_gb=16)
+        for _ in range(_MIN_OBSERVATIONS_FOR_MEASURED - 1):
+            store.observe_peak(small, 9000.0)
+        for _ in range(_MIN_OBSERVATIONS_FOR_MEASURED):
+            store.observe_peak(large, 9000.0)
+
+        assert store.has_measurement(large)
+        assert not store.has_measurement(small)
+        store.observe_peak(small, 9000.0)
+        assert store.has_measurement(small)
+        assert not store.has_measurement(_key(card_total_gb=12))
+
+    def test_has_measurement_agrees_with_the_measured_estimate(self) -> None:
+        """The query and the bidirectional estimate share one threshold."""
+        store = LearnedFootprintStore()
+        key = _key()
+        for _ in range(_MIN_OBSERVATIONS_FOR_MEASURED):
+            assert store.has_measurement(key) == (store.measured_estimate_mb(key) is not None)
+            store.observe_peak(key, 9000.0)
+        assert store.has_measurement(key)
+        assert store.measured_estimate_mb(key) is not None
+
+    def test_the_sanitiser_bounds_each_key_by_its_own_card(self) -> None:
+        """A reading plausible on the key's card is kept, and the same reading on a smaller card's key is clamped."""
+        store = LearnedFootprintStore()
+        large = _key(baseline="no_such_baseline", card_total_gb=24)
+        small = _key(baseline="no_such_baseline", card_total_gb=8)
+        store.observe_peak(large, 15000.0)
+        store.observe_peak(small, 15000.0)
+
+        changed = store.sanitize_sampling_observations(
+            lambda key: plausible_sampling_peak_mb(key, key.card_total_gb * 1024.0),
+        )
+
+        assert changed == [small]
+        large_observation = store.get_observation(large)
+        small_observation = store.get_observation(small)
+        assert large_observation is not None and small_observation is not None
+        assert large_observation.watermark_mb == pytest.approx(15000.0)
+        assert small_observation.watermark_mb == pytest.approx(plausible_activation_ceiling_mb(8192.0))
+
+    def test_a_saved_file_carries_the_card_on_every_key(self, tmp_path: Path) -> None:
+        """The file records the card, and two cards' figures for one band reload apart."""
+        path = tmp_path / "vram_footprints.json"
+        store = LearnedFootprintStore(path=path)
+        store.observe_peak(_key(card_total_gb=24), 18920.0)
+        store.observe_peak(_key(card_total_gb=16), 15700.0)
+        store.save()
+
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        assert sorted(entry["key"]["card_total_gb"] for entry in raw["observations"]) == [16, 24]
+        reloaded = LearnedFootprintStore(path=path)
+        large = reloaded.get_observation(_key(card_total_gb=24))
+        small = reloaded.get_observation(_key(card_total_gb=16))
+        assert large is not None and small is not None
+        assert large.watermark_mb == pytest.approx(18920.0)
+        assert small.watermark_mb == pytest.approx(15700.0)
+
+
+class TestCardBlindFileMigration:
+    """A file written before keys carried a card is re-keyed to the one card that measured it, else dropped."""
+
+    _READINGS = (9000.0, 9100.0, 9050.0, 9200.0, 9000.0)
+
+    def _write_card_blind_file(self, path: Path, keys: list[FootprintKey], *, schema_version: int = 5) -> None:
+        path.write_text(
+            json.dumps(
+                {
+                    "schema_version": schema_version,
+                    "observations": [
+                        {
+                            "key": _card_blind_dump(key),
+                            "observation": {
+                                "ewma_mb": 9100.0,
+                                "watermark_mb": 9200.0,
+                                "observation_count": len(self._READINGS),
+                                "recent_mb": list(self._READINGS),
+                            },
+                        }
+                        for key in keys
+                    ],
+                },
+            ),
+            encoding="utf-8",
+        )
+
+    def _keys(self) -> list[FootprintKey]:
+        sample = _key()
+        return [sample, sample.for_job_class(batch=1, hires_fix=False), _resident_key(), _safety_key()]
+
+    def test_one_card_of_known_size_takes_every_entry(self, tmp_path: Path) -> None:
+        """Every entry was measured on the one card the worker drives, so each is re-keyed to it."""
+        path = tmp_path / "vram_footprints.json"
+        self._write_card_blind_file(path, self._keys())
+
+        store = LearnedFootprintStore(path=path, driven_card_totals_gb=[16])
+
+        assert len(store) == len(self._keys())
+        for key in self._keys():
+            migrated = key.model_copy(update={"card_total_gb": 16})
+            observation = store.get_observation(migrated)
+            assert observation is not None
+            assert observation.watermark_mb == pytest.approx(9200.0)
+            assert observation.recent_mb == pytest.approx(list(self._READINGS))
+            assert store.get_observation(key.model_copy(update={"card_total_gb": 24})) is None
+        assert store.card_blind_entries_dropped == 0
+
+    def test_a_migrated_file_is_written_back_under_the_current_schema(self, tmp_path: Path) -> None:
+        """The next save writes the card into every key, so the file is migrated once."""
+        path = tmp_path / "vram_footprints.json"
+        self._write_card_blind_file(path, self._keys())
+
+        LearnedFootprintStore(path=path, driven_card_totals_gb=[16]).save()
+
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        assert raw["schema_version"] == FOOTPRINT_STORE_SCHEMA_VERSION
+        assert {entry["key"]["card_total_gb"] for entry in raw["observations"]} == {16}
+        assert len(LearnedFootprintStore(path=path)) == len(self._keys())
+
+    @pytest.mark.parametrize("driven", [[16, 24], [24, 24], [None], [], None])
+    def test_entries_are_dropped_unless_one_card_of_known_size_measured_them(
+        self,
+        tmp_path: Path,
+        driven: list[int | None] | None,
+    ) -> None:
+        """More than one card, a card of unknown size, or unknown cards leave the entries unattributable."""
+        path = tmp_path / "vram_footprints.json"
+        self._write_card_blind_file(path, self._keys())
+        messages: list[str] = []
+        sink_id = logger.add(lambda message: messages.append(message.record["message"]), level="INFO")
+        try:
+            store = LearnedFootprintStore(path=path, driven_card_totals_gb=driven)
+        finally:
+            logger.remove(sink_id)
+
+        assert len(store) == 0
+        assert store.card_blind_entries_dropped == len(self._keys())
+        assert [message for message in messages if f"dropped {len(self._keys())} entries" in message]
+
+    def test_a_miskeyed_older_file_migrates_without_its_monolithic_sampling_stages(self, tmp_path: Path) -> None:
+        """A file older than per-model sampling keys still loses those stages when it is re-keyed to the card."""
+        path = tmp_path / "vram_footprints.json"
+        isolated = _key(stage=FootprintStage.SAMPLE_ISOLATED)
+        self._write_card_blind_file(path, [_key(), isolated], schema_version=4)
+
+        store = LearnedFootprintStore(path=path, driven_card_totals_gb=[16])
+
+        assert store.get_observation(_key(card_total_gb=16)) is None
+        assert store.get_observation(isolated.model_copy(update={"card_total_gb": 16})) is not None

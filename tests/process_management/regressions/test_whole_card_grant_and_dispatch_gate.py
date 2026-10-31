@@ -219,7 +219,7 @@ def _card24_flux_dominance() -> pricing.CardDominance:
         foreign_floor_bucket=None,
         sample_observation_counts=(),
     )
-    peaks = [pricing.model_sampling_peak(None, _FLUX_MODEL, _FLUX_BASELINE)]
+    peaks = [pricing.model_sampling_peak(None, _FLUX_MODEL, _FLUX_BASELINE, card_total_gb=None)]
     return pricing.decide_card_dominance(inputs, foreign_floor_mb=0.0, peaks=peaks)
 
 

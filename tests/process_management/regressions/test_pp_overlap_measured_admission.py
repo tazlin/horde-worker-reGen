@@ -49,7 +49,7 @@ def _make_scheduler_with_active_chain(
     # Static reported-total accounting withholds: this test exercises the measured second path given a miss.
     scheduler.pp_sampling_coresidency_affordable = Mock(return_value=False)  # type: ignore[method-assign]
     # Pin the sampling peak so the measured arithmetic is deterministic, independent of the peak estimator.
-    scheduler._sampling_peak_mb = lambda _job: _SAMPLING_PEAK_MB  # type: ignore[method-assign]
+    scheduler._sampling_peak_mb = lambda _job, *, device_index: _SAMPLING_PEAK_MB  # type: ignore[method-assign]
     return scheduler, target_process
 
 
@@ -63,7 +63,7 @@ def _make_scheduler_with_pending_chain(
     process_map = ProcessMap({0: target_process})
     scheduler = _make_inference_scheduler(process_map=process_map, device_free_mb=device_free_mb)
     scheduler.pp_sampling_coresidency_affordable = Mock(return_value=False)  # type: ignore[method-assign]
-    scheduler._sampling_peak_mb = lambda _job: _SAMPLING_PEAK_MB  # type: ignore[method-assign]
+    scheduler._sampling_peak_mb = lambda _job, *, device_index: _SAMPLING_PEAK_MB  # type: ignore[method-assign]
     # No active reserve: force the pending branch with a fixed predicted reserve.
     scheduler._pending_post_processing_reserve_mb = lambda *, device_index: pending_reserve_mb  # type: ignore[method-assign]
     return scheduler, target_process

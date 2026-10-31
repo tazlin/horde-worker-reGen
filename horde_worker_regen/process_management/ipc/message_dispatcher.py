@@ -79,6 +79,7 @@ from horde_worker_regen.process_management.resources.vram_footprints import (
     FootprintStage,
     LearnedFootprintStore,
     ResolutionBucket,
+    card_total_gb,
     job_class_key,
     plausible_activation_ceiling_mb,
     plausible_sampling_peak_mb,
@@ -1188,8 +1189,8 @@ class MessageDispatcher:
                 running.finished = True
 
     def _commit_chain_peak(self, running: _ChainPeak, *, total_vram_mb: int | None) -> None:
-        """Record one finished chain's growth under its post-processing key."""
-        key = post_process_footprint_key(running.job)
+        """Record one finished chain's growth under its post-processing key for the lane's card."""
+        key = post_process_footprint_key(running.job, card_total_gb=card_total_gb(total_vram_mb))
         growth_mb = running.peak_reserved_mb - running.floor_reserved_mb
         if self._footprint_store is None or key is None or growth_mb <= 0.0:
             return
@@ -1338,13 +1339,15 @@ class MessageDispatcher:
 
         width = job.payload.width
         height = job.payload.height
-        if width is None or height is None:
+        card_gb = card_total_gb(process_info.total_vram_mb)
+        if width is None or height is None or card_gb is None:
             return
 
         key = FootprintKey(
             model_baseline=str(baseline),
             resolution_bucket=ResolutionBucket.from_dimensions(width, height, job.payload.n_iter or 1),
             platform=sys.platform,
+            card_total_gb=card_gb,
             stage=FootprintStage.SAMPLE,
         )
         # The reading is the process's allocator high-water, not the job's. A process that cached another
@@ -1450,10 +1453,12 @@ class MessageDispatcher:
             running.peak_resident_weights_mb = footprint.peak_resident_weights_mb
 
         baseline = self._model_metadata.get_baseline(footprint.model_name) if footprint.model_name else None
+        process_info = self._process_map.get(message.process_id)
         store.observe_job_footprint(
             footprint,
             baseline=str(baseline) if baseline is not None else None,
             platform=sys.platform,
+            card_total_gb=card_total_gb(process_info.total_vram_mb) if process_info is not None else None,
             # The backend measures weights alone; the resident population the store keeps (and every consumer
             # that nets it back out) is in whole-device terms, the process's context included.
             context_constant_mb=platform_context_constant_mb(),
@@ -1527,13 +1532,15 @@ class MessageDispatcher:
             return
 
         baseline = self._model_metadata.get_baseline(model_name)
-        if baseline is None:
+        card_gb = card_total_gb(process_info.total_vram_mb)
+        if baseline is None or card_gb is None:
             return
 
         key = FootprintKey(
             model_baseline=str(baseline),
             resolution_bucket=None,
             platform=sys.platform,
+            card_total_gb=card_gb,
             stage=FootprintStage.RESIDENT,
             checkpoint=model_name,
         )
@@ -1567,13 +1574,15 @@ class MessageDispatcher:
         process_info = self._process_map.get(message.process_id)
         if process_info is None or process_info.process_type is not HordeProcessType.SAFETY:
             return
-        if process_info.is_process_busy():
+        card_gb = card_total_gb(process_info.total_vram_mb)
+        if process_info.is_process_busy() or card_gb is None:
             return
 
         key = FootprintKey(
             model_baseline=SAFETY_PROCESS_BASELINE,
             resolution_bucket=None,
             platform=sys.platform,
+            card_total_gb=card_gb,
             stage=FootprintStage.SAFETY,
         )
         store.observe_peak(key, platform_context_constant_mb() + float(allocated_mb))
@@ -1593,10 +1602,14 @@ class MessageDispatcher:
         process_info = self._process_map.get(message.process_id)
         if process_info is None or process_info.process_type is not HordeProcessType.SAFETY:
             return
+        card_gb = card_total_gb(process_info.total_vram_mb)
+        if card_gb is None:
+            return
         key = FootprintKey(
             model_baseline=SAFETY_PROCESS_BASELINE,
             resolution_bucket=None,
             platform=sys.platform,
+            card_total_gb=card_gb,
             stage=FootprintStage.SAFETY_CHECK,
         )
         store.observe_peak(key, platform_context_constant_mb() + float(peak_reserved_mb))

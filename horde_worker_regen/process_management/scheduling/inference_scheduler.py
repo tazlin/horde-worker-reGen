@@ -142,10 +142,12 @@ from horde_worker_regen.process_management.resources.vram_footprints import (
     FootprintStage,
     LearnedFootprintStore,
     ResolutionBucket,
+    card_total_gb,
     job_class_key,
     learned_post_process_vram_mb,
     plausible_sampling_peak_mb,
     sampling_footprint_key,
+    view_card_total_gb,
 )
 from horde_worker_regen.process_management.scheduling.admission import pricing
 from horde_worker_regen.process_management.scheduling.admission.clearance import (
@@ -782,7 +784,9 @@ class InferenceScheduler:
         # sampling keys of the offered baselines, rebuilt only when the offer changes, so the per-read change test
         # is a handful of lookups.
         self._card_dominance: dict[int | None, pricing.CardDominance] = {}
-        self._dominance_sample_keys: dict[frozenset[str], tuple[tuple[str, tuple[FootprintKey, ...]], ...]] = {}
+        self._dominance_sample_keys: dict[
+            int, tuple[frozenset[str], tuple[tuple[str, tuple[FootprintKey, ...]], ...]]
+        ] = {}
 
         # Pipeline-disaggregation hooks, wired by the manager via set_disaggregation_hooks. The predicate
         # decides whether a job takes the disaggregated path (so its verdicts charge the UNet-only sampler
@@ -1582,7 +1586,9 @@ class InferenceScheduler:
         # dispatch predicate) is used so a job that will run disaggregated is charged sampler-only even during a
         # whole-card window when the lane is transiently paused.
         disaggregated = self._is_disaggregation_class_eligible(job)
-        measured_resident_mb, measured_observation_count = self._measured_resident_footprint_mb(job.model, baseline)
+        measured_resident_mb, measured_observation_count = self._measured_resident_footprint_mb(
+            job.model, baseline, device_index=device_index
+        )
         return forecast_weight_streaming(
             job,
             str(baseline) if baseline is not None else None,
@@ -1594,7 +1600,9 @@ class InferenceScheduler:
             platform=self._platform,
             num_extra_resident_contexts=num_post_process_contexts,
             safety_context_charge_mb=safety_context_charge_mb,
-            learned_resident_footprint_mb=self._learned_resident_footprint_mb(job.model, baseline),
+            learned_resident_footprint_mb=self._learned_resident_footprint_mb(
+                job.model, baseline, device_index=device_index
+            ),
             measured_resident_footprint_mb=measured_resident_mb,
             measured_observation_count=measured_observation_count,
             committed_reserve_mb=self._committed_vram_reserve_mb(device_index=device_index),
@@ -1666,17 +1674,30 @@ class InferenceScheduler:
         never disagree about what safety costs the card.
         """
         store = self._footprint_store
-        if store is None:
+        card_gb = self._safety_card_gb()
+        if store is None or card_gb is None:
             return SAFETY_GPU_LOAD_CHARGE_MB
         return store.estimate_mb(
             FootprintKey(
                 model_baseline=SAFETY_PROCESS_BASELINE,
                 resolution_bucket=None,
                 platform=sys.platform,
+                card_total_gb=card_gb,
                 stage=FootprintStage.SAFETY,
             ),
             static_seed_mb=SAFETY_GPU_LOAD_CHARGE_MB,
         )
+
+    def _safety_card_gb(self) -> int | None:
+        """The card-size class safety's learned figures are read under, or None while no safety process has reported.
+
+        Safety's figures are learned on the card the safety process sits on, which is fixed for a session, so a
+        consumer pricing another card still reads the safety process's card.
+        """
+        safety_process = self._process_map.get_safety_process()
+        if safety_process is None:
+            return None
+        return card_total_gb(safety_process.total_vram_mb)
 
     def _arbiter_admits_safety_gpu_load(self, device_index: int | None) -> bool:
         """Whether the safety process may (re)load onto the GPU now, the VRAM arbiter deciding the memory question.
@@ -1725,13 +1746,15 @@ class InferenceScheduler:
         reports carry (:attr:`FootprintStage.SAFETY_CHECK`).
         """
         store = self._footprint_store
-        if store is None:
+        card_gb = self._safety_card_gb()
+        if store is None or card_gb is None:
             return SAFETY_GPU_LOAD_CHARGE_MB
         return store.estimate_mb(
             FootprintKey(
                 model_baseline=SAFETY_PROCESS_BASELINE,
                 resolution_bucket=None,
                 platform=sys.platform,
+                card_total_gb=card_gb,
                 stage=FootprintStage.SAFETY_CHECK,
             ),
             static_seed_mb=SAFETY_GPU_LOAD_CHARGE_MB,
@@ -2021,6 +2044,7 @@ class InferenceScheduler:
                 baseline,
                 static_seed_mb=static_peak_mb,
                 stage=FootprintStage.SAMPLE,
+                device_index=self._job_card_index(job, device_index),
             )
             if heaviest is None or peak_mb > heaviest[0]:
                 heaviest = (peak_mb, job.model)
@@ -2531,7 +2555,7 @@ class InferenceScheduler:
         for job in (*self._job_tracker.jobs_pending_inference, *self._job_tracker.jobs_in_progress):
             if job.model != model:
                 continue
-            need_mb = self._sampling_peak_mb(job)
+            need_mb = self._sampling_peak_mb(job, device_index=device_index)
             if need_mb is None:
                 continue
             if need_mb > room_mb:
@@ -5524,11 +5548,13 @@ class InferenceScheduler:
         )
         if static_gross_mb is None:
             return None
+        target = self._process_map.get(process_id) if process_id is not None else None
         gross_mb = self._learned_sampling_peak_mb(
             job,
             baseline,
             static_seed_mb=static_gross_mb,
             stage=FootprintStage.SAMPLE_ISOLATED if sampler_only else FootprintStage.SAMPLE,
+            device_index=target.device_index if target is not None else None,
         )
         resident_credit_mb = 0.0
         if self._candidate_weights_resident_on_process(job.model, process_id):
@@ -5623,7 +5649,9 @@ class InferenceScheduler:
         self._footprint_store = store
         max_batch = config_number(self._runtime_config.bridge_data.max_batch)
         batch = int(max_batch) if max_batch is not None and max_batch >= 1 else 1
-        clamped = store.sanitize_sampling_observations(lambda key: plausible_sampling_peak_mb(key, None, batch=batch))
+        clamped = store.sanitize_sampling_observations(
+            lambda key: plausible_sampling_peak_mb(key, key.card_total_gb * 1024.0, batch=batch),
+        )
         if clamped:
             logger.info(
                 f"Learned VRAM footprints: clamped {len(clamped)} sampling key(s) above their plausible bound "
@@ -5634,6 +5662,8 @@ class InferenceScheduler:
         self,
         model_name: str | None,
         baseline: KNOWN_IMAGE_GENERATION_BASELINE | str | None,
+        *,
+        device_index: int | None,
     ) -> float | None:
         """The measured at-rest device footprint (MB) of this checkpoint, or None when nothing was measured.
 
@@ -5653,13 +5683,15 @@ class InferenceScheduler:
         forecast's arithmetic exactly as the static seeds compute it.
         """
         store = self._footprint_store
-        if store is None or model_name is None or baseline is None:
+        card_gb = self._footprint_card_gb(device_index)
+        if store is None or model_name is None or baseline is None or card_gb is None:
             return None
         watermark_mb = store.estimate_mb(
             FootprintKey(
                 model_baseline=str(baseline),
                 resolution_bucket=None,
                 platform=sys.platform,
+                card_total_gb=card_gb,
                 stage=FootprintStage.RESIDENT,
                 checkpoint=model_name,
             ),
@@ -5673,6 +5705,8 @@ class InferenceScheduler:
         self,
         model_name: str | None,
         baseline: KNOWN_IMAGE_GENERATION_BASELINE | str | None,
+        *,
+        device_index: int | None,
     ) -> tuple[float | None, int]:
         """The margined *measured* at-rest charge (MB) of this checkpoint and how many runs back it.
 
@@ -5698,10 +5732,14 @@ class InferenceScheduler:
             return (None, 0)
         if not self._job_tracker.has_model_produced_result(model_name):
             return (None, 0)
+        card_gb = self._footprint_card_gb(device_index)
+        if card_gb is None:
+            return (None, 0)
         key = FootprintKey(
             model_baseline=str(baseline),
             resolution_bucket=None,
             platform=sys.platform,
+            card_total_gb=card_gb,
             stage=FootprintStage.RESIDENT,
             checkpoint=model_name,
         )
@@ -5717,8 +5755,9 @@ class InferenceScheduler:
         *,
         static_seed_mb: float,
         stage: FootprintStage,
+        device_index: int | None,
     ) -> float:
-        """Price a static sampling-peak seed against the learned footprint population for ``stage``.
+        """Price a static sampling-peak seed against the card's learned footprint population for ``stage``.
 
         The static predictor stays the seed and the learned watermark can RAISE it (a cold key, a None
         baseline, or an unkeyable job returns the seed unchanged). This is the single seam admission pricing of
@@ -5739,7 +5778,7 @@ class InferenceScheduler:
         store = self._footprint_store
         if store is None:
             return static_seed_mb
-        key = sampling_footprint_key(job, baseline, stage=stage)
+        key = sampling_footprint_key(job, baseline, stage=stage, card_total_gb=self._footprint_card_gb(device_index))
         if key is None:
             return static_seed_mb
         raised_mb = store.estimate_mb(key, static_seed_mb=static_seed_mb)
@@ -5771,7 +5810,24 @@ class InferenceScheduler:
             return None
         return store.measured_job_estimate_net_of_context_mb(key, job_class_key(key, job))
 
-    def observe_disaggregated_sampling_peak(self, job_info: HordeJobInfo, peak_reserved_mb: float) -> None:
+    def _footprint_card_gb(self, device_index: int | None) -> int | None:
+        """Return the card-size class learned figures are read under for the card (:func:`view_card_total_gb`)."""
+        return view_card_total_gb(
+            self._process_map.get_reported_total_vram_mb(
+                device_index=device_index if self._multi_gpu_routing_active else None,
+            ),
+            multi_gpu_routing_active=self._multi_gpu_routing_active,
+            device_index=device_index,
+        )
+
+    def _job_card_index(self, job: ImageGenerateJobPopResponse, device_index: int | None) -> int | None:
+        """Return the card a job's figures are read for: its lane's card while it runs, else ``device_index``."""
+        lane = self._process_map.process_running_job(job)
+        return lane.device_index if lane is not None else device_index
+
+    def observe_disaggregated_sampling_peak(
+        self, job_info: HordeJobInfo, peak_reserved_mb: float, device_index: int | None
+    ) -> None:
         """Fold a disaggregated sampler's measured peak into the store under this job's SAMPLE_ISOLATED key.
 
         The message dispatcher observes the monolithic case under :attr:`FootprintStage.SAMPLE`, but a
@@ -5796,6 +5852,7 @@ class InferenceScheduler:
             job,
             self._model_metadata.get_baseline(job.model),
             stage=FootprintStage.SAMPLE_ISOLATED,
+            card_total_gb=self._footprint_card_gb(device_index),
         )
         if key is None:
             return
@@ -6311,9 +6368,12 @@ class InferenceScheduler:
             else frozenset()
         )
         store = self._footprint_store
+        card_gb = card_total_gb(total_vram_mb)
         counts = tuple(
             (baseline_id, tuple(store.observation_count(key) for key in keys) if store is not None else ())
-            for baseline_id, keys in self._offered_sample_keys(offered_models)
+            for baseline_id, keys in (
+                self._offered_sample_keys(offered_models, card_gb) if card_gb is not None else ()
+            )
         )
         return pricing.DominanceInputs(
             offered_models=offered_models,
@@ -6329,11 +6389,12 @@ class InferenceScheduler:
     def _offered_sample_keys(
         self,
         offered_models: frozenset[str],
+        card_gb: int,
     ) -> tuple[tuple[str, tuple[FootprintKey, ...]], ...]:
-        """Return each offered baseline's pooled sampling keys, one per band, built once per offered set."""
-        cached = self._dominance_sample_keys.get(offered_models)
-        if cached is not None:
-            return cached
+        """Return each offered baseline's pooled sampling keys on the card, one per band, cached per card size."""
+        cached = self._dominance_sample_keys.get(card_gb)
+        if cached is not None and cached[0] == offered_models:
+            return cached[1]
         baseline_ids = sorted(
             {
                 str(baseline)
@@ -6342,10 +6403,15 @@ class InferenceScheduler:
             },
         )
         keys = tuple(
-            (baseline_id, tuple(pricing.pooled_sample_key(baseline_id, band) for band in ResolutionBucket))
+            (
+                baseline_id,
+                tuple(
+                    pricing.pooled_sample_key(baseline_id, band, card_total_gb=card_gb) for band in ResolutionBucket
+                ),
+            )
             for baseline_id in baseline_ids
         )
-        self._dominance_sample_keys = {offered_models: keys}
+        self._dominance_sample_keys[card_gb] = (offered_models, keys)
         return keys
 
     def _marginal_or_seed_mb(self, device_index: int | None) -> float:
@@ -6363,7 +6429,11 @@ class InferenceScheduler:
         """Compute the card's dominance verdict and the partial-load seat of every rung-2 or pinned model."""
         store = self._footprint_store
         baselines = {model: self._model_metadata.get_baseline(model) for model in sorted(inputs.offered_models)}
-        peaks = [pricing.model_sampling_peak(store, model, baseline) for model, baseline in baselines.items()]
+        card_gb = card_total_gb(inputs.total_vram_mb)
+        peaks = [
+            pricing.model_sampling_peak(store, model, baseline, card_total_gb=card_gb)
+            for model, baseline in baselines.items()
+        ]
         dominance = pricing.decide_card_dominance(
             inputs,
             foreign_floor_mb=self.current_foreign_floor_mb(device_index) or 0.0,
@@ -9468,7 +9538,7 @@ class InferenceScheduler:
         baseline), which leaves the unverifiable-rung path to grade it on an honest absence of evidence.
         """
         baseline = self._model_metadata.get_baseline(model_name)
-        learned_mb = self._learned_resident_footprint_mb(model_name, baseline)
+        learned_mb = self._learned_resident_footprint_mb(model_name, baseline, device_index=process_info.device_index)
         if learned_mb is not None:
             return learned_mb
         job = process_info.last_job_referenced
@@ -12123,6 +12193,7 @@ class InferenceScheduler:
                 self._footprint_store,
                 dispatched_job,
                 predict_job_post_processing_vram_mb(dispatched_job, baseline),
+                card_total_gb=self._footprint_card_gb(device_index),
             )
             if own_post_processing_mb is not None:
                 charges_mb += max(0.0, own_post_processing_mb)
@@ -12496,13 +12567,16 @@ class InferenceScheduler:
                     baseline,
                     static_seed_mb=static_peak_mb,
                     stage=FootprintStage.SAMPLE,
+                    device_index=self._job_card_index(job, None),
                 ),
             )
         if not peaks:
             return None
         return max(peaks)
 
-    def estimate_disaggregated_sampling_peak_mb(self, job_info: HordeJobInfo) -> float | None:
+    def estimate_disaggregated_sampling_peak_mb(
+        self, job_info: HordeJobInfo, device_index: int | None
+    ) -> float | None:
         """Return a disaggregated job's estimated sampling-phase peak VRAM (MB), or None when unavailable.
 
         Injected into the disaggregation orchestrator's concurrent-sampling gate. Charges the whole-job
@@ -12527,6 +12601,7 @@ class InferenceScheduler:
             baseline,
             static_seed_mb=static_peak_mb,
             stage=FootprintStage.SAMPLE_ISOLATED,
+            device_index=device_index,
         )
 
     def estimate_disaggregated_decode_spike_mb(self, job_info: HordeJobInfo) -> float | None:
@@ -12568,8 +12643,8 @@ class InferenceScheduler:
             )
         return 0.0
 
-    def _sampling_peak_mb(self, job: ImageGenerateJobPopResponse) -> float | None:
-        """Return the sampling peak estimate for ``job``, raised by any learned SAMPLE-stage watermark."""
+    def _sampling_peak_mb(self, job: ImageGenerateJobPopResponse, *, device_index: int | None) -> float | None:
+        """Return the sampling peak estimate for ``job`` on the card, raised by the card's SAMPLE-stage watermark."""
         if job.model is None:
             return None
         baseline = self._model_metadata.get_baseline(job.model)
@@ -12581,6 +12656,7 @@ class InferenceScheduler:
             baseline,
             static_seed_mb=static_peak_mb,
             stage=FootprintStage.SAMPLE,
+            device_index=device_index,
         )
 
     def _pending_post_processing_reserve_mb(self, *, device_index: int | None) -> float:
@@ -12606,6 +12682,7 @@ class InferenceScheduler:
                 self._footprint_store,
                 sdk_job,
                 predict_job_post_processing_vram_mb(sdk_job, baseline_name),
+                card_total_gb=card_total_gb(post_process_process.total_vram_mb),
             )
             if estimate is None or estimate <= 0:
                 continue
@@ -12828,7 +12905,7 @@ class InferenceScheduler:
             for process_info in self._process_map.values()
         )
         if pp_committed_mb > 0 and pp_busy:
-            sampling_peak_mb = self._sampling_peak_mb(next_job)
+            sampling_peak_mb = self._sampling_peak_mb(next_job, device_index=device_index)
             return _PostProcessingOverlap(
                 chain_running=True,
                 chain_mb=pp_committed_mb,
@@ -12851,7 +12928,7 @@ class InferenceScheduler:
         if pending_pp_reserve_mb <= 0:
             return None
 
-        sampling_peak_mb = self._sampling_peak_mb(next_job)
+        sampling_peak_mb = self._sampling_peak_mb(next_job, device_index=device_index)
         return _PostProcessingOverlap(
             chain_running=False,
             chain_mb=pending_pp_reserve_mb,

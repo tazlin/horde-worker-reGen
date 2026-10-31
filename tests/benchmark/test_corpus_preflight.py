@@ -382,6 +382,7 @@ def test_a_persisted_store_is_read_back_by_the_default_probe(tmp_path: Path) -> 
         platform=sys.platform,
         stage=FootprintStage.RESIDENT,
         checkpoint="Deliberate",
+        card_total_gb=24,
     )
     store.observe_peak(resident_key, 5000.0)
     store.save()
@@ -399,6 +400,7 @@ def test_a_persisted_store_is_read_back_by_the_default_probe(tmp_path: Path) -> 
                 platform=sys.platform,
                 stage=FootprintStage.SAMPLE,
                 checkpoint=None,
+                card_total_gb=24,
             ),
         )
         is None

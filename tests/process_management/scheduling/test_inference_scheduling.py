@@ -50,6 +50,7 @@ from horde_worker_regen.process_management.resources.vram_footprints import (
     _MIN_OBSERVATIONS_FOR_MEASURED,
     LearnedFootprintStore,
     ResolutionBucket,
+    card_total_gb,
 )
 from horde_worker_regen.process_management.scheduling import inference_scheduler as _sched_mod
 from horde_worker_regen.process_management.scheduling.admission import preload, pricing
@@ -260,6 +261,8 @@ class TestModelServiceabilityAdmission:
 
 _MOSS = "moss_model"
 _SMALL_CARD_TOTAL_MB = 8188.0
+_SMALL_CARD_GB = card_total_gb(_SMALL_CARD_TOTAL_MB)
+"""The card-size class of :data:`_SMALL_CARD_TOTAL_MB`, which the card's learned figures are keyed under."""
 _REGISTRY_BASELINES = tuple(
     baseline for baseline in KNOWN_IMAGE_GENERATION_BASELINE if baseline is not KNOWN_IMAGE_GENERATION_BASELINE.infer
 )
@@ -343,7 +346,7 @@ class TestPreloadGateChecksTheSeatWithoutTheFloor:
         store = LearnedFootprintStore()
         for band in ResolutionBucket:
             for _ in range(_MIN_OBSERVATIONS_FOR_MEASURED):
-                store.observe_peak(pricing.pooled_sample_key("moss_image", band), 1500.0)
+                store.observe_peak(pricing.pooled_sample_key("moss_image", band, card_total_gb=_SMALL_CARD_GB), 1500.0)
         scheduler.set_footprint_store(store)
 
         dominance = scheduler.card_dominance(0)

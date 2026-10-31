@@ -7,8 +7,8 @@ report and offers them back as an estimate that can only ever *raise* the static
 so a consumer sizing a request never plans below what the hardware has already demonstrated it needs.
 
 Admission pricing of a job's sampling peak reads :meth:`LearnedFootprintStore.estimate_mb` with the static
-per-model predictor as the seed: a measured watermark for the job's (baseline, resolution, platform, stage)
-raises the priced peak above the seed and never below it. A whole-job monolithic peak and a disaggregated
+per-model predictor as the seed: a measured watermark for the job's (baseline, resolution, platform, card size,
+stage) raises the priced peak above the seed and never below it. A whole-job monolithic peak and a disaggregated
 UNet-only sampler peak are physically different quantities and are kept under distinct stages
 (:attr:`FootprintStage.SAMPLE` vs :attr:`FootprintStage.SAMPLE_ISOLATED`) so a monolithic peak never
 over-prices an isolated sampler (mixed operation is designed: a stage fault re-routes a disaggregated job
@@ -47,7 +47,7 @@ import json
 import os
 import sys
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Protocol
 
@@ -58,6 +58,34 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from horde_worker_regen.process_management.resources.admission_identity import admission_noise_buffer_mb
 from horde_worker_regen.process_management.resources.resource_budget import platform_context_constant_mb
+
+
+def card_total_gb(total_vram_mb: float | None) -> int | None:
+    """Return the card-size class (GiB) a learned figure is keyed under, or None when the card total is unknown.
+
+    The card's total rounded to the nearest GiB, so a card's reported total (16275 MB) and its marketed size
+    land in one class (16).
+    """
+    if total_vram_mb is None or total_vram_mb <= 0:
+        return None
+    return round(total_vram_mb / 1024.0)
+
+
+def view_card_total_gb(
+    total_vram_mb: float | None,
+    *,
+    multi_gpu_routing_active: bool,
+    device_index: int | None,
+) -> int | None:
+    """Return the card-size class a pricing view reads learned figures under, or None when the view has no card.
+
+    On one card the worker-wide view is that card. On a multi-card worker the worker-wide view (``device_index``
+    None) has no card, and a figure describes only the card it was measured on, so the view does not read a
+    learned figure and prices from the seed.
+    """
+    if multi_gpu_routing_active and device_index is None:
+        return None
+    return card_total_gb(total_vram_mb)
 
 
 def plausible_activation_ceiling_mb(total_vram_mb: float | None) -> float | None:
@@ -191,16 +219,24 @@ class MeasuredJobFootprint(Protocol):
         """``whole_job`` for a monolithic run, ``sample_stage`` for a disaggregated sampler stage."""
 
 
-FOOTPRINT_STORE_SCHEMA_VERSION = 5
+FOOTPRINT_STORE_SCHEMA_VERSION = 6
 """Bumped when the file format changes, or when observations written by an older build can no longer be trusted.
-A file with another version is discarded on read, except those in :data:`_MISKEYED_SAMPLING_SCHEMA_VERSIONS`.
+A file with another version is discarded on read, except those in :data:`_CARD_BLIND_SCHEMA_VERSIONS`.
 Version 2 drops files written before observations were bounds-checked (see
 :meth:`LearnedFootprintStore.observe_peak`): those can hold activation watermarks at the size of the card and
 resident figures smaller than the checkpoint's weights, and since watermarks only ever rise, the store would price
 from them forever. Version 3 marks :attr:`FootprintStage.SAMPLE` windows that hold one figure per job. Version 4
 adds job-class keys (:meth:`FootprintKey.for_job_class`). A build that predates them discards the file, since it
 would read a class key as its pooled key. In version 5, :attr:`FootprintStage.SAMPLE` and
-:attr:`FootprintStage.SAMPLE_ACTIVATION` keys are filed under the job's own model."""
+:attr:`FootprintStage.SAMPLE_ACTIVATION` keys are filed under the job's own model. Version 6 adds the card-size
+class (:attr:`FootprintKey.card_total_gb`)."""
+
+_CARD_BLIND_SCHEMA_VERSIONS = frozenset({2, 3, 4, 5})
+"""Older schemas whose keys carry no card identity, still loaded when the card they were measured on is known.
+
+A worker that drives exactly one card of known size measured every entry on it, so the entries are re-keyed to
+that card. On more than one card, or a card of unknown size, the file does not record which card an entry
+describes, so the entry is dropped."""
 
 _MISKEYED_SAMPLING_SCHEMA_VERSIONS = frozenset({2, 3, 4})
 """Older schemas still loaded, without any entry of a stage in :data:`_MISKEYED_SAMPLING_STAGES`.
@@ -358,6 +394,12 @@ class FootprintKey(BaseModel):
     Peaks are keyed by platform because the measured device-memory high-water differs by driver model:
     Windows/WDDM demand-pages and reports peaks unlike native Linux, so a peak learned on one platform
     is not a valid prior for the other."""
+    card_total_gb: int
+    """The card-size class (:func:`card_total_gb`) of the card the figure was measured on.
+
+    ComfyUI keeps a component resident when it fits, so a 24 GB card's Flux sampling peak includes the text
+    encoder that a 16 GB card releases. Priced on the smaller card, that figure would refuse a model the card can
+    run. The field is required so that every key carries a card."""
     stage: FootprintStage
     """The pipeline stage the peak was observed for."""
     checkpoint: str | None = None
@@ -384,14 +426,16 @@ def sampling_footprint_key(
     baseline: str | None,
     *,
     stage: FootprintStage,
+    card_total_gb: int | None,
 ) -> FootprintKey | None:
-    """The activation-stage key for ``job``, or None when the job cannot be attributed to a population.
+    """The activation-stage key for ``job`` on a card of ``card_total_gb``, or None when it cannot be attributed.
 
     A monolithic peak (:attr:`FootprintStage.SAMPLE`) and a disaggregated sampler-only peak
     (:attr:`FootprintStage.SAMPLE_ISOLATED`) are different quantities and, since watermarks are raise-only, must
-    never share a key. A None baseline or a missing dimension returns None so the caller keeps its static seed.
+    never share a key. A None baseline, a missing dimension or an unknown card returns None so the caller keeps
+    the static seed.
     """
-    if baseline is None:
+    if baseline is None or card_total_gb is None:
         return None
     width = job.payload.width
     height = job.payload.height
@@ -401,25 +445,28 @@ def sampling_footprint_key(
         model_baseline=str(baseline),
         resolution_bucket=ResolutionBucket.from_dimensions(width, height, job.payload.n_iter or 1),
         platform=sys.platform,
+        card_total_gb=card_total_gb,
         stage=stage,
     )
 
 
-def post_process_footprint_key(job: ImageGenerateJobPopResponse) -> FootprintKey | None:
-    """The key a job's post-processing chain is recorded and priced under, or None when the lane runs nothing.
+def post_process_footprint_key(job: ImageGenerateJobPopResponse, *, card_total_gb: int | None) -> FootprintKey | None:
+    """The key a job's post-processing chain is recorded and priced under on the lane's card, or None.
 
-    The operations are the ones the post-processing lane runs (background removal runs on another lane), sorted
-    so one set of operations is one key, and the band is the size of the generated image the chain is given.
+    None when the lane runs nothing or its card is unknown. The operations are the ones the post-processing lane
+    runs (background removal runs on another lane), sorted so one set of operations is one key, and the band is
+    the size of the generated image the chain is given.
     """
     forms = sorted(str(form) for form in (job.payload.post_processing or []) if not is_strip_background_form(form))
     width = job.payload.width
     height = job.payload.height
-    if not forms or width is None or height is None:
+    if not forms or width is None or height is None or card_total_gb is None:
         return None
     return FootprintKey(
         model_baseline=POST_PROCESS_CHAIN_BASELINE,
         resolution_bucket=ResolutionBucket.from_dimensions(width, height),
         platform=sys.platform,
+        card_total_gb=card_total_gb,
         stage=FootprintStage.POST_PROCESS,
         checkpoint="+".join(forms),
     )
@@ -429,13 +476,15 @@ def learned_post_process_vram_mb(
     store: LearnedFootprintStore | None,
     job: ImageGenerateJobPopResponse,
     static_mb: float | None,
+    *,
+    card_total_gb: int | None,
 ) -> float | None:
     """Return a chain's VRAM charge (MB), the static estimate raised by its watermark and lowered by its measurement.
 
-    The figure is the growth of the lane's reservation over the chain, the quantity its booking charges. None when
-    neither the estimate nor the store can price the chain.
+    The figure is the growth of the lane's reservation over the chain, the quantity the lane's booking charges,
+    read for the post-processing lane's card. None when neither the estimate nor the store can price the chain.
     """
-    key = post_process_footprint_key(job) if store is not None else None
+    key = post_process_footprint_key(job, card_total_gb=card_total_gb) if store is not None else None
     if store is None or key is None:
         return static_mb
     raised_mb = store.estimate_mb(key, static_seed_mb=static_mb or 0.0)
@@ -546,21 +595,33 @@ def _atomic_write_text(path: Path, content: str) -> None:
 
 
 class LearnedFootprintStore:
-    """A store of measured VRAM peaks keyed by (baseline, resolution, platform, stage).
+    """A store of measured VRAM peaks keyed by (baseline, resolution, platform, card size, stage).
 
     Single-threaded use only (the parent control loop). Given a path it loads any previously persisted
     observations at construction and writes them back on a debounce, so a restart keeps its calibration;
     without one it is purely in memory and cold at every worker start.
     """
 
-    def __init__(self, *, path: Path | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        path: Path | None = None,
+        driven_card_totals_gb: Sequence[int | None] | None = None,
+    ) -> None:
         """Initialise the store, loading any persisted observations from ``path``.
 
         Args:
             path: Where to persist observations; ``None`` keeps the store purely in memory (tests).
+            driven_card_totals_gb: The card-size class (:func:`card_total_gb`) of every card the worker drives,
+                None for a card of unknown size. A file of :data:`_CARD_BLIND_SCHEMA_VERSIONS` is re-keyed to the
+                card when there is exactly one of known size, and dropped otherwise. ``None`` is a reader that
+                does not know which cards wrote the file.
         """
         self._observations: dict[FootprintKey, _FootprintObservation] = {}
         self._path = path
+        self._driven_card_totals_gb = tuple(driven_card_totals_gb) if driven_card_totals_gb is not None else ()
+        self.card_blind_entries_dropped = 0
+        """How many entries of a card-blind schema the load dropped, for a reader that reports them."""
         self._observations_since_save = 0
         self._file_disabled = False
         self._load()
@@ -654,6 +715,7 @@ class LearnedFootprintStore:
         *,
         baseline: str | None,
         platform: str,
+        card_total_gb: int | None,
         context_constant_mb: float = 0.0,
         resident_floor_mb: float | None = None,
     ) -> list[FootprintKey]:
@@ -675,13 +737,14 @@ class LearnedFootprintStore:
         it needs the whole card and defers it against room that is really there. The activation keys keep
         their process-local source (the child's own reserved-peak report).
 
-        Anything the footprint cannot key (no baseline, a non-positive figure) is skipped rather than
-        guessed. Returns the keys actually written, for the caller's logging.
+        Anything the footprint cannot key (no baseline, a non-positive figure, an unknown card) is skipped rather
+        than guessed. Returns the keys actually written, for the caller's logging.
 
         Args:
             footprint: The measured footprint the child reported.
             baseline: The model's baseline, resolved by the caller when the footprint does not carry one.
             platform: The host platform token the observation belongs to (``sys.platform``).
+            card_total_gb: The card-size class of the reporting process's card, or None when unknown.
             context_constant_mb: The per-process CUDA-context charge to add to the resident figure.
             resident_floor_mb: The checkpoint's known weight bytes (MB); a resident figure below it is dropped.
 
@@ -689,7 +752,7 @@ class LearnedFootprintStore:
             list[FootprintKey]: Every key this footprint was recorded under.
         """
         resolved_baseline = footprint.baseline or baseline
-        if resolved_baseline is None:
+        if resolved_baseline is None or card_total_gb is None:
             return []
 
         written: list[FootprintKey] = []
@@ -702,6 +765,7 @@ class LearnedFootprintStore:
                 model_baseline=str(resolved_baseline),
                 resolution_bucket=None,
                 platform=platform,
+                card_total_gb=card_total_gb,
                 stage=FootprintStage.RESIDENT,
                 checkpoint=footprint.model_name,
             )
@@ -724,7 +788,8 @@ class LearnedFootprintStore:
 
         Watermarks only rise and are persisted, so a reading that predates a feeder's bound keeps mispricing
         its key until it is cut back. Counts and keys are kept; only the watermark, the recent window and the
-        EWMA are clamped, so the key keeps its authority and its genuine evidence.
+        EWMA are clamped, so the key keeps its authority and its genuine evidence. ``bound_for_key`` bounds each
+        key by the key's card (:attr:`FootprintKey.card_total_gb`), since the store holds keys of every card.
         """
         changed: list[FootprintKey] = []
         for key, observation in list(self._observations.items()):
@@ -807,6 +872,14 @@ class LearnedFootprintStore:
             basis_mb = max(observation.recent_mb)
         return (basis_mb * _MEASURED_ESTIMATE_MARGIN) + platform_context_constant_mb(platform=key.platform)
 
+    def has_measurement(self, key: FootprintKey) -> bool:
+        """Return whether ``key`` holds enough recent observations for :meth:`measured_estimate_mb` to return a figure.
+
+        The key carries the card, so this reports whether that card has measured the figure, whatever other cards hold.
+        """
+        observation = self._observations.get(key)
+        return observation is not None and len(observation.recent_mb) >= _MIN_OBSERVATIONS_FOR_MEASURED
+
     def measured_estimate_net_of_context_mb(self, key: FootprintKey) -> float | None:
         """Return :meth:`measured_estimate_mb` without the context charge it adds, or None while under-observed.
 
@@ -879,7 +952,8 @@ class LearnedFootprintStore:
         A file the current build cannot parse is discarded rather than repaired: the store re-learns from
         live traffic within a handful of jobs, so nothing is worth failing a worker start over. A file of
         :data:`_MISKEYED_SAMPLING_SCHEMA_VERSIONS` loads without its :data:`_MISKEYED_SAMPLING_STAGES` entries,
-        since those may carry another model's readings.
+        since those may carry another model's readings. A file of :data:`_CARD_BLIND_SCHEMA_VERSIONS` is re-keyed
+        to the worker's card when it drives exactly one card of known size, and dropped otherwise.
         """
         if self._path is None or not self._path.exists():
             return
@@ -893,18 +967,28 @@ class LearnedFootprintStore:
             return
         schema_version = raw.get("schema_version")
         sampling_is_miskeyed = schema_version in _MISKEYED_SAMPLING_SCHEMA_VERSIONS
-        if schema_version != FOOTPRINT_STORE_SCHEMA_VERSION and not sampling_is_miskeyed:
+        card_blind = schema_version in _CARD_BLIND_SCHEMA_VERSIONS
+        if schema_version != FOOTPRINT_STORE_SCHEMA_VERSION and not card_blind:
             return
         entries = raw.get("observations")
         if not isinstance(entries, list):
             return
+        measured_card_gb: int | None = None
+        if card_blind:
+            measured_card_gb = self._card_of_card_blind_file()
+            if measured_card_gb is None:
+                self._drop_card_blind_file(entries, schema_version)
+                return
 
         miskeyed_entries_dropped = 0
         for entry in entries:
             if not isinstance(entry, dict):
                 continue
+            key_data = entry.get("key")
+            if card_blind and isinstance(key_data, dict):
+                key_data = {**key_data, "card_total_gb": measured_card_gb}
             try:
-                key = FootprintKey.model_validate(entry.get("key"))
+                key = FootprintKey.model_validate(key_data)
                 observation = _FootprintObservation.model_validate(entry.get("observation"))
             except ValueError:
                 continue
@@ -917,5 +1001,29 @@ class LearnedFootprintStore:
                 f"Learned VRAM footprints at {self._path}: dropped {miskeyed_entries_dropped} sampling entries "
                 f"written under schema {schema_version}, since they may carry another model's readings.",
             )
+
+    def _card_of_card_blind_file(self) -> int | None:
+        """Return the card every entry of a card-blind file was measured on, or None when it cannot be known."""
+        if len(self._driven_card_totals_gb) != 1:
+            return None
+        return self._driven_card_totals_gb[0]
+
+    def _drop_card_blind_file(self, entries: list[object], schema_version: object) -> None:
+        """Record and log that a card-blind file's entries were dropped, since no card can be assigned to them."""
+        self.card_blind_entries_dropped = sum(1 for entry in entries if isinstance(entry, dict))
+        if self.card_blind_entries_dropped == 0:
+            return
+        cards = len(self._driven_card_totals_gb)
+        if cards == 1:
+            reason = "the card the worker drives is of unknown size"
+        elif cards > 1:
+            reason = f"this worker drives {cards} cards"
+        else:
+            reason = "the cards that wrote them are unknown"
+        logger.info(
+            f"Learned VRAM footprints at {self._path}: dropped {self.card_blind_entries_dropped} entries written "
+            f"under schema {schema_version}, which carry no card identity, since {reason} and a figure only "
+            f"describes the card it was measured on.",
+        )
 
     # endregion

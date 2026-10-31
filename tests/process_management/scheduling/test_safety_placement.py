@@ -43,6 +43,7 @@ from horde_worker_regen.process_management.resources.vram_footprints import (
     FootprintKey,
     FootprintStage,
     LearnedFootprintStore,
+    card_total_gb,
 )
 from horde_worker_regen.process_management.scheduling import inference_scheduler as sched_mod
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
@@ -63,6 +64,9 @@ from tests.process_management.conftest import (
     make_test_card_runtimes,
 )
 from tests.process_management.scheduling.test_inference_scheduling import _make_inference_scheduler
+
+_SAFETY_CARD_TOTAL_MB = 24576
+"""The card a safety process that has not reported a total is placed on, so its learned price has a card."""
 
 _READINESS_SECONDS = 30.0
 """What the stand-in lifecycle reports one safety placement flip costs, and hence the demotion dwell.
@@ -224,7 +228,20 @@ async def _queue_safety_backlog(scheduler: object, depth: int) -> None:
 
 
 def _observe_safety_footprint(scheduler: object, device_footprint_mb: float) -> None:
-    """Fold one measured safety device footprint into the scheduler's learned-footprint store."""
+    """Fold one measured safety device footprint, learned on the safety process's card, into the scheduler's store.
+
+    A harness without a safety process stands in the card a reporting safety process would report, since the price
+    reads safety's figures for the card safety sits on.
+    """
+    safety_process = scheduler._process_map.get_safety_process()  # type: ignore[attr-defined]
+    if safety_process is not None and safety_process.total_vram_mb <= 0:
+        safety_process.total_vram_mb = _SAFETY_CARD_TOTAL_MB
+    card_gb = card_total_gb(
+        safety_process.total_vram_mb if safety_process is not None else _SAFETY_CARD_TOTAL_MB,
+    )
+    assert card_gb is not None
+    if safety_process is None:
+        scheduler._safety_card_gb = lambda: card_gb  # type: ignore[attr-defined]
     store = LearnedFootprintStore()
     store.observe_peak(
         FootprintKey(
@@ -232,6 +249,7 @@ def _observe_safety_footprint(scheduler: object, device_footprint_mb: float) -> 
             resolution_bucket=None,
             platform=sys.platform,
             stage=FootprintStage.SAFETY,
+            card_total_gb=card_gb,
         ),
         device_footprint_mb,
     )
@@ -531,7 +549,7 @@ class TestPerCardCommittedPeak:
             lambda job, baseline: peak_by_model[str(job.model)],
         )
         scheduler._learned_sampling_peak_mb = (  # type: ignore[method-assign]
-            lambda job, baseline, *, static_seed_mb, stage: static_seed_mb
+            lambda job, baseline, *, static_seed_mb, stage, device_index: static_seed_mb
         )
 
         assert scheduler._largest_active_sampling_peak(0) == (4600.0, "heavy-model")

@@ -155,7 +155,8 @@ Start from the mechanism, not the file. Each line states the owner of one questi
   since the send.
 - **What a job costs the card:** `scheduling/admission/pricing.py` (`partial_seat_mb`, `sampling_reserve_mb`,
   `has_reclaimable_idle_model`, `sweep_spares_idle_copy`, the ready seats), `resources/vram_footprints.py`
-  (`LearnedFootprintStore`, stages `SAMPLE`, `SAMPLE_ACTIVATION`, `RESIDENT`, keyed by platform) and
+  (`LearnedFootprintStore`, stages `SAMPLE`, `SAMPLE_ACTIVATION`, `RESIDENT`, keyed by platform and card size,
+  `FootprintKey.card_total_gb`, so a figure prices only a card of the size it was measured on) and
   `resources/resource_budget.py` (`StreamForecast`, the static seeds, the booking decay). A dispatch booking is
   set at clearance against the lane's report and decays only by growth past the lowest report since, so a job
   past its first step can still carry gigabytes of booking.

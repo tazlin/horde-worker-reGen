@@ -45,6 +45,7 @@ from tests.process_management.liveness._dispatch_world import (
 )
 from tests.process_management.liveness._host_ram import HostRamLedger
 from tests.process_management.liveness._session_replay import (
+    REPLAY_CARD_GB,
     SESSION_FOOTPRINTS_PATH,
     SESSION_JOBS_PATH,
     PopDriverRecord,
@@ -542,7 +543,9 @@ def test_the_truth_hook_leaves_the_encoder_and_vae_to_the_support_tenant(tmp_pat
         _, peak_share_mb = whole(job)
         support_mb = _support_component_mb(model_class)
         assert weights_mb == model_class.weights_mb
-        activation_key = sampling_footprint_key(job, str(model_class.baseline), stage=FootprintStage.SAMPLE_ACTIVATION)
+        activation_key = sampling_footprint_key(
+            job, str(model_class.baseline), stage=FootprintStage.SAMPLE_ACTIVATION, card_total_gb=REPLAY_CARD_GB
+        )
         assert activation_key is not None
         measured_activation_mb = store.measured_job_estimate_net_of_context_mb(
             activation_key, job_class_key(activation_key, job)
@@ -591,6 +594,7 @@ _FLUX_SAMPLE_KEY = FootprintKey(
     model_baseline=str(_FLUX.baseline),
     resolution_bucket=ResolutionBucket.LE_1024,
     platform=sys.platform,
+    card_total_gb=REPLAY_CARD_GB,
     stage=FootprintStage.SAMPLE,
 )
 """The Flux sampling key most of the window's Flux jobs are learned under."""

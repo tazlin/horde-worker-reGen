@@ -264,6 +264,7 @@ from horde_worker_regen.process_management.resources.vram_attribution import (
 from horde_worker_regen.process_management.resources.vram_footprints import (
     FOOTPRINT_STORE_FILENAME,
     LearnedFootprintStore,
+    card_total_gb,
 )
 from horde_worker_regen.process_management.scheduling import pool_ranker
 from horde_worker_regen.process_management.scheduling.clearance_lease import (
@@ -1762,12 +1763,14 @@ class HordeWorkerProcessManager:
         self._performance_model = self._build_performance_model()
 
         # Learned VRAM footprints: the parent observes measured device-memory peaks per (baseline,
-        # resolution, platform, stage) so admission has a measured prior instead of a static seed alone.
-        # Populated from memory reports and from the backend's per-job footprint, and persisted beside the
+        # resolution, platform, card size, stage) so admission has a measured prior instead of a static seed
+        # alone. Populated from memory reports and from the backend's per-job footprint, and persisted beside the
         # performance model so a restart keeps its calibration rather than re-learning it from live traffic.
-        # In memory only under test, on the same terms as the performance model.
+        # In memory only under test, on the same terms as the performance model. A file written before keys
+        # carried a card is re-keyed only when the worker drives one card, the card that measured it.
         self._learned_footprint_store = LearnedFootprintStore(
             path=None if os.environ.get("AI_HORDE_TESTING") else default_app_state_dir() / FOOTPRINT_STORE_FILENAME,
+            driven_card_totals_gb=[card_total_gb(card.total_vram_mb) for card in self._card_runtimes.values()],
         )
         self._message_dispatcher.set_footprint_store(self._learned_footprint_store)
 

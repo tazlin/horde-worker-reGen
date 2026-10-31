@@ -21,6 +21,7 @@ from horde_worker_regen.process_management.resources.vram_footprints import (
     FootprintKey,
     FootprintStage,
     LearnedFootprintStore,
+    card_total_gb,
 )
 from tests.process_management.conftest import make_job_pop_response
 from tests.process_management.liveness._dispatch_world import (
@@ -202,6 +203,7 @@ async def test_a_seeded_store_is_the_parents_prior_and_keeps_learning() -> None:
         model_baseline=KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl.value,
         resolution_bucket=None,
         platform=sys.platform,
+        card_total_gb=card_total_gb(_CARD_24GB.total_mb),
         stage=FootprintStage.RESIDENT,
         checkpoint="world-inputs-unserved-checkpoint",
     )

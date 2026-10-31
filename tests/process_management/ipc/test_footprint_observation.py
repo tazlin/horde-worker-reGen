@@ -66,6 +66,9 @@ from tests.process_management.conftest import (
 
 _MODEL = "stable_diffusion"
 _BASELINE = KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl
+_CARD_TOTAL_MB = 24576
+"""The total every reporting process's card carries, so its figures are keyed to a 24 GB card."""
+_CARD_GB = 24
 
 
 def _dispatcher_with_store(
@@ -100,6 +103,7 @@ def _memory_message(
     allocated_mb: int | None = None,
     vram_usage_mb: int = 0,
     sampled_at: float | None = None,
+    vram_total_mb: int | None = _CARD_TOTAL_MB,
 ) -> HordeProcessMemoryMessage:
     return HordeProcessMemoryMessage(
         process_id=process_id,
@@ -111,6 +115,7 @@ def _memory_message(
         process_reserved_mb=reserved_mb,
         process_allocated_mb=allocated_mb,
         sampled_at=sampled_at,
+        vram_total_mb=vram_total_mb,
     )
 
 
@@ -121,6 +126,7 @@ def _resident_key(checkpoint: str = _MODEL) -> FootprintKey:
         platform=sys.platform,
         stage=FootprintStage.RESIDENT,
         checkpoint=checkpoint,
+        card_total_gb=_CARD_GB,
     )
 
 
@@ -130,6 +136,7 @@ def _safety_key() -> FootprintKey:
         resolution_bucket=None,
         platform=sys.platform,
         stage=FootprintStage.SAFETY,
+        card_total_gb=_CARD_GB,
     )
 
 
@@ -172,6 +179,7 @@ async def test_running_inference_peak_is_recorded_with_the_right_key() -> None:
         resolution_bucket=ResolutionBucket.LE_512,
         platform=sys.platform,
         stage=FootprintStage.SAMPLE,
+        card_total_gb=_CARD_GB,
     )
     observation = store.get_observation(expected_key)
     assert observation is not None
@@ -221,6 +229,7 @@ def _sample_key_512(baseline: KNOWN_IMAGE_GENERATION_BASELINE) -> FootprintKey:
         resolution_bucket=ResolutionBucket.LE_512,
         platform=sys.platform,
         stage=FootprintStage.SAMPLE,
+        card_total_gb=_CARD_GB,
     )
 
 
@@ -295,6 +304,7 @@ async def test_a_primed_lanes_peak_is_not_attributed_until_its_first_step() -> N
         resolution_bucket=ResolutionBucket.LE_512,
         platform=sys.platform,
         stage=FootprintStage.SAMPLE,
+        card_total_gb=_CARD_GB,
     )
     observation = store.get_observation(key)
     assert observation is not None
@@ -564,12 +574,14 @@ _BACKEND_REPORTS_FOOTPRINTS = "vram_footprint" in JobPhaseMetrics.model_fields
 
 @pytest.mark.skipif(not _BACKEND_REPORTS_FOOTPRINTS, reason="installed backend does not report a job VRAM footprint")
 def test_measured_job_footprint_is_recorded_from_the_metrics_message() -> None:
-    """A child's measured footprint lands under the store's resident and sampling keys for its own model."""
+    """A child's measured footprint lands under the store's resident key for its own model on the child's card."""
     from hordelib.metrics import JobVramFootprint
 
     store = LearnedFootprintStore()
+    reporting_process = make_mock_process_info(1, model_name=_MODEL)
+    reporting_process.total_vram_mb = _CARD_TOTAL_MB
     dispatcher = _dispatcher_with_store(
-        process_map=ProcessMap({}),
+        process_map=ProcessMap({1: reporting_process}),
         job_tracker=JobTracker(),
         store=store,
     )
@@ -605,6 +617,7 @@ def test_measured_job_footprint_is_recorded_from_the_metrics_message() -> None:
         resolution_bucket=ResolutionBucket.LE_1024,
         platform=sys.platform,
         stage=FootprintStage.SAMPLE,
+        card_total_gb=_CARD_GB,
     )
     assert store.get_observation(sampling_key) is None
 
@@ -774,6 +787,7 @@ def _activation_key() -> FootprintKey:
         resolution_bucket=ResolutionBucket.LE_1024,
         platform=sys.platform,
         stage=FootprintStage.SAMPLE_ACTIVATION,
+        card_total_gb=_CARD_GB,
     )
 
 
@@ -918,7 +932,7 @@ def test_a_chain_is_learned_as_the_lanes_growth_once_its_last_stretch_is_reporte
     reservation the growth is measured from.
     """
     dispatcher, store, job = _post_process_lane_running_chain()
-    key = post_process_footprint_key(job)  # type: ignore[arg-type]
+    key = post_process_footprint_key(job, card_total_gb=_CARD_GB)  # type: ignore[arg-type]
     assert key is not None
 
     dispatcher._handle_memory_report(_memory_message(7, reserved_mb=800, peak_mb=9000))
@@ -937,7 +951,7 @@ def test_a_chain_is_learned_as_the_lanes_growth_once_its_last_stretch_is_reporte
 def test_a_chain_without_a_result_is_not_learned() -> None:
     """A chain whose result never arrived has no known end, so its readings are never committed."""
     dispatcher, store, job = _post_process_lane_running_chain()
-    key = post_process_footprint_key(job)  # type: ignore[arg-type]
+    key = post_process_footprint_key(job, card_total_gb=_CARD_GB)  # type: ignore[arg-type]
 
     dispatcher._handle_memory_report(_memory_message(7, reserved_mb=800, peak_mb=900))
     dispatcher._handle_memory_report(_memory_message(7, reserved_mb=2100, peak_mb=2300))

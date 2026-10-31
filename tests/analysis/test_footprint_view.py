@@ -28,6 +28,7 @@ _SAMPLE_KEY = FootprintKey(
     resolution_bucket=ResolutionBucket.LE_1024,
     platform=_PLATFORM,
     stage=FootprintStage.SAMPLE,
+    card_total_gb=24,
 )
 _ACTIVATION_KEY = _SAMPLE_KEY.model_copy(update={"stage": FootprintStage.SAMPLE_ACTIVATION})
 
@@ -39,6 +40,7 @@ def _resident_key(checkpoint: str) -> FootprintKey:
         platform=_PLATFORM,
         stage=FootprintStage.RESIDENT,
         checkpoint=checkpoint,
+        card_total_gb=24,
     )
 
 
@@ -55,6 +57,7 @@ def _write_store(path: Path) -> LearnedFootprintStore:
             resolution_bucket=ResolutionBucket.LE_1024,
             platform=_PLATFORM,
             stage=FootprintStage.SAMPLE,
+            card_total_gb=24,
         ),
         17000.0,
     )
@@ -107,10 +110,13 @@ class TestLearnedSamplingFootprints:
 
         output = render_learned_sampling_footprints(path, learned_sampling_footprints(path))
 
-        assert "stable_diffusion_xl le_1024 sample [all]: watermark 15000MB, measured " in output
+        assert "stable_diffusion_xl le_1024 24GB card sample [all]: watermark 15000MB, measured " in output
         assert "activation watermark 6000MB" in output
         assert "across 2 checkpoints" in output
-        assert "flux_1 le_1024 sample [all]: watermark 17000MB, measured n/a (1 recent reading, too few)" in output
+        assert (
+            "flux_1 le_1024 24GB card sample [all]: watermark 17000MB, measured n/a (1 recent reading, too few)"
+            in output
+        )
 
     def test_missing_store_yields_no_rows(self, tmp_path: Path) -> None:
         """A path with no store lists nothing."""
@@ -147,6 +153,7 @@ def test_a_post_processing_chain_is_listed_with_its_operations(tmp_path: Path) -
             platform=_PLATFORM,
             stage=FootprintStage.POST_PROCESS,
             checkpoint="GFPGAN+RealESRGAN_x4plus",
+            card_total_gb=24,
         ),
         1500.0,
     )

@@ -40,8 +40,10 @@ from horde_worker_regen.process_management.resources.vram_footprints import (
     FootprintStage,
     LearnedFootprintStore,
     ResolutionBucket,
+    card_total_gb,
     job_class_key,
     sampling_footprint_key,
+    view_card_total_gb,
 )
 from horde_worker_regen.process_management.scheduling.admission.snapshot import SchedulingSnapshot, SlotSnapshot
 from horde_worker_regen.process_management.scheduling.clearance_lease import CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS
@@ -248,16 +250,33 @@ def target_slot_is_spared(slot: SlotSnapshot, *, make_room_for_model: str | None
 # ---- learned and measured footprints
 
 
-def learned_resident_footprint_mb(snapshot: SchedulingSnapshot, model: str | None, baseline: Baseline) -> float | None:
-    """The measured at-rest footprint (MB) of a checkpoint net of its context, or None when unmeasured."""
+def footprint_card_gb(snapshot: SchedulingSnapshot, device_index: int | None) -> int | None:
+    """Return the card-size class learned figures are read under for the card (:func:`view_card_total_gb`)."""
+    return view_card_total_gb(
+        snapshot.card(device_index).total_vram_mb,
+        multi_gpu_routing_active=snapshot.multi_gpu_routing_active,
+        device_index=device_index,
+    )
+
+
+def learned_resident_footprint_mb(
+    snapshot: SchedulingSnapshot,
+    model: str | None,
+    baseline: Baseline,
+    *,
+    device_index: int | None,
+) -> float | None:
+    """The measured at-rest footprint (MB) of a checkpoint on the card net of its context, or None when unmeasured."""
     store = snapshot.services.footprint_store
-    if store is None or model is None or baseline is None:
+    card_gb = footprint_card_gb(snapshot, device_index)
+    if store is None or model is None or baseline is None or card_gb is None:
         return None
     watermark_mb = store.estimate_mb(
         FootprintKey(
             model_baseline=str(baseline),
             resolution_bucket=None,
             platform=sys.platform,
+            card_total_gb=card_gb,
             stage=FootprintStage.RESIDENT,
             checkpoint=model,
         ),
@@ -272,15 +291,21 @@ def measured_resident_footprint_mb(
     snapshot: SchedulingSnapshot,
     model: str | None,
     baseline: Baseline,
+    *,
+    device_index: int | None,
 ) -> tuple[float | None, int]:
-    """The margined measured at-rest charge (MB) and its observation count; ``(None, 0)`` without authority."""
+    """The margined measured at-rest charge (MB) on the card and its observation count, ``(None, 0)`` without one."""
     store = snapshot.services.footprint_store
+    card_gb = footprint_card_gb(snapshot, device_index)
     if store is None or model is None or baseline is None or model not in snapshot.models_with_results:
+        return (None, 0)
+    if card_gb is None:
         return (None, 0)
     key = FootprintKey(
         model_baseline=str(baseline),
         resolution_bucket=None,
         platform=sys.platform,
+        card_total_gb=card_gb,
         stage=FootprintStage.RESIDENT,
         checkpoint=model,
     )
@@ -297,8 +322,9 @@ def learned_sampling_peak_mb(
     *,
     static_seed_mb: float,
     stage: FootprintStage,
+    device_index: int | None,
 ) -> float:
-    """The static sampling-peak seed raised by the learned watermark, lowered by the key's trusted measurement.
+    """The static sampling-peak seed raised by the card's learned watermark, lowered by the trusted measurement.
 
     Never lowered below the job's own core weights, which is what stops a light sibling's measurements in the
     same band from underpricing a heavy checkpoint. A LoRA job's measured figure carries the LoRA delta the seed
@@ -308,7 +334,7 @@ def learned_sampling_peak_mb(
     store = snapshot.services.footprint_store
     if store is None:
         return static_seed_mb
-    key = sampling_footprint_key(job, baseline, stage=stage)
+    key = sampling_footprint_key(job, baseline, stage=stage, card_total_gb=footprint_card_gb(snapshot, device_index))
     if key is None:
         return static_seed_mb
     raised_mb = store.estimate_mb(key, static_seed_mb=static_seed_mb)
@@ -409,7 +435,10 @@ def sampling_peak_measured(
     device_index = snapshot.routing_device_index(slot) if slot is not None else None
     sampler_only = disaggregated or prices_sampler_only_on_card(snapshot, job, device_index)
     key = sampling_footprint_key(
-        job, baseline, stage=FootprintStage.SAMPLE_ISOLATED if sampler_only else FootprintStage.SAMPLE
+        job,
+        baseline,
+        stage=FootprintStage.SAMPLE_ISOLATED if sampler_only else FootprintStage.SAMPLE,
+        card_total_gb=footprint_card_gb(snapshot, device_index),
     )
     return key is not None and store.measured_estimate_mb(key) is not None
 
@@ -443,6 +472,7 @@ def candidate_delta_mb(
         baseline,
         static_seed_mb=static_gross_mb,
         stage=FootprintStage.SAMPLE_ISOLATED if sampler_only else FootprintStage.SAMPLE,
+        device_index=device_index,
     )
     resident_credit_mb = 0.0
     if candidate_weights_resident(snapshot, job.model, process_id):
@@ -521,6 +551,8 @@ def partial_seat_activation_mb(
     snapshot: SchedulingSnapshot,
     job: ImageGenerateJobPopResponse,
     baseline: str | None,
+    *,
+    device_index: int | None,
 ) -> float | None:
     """Return the non-weight memory (MB) a whole job needs, or None when its weights or peak cannot be predicted.
 
@@ -533,21 +565,28 @@ def partial_seat_activation_mb(
     leave free, so one reading that also held streamed weights or another model's cache would hold that room
     free on every later grant and force partial loads.
     """
-    return _partial_seat_activation_from_store_mb(snapshot.services.footprint_store, job, baseline)
+    return _partial_seat_activation_from_store_mb(
+        snapshot.services.footprint_store,
+        job,
+        baseline,
+        card_total_gb=footprint_card_gb(snapshot, device_index),
+    )
 
 
 def _partial_seat_activation_from_store_mb(
     store: LearnedFootprintStore | None,
     job: ImageGenerateJobPopResponse,
     baseline: str | None,
+    *,
+    card_total_gb: int | None,
 ) -> float | None:
-    """Return :func:`partial_seat_activation_mb` priced from ``store`` rather than a snapshot's."""
+    """Return :func:`partial_seat_activation_mb` priced from ``store`` for a card of ``card_total_gb``."""
     weights_mb = predict_job_weight_mb(job, baseline)
     sampler_only_mb = predict_job_sampler_only_vram_mb(job, baseline)
     if weights_mb is None or sampler_only_mb is None:
         return None
     static_seed_mb = max(0.0, sampler_only_mb - weights_mb)
-    key = sampling_footprint_key(job, baseline, stage=FootprintStage.SAMPLE_ACTIVATION)
+    key = sampling_footprint_key(job, baseline, stage=FootprintStage.SAMPLE_ACTIVATION, card_total_gb=card_total_gb)
     if store is None or key is None:
         return static_seed_mb
     measured_mb = store.measured_job_estimate_net_of_context_mb(key, job_class_key(key, job))
@@ -587,7 +626,9 @@ def sampling_reserve_mb(
     predicted.
     """
     non_weight_mb = _sampling_non_weight_mb(
-        snapshot, partial_seat_activation_mb(snapshot, job, baseline), device_index=device_index
+        snapshot,
+        partial_seat_activation_mb(snapshot, job, baseline, device_index=device_index),
+        device_index=device_index,
     )
     return non_weight_mb if non_weight_mb > 0.0 else None
 
@@ -640,7 +681,9 @@ def partial_seat_on_card_mb(
     if FEATURE_KIND.lora in _job_feature_kinds(job):
         return None
     weights_mb = predict_job_weight_mb(job, baseline)
-    activation_mb = _partial_seat_activation_from_store_mb(store, job, baseline)
+    activation_mb = _partial_seat_activation_from_store_mb(
+        store, job, baseline, card_total_gb=card_total_gb(total_vram_mb)
+    )
     if weights_mb is None or activation_mb is None:
         return None
     return weight_fraction * weights_mb + _non_weight_on_card_mb(total_vram_mb, activation_mb, platform=platform)
@@ -736,7 +779,9 @@ def forecast_streaming(
     job_id = str(job.id_) if job.id_ is not None else None
     queued = snapshot.queue.jobs.get(job_id) if job_id is not None else None
     disaggregated = queued.disaggregation_class_eligible if queued is not None else False
-    measured_mb, observation_count = measured_resident_footprint_mb(snapshot, job.model, baseline)
+    measured_mb, observation_count = measured_resident_footprint_mb(
+        snapshot, job.model, baseline, device_index=device_index
+    )
     return forecast_weight_streaming(
         job,
         str(baseline) if baseline is not None else None,
@@ -748,7 +793,9 @@ def forecast_streaming(
         platform=snapshot.platform,
         num_extra_resident_contexts=num_post_process_contexts,
         safety_context_charge_mb=num_safety_contexts * snapshot.safety_footprint_mb,
-        learned_resident_footprint_mb=learned_resident_footprint_mb(snapshot, job.model, baseline),
+        learned_resident_footprint_mb=learned_resident_footprint_mb(
+            snapshot, job.model, baseline, device_index=device_index
+        ),
         measured_resident_footprint_mb=measured_mb,
         measured_observation_count=observation_count,
         committed_reserve_mb=snapshot.committed_vram_reserve_mb,
@@ -986,10 +1033,16 @@ def decide_card_dominance(
     )
 
 
-def pooled_sample_key(baseline: str, band: ResolutionBucket, *, platform: str = sys.platform) -> FootprintKey:
-    """Return the pooled (all job classes) SAMPLE key for a baseline and band."""
+def pooled_sample_key(
+    baseline: str, band: ResolutionBucket, *, card_total_gb: int, platform: str = sys.platform
+) -> FootprintKey:
+    """Return the pooled (all job classes) SAMPLE key for a baseline and band on a card of ``card_total_gb``."""
     return FootprintKey(
-        model_baseline=baseline, resolution_bucket=band, platform=platform, stage=FootprintStage.SAMPLE
+        model_baseline=baseline,
+        resolution_bucket=band,
+        platform=platform,
+        card_total_gb=card_total_gb,
+        stage=FootprintStage.SAMPLE,
     )
 
 
@@ -1019,22 +1072,24 @@ def model_sampling_peak(
     store: LearnedFootprintStore | None,
     model: str,
     baseline: Baseline,
+    *,
+    card_total_gb: int | None,
 ) -> ModelSamplingPeak:
-    """Return the sampling peak the dominance verdict prices ``model`` at.
+    """Return the sampling peak the dominance verdict prices ``model`` at on a card of ``card_total_gb``.
 
     The figure is the measured SAMPLE window, net of context, at the baseline's most-observed band among the bands
     with a measured figure. Without one, it is the static sampling seed of a plain batch-1 job at the most-observed
     band's upper side, or at :data:`DOMINANCE_SEED_BAND` when the store has seen no band of it. The raise-only
     watermark is never read, since it carries card-sized child peaks and would price a model off the card on one
-    reading.
+    reading. A card of unknown size prices from the seed.
     """
     baseline_id = str(baseline) if baseline is not None else None
     seed_band = DOMINANCE_SEED_BAND
-    if store is not None and baseline_id is not None:
+    if store is not None and baseline_id is not None and card_total_gb is not None:
         measured: tuple[ResolutionBucket, float, int] | None = None
         most_seen: tuple[ResolutionBucket, int] | None = None
         for band in ResolutionBucket:
-            key = pooled_sample_key(baseline_id, band)
+            key = pooled_sample_key(baseline_id, band, card_total_gb=card_total_gb)
             count = store.observation_count(key)
             if count > 0 and (most_seen is None or count > most_seen[1]):
                 most_seen = (band, count)
@@ -1067,7 +1122,9 @@ def model_dominance(
     cached = dominance.verdicts.get(model)
     if cached is not None:
         return cached
-    return dominance.judge(model_sampling_peak(store, model, baseline))
+    return dominance.judge(
+        model_sampling_peak(store, model, baseline, card_total_gb=card_total_gb(dominance.inputs.total_vram_mb))
+    )
 
 
 def pair_co_samples(

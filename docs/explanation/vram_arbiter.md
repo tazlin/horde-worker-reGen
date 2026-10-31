@@ -153,8 +153,8 @@ The arbiter keeps four concerns deliberately separate:
   stage's static spike figure); an unpriceable candidate is charged nothing, matching the predictive
   gate's admit-on-unknown-cost contract. Where a request prices *sampling* work (the disaggregated
   concurrent-sampling estimate, the measured-overlay candidate delta, and the post-processing
-  co-residency gates), the scheduler prices it from a learned per-(baseline, resolution, platform, stage)
-  peak held in the
+  co-residency gates), the scheduler prices it from a learned per-(baseline, resolution, platform, card size,
+  stage) peak held in the
   [`LearnedFootprintStore`][horde_worker_regen.process_management.resources.vram_footprints.LearnedFootprintStore],
   with the static per-model predictor as a floor: a measured SAMPLE-stage activation high-water can only
   ever *raise* the priced peak, never lower it, closing the systematic undershoot where a static
@@ -232,6 +232,13 @@ The arbiter keeps four concerns deliberately separate:
     so a small model's key, its watermark included, can hold a large model's peak. Each such key prices from
     its static seed until it is learned again; the `SAMPLE_ISOLATED` and at-rest entries load as written. A
     build that predates class keys discards a newer file, since it would read a class key as its pooled key.
+    Every key carries the class of the card it was measured on (`FootprintKey.card_total_gb`, the card's total
+    rounded to the nearest GiB). ComfyUI keeps a component resident when it fits, so a 24 GB card's sampling
+    peak can hold a text encoder a 16 GB card releases, and a figure prices only a card of the same size. A
+    card with no figure of its own prices from the static seed. A worker-wide view on a multi-card worker
+    has no card and does not read a learned figure. Safety's figures are read for the card the safety process
+    sits on. A file written before keys carried a card (`_CARD_BLIND_SCHEMA_VERSIONS`) is re-keyed to the
+    worker's card when it drives exactly one card of known size, and dropped, with one log line, otherwise.
 
     Every feeder reads a per-process allocator counter, and a process can hold things its key does not
     describe, so each reading is bounds-checked before the store accepts it (the `plausible_min_mb` and

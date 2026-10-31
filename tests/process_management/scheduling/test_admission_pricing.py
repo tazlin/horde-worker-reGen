@@ -42,6 +42,7 @@ from horde_worker_regen.process_management.resources.vram_footprints import (
     FootprintStage,
     LearnedFootprintStore,
     ResolutionBucket,
+    card_total_gb,
     sampling_footprint_key,
 )
 from horde_worker_regen.process_management.scheduling.admission import materialization, preload, pricing
@@ -104,7 +105,13 @@ async def _worker(
         store = LearnedFootprintStore()
         for (baseline, stage), peak_mb in learned.items():
             store.observe_peak(
-                FootprintKey(model_baseline=baseline, resolution_bucket=None, platform=sys.platform, stage=stage),
+                FootprintKey(
+                    model_baseline=baseline,
+                    resolution_bucket=None,
+                    platform=sys.platform,
+                    stage=stage,
+                    card_total_gb=card_total_gb(16000.0),
+                ),
                 peak_mb,
             )
         scheduler.set_footprint_store(store)
@@ -211,6 +218,7 @@ class TestForecastAndDeltas:
             job_tracker=JobTracker(),
             model_metadata=make_test_model_metadata(reference),
         )
+        scheduler._process_map.get_reported_total_vram_mb = Mock(return_value=24576.0)  # type: ignore[method-assign]
         plain_job = make_job_pop_response(model="sdxl_model", width=1024, height=1024)
         lora_job = make_job_pop_response(
             model="sdxl_model",
@@ -224,9 +232,9 @@ class TestForecastAndDeltas:
         assert plain_seed_mb is not None and lora_seed_mb is not None
         seed_lora_delta_mb = lora_seed_mb - plain_seed_mb
         assert seed_lora_delta_mb > 0.0
-        key = sampling_footprint_key(plain_job, baseline, stage=FootprintStage.SAMPLE)
+        key = sampling_footprint_key(plain_job, baseline, stage=FootprintStage.SAMPLE, card_total_gb=24)
         assert key is not None
-        assert key == sampling_footprint_key(lora_job, baseline, stage=FootprintStage.SAMPLE)
+        assert key == sampling_footprint_key(lora_job, baseline, stage=FootprintStage.SAMPLE, card_total_gb=24)
         floor_mb = predict_job_weight_mb(plain_job, baseline) or 0.0
         store = LearnedFootprintStore()
         for _ in range(_MIN_OBSERVATIONS_FOR_MEASURED):
@@ -237,10 +245,20 @@ class TestForecastAndDeltas:
         assert measured_estimate_mb is not None
 
         plain_mb = pricing.learned_sampling_peak_mb(
-            snapshot, plain_job, baseline, static_seed_mb=plain_seed_mb, stage=FootprintStage.SAMPLE
+            snapshot,
+            plain_job,
+            baseline,
+            static_seed_mb=plain_seed_mb,
+            stage=FootprintStage.SAMPLE,
+            device_index=None,
         )
         lora_mb = pricing.learned_sampling_peak_mb(
-            snapshot, lora_job, baseline, static_seed_mb=lora_seed_mb, stage=FootprintStage.SAMPLE
+            snapshot,
+            lora_job,
+            baseline,
+            static_seed_mb=lora_seed_mb,
+            stage=FootprintStage.SAMPLE,
+            device_index=None,
         )
 
         assert floor_mb < plain_mb < plain_seed_mb, "the trusted measurement prices the job without LoRAs"
@@ -837,7 +855,11 @@ def _replay_dominance(store: LearnedFootprintStore, *, foreign_floor_mb: float) 
         foreign_floor_bucket=None,
         sample_observation_counts=(),
     )
-    peaks = [pricing.model_sampling_peak(store, model, baseline) for model, baseline in _REPLAY_CATALOGUE.items()]
+    card_gb = card_total_gb(inputs.total_vram_mb)
+    peaks = [
+        pricing.model_sampling_peak(store, model, baseline, card_total_gb=card_gb)
+        for model, baseline in _REPLAY_CATALOGUE.items()
+    ]
     return pricing.decide_card_dominance(inputs, foreign_floor_mb=foreign_floor_mb, peaks=peaks)
 
 
@@ -911,7 +933,9 @@ class TestDominanceVerdict:
 
     def test_an_unmeasured_model_is_priced_at_the_le_1024_sampling_seed(self) -> None:
         """With no observation the peak is the static sampling seed of a plain 1024x1024 job of the model."""
-        peak = pricing.model_sampling_peak(LearnedFootprintStore(), "Flux.1-Schnell fp8 (Compact)", "flux_1")
+        peak = pricing.model_sampling_peak(
+            LearnedFootprintStore(), "Flux.1-Schnell fp8 (Compact)", "flux_1", card_total_gb=16
+        )
 
         assert peak.band is ResolutionBucket.LE_1024
         assert peak.observation_count == 0
@@ -931,8 +955,8 @@ class TestDominanceVerdict:
             sample_observation_counts=(),
         )
         peaks = [
-            pricing.model_sampling_peak(None, "Flux.1-Schnell fp8 (Compact)", "flux_1"),
-            pricing.model_sampling_peak(None, "stable_diffusion", "stable_diffusion_1"),
+            pricing.model_sampling_peak(None, "Flux.1-Schnell fp8 (Compact)", "flux_1", card_total_gb=16),
+            pricing.model_sampling_peak(None, "stable_diffusion", "stable_diffusion_1", card_total_gb=16),
         ]
         dominance = pricing.decide_card_dominance(inputs, foreign_floor_mb=0.0, peaks=peaks)
 
@@ -1163,7 +1187,10 @@ class TestDominanceCache:
         store = LearnedFootprintStore()
         scheduler.set_footprint_store(store)
         first = scheduler.card_dominance(None)
-        store.observe_peak(pricing.pooled_sample_key("flux_1", ResolutionBucket.LE_1024), 15000.0)
+        store.observe_peak(
+            pricing.pooled_sample_key("flux_1", ResolutionBucket.LE_1024, card_total_gb=card_total_gb(16384.0)),
+            15000.0,
+        )
 
         assert scheduler.card_dominance(None) is not first
 

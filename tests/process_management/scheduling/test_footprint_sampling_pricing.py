@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import sys
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
@@ -57,6 +58,14 @@ _SAMPLER_ONLY_SEED_MB = 6158.0
 """The static UNet-only sampler seed for the disaggregated pricing branch."""
 _WATERMARK_MB = 10500.0
 """A learned SAMPLE-stage watermark well above the seed (the ~11GB-against-6158MB undershoot the store closes)."""
+_CARD_TOTAL_MB = 24576.0
+"""The total the manager's card reports, so its learned figures are read for a 24 GB card."""
+_CARD_GB = 24
+
+
+def _report_card_total(pm: HordeWorkerProcessManager) -> None:
+    """Have the manager's card report its total, as its children do, so the store is read for that card."""
+    pm._process_map.get_reported_total_vram_mb = Mock(return_value=_CARD_TOTAL_MB)  # type: ignore[method-assign]
 
 
 def _reference() -> dict[str, object]:
@@ -72,6 +81,7 @@ def _make_manager() -> HordeWorkerProcessManager:
         stable_diffusion_reference=ref,  # type: ignore[arg-type]
     )
     pm._model_metadata.set_reference(ref)  # type: ignore[arg-type]
+    _report_card_total(pm)
     return pm
 
 
@@ -94,6 +104,7 @@ def _sample_key(bucket: ResolutionBucket) -> FootprintKey:
         resolution_bucket=bucket,
         platform=sys.platform,
         stage=FootprintStage.SAMPLE,
+        card_total_gb=_CARD_GB,
     )
 
 
@@ -104,6 +115,7 @@ def _isolated_key(bucket: ResolutionBucket) -> FootprintKey:
         resolution_bucket=bucket,
         platform=sys.platform,
         stage=FootprintStage.SAMPLE_ISOLATED,
+        card_total_gb=_CARD_GB,
     )
 
 
@@ -114,7 +126,7 @@ class TestDisaggregatedEstimatePricing:
         """With nothing observed, the estimate is the static seed unchanged."""
         _pin_static_predictors(monkeypatch)
         scheduler = _make_manager()._inference_scheduler
-        assert scheduler.estimate_disaggregated_sampling_peak_mb(_job_info(1024, 1024)) == _SEED_MB  # type: ignore[arg-type]
+        assert scheduler.estimate_disaggregated_sampling_peak_mb(_job_info(1024, 1024), device_index=None) == _SEED_MB  # type: ignore[arg-type]
 
     def test_learned_watermark_raises_the_estimate(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A SAMPLE_ISOLATED watermark above the seed for the job's bucket raises the priced peak to it."""
@@ -122,7 +134,7 @@ class TestDisaggregatedEstimatePricing:
         pm = _make_manager()
         pm._learned_footprint_store.observe_peak(_isolated_key(ResolutionBucket.LE_1024), _WATERMARK_MB)
         assert (
-            pm._inference_scheduler.estimate_disaggregated_sampling_peak_mb(_job_info(1024, 1024))  # type: ignore[arg-type]
+            pm._inference_scheduler.estimate_disaggregated_sampling_peak_mb(_job_info(1024, 1024), device_index=None)  # type: ignore[arg-type]
             == _WATERMARK_MB
         )
 
@@ -132,7 +144,7 @@ class TestDisaggregatedEstimatePricing:
         pm = _make_manager()
         pm._learned_footprint_store.observe_peak(_isolated_key(ResolutionBucket.LE_1024), _WATERMARK_MB)
         assert (
-            pm._inference_scheduler.estimate_disaggregated_sampling_peak_mb(_job_info(512, 512))  # type: ignore[arg-type]
+            pm._inference_scheduler.estimate_disaggregated_sampling_peak_mb(_job_info(512, 512), device_index=None)  # type: ignore[arg-type]
             == _SEED_MB
         )
 
@@ -220,7 +232,7 @@ class TestStageIsolation:
         job = make_job_pop_response(model=_MODEL, width=1024, height=1024)
         pm._learned_footprint_store.observe_peak(_sample_key(ResolutionBucket.LE_1024), _WATERMARK_MB)
 
-        assert scheduler.estimate_disaggregated_sampling_peak_mb(_job_info(1024, 1024)) == _SEED_MB  # type: ignore[arg-type]
+        assert scheduler.estimate_disaggregated_sampling_peak_mb(_job_info(1024, 1024), device_index=None) == _SEED_MB  # type: ignore[arg-type]
         disagg_delta = scheduler._measured_admission_candidate_delta_mb(
             job,
             baseline,
@@ -299,12 +311,12 @@ class TestGateIntegration:
         arbiter = VramArbiter()
 
         arbiter.begin_cycle(MeasuredVramSnapshot(devices={0: self._cycle_state()}))
-        seed_peak = scheduler.estimate_disaggregated_sampling_peak_mb(_job_info(1024, 1024))  # type: ignore[arg-type]
+        seed_peak = scheduler.estimate_disaggregated_sampling_peak_mb(_job_info(1024, 1024), device_index=None)  # type: ignore[arg-type]
         assert self._second_sample_verdict(arbiter, seed_peak) == VramDisposition.FITS
 
         pm._learned_footprint_store.observe_peak(_isolated_key(ResolutionBucket.LE_1024), _WATERMARK_MB)
         arbiter.begin_cycle(MeasuredVramSnapshot(devices={0: self._cycle_state()}))
-        learned_peak = scheduler.estimate_disaggregated_sampling_peak_mb(_job_info(1024, 1024))  # type: ignore[arg-type]
+        learned_peak = scheduler.estimate_disaggregated_sampling_peak_mb(_job_info(1024, 1024), device_index=None)  # type: ignore[arg-type]
         assert self._second_sample_verdict(arbiter, learned_peak) == VramDisposition.DEFER
 
     def test_small_bucket_job_still_admits_after_a_large_watermark_is_learned(
@@ -319,7 +331,7 @@ class TestGateIntegration:
 
         arbiter = VramArbiter()
         arbiter.begin_cycle(MeasuredVramSnapshot(devices={0: self._cycle_state()}))
-        small_peak = scheduler.estimate_disaggregated_sampling_peak_mb(_job_info(512, 512))  # type: ignore[arg-type]
+        small_peak = scheduler.estimate_disaggregated_sampling_peak_mb(_job_info(512, 512), device_index=None)  # type: ignore[arg-type]
         assert self._second_sample_verdict(arbiter, small_peak) == VramDisposition.FITS
 
 
@@ -332,10 +344,10 @@ class TestDisaggregatedObservation:
         store = pm._learned_footprint_store
         job_info = _job_info(1024, 1024)
 
-        pm._inference_scheduler.observe_disaggregated_sampling_peak(job_info, 0.0)  # type: ignore[arg-type]
+        pm._inference_scheduler.observe_disaggregated_sampling_peak(job_info, 0.0, device_index=None)  # type: ignore[arg-type]
         assert len(store) == 0
 
-        pm._inference_scheduler.observe_disaggregated_sampling_peak(job_info, _WATERMARK_MB)  # type: ignore[arg-type]
+        pm._inference_scheduler.observe_disaggregated_sampling_peak(job_info, _WATERMARK_MB, device_index=None)  # type: ignore[arg-type]
         observation = store.get_observation(_isolated_key(ResolutionBucket.LE_1024))
         assert observation is not None
         assert observation.watermark_mb == _WATERMARK_MB
@@ -446,6 +458,7 @@ def _make_monolithic_manager() -> HordeWorkerProcessManager:
         stable_diffusion_reference=ref,  # type: ignore[arg-type]
     )
     pm._model_metadata.set_reference(ref)  # type: ignore[arg-type]
+    _report_card_total(pm)
     return pm
 
 
@@ -457,6 +470,7 @@ def _resident_key(checkpoint: str) -> FootprintKey:
         platform=sys.platform,
         stage=FootprintStage.RESIDENT,
         checkpoint=checkpoint,
+        card_total_gb=_CARD_GB,
     )
 
 
@@ -471,14 +485,14 @@ class TestResidentFootprintPricing:
     def test_cold_key_prices_nothing(self) -> None:
         """Nothing observed yields None, which leaves the forecast on its static seeds."""
         scheduler = _make_manager()._inference_scheduler
-        assert scheduler._learned_resident_footprint_mb(_MODEL, _BASELINE) is None
+        assert scheduler._learned_resident_footprint_mb(_MODEL, _BASELINE, device_index=None) is None
 
     def test_watermark_is_returned_net_of_the_context_constant(self) -> None:
         """The measured device charge is offered back with the context term removed."""
         pm = _make_manager()
         scheduler = pm._inference_scheduler
         pm._learned_footprint_store.observe_peak(_resident_key(_MODEL), 12000.0)
-        assert scheduler._learned_resident_footprint_mb(_MODEL, _BASELINE) == pytest.approx(
+        assert scheduler._learned_resident_footprint_mb(_MODEL, _BASELINE, device_index=None) == pytest.approx(
             12000.0 - scheduler.resolved_context_constant_mb(),
         )
 
@@ -486,13 +500,13 @@ class TestResidentFootprintPricing:
         """Resident weights are a property of the file, so one checkpoint's measurement never prices another."""
         pm = _make_manager()
         pm._learned_footprint_store.observe_peak(_resident_key("some other checkpoint"), 12000.0)
-        assert pm._inference_scheduler._learned_resident_footprint_mb(_MODEL, _BASELINE) is None
+        assert pm._inference_scheduler._learned_resident_footprint_mb(_MODEL, _BASELINE, device_index=None) is None
 
     def test_unkeyable_model_prices_nothing(self) -> None:
         """A model or baseline that cannot be keyed leaves the forecast on its static seeds."""
         scheduler = _make_manager()._inference_scheduler
-        assert scheduler._learned_resident_footprint_mb(None, _BASELINE) is None
-        assert scheduler._learned_resident_footprint_mb(_MODEL, None) is None
+        assert scheduler._learned_resident_footprint_mb(None, _BASELINE, device_index=None) is None
+        assert scheduler._learned_resident_footprint_mb(_MODEL, None, device_index=None) is None
 
     def test_forecast_footprint_rises_with_the_measurement(self) -> None:
         """End to end: the measured resident figure reaches the streaming forecast's footprint term.
@@ -576,7 +590,7 @@ class TestMeasuredLoweringPricing:
         priced = scheduler._measured_admission_candidate_delta_mb(job, baseline, process_id=None, disaggregated=False)
         assert priced == pytest.approx(expected)
         assert scheduler._learned_sampling_peak_mb(
-            job, baseline, static_seed_mb=17000.0, stage=FootprintStage.SAMPLE
+            job, baseline, static_seed_mb=17000.0, stage=FootprintStage.SAMPLE, device_index=None
         ) == pytest.approx(expected)
 
     def test_model_without_a_result_is_priced_from_its_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -693,7 +707,7 @@ class TestJobClassPricing:
         scheduler = pm._inference_scheduler
         baseline = scheduler._model_metadata.get_baseline(_MODEL)
         scheduler_price = scheduler._learned_sampling_peak_mb(
-            job, baseline, static_seed_mb=17000.0, stage=FootprintStage.SAMPLE
+            job, baseline, static_seed_mb=17000.0, stage=FootprintStage.SAMPLE, device_index=None
         )
         pricing_price = pricing.learned_sampling_peak_mb(
             scheduler.snapshot(),
@@ -701,6 +715,7 @@ class TestJobClassPricing:
             str(baseline),
             static_seed_mb=17000.0,
             stage=FootprintStage.SAMPLE,
+            device_index=None,
         )
         return scheduler_price, pricing_price
 

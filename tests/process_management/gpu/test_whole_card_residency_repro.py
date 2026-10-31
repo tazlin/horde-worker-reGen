@@ -91,7 +91,7 @@ def _card16_flux_dominance() -> pricing.ModelDominance:
         foreign_floor_bucket=None,
         sample_observation_counts=(),
     )
-    peaks = [pricing.model_sampling_peak(None, _FLUX_MODEL, _FLUX_REFERENCE_BASELINE)]
+    peaks = [pricing.model_sampling_peak(None, _FLUX_MODEL, _FLUX_REFERENCE_BASELINE, card_total_gb=None)]
     return pricing.decide_card_dominance(inputs, foreign_floor_mb=0.0, peaks=peaks).verdicts[_FLUX_MODEL]
 
 

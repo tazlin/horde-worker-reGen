@@ -56,18 +56,25 @@ from pydantic import BaseModel, ConfigDict
 from horde_worker_regen.analysis.replay_fixture import PLATFORM_PLACEHOLDER, ReplayJobRow, read_replay_job_rows
 from horde_worker_regen.process_management.resources.resource_budget import predict_job_sampling_vram_mb
 from horde_worker_regen.process_management.resources.vram_footprints import (
+    _CARD_BLIND_SCHEMA_VERSIONS,
     _MEASURED_ESTIMATE_MARGIN,
-    FOOTPRINT_STORE_SCHEMA_VERSION,
+    _MISKEYED_SAMPLING_SCHEMA_VERSIONS,
     POST_PROCESS_CHAIN_BASELINE,
     SAFETY_PROCESS_BASELINE,
     FootprintKey,
     FootprintStage,
     LearnedFootprintStore,
+    card_total_gb,
     job_class_key,
     sampling_footprint_key,
 )
 from tests.process_management.conftest import make_job_pop_response
-from tests.process_management.liveness._dispatch_world import _DispatchWorld, _ModelClass, _support_component_mb
+from tests.process_management.liveness._dispatch_world import (
+    _CARD_24GB,
+    _DispatchWorld,
+    _ModelClass,
+    _support_component_mb,
+)
 
 REPLAY_FIXTURE_DIRECTORY = Path(__file__).parent / "replay"
 """Where the committed session fixture lives."""
@@ -75,6 +82,11 @@ SESSION_JOBS_PATH = REPLAY_FIXTURE_DIRECTORY / "session_24gb_two_lane.jsonl"
 """The job stream of one 191-minute session on a 24 GB card."""
 SESSION_FOOTPRINTS_PATH = REPLAY_FIXTURE_DIRECTORY / "footprints_24gb_two_lane.json"
 """The learned footprint store the same worker held, with every key's platform replaced by a placeholder."""
+REPLAY_CARD_GB = card_total_gb(_CARD_24GB.total_mb)
+"""The card-size class of the one card the fixture's worker drove, which every fixture figure was measured on."""
+
+_FIXTURE_LOAD_SCHEMA_VERSION = max(_CARD_BLIND_SCHEMA_VERSIONS - _MISKEYED_SAMPLING_SCHEMA_VERSIONS)
+"""The schema the fixture is stamped with: the newest whose keys carry no card, which loads every stage whole."""
 
 _REPLAY_CLASS_LABEL_PREFIX = "replay_"
 """Keeps a replayed class's label apart from the world's own pool labels."""
@@ -203,6 +215,8 @@ def load_footprint_store(path: Path, *, scratch_directory: Path) -> LearnedFootp
     The fixture's keys carry :data:`PLATFORM_PLACEHOLDER`, and the store only prices keys for ``sys.platform``, so
     the placeholder is rewritten into a copy under ``scratch_directory`` and the store is built from the copy. A
     store built with a path writes back to it as it learns, which is why the committed fixture is never the path.
+    The fixture's keys carry no card, so the store re-keys them to :data:`REPLAY_CARD_GB`, the one card its worker
+    drove, as a worker attaching the file on that card does.
 
     Args:
         path: The platform-neutral footprint fixture.
@@ -214,15 +228,15 @@ def load_footprint_store(path: Path, *, scratch_directory: Path) -> LearnedFootp
     scratch_directory.mkdir(parents=True, exist_ok=True)
     copy_path = scratch_directory / path.name
     copy_path.write_text(_rewritten_fixture_text(path), encoding="utf-8")
-    return LearnedFootprintStore(path=copy_path)
+    return LearnedFootprintStore(path=copy_path, driven_card_totals_gb=[REPLAY_CARD_GB])
 
 
 class _FixtureStoreEntry(BaseModel):
-    """Represents one persisted observation's key in the footprint fixture."""
+    """Represents one persisted observation's key in the footprint fixture, which carries no card."""
 
     model_config = ConfigDict(frozen=True, extra="ignore")
 
-    key: FootprintKey
+    key: dict[str, object]
 
 
 class _FixtureStoreFile(BaseModel):
@@ -240,17 +254,20 @@ def load_footprint_keys(path: Path) -> tuple[FootprintKey, ...]:
     checkpoints, the post-processing chains) are taken from the fixture itself.
     """
     stored = _FixtureStoreFile.model_validate_json(_rewritten_fixture_text(path))
-    return tuple(entry.key for entry in stored.observations)
+    return tuple(
+        FootprintKey.model_validate({**entry.key, "card_total_gb": REPLAY_CARD_GB}) for entry in stored.observations
+    )
 
 
 def _rewritten_fixture_text(path: Path) -> str:
-    """Return the footprint fixture's text keyed for ``sys.platform`` and stamped with the current store schema.
+    """Return the footprint fixture's text keyed for ``sys.platform`` and stamped with a card-blind store schema.
 
     The fixture's figures are the replay's stated inputs, so they load whole. A store file of an older schema
-    would otherwise shed the stages the store drops from a live file of that schema.
+    would otherwise shed the stages the store drops from a live file of that schema. The stamp is
+    :data:`_FIXTURE_LOAD_SCHEMA_VERSION`, so the store re-keys the fixture to its card on load.
     """
     text = path.read_text(encoding="utf-8").replace(f'"{PLATFORM_PLACEHOLDER}"', f'"{sys.platform}"')
-    return re.sub(r'"schema_version":\s*\d+', f'"schema_version": {FOOTPRINT_STORE_SCHEMA_VERSION}', text, count=1)
+    return re.sub(r'"schema_version":\s*\d+', f'"schema_version": {_FIXTURE_LOAD_SCHEMA_VERSION}', text, count=1)
 
 
 def _resident_key(model: str, baseline: str) -> FootprintKey:
@@ -259,6 +276,7 @@ def _resident_key(model: str, baseline: str) -> FootprintKey:
         model_baseline=baseline,
         resolution_bucket=None,
         platform=sys.platform,
+        card_total_gb=REPLAY_CARD_GB,
         stage=FootprintStage.RESIDENT,
         checkpoint=model,
     )
@@ -391,7 +409,9 @@ def _measured_activation_mb(
     activation reserve from (a job-class key's once observed, else the pooled key's), without the store's margin,
     as :func:`_measured_mb` reads every other key.
     """
-    activation_key = sampling_footprint_key(job, baseline, stage=FootprintStage.SAMPLE_ACTIVATION)
+    activation_key = sampling_footprint_key(
+        job, baseline, stage=FootprintStage.SAMPLE_ACTIVATION, card_total_gb=REPLAY_CARD_GB
+    )
     if activation_key is None:
         return None
     measured_mb = store.measured_job_estimate_net_of_context_mb(activation_key, job_class_key(activation_key, job))
@@ -445,7 +465,7 @@ def true_footprint(
     def true_footprint_mb(job: ImageGenerateJobPopResponse) -> tuple[float, float]:
         model_class = classes_by_name[job.model or ""]
         baseline = str(model_class.baseline)
-        pooled_key = sampling_footprint_key(job, baseline, stage=FootprintStage.SAMPLE)
+        pooled_key = sampling_footprint_key(job, baseline, stage=FootprintStage.SAMPLE, card_total_gb=REPLAY_CARD_GB)
         class_key = job_class_key(pooled_key, job) if pooled_key is not None else None
         cache_key = (model_class.name, class_key)
         cached = figures.get(cache_key)
@@ -561,6 +581,7 @@ def _safety_key(stage: FootprintStage) -> FootprintKey:
         model_baseline=SAFETY_PROCESS_BASELINE,
         resolution_bucket=None,
         platform=sys.platform,
+        card_total_gb=REPLAY_CARD_GB,
         stage=stage,
     )
 

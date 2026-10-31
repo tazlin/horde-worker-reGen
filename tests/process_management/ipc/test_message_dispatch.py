@@ -1687,6 +1687,7 @@ class TestJobSamplingPeakFold:
         resolution_bucket=ResolutionBucket.LE_512,
         platform=sys.platform,
         stage=FootprintStage.SAMPLE,
+        card_total_gb=24,
     )
 
     async def _running_job(
@@ -1715,7 +1716,7 @@ class TestJobSamplingPeakFold:
         return dispatcher, store, job_tracker, job
 
     @staticmethod
-    def _report(process_id: int, peak_mb: int, *, total_mb: int | None = None) -> HordeProcessMemoryMessage:
+    def _report(process_id: int, peak_mb: int, *, total_mb: int | None = 24576) -> HordeProcessMemoryMessage:
         message = HordeProcessMemoryMessage(
             process_id=process_id,
             process_launch_identifier=0,
@@ -1813,6 +1814,7 @@ class TestJobSamplingPeakFold:
             resolution_bucket=ResolutionBucket.GT_1024,
             platform=sys.platform,
             stage=FootprintStage.SAMPLE,
+            card_total_gb=24,
         )
         observation = store.get_observation(key)
         assert observation is not None
