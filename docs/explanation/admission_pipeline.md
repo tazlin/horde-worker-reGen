@@ -195,6 +195,13 @@ result report are not in the wait, which favours waiting. The copy's disk-to-RAM
 figure, which favours the copy. The retention fit (`_retention_affinity_retainer`) re-prices room at dispatch,
 so where it disagrees with the preload budget the head goes back to the busy retainer and the copy is wasted.
 
+On a worker with more than one card, the eligible set's weight-budget check (`check_card_weight_budget`, in
+`gpu_eligibility.reasons_card_cannot_serve`) is the same check as the first leg of the serviceability verdict. A
+resident copy on a card the offer cannot serve is therefore outside the job's candidates, and the preload pass
+loads a copy for the job on an eligible card. When a head is held on a copy because the arbiter returns a
+structural DENY for that card, the arbiter's structural test and the serviceability verdict disagree about the
+price, and the fix belongs in pricing.
+
 A head that cannot be seated therefore blocks only its own card. Where the worker drives more than one, the
 walk resumes and the first job another card can serve immediately is dispatched instead
 (`LineSkip(reason="cross_card")`). The head's own card is excluded, so nothing takes the capacity it is
