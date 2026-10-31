@@ -131,6 +131,12 @@ transfer of the same file on the next reconcile re-request (the engine keeps no 
 slow-but-alive stream must be left to finish and populate the cache even after its original jobs faulted.
 A genuinely stalled stream is cut much earlier by the engine's per-chunk read timeout."""
 
+_TI_NAME_UNRESOLVED_REASON = "name_unresolved"
+"""Rejection reason for a TI fetch that returned a key the requested name does not resolve to.
+
+A name search can land a different embedding. If the fetch reported that as success, the job's readiness probe
+would still miss the requested name, and the TI would be queued and fetched again indefinitely."""
+
 FEATURE_IMAGE_MODEL = "image model"
 FEATURE_LORA = "LoRa (default set)"
 FEATURE_CONTROLNET = "ControlNet"
@@ -953,11 +959,20 @@ class HordeDownloadProcess(HordeProcess):
             key = None
             rejected_reason = None
         fetch_elapsed = time.monotonic() - fetch_started
+        # The job's readiness probe uses this lookup, so success is reported only when that probe will find the TI.
+        resolved_key = manager.fuzzy_find_ti_key(task.model_name)
+        if resolved_key is not None:
+            if key is not None:
+                logger.success(f"Download process: prefetched TI {task.model_name}")
+            return True
         if key is not None:
-            logger.success(f"Download process: prefetched TI {task.model_name}")
-            return True
-        if manager.fuzzy_find_ti_key(task.model_name) is not None:
-            return True
+            with self._lock:
+                self._aux_rejections[task.dedup_key] = _TI_NAME_UNRESOLVED_REASON
+            logger.warning(
+                f"Download process: TI {task.model_name!r} fetch returned key {key!r}, but the requested name does "
+                "not resolve to it. Requesting job(s) will proceed without it.",
+            )
+            return False
         if self._stash_adhoc_skip(task, rejected_reason, label="TI"):
             return False
         if rejected_reason is not None:

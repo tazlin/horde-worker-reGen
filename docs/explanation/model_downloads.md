@@ -191,6 +191,14 @@ file, not a sick download path). The fetch layer surfaces a definitive upstream 
 (an exhausted retry budget), so a reference that can never exist is skipped once rather
 than retried into a fault storm.
 
+A name lookup goes through CivitAI's search, which can return a different file than the one
+requested. The fetch layer prefers the result whose name matches the request and rejects a
+result that names a different file (`MISMATCH`). The download process also checks a returned
+textual inversion key against the requested name, since the job's readiness check looks the
+file up by that name. A key the name does not resolve to is a rejection
+(`name_unresolved`). Reporting it as a success would leave the readiness check missing and
+queue the same fetch again indefinitely.
+
 A plain *failure* (a transient transfer error) faults the affected pending job promptly
 (it holds no lane or reservation, so nothing in flight is disturbed) and arms that file's
 per-class download backoff, exactly as an inference-side aux failure does: once a class

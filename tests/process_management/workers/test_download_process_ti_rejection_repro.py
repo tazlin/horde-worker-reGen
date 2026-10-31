@@ -4,7 +4,8 @@ A real :class:`HordeDownloadProcess` is driven through its real control/executor
 manager standing in for hordelib (no network, no torch). The contract under test: when the TI manager can
 report a terminal upstream rejection, the download process surfaces it as a non-retryable rejection outcome
 carrying the reason, exactly as the LoRA path does, so the parent skips the file and dispatches the job rather
-than faulting it. A companion case documents that one plain failure outcome names every requesting job.
+than faulting it. A fetch whose key the requested name does not resolve to is the same kind of rejection. A
+companion case documents that one plain failure outcome names every requesting job.
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     AuxModelKind,
     HordeAuxPrefetchControlMessage,
 )
+from horde_worker_regen.process_management.workers.download_process import _TI_NAME_UNRESOLVED_REASON
 
 from .test_download_process_aux_prefetch import (
     _JOB_A,
@@ -79,6 +81,48 @@ def test_ti_terminal_rejection_surfaces_reason_not_bare_failure(monkeypatch: pyt
     assert outcomes[0].rejection_reason == _TI_TERMINAL_REASON
     assert ti.reasoned_calls == ["bad-emb"]
     assert [str(j) for j in outcomes[0].requesting_job_ids] == [_JOB_A]
+
+
+class _WrongKeyTiManager(_FakeTiManager):
+    """A TI fake whose fetch lands a different embedding, so the requested name does not resolve."""
+
+    def __init__(self, *, landed_key: str) -> None:
+        super().__init__(present=set())
+        self.landed_key = landed_key
+
+    def fetch_adhoc_ti(
+        self,
+        name: str,
+        timeout: float = 15,
+        progress_callback: Callable[[int, int], None] | None = None,
+    ) -> str | None:
+        self.fetch_calls.append(name)
+        self.present.add(self.landed_key)
+        return self.landed_key
+
+
+def test_ti_fetch_returning_an_unresolvable_key_is_a_rejection(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A returned key the requested name does not resolve to is a terminal rejection, not a success.
+
+    The job's readiness probe looks the TI up by the requested name. Reporting success here would leave that
+    probe missing and queue the same fetch again.
+    """
+    ti = _WrongKeyTiManager(landed_key="negative_hand negative embedding")
+    process = _make_process(monkeypatch, lora=None, ti=ti)
+
+    process._handle_aux_prefetch_request(
+        HordeAuxPrefetchControlMessage(
+            entries=[_entry("Negative & Positive Embeddings By Stable Yogi", kind=AuxModelKind.TI, job=_JOB_A)],
+        ),
+    )
+    _drain_scheduler(process)
+
+    outcomes = _collect_prefetch_outcomes(process)
+    assert len(outcomes) == 1
+    assert outcomes[0].ok is False
+    assert outcomes[0].retryable is False
+    assert outcomes[0].rejection_reason == _TI_NAME_UNRESOLVED_REASON
+    assert ti.fetch_calls == ["Negative & Positive Embeddings By Stable Yogi"]
 
 
 def test_ti_failure_outcome_names_every_requesting_job(monkeypatch: pytest.MonkeyPatch) -> None:
