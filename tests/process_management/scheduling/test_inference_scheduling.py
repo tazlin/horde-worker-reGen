@@ -96,6 +96,7 @@ from tests.process_management.conftest import (
     mark_job_aux_prepared,
     mark_job_in_progress_async,
     mark_ram_unload_settled,
+    moss_card_below_recommended_minimum_mb,
     track_popped_job_async,
 )
 
@@ -261,26 +262,28 @@ class TestModelServiceabilityAdmission:
 
 _MOSS = "moss_model"
 _SMALL_CARD_TOTAL_MB = 8188.0
-_SMALL_CARD_GB = card_total_gb(_SMALL_CARD_TOTAL_MB)
-"""The card-size class of :data:`_SMALL_CARD_TOTAL_MB`, which the card's learned figures are keyed under."""
 _REGISTRY_BASELINES = tuple(
     baseline for baseline in KNOWN_IMAGE_GENERATION_BASELINE if baseline is not KNOWN_IMAGE_GENERATION_BASELINE.infer
 )
 
 
-def _small_card_scheduler(models: dict[str, KNOWN_IMAGE_GENERATION_BASELINE]) -> InferenceScheduler:
-    """Build a scheduler serving ``models`` on one 8188 MB card, priced from hordelib's seeds and an empty store."""
+def _small_card_scheduler(
+    models: dict[str, KNOWN_IMAGE_GENERATION_BASELINE],
+    *,
+    total_vram_mb: float = _SMALL_CARD_TOTAL_MB,
+) -> InferenceScheduler:
+    """Build a scheduler serving ``models`` on one card, priced from hordelib's seeds and an empty store."""
     bridge_data = make_mock_bridge_data(image_models_to_load=list(models))
     reference = {
         model: make_mock_model_reference_record(model, baseline=baseline) for model, baseline in models.items()
     }
     process_info = make_mock_process_info(0, model_name=None)
-    process_info.total_vram_mb = int(_SMALL_CARD_TOTAL_MB)
+    process_info.total_vram_mb = int(total_vram_mb)
     scheduler = _make_inference_scheduler(
         bridge_data=bridge_data,
         model_metadata=make_test_model_metadata(reference),
         process_map=ProcessMap({0: process_info}),
-        card_runtimes=make_test_card_runtimes(config=bridge_data, total_vram_mb=_SMALL_CARD_TOTAL_MB),
+        card_runtimes=make_test_card_runtimes(config=bridge_data, total_vram_mb=total_vram_mb),
         platform="win32",
     )
     scheduler.set_footprint_store(LearnedFootprintStore())
@@ -290,8 +293,8 @@ def _small_card_scheduler(models: dict[str, KNOWN_IMAGE_GENERATION_BASELINE]) ->
 class TestPreloadGateChecksTheSeatWithoutTheFloor:
     """The preload gate checks a rung-2 model's seat from the offer against the total net of the margin only.
 
-    The ``moss_image`` seed recommends a 10 GB card while its core weights pass an 8 GB card's weight budget,
-    so on an 8188 MB card the recommended-minimum rule refuses what the partial-load seat serves.
+    On rung 2 the gate checks a popped job against the model's partial-load seat. A whole-card model off rung 2 is
+    checked against the recommended minimum card instead.
     """
 
     def test_a_seat_that_fits_without_the_floor_passes_though_the_floor_would_refuse_it(self) -> None:
@@ -341,12 +344,19 @@ class TestPreloadGateChecksTheSeatWithoutTheFloor:
         assert scheduler._unserviceable_job_reason(make_job_pop_response(_MOSS)) is None
 
     def test_a_whole_card_model_off_rung_two_faults_by_the_recommended_minimum_card(self) -> None:
-        """A measured peak that seats the model beside a context leaves it to the recommended-minimum rule."""
-        scheduler = _small_card_scheduler({_MOSS: KNOWN_IMAGE_GENERATION_BASELINE.moss_image})
+        """A measured peak that seats the model beside a context puts it under the recommended-minimum rule.
+
+        The card is below the ``moss_image`` recommended minimum card, so the gate faults the job under that rule.
+        """
+        total_vram_mb = moss_card_below_recommended_minimum_mb()
+        scheduler = _small_card_scheduler(
+            {_MOSS: KNOWN_IMAGE_GENERATION_BASELINE.moss_image}, total_vram_mb=total_vram_mb
+        )
         store = LearnedFootprintStore()
+        card_gb = card_total_gb(total_vram_mb)
         for band in ResolutionBucket:
             for _ in range(_MIN_OBSERVATIONS_FOR_MEASURED):
-                store.observe_peak(pricing.pooled_sample_key("moss_image", band, card_total_gb=_SMALL_CARD_GB), 1500.0)
+                store.observe_peak(pricing.pooled_sample_key("moss_image", band, card_total_gb=card_gb), 1500.0)
         scheduler.set_footprint_store(store)
 
         dominance = scheduler.card_dominance(0)

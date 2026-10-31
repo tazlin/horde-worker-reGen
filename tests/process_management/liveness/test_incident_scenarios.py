@@ -287,9 +287,8 @@ from horde_worker_regen.process_management.scheduling.ledgers.safety_placement i
 )
 from horde_worker_regen.process_management.scheduling.workload_flow import POST_PROCESS_RESERVE_FLOW
 from horde_worker_regen.process_management.workers import post_process_orchestrator
-from tests.process_management.conftest import make_job_pop_response
+from tests.process_management.conftest import make_job_pop_response, moss_card_below_recommended_minimum_mb
 from tests.process_management.liveness._dispatch_world import (
-    _CARD_8GB,
     _CARD_10GB,
     _CARD_16GB,
     _CARD_24GB,
@@ -8571,9 +8570,14 @@ _BELOW_RECOMMENDED_CARD_TICKS = 40
 """Ticks the row runs after the pop, which is enough for the head's load, whole-card residency and sample."""
 
 
+def _moss_card_below_recommended_minimum() -> _CardClass:
+    """Return a card below the Moss baseline's recommended minimum card whose weight budget holds the core weights."""
+    return _CardClass("below_recommended_moss", moss_card_below_recommended_minimum_mb())
+
+
 @dataclass
 class SeatBelowRecommendedCard:
-    """The finished world of one Moss job popped on an 8 GB card, below the baseline's recommended minimum."""
+    """The finished world of one Moss job popped on a card below the baseline's recommended minimum card."""
 
     world: _DispatchWorld
     job: ImageGenerateJobPopResponse
@@ -8586,9 +8590,9 @@ class SeatBelowRecommendedCard:
 
 
 async def drive_seat_below_recommended_card(*, ticks: int = _BELOW_RECOMMENDED_CARD_TICKS) -> SeatBelowRecommendedCard:
-    """Pop one Moss job on an 8 GB card that runs the preload gate over per-card runtimes."""
+    """Pop one Moss job on a card below the recommended minimum card and run it through the per-card preload gate."""
     world = _DispatchWorld(
-        card=_CARD_8GB,
+        card=_moss_card_below_recommended_minimum(),
         lane_count=1,
         max_threads=1,
         queue_depth=1,
@@ -8609,8 +8613,8 @@ async def drive_seat_below_recommended_card(*, ticks: int = _BELOW_RECOMMENDED_C
 async def test_r_a_seat_below_the_recommended_card_dispatches_instead_of_faulting() -> None:
     """A Moss job on a card below the baseline's recommended minimum card loads and samples by its seat.
 
-    This row encodes the failure in which the offer advertised the model by its partial-load seat, which an 8 GB card
-    holds, and the preload gate faulted the popped job by the recommended minimum card, which the card is below.
+    The offer advertises the model by its partial-load seat, which the card holds. The preload gate must check the
+    popped job by the same seat, because the card is below the recommended minimum card.
     """
     row = await drive_seat_below_recommended_card()
     world = row.world

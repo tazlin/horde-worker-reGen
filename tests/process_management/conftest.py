@@ -44,6 +44,10 @@ from horde_worker_regen.process_management.process_manager import (
 )
 from horde_worker_regen.process_management.resources.device_info import TorchDeviceInfo, TorchDeviceMap
 from horde_worker_regen.process_management.resources.device_memory_source import DeviceMemoryReading, nvml_reading
+from horde_worker_regen.process_management.resources.model_serviceability import (
+    check_card_weight_budget,
+    model_footprint_figures_for_baseline,
+)
 from horde_worker_regen.process_management.resources.reclaim_ladder import LadderCandidates
 from horde_worker_regen.process_management.resources.resource_budget import CommittedReserveLedger
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
@@ -412,6 +416,29 @@ def make_test_model_metadata(
     if reference is not None:
         metadata.set_reference(reference)  # type: ignore[arg-type]
     return metadata
+
+
+BELOW_RECOMMENDED_CARD_MARGIN_MB = 256.0
+"""How far below the ``moss_image`` recommended minimum card the test card is.
+
+Small enough that the card's weight budget still holds the seed's core weights.
+"""
+
+
+def moss_card_below_recommended_minimum_mb() -> float:
+    """Return a card total below the ``moss_image`` recommended minimum card whose weight budget holds the weights.
+
+    The total is derived from hordelib's seed, so a changed seed moves the card with it or fails the precondition
+    instead of silently changing which rule a test exercises.
+    """
+    figures = model_footprint_figures_for_baseline(KNOWN_IMAGE_GENERATION_BASELINE.moss_image)
+    assert figures is not None, "precondition: hordelib has a moss_image burden seed"
+    total_vram_mb = figures.min_recommended_card_mb - BELOW_RECOMMENDED_CARD_MARGIN_MB
+    budget = check_card_weight_budget(total_vram_mb=total_vram_mb, weight_mb=figures.weights_mb)
+    assert budget.fits, (
+        f"precondition: the moss_image core weights must pass the card's weight budget. {budget.reason()}"
+    )
+    return total_vram_mb
 
 
 def make_job_pop_response(

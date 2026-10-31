@@ -23,6 +23,7 @@ from tests.process_management.conftest import (
     make_mock_model_reference_record,
     make_test_card_runtimes,
     make_test_model_metadata,
+    moss_card_below_recommended_minimum_mb,
 )
 
 _GB = 1024.0
@@ -510,18 +511,19 @@ class TestModelServiceabilityVerdicts:
         seat: WholeCardSeat | None,
         expected: ModelServiceabilityTier,
     ) -> None:
-        """A whole-card model whose weights pass an 8 GB budget is checked by the seat when one is supplied.
+        """A whole-card model whose weights pass the card's weight budget is checked by the seat when one is supplied.
 
-        The ``moss_image`` seed recommends a 10 GB card, above the 8188 MB total, while its core weights pass the
-        card's weight budget and a plain job's seat fits the ceiling. The seat rule is the more lenient of the
+        The card is below the ``moss_image`` recommended minimum card while the seed's core weights pass the
+        card's weight budget, and the supplied seat fits the ceiling. The seat rule is the more lenient of the
         two here, so a caller that supplies the seat and one that does not reach opposite verdicts.
         """
+        total_vram_mb = moss_card_below_recommended_minimum_mb()
         model = "moss_model"
         config = make_mock_bridge_data(image_models_to_load=[model])
         metadata = make_test_model_metadata(
             {model: make_mock_model_reference_record(model, baseline=KNOWN_IMAGE_GENERATION_BASELINE.moss_image)},
         )
-        cards = make_test_card_runtimes(config=config, total_vram_mb=8188.0)
+        cards = make_test_card_runtimes(config=config, total_vram_mb=total_vram_mb)
 
         verdicts = model_serviceability_verdicts(
             model,
@@ -534,7 +536,7 @@ class TestModelServiceabilityVerdicts:
 
         figures = verdicts[0][1].figures
         assert figures is not None
-        assert figures.min_recommended_card_mb > 8188.0
+        assert figures.min_recommended_card_mb > total_vram_mb
         assert verdicts[0][1].whole_card is True
         assert verdicts[0][1].over_weight_budget is False
         assert [verdict.tier for _, verdict in verdicts] == [expected]
