@@ -2517,6 +2517,10 @@ class InferenceScheduler:
         residency, since once safety leaves the live reading would say the job fits and bring safety straight
         back. False with no residency or no forecast, so the operator's keep-safety-on-GPU choice stands wherever
         the job fits.
+
+        The weight fit is checked before any partial seat. The teardown completes only when the whole weights and
+        the reserve fit (:meth:`_whole_card_teardown_exhausted`), so a seat that fits beside safety does not let
+        the head load while safety stays on the card.
         """
         state = self._whole_card_ledger.state_for(device_index)
         if state.model is None or state.forecast is None:
@@ -2524,19 +2528,17 @@ class InferenceScheduler:
             return False
         if device_index in self._residencies_displacing_safety:
             return True
-        room_mb = state.forecast.sole_residency_room_mb(self._safety_footprint_mb())
-        need_mb = (
-            None
-            if room_mb is None
-            else self._residency_head_need_mb(state.model, room_mb=room_mb, device_index=device_index)
-        )
-        if room_mb is None or need_mb is None:
-            if state.forecast.fits_alone_beside(self._safety_footprint_mb()):
-                return False
-            if self._whole_card_weights_fit_live(state.forecast, device_index=device_index, model=state.model):
-                return False
-        else:
-            if need_mb <= room_mb:
+        weights_fit_beside_safety = state.forecast.fits_alone_beside(
+            self._safety_footprint_mb(),
+        ) or self._whole_card_weights_fit_live(state.forecast, device_index=device_index, model=state.model)
+        if weights_fit_beside_safety:
+            room_mb = state.forecast.sole_residency_room_mb(self._safety_footprint_mb())
+            need_mb = (
+                None
+                if room_mb is None
+                else self._residency_head_need_mb(state.model, room_mb=room_mb, device_index=device_index)
+            )
+            if room_mb is None or need_mb is None or need_mb <= room_mb:
                 return False
             if self._residency_need_fits_live(state, need_mb, device_index=device_index):
                 return False

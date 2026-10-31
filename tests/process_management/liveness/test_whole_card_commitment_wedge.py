@@ -30,6 +30,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeControlMessage,
     HordeProcessState,
 )
+from horde_worker_regen.process_management.lifecycle.process_lifecycle import PauseOwner
 from horde_worker_regen.process_management.scheduling.admission import pricing
 from horde_worker_regen.process_management.scheduling.clearance_lease import CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS
 from tests.process_management.conftest import make_job_pop_response, track_popped_job_async
@@ -337,3 +338,60 @@ async def test_a_served_post_processing_unload_stands_and_leaves_the_card_conver
         for_head_of_queue=True,
         device_index=lane.device_index,
     ), "a post-processing lane that has served its unload must not keep the card from reading converged-empty"
+
+
+_SAFETY_ROW_LONG_SAMPLE_SECONDS = 25.0
+"""How long the card's running SDXL job samples before the Qwen-class head can take the card."""
+_SAFETY_ROW_TICKS = 90
+"""Ticks the safety row runs: the long job, the teardown and the head's load and sample."""
+_SAFETY_ROW_HEAD_BOUND_SECONDS = 15.0
+"""How long the head may take to reach sampling once the card frees, inside the queue-deadlock horizon."""
+
+
+async def test_a_whole_card_head_whose_weights_do_not_fit_beside_safety_moves_safety_off_the_card() -> None:
+    """A Qwen-class head whose whole weights do not fit beside safety on a 24 GB card has the residency move safety.
+
+    The teardown completes only when the whole weights and the reserve fit, and 19.5 GB of weights do not fit
+    beside safety's context. The head's partial seat would fit beside safety, so a check on the seat alone keeps
+    safety on the card and leaves the head waiting for the runtime safety placement's dwell.
+    """
+    long_job = make_job_pop_response(_SDXL.name, width=1024, height=1024, ddim_steps=30)
+    head = make_job_pop_response(_SEAT_QWEN.name, width=1024, height=1024, ddim_steps=4)
+    world = _DispatchWorld(
+        card=_CARD_24GB,
+        lane_count=2,
+        max_threads=1,
+        queue_depth=5,
+        whole_card_enabled=True,
+        closed_loop=True,
+        tick_seconds=_TICK_SECONDS,
+        service_contexts=True,
+        sample_seconds_by_job={str(long_job.id_): _SAFETY_ROW_LONG_SAMPLE_SECONDS},
+        extra_model_classes=(_SEAT_QWEN,),
+    )
+    world.seed_resident(0, _SDXL, in_vram=True)
+    await world.pop(long_job)
+    for _ in range(2):
+        await world.step()
+    await world.pop(head)
+    for _ in range(_SAFETY_ROW_TICKS):
+        await world.step()
+
+    long_window = world.job_windows.get(str(long_job.id_))
+    assert long_window is not None and long_window.sample_until is not None, (
+        f"precondition: the long job must finish. {world.state_dump()}"
+    )
+    head_sampled_tick = world.dispatch_tick(head)
+    sampled_at = _tick_time(world, head_sampled_tick)
+    assert sampled_at is not None and sampled_at - long_window.sample_until < _SAFETY_ROW_HEAD_BOUND_SECONDS, (
+        f"the head did not sample within {_SAFETY_ROW_HEAD_BOUND_SECONDS:.0f}s of the card freeing (sampled at "
+        f"tick {head_sampled_tick}); safety pause events {world.safety_pause_events}. {world.state_dump()}"
+    )
+    assert any(owner is PauseOwner.WHOLE_CARD for _, _, owner in world.safety_pause_events), (
+        f"the residency did not move safety off the card; pause events {world.safety_pause_events}. "
+        f"{world.state_dump()}"
+    )
+    assert not world.structural_queue_wedges, (
+        f"the queue-deadlock detector reported a wedge on tick(s) {world.structural_queue_wedges}. "
+        f"{world.state_dump()}"
+    )

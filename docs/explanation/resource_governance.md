@@ -489,6 +489,12 @@ the head against room only a departure the configuration forbids would free, and
 short by roughly the safety footprint and stream. Which contexts stay is a configuration and lifecycle fact,
 not residency state, so the machine takes the charge as an input and remains a pure state machine.
 
+Without that permission the residency still moves safety off when its model cannot fit beside it
+(`_residency_cannot_fit_beside_safety`). The whole weights are checked first. The teardown completes only when
+the whole weights and the reserve fit, so a partial-load seat that fits beside safety does not let the head
+load while safety stays. Otherwise the head waits on an idle card until the runtime safety placement moves
+safety after its pressure dwell.
+
 Safety readiness is card-local as well. The scheduler passes `safety_clear_of_card`, computed from the safety
 process's actual/headroom-selected card, rather than the global `safety_paused` flag. A live safety process on
 card 1 is already clear of a residency on card 0; only the residency on the card safety occupies waits for it
