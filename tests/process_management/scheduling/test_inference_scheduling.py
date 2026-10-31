@@ -16,11 +16,14 @@ from loguru import logger
 
 from horde_worker_regen.process_management.config.worker_state import WorkerState
 from horde_worker_regen.process_management.gpu.card_runtime import CardRuntime
-from horde_worker_regen.process_management.ipc.action_ledger import LedgerEventType
+from horde_worker_regen.process_management.ipc.action_ledger import ActionLedger, LedgerEventType
+from horde_worker_regen.process_management.ipc.message_dispatcher import MessageDispatcher
 from horde_worker_regen.process_management.ipc.messages import (
     HordeControlFlag,
     HordeImageResult,
+    HordeModelStateChangeMessage,
     HordeProcessState,
+    HordeProcessStateChangeMessage,
     ModelInfo,
     ModelLoadState,
 )
@@ -41,7 +44,7 @@ from horde_worker_regen.process_management.models.horde_model_map import (
 from horde_worker_regen.process_management.models.lru_cache import LRUCache
 from horde_worker_regen.process_management.models.model_metadata import ModelMetadata
 from horde_worker_regen.process_management.resources.reclaim_ladder import VerifiedReclaimLadder
-from horde_worker_regen.process_management.resources.resource_budget import StreamForecast
+from horde_worker_regen.process_management.resources.resource_budget import CommittedReserveLedger, StreamForecast
 from horde_worker_regen.process_management.resources.vram_arbiter import VramArbiter
 from horde_worker_regen.process_management.resources.vram_footprints import (
     _MIN_OBSERVATIONS_FOR_MEASURED,
@@ -2370,6 +2373,167 @@ class TestCrossModelPreloadOntoARetainingLane:
         flags = [call.args[0].control_flag for call in lane.pipe_connection.send.call_args_list]
         assert flags == [HordeControlFlag.PRELOAD_MODEL]
         assert lane.retained_resident_model == "stable_diffusion"
+
+
+class TestAReplyToAnEarlierCommandDoesNotRetireTheNextPreload:
+    """A lane's reply to a command sent before a preload does not cancel that preload.
+
+    A child reads its control pipe in order, so when the parent sends a VRAM unload and then a preload, the
+    child's reply to the unload arrives after the parent has booked the preload. That reply is about the old
+    model, which the lane did move to system RAM, and the load queued behind it is still on. If the parent took
+    it as a report on the preload, the sweep would expire a load that is about to begin, and the preload pass
+    would stage the same model again on another lane, which on a multi-card host can be another card.
+    """
+
+    _OLD = "moss-model"
+    _NEW = "flux-model"
+
+    def _lane_and_scheduler(self) -> tuple[HordeProcessInfo, HordeProcessInfo, InferenceScheduler, MessageDispatcher]:
+        lane = make_mock_process_info(0, model_name=self._OLD)
+        spare = make_mock_process_info(1, model_name=None)
+        process_map = ProcessMap({0: lane, 1: spare})
+        horde_model_map = HordeModelMap(root={})
+        horde_model_map.update_entry(self._OLD, load_state=ModelLoadState.LOADED_IN_VRAM, process_id=0)
+        scheduler = _make_inference_scheduler(process_map=process_map, horde_model_map=horde_model_map)
+        dispatcher = MessageDispatcher(
+            process_map=process_map,
+            horde_model_map=horde_model_map,
+            job_tracker=scheduler._job_tracker,
+            process_message_queue=Mock(),
+            runtime_config=make_test_runtime_config(bridge_data=make_mock_bridge_data()),
+            model_metadata=make_test_model_metadata(),
+            action_ledger=ActionLedger(),
+            reserve_ledger=CommittedReserveLedger(),
+            on_unload_vram=Mock(),
+            state=WorkerState(),
+        )
+        return lane, spare, scheduler, dispatcher
+
+    def _model_reply(
+        self, model: str, model_state: ModelLoadState, lane_state: HordeProcessState
+    ) -> HordeModelStateChangeMessage:
+        return HordeModelStateChangeMessage(
+            process_id=0,
+            process_launch_identifier=0,
+            info=f"{model} {model_state.name}",
+            process_state=lane_state,
+            horde_model_name=model,
+            horde_model_state=model_state,
+        )
+
+    def _child_replies_in_pipe_order(self) -> list[HordeProcessStateChangeMessage]:
+        """What the child sends, in order, for an unload of the old model followed by a preload of the new one."""
+        return [
+            self._model_reply(self._OLD, ModelLoadState.LOADED_IN_RAM, HordeProcessState.UNLOADED_MODEL_FROM_VRAM),
+            HordeProcessStateChangeMessage(
+                process_id=0,
+                process_launch_identifier=0,
+                info="Unloaded models from VRAM",
+                process_state=HordeProcessState.WAITING_FOR_JOB,
+            ),
+            self._model_reply(self._OLD, ModelLoadState.ON_DISK, HordeProcessState.UNLOADED_MODEL_FROM_RAM),
+            self._model_reply(self._NEW, ModelLoadState.LOADING, HordeProcessState.PRELOADING_MODEL),
+            self._model_reply(self._NEW, ModelLoadState.LOADED_IN_RAM, HordeProcessState.PRELOADED_MODEL),
+        ]
+
+    @staticmethod
+    def _sent_flags(lane: HordeProcessInfo) -> list[HordeControlFlag]:
+        send = lane.pipe_connection.send
+        assert isinstance(send, Mock)
+        return [call.args[0].control_flag for call in send.call_args_list]
+
+    async def _send_unload_then_preload(
+        self,
+        scheduler: InferenceScheduler,
+        lane: HordeProcessInfo,
+        *,
+        unload_rides_the_preload: bool,
+    ) -> ImageGenerateJobPopResponse:
+        job = make_job_pop_response(self._NEW)
+        await track_popped_job_async(scheduler._job_tracker, job)
+        if unload_rides_the_preload:
+            # The preload sends the unload itself, ahead of it on the same pipe, for weights the lane retains.
+            lane.note_retention_grant(self._OLD)
+            lane.settle_retention_after_job()
+        else:
+            scheduler._send_idle_model_vram_unload(lane)
+        assert scheduler._send_preload(job, lane, planned_charge_mb=None) is True
+        flags = self._sent_flags(lane)
+        assert flags == [HordeControlFlag.UNLOAD_MODELS_FROM_VRAM, HordeControlFlag.PRELOAD_MODEL], (
+            f"precondition: the unload must sit ahead of the preload on the pipe, got {flags}"
+        )
+        return job
+
+    @pytest.mark.parametrize("unload_rides_the_preload", [False, True], ids=["separate_unload", "retained_unload"])
+    async def test_the_load_survives_every_reply_the_child_sends_for_it(self, unload_rides_the_preload: bool) -> None:
+        """Swept after every reply, the new model is recorded as loading on the lane until the child finishes it."""
+        lane, _spare, scheduler, dispatcher = self._lane_and_scheduler()
+        await self._send_unload_then_preload(scheduler, lane, unload_rides_the_preload=unload_rides_the_preload)
+
+        for reply in self._child_replies_in_pipe_order():
+            await dispatcher._dispatch_buffered_message(reply)
+            expired = scheduler._expire_stale_model_map_entries()
+            entry = scheduler._horde_model_map.root.get(self._NEW)
+            assert self._NEW not in expired and entry is not None and entry.process_id == 0, (
+                f"after the child's {reply.info!r} the sweep forgot the load queued behind it "
+                f"(expired={expired}, entry={entry}, lane model {lane.loaded_horde_model_name!r} in "
+                f"{lane.last_process_state.name})"
+            )
+
+        final = scheduler._horde_model_map.root[self._NEW]
+        assert final.horde_model_load_state is ModelLoadState.LOADED_IN_RAM
+        assert lane.loaded_horde_model_name == self._NEW
+
+    async def test_the_reply_does_not_send_the_model_to_a_second_lane(self) -> None:
+        """A preload pass run between the stale reply and the child's acknowledgement does not stage a second copy.
+
+        The pass uses the model map and the lanes to find what still needs a lane, so a load the parent has
+        dropped is staged again. The second copy costs disk reads and the room it takes from work queued for the
+        other lane.
+        """
+        lane, spare, scheduler, dispatcher = self._lane_and_scheduler()
+        await self._send_unload_then_preload(scheduler, lane, unload_rides_the_preload=False)
+
+        await dispatcher._dispatch_buffered_message(self._child_replies_in_pipe_order()[0])
+        scheduler._expire_stale_model_map_entries()
+        scheduler.preload_models()
+
+        spare_flags = self._sent_flags(spare)
+        assert HordeControlFlag.PRELOAD_MODEL not in spare_flags, (
+            f"the spare lane was sent a preload of {self._NEW} while lane 0 still had that load queued "
+            f"(spare flags {spare_flags}, model map {scheduler._horde_model_map.root})"
+        )
+
+    async def test_a_report_for_the_preloaded_model_sets_the_lane_model(self) -> None:
+        """Reports about other models leave the lane alone, and the report for the preloaded model sets it."""
+        lane, _spare, scheduler, dispatcher = self._lane_and_scheduler()
+        await self._send_unload_then_preload(scheduler, lane, unload_rides_the_preload=False)
+        stale_reply, *_, loading_reply, _loaded_reply = self._child_replies_in_pipe_order()
+
+        await dispatcher._dispatch_buffered_message(stale_reply)
+        assert lane.loaded_horde_model_name == self._NEW
+        # With the lane model cleared, only the child's report for the preloaded model can set it again.
+        lane.loaded_horde_model_name = None
+        await dispatcher._dispatch_buffered_message(loading_reply)
+
+        assert lane.loaded_horde_model_name == self._NEW
+        entry = scheduler._horde_model_map.root[self._NEW]
+        assert entry.horde_model_load_state is ModelLoadState.LOADING and entry.process_id == 0
+
+    async def test_a_report_for_another_model_sets_the_lane_model_when_no_preload_is_outstanding(self) -> None:
+        """Without a preload sent, a report about another model is the lane's current state and sets the lane model.
+
+        The preload attribution outlives the preload that recorded it, so it alone does not show a load is queued.
+        """
+        lane, _spare, scheduler, dispatcher = self._lane_and_scheduler()
+        lane.loaded_horde_model_name = self._NEW
+        lane.record_preload_intent(make_job_pop_response(self._NEW))
+        scheduler._send_idle_model_vram_unload(lane)
+        assert lane.last_control_flag is not HordeControlFlag.PRELOAD_MODEL
+
+        await dispatcher._dispatch_buffered_message(self._child_replies_in_pipe_order()[0])
+
+        assert lane.loaded_horde_model_name == self._OLD
 
 
 class TestDominantRunGrantAtFirstStep:

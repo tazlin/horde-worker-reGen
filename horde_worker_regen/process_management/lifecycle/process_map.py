@@ -652,6 +652,11 @@ class ProcessMap(dict[int, HordeProcessInfo]):
     ) -> None:
         """Update the model load state for the given process ID.
 
+        While a preload is outstanding on the lane, a report about a different model does not change the lane's
+        model name, which records the lane's commitment to the preloaded model. The child reads its control pipe in
+        order, so that report is the reply to an earlier command, the unload of the previous model, and the load
+        queued behind it is still on. The caller updates the model map entry for the reported model as usual.
+
         Args:
             process_id (int): The ID of the process to update.
             horde_model_name (str): The name of the horde model to update.
@@ -659,22 +664,32 @@ class ProcessMap(dict[int, HordeProcessInfo]):
             last_job_referenced (ImageGenerateJobPopResponse | None, optional): The last job referenced by this \
                  process. Defaults to None.
         """
-        if horde_model_name is not None:
-            self[process_id].recently_unloaded_from_ram = False
-
-        self[process_id].loaded_horde_model_name = horde_model_name
-        self[process_id].loaded_horde_model_baseline = horde_model_baseline
-        self[process_id].forget_release_cache_request()
-
-        self[process_id].last_received_timestamp = time.time()
+        process_info = self[process_id]
+        # Recorded before the commitment check, so the preload's booking sets the lane to the preloaded model.
         if last_job_referenced is not None:
             if (
-                self[process_id].last_job_referenced is not None
-                and last_job_referenced != self[process_id].last_job_referenced
+                process_info.last_job_referenced is not None
+                and last_job_referenced != process_info.last_job_referenced
             ):
                 logger.trace(f"Resetting heartbeat for process {process_id}")
                 self.reset_heartbeat_state(process_id)
-            self[process_id].record_preload_intent(last_job_referenced)
+            process_info.record_preload_intent(last_job_referenced)
+
+        if horde_model_name is not None:
+            process_info.recently_unloaded_from_ram = False
+        process_info.forget_release_cache_request()
+        process_info.last_received_timestamp = time.time()
+
+        preload_intent = process_info.preload_job_intent
+        if (
+            process_info.last_control_flag == HordeControlFlag.PRELOAD_MODEL
+            and preload_intent is not None
+            and preload_intent.job.model != horde_model_name
+        ):
+            return
+
+        process_info.loaded_horde_model_name = horde_model_name
+        process_info.loaded_horde_model_baseline = horde_model_baseline
 
     def on_model_load_failed(self, process_id: int, horde_model_name: str) -> None:
         """Drop the lane's record of the model it was loading, because the lane reported that load failed.

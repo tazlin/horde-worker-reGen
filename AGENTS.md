@@ -204,7 +204,11 @@ Start from the mechanism, not the file. Each line states the owner of one questi
   the three target selectors) and `pricing.sweep_spares_idle_copy`: a lane loading one model is no target for
   another, a lane that owns a dispatched job is busy whatever it last reported, and the queue head's ready seat is
   spared by the clearance and pressure sweeps. The commitment is bound to the model map's `LOADING` entry
-  (`models/horde_model_map.py`, `PRELOAD_FIRST_REPORT_GRACE_SECONDS`), not to the control flag.
+  (`models/horde_model_map.py`, `PRELOAD_FIRST_REPORT_GRACE_SECONDS`), not to the control flag. The lane's own
+  model name is part of that commitment. While `last_control_flag` is `PRELOAD_MODEL` and `preload_job_intent`
+  holds the preloaded model, `ProcessMap.on_model_load_state_change` keeps the lane's model name when a report
+  for another model arrives. The child replies in command order, so that report is the reply to the unload sent
+  before the preload.
 - **What the child does between its clearance and its first step:** hordelib `execution/sampling_lease.py`
   (the `CFGGuider.sample` hook: encoder release, stage upload, the sample permit) and
   `execution/comfy_patches.py` (`_load_models_gpu_hijack`, the class-list skip, the overflow check charging the
