@@ -10047,11 +10047,12 @@ class InferenceScheduler:
         head_job = snapshot.queue.payloads[head_job_id] if head_job_id is not None else None
         self._update_head_starvation_timer(head_job)
         self._reconcile_head_priority_barrier(head_job)
-        if self._resident_head_should_dispatch_before_preload(head_job):
+        cards_yielded_to_head = self._cards_yielded_to_resident_head(head_job)
+        if cards_yielded_to_head is None:
             return False
 
         residency_lanes = self._residency_promoted_lanes()
-        stopped_cards: set[int] = set()
+        stopped_cards: set[int] = cards_yielded_to_head
         for job_id in snapshot.queue.pending_in_placement_order:
             if job_id not in snapshot.queue.jobs:
                 continue
@@ -10203,15 +10204,30 @@ class InferenceScheduler:
         post_process_process = self._process_map.get_first_available_post_process_process()
         return post_process_process.device_index if post_process_process is not None else None
 
-    def _resident_head_should_dispatch_before_preload(self, head_job: ImageGenerateJobPopResponse | None) -> bool:
-        """Whether the queue head can already try dispatch, so speculative preloading should yield.
+    def _cards_yielded_to_resident_head(self, head_job: ImageGenerateJobPopResponse | None) -> set[int] | None:
+        """The cards the preload pass leaves to a resident queue head, or None when the whole pass yields to it.
 
-        A head the post-processing gate is holding is not about to dispatch however ready its lane is, and it
-        can stay held for a whole chain. The loads behind it go ahead in that case.
+        A head that can already try dispatch gets the cycle before any speculative load, so the pass yields
+        whole. Two holds relax that. A head held by the post-processing gate is not about to dispatch however
+        ready its lane is, and the hold can last a whole chain, so every card's loads go ahead and the result is
+        empty. A head held by the residency-reconciliation gate keeps its own card, where reclaim is still
+        closing room for it, and the loads go ahead on every other card. The hold's card is the card of the lane
+        holding the head's copy. A single card has no other card to load onto, so the pass yields whole there.
         """
         if head_job is None or not self._job_dispatchable_now(head_job):
-            return False
-        return not self._post_processing_hold_frees_preload(head_job)
+            return set()
+        if self._post_processing_hold_frees_preload(head_job):
+            return set()
+        if self._residency_hold_frees_preload(head_job):
+            held_copy = self.resident_process_for_job(head_job)
+            held_card = self._routing_device_index(held_copy) if held_copy is not None else None
+            if held_card is not None:
+                return {held_card}
+        return None
+
+    def _residency_hold_frees_preload(self, head_job: ImageGenerateJobPopResponse) -> bool:
+        """Whether the residency-reconciliation gate is holding ``head_job``, so loads behind it need not wait."""
+        return head_job.id_ is not None and str(head_job.id_) in self._dispatch_holds.hold_since
 
     def _post_processing_hold_frees_preload(self, head_job: ImageGenerateJobPopResponse) -> bool:
         """Whether the post-processing gate is holding ``head_job``, so loads behind it need not wait for it."""
@@ -10220,9 +10236,8 @@ class InferenceScheduler:
     def _job_dispatchable_now(self, job: ImageGenerateJobPopResponse) -> bool:
         """Whether ``job`` could be dispatched this cycle: its model is resident on a free slot under the cap.
 
-        The question the preload pass asks before spending a cycle on a speculative load, of the head and of a
-        retention-affinity candidate alike: dispatch beats staging whenever it is available, so both callers
-        need the same answer and neither may reach a different one.
+        The preload pass asks this of the queue head before spending a cycle on a speculative load, since
+        dispatch beats staging whenever it is available.
         """
         if job.model is None:
             return False

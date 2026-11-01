@@ -537,6 +537,105 @@ class TestPreloadModels:
         assert result is False
         assert later_process.last_control_flag != HordeControlFlag.PRELOAD_MODEL
 
+    @staticmethod
+    async def _resident_head_with_cold_sibling(
+        *,
+        two_cards: bool,
+        sibling_lane_card: int,
+    ) -> tuple[InferenceScheduler, HordeProcessInfo, str]:
+        """A head resident on an idle lane of card 0, a cold sibling behind it and an idle lane with no model.
+
+        The empty lane sits on ``sibling_lane_card``. With ``two_cards`` the worker drives cards 0 and 1;
+        without it the worker drives one card.
+        """
+        head_process = make_mock_process_info(
+            0,
+            model_name="head_model",
+            state=HordeProcessState.WAITING_FOR_JOB,
+            device_index=0,
+        )
+        later_process = make_mock_process_info(
+            1,
+            model_name=None,
+            state=HordeProcessState.WAITING_FOR_JOB,
+            device_index=sibling_lane_card,
+        )
+        job_tracker = JobTracker()
+        head_job = make_job_pop_response("head_model")
+        await track_popped_job_async(job_tracker, head_job)
+        await track_popped_job_async(job_tracker, make_job_pop_response("later_model"))
+        bridge_data = make_mock_bridge_data(image_models_to_load=["head_model", "later_model"])
+        inference_scheduler = _make_inference_scheduler(
+            process_map=ProcessMap({0: head_process, 1: later_process}),
+            job_tracker=job_tracker,
+            bridge_data=bridge_data,
+            max_concurrent=1,
+            max_inference=2,
+            card_runtimes=make_test_card_runtimes(device_indices=(0, 1), config=bridge_data) if two_cards else None,
+        )
+        assert head_job.id_ is not None
+        return inference_scheduler, later_process, str(head_job.id_)
+
+    async def test_residency_held_head_does_not_block_a_cold_sibling_preload_on_another_card(self) -> None:
+        """A head held by the residency-reconciliation gate does not stop a sibling's load onto another card.
+
+        Otherwise the pass yields on every cycle to a dispatch that the gate refuses, and a cold sibling never gets
+        the idle card beside the held head.
+        """
+        inference_scheduler, later_process, head_id = await self._resident_head_with_cold_sibling(
+            two_cards=True,
+            sibling_lane_card=1,
+        )
+        inference_scheduler.dispatch_holds.note_hold(head_id, reclaim_applied=False, room_inputs=None)
+
+        assert inference_scheduler.preload_models() is True
+        assert later_process.last_control_flag == HordeControlFlag.PRELOAD_MODEL
+        assert later_process.loaded_horde_model_name == "later_model"
+
+    async def test_residency_held_head_keeps_its_own_card_on_a_two_card_host(self) -> None:
+        """A sibling is not preloaded onto the held head's card, where reclaim is still closing room for the head."""
+        inference_scheduler, later_process, head_id = await self._resident_head_with_cold_sibling(
+            two_cards=True,
+            sibling_lane_card=0,
+        )
+        inference_scheduler.dispatch_holds.note_hold(head_id, reclaim_applied=False, room_inputs=None)
+
+        assert inference_scheduler.preload_models() is False
+        assert later_process.last_control_flag != HordeControlFlag.PRELOAD_MODEL
+
+    async def test_residency_held_head_on_the_only_card_still_yields_the_preload_pass(self) -> None:
+        """On a single card a residency-held head keeps the cycle, so no sibling load competes for its room."""
+        inference_scheduler, later_process, head_id = await self._resident_head_with_cold_sibling(
+            two_cards=False,
+            sibling_lane_card=0,
+        )
+        inference_scheduler.dispatch_holds.note_hold(head_id, reclaim_applied=False, room_inputs=None)
+
+        assert inference_scheduler.preload_models() is False
+        assert later_process.last_control_flag != HordeControlFlag.PRELOAD_MODEL
+
+    async def test_post_processing_held_head_does_not_block_a_cold_sibling_preload(self) -> None:
+        """A head deferred by the post-processing gate lets the loads behind it go ahead on its own card."""
+        inference_scheduler, later_process, head_id = await self._resident_head_with_cold_sibling(
+            two_cards=False,
+            sibling_lane_card=0,
+        )
+        inference_scheduler.dispatch_holds.note_pp_defer(head_id, deferred=True)
+
+        assert inference_scheduler.preload_models() is True
+        assert later_process.last_control_flag == HordeControlFlag.PRELOAD_MODEL
+        assert later_process.loaded_horde_model_name == "later_model"
+
+    async def test_unheld_dispatchable_head_still_yields_the_preload_pass(self) -> None:
+        """With no hold standing, the head keeps the cycle and the sibling waits, even with another card idle."""
+        inference_scheduler, later_process, _head_id = await self._resident_head_with_cold_sibling(
+            two_cards=True,
+            sibling_lane_card=1,
+        )
+
+        assert inference_scheduler.preload_models() is False
+        assert later_process.last_control_flag != HordeControlFlag.PRELOAD_MODEL
+
     async def test_pending_post_processing_holds_speculative_preload(self, monkeypatch: object) -> None:
         """A pending chain gets a drain window before another model is staged."""
         monkeypatch.setattr(  # type: ignore[attr-defined]
