@@ -40,6 +40,7 @@ from horde_worker_regen.process_management.resources.reclaim_ladder import (
 )
 from horde_worker_regen.process_management.resources.resource_budget import CommittedReserveLedger
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
+from horde_worker_regen.process_management.scheduling.ledgers.dispatch_holds import HoldLiveness, HoldLivenessEnd
 from horde_worker_regen.process_management.scheduling.workload_flow import POST_PROCESS_RESERVE_FLOW
 
 
@@ -796,10 +797,10 @@ class WorkerRecoveryCoordinator:
         self._wedge_assessment_saw_inference_boot = inference_booting
         snapshot = self._message_dispatcher.get_deadlock_snapshot()
         if not snapshot.indicates_structural_wedge():
-            self._note_dispatch_hold_deferral(False)
+            self._note_dispatch_hold_deferral(False, queue_deadlocked=False)
             return False
         hold_alive = bool(self._inference_scheduler.dispatch_hold_liveness_active())
-        self._note_dispatch_hold_deferral(hold_alive)
+        self._note_dispatch_hold_deferral(hold_alive, queue_deadlocked=True)
         queue_held_for_capacity = (
             self._inference_scheduler.whole_card_residency_grace_active()
             or self._inference_scheduler.whole_card_governor_defer_active()
@@ -816,30 +817,41 @@ class WorkerRecoveryCoordinator:
             return False
         return not self._process_map.has_inference_in_progress()
 
-    def _note_dispatch_hold_deferral(self, hold_alive: bool) -> None:
-        """Log once when the wedge assessment starts deferring to a standing dispatch hold, and once when that lapses.
+    def _note_dispatch_hold_deferral(self, hold_alive: bool, *, queue_deadlocked: bool) -> None:
+        """Log once when the wedge assessment starts deferring to a standing dispatch hold, and once when that ends.
 
         The deferral itself is silent by design (it is the absence of a remedy), so without an edge line a
         reader of the log sees an idle card, pending work and no recovery, with nothing saying why. The
-        lapse line is the one that matters after the fact: it says the hold outlived its liveness bound and
-        recovery took over from there.
+        end line is the one that matters after the fact. It says which of these ended the deferral: the queue
+        stopped reading as deadlocked, the head is no longer held, the hold has no remedy left, or the hold
+        outlived its liveness bound.
         """
         if hold_alive == self._deferring_to_dispatch_hold:
             return
         self._deferring_to_dispatch_hold = hold_alive
-        ages = self._inference_scheduler.dispatch_hold_liveness_seconds()
+        liveness = self._inference_scheduler.dispatch_hold_liveness_seconds()
+        if not isinstance(liveness, HoldLiveness):
+            liveness = None
         if hold_alive:
-            age, bound = ages if isinstance(ages, tuple) else (0.0, 0.0)
+            age, bound = (liveness.held_seconds, liveness.bound_seconds) if liveness is not None else (0.0, 0.0)
+            activity = liveness.remedy.phrase if liveness is not None else "holding the head"
             logger.info(
                 f"Recovery is deferring to the head's dispatch hold (held {age:.0f}s of a {bound:.0f}s liveness "
-                "bound): the residency gate is reclaiming or waiting on its probe, so the idle card with pending "
-                "work is not a wedge yet.",
+                f"bound): the residency gate is {activity}, so the idle card with pending work is not a wedge yet.",
             )
+            return
+        if not queue_deadlocked:
+            ended = "the queue no longer reads as deadlocked"
+        elif liveness is None:
+            ended = "the head is no longer held"
+        elif liveness.ended_by is HoldLivenessEnd.NO_REMEDY:
+            ended = f"the hold has no remedy left after {liveness.held_seconds:.0f}s"
         else:
-            logger.warning(
-                "Recovery stopped deferring to the head's dispatch hold: it lapsed its liveness bound or released, "
-                "so the wedge assessment reads the queue on its own terms again.",
-            )
+            ended = f"the hold outlived its {liveness.bound_seconds:.0f}s liveness bound"
+        logger.warning(
+            f"Recovery stopped deferring to the head's dispatch hold: {ended}, so the wedge assessment reads the "
+            "queue on its own terms again.",
+        )
 
     def pop_gate_wedge_active(self) -> bool:
         """Return whether job pops have been gated far too long with no work completing behind the gate.

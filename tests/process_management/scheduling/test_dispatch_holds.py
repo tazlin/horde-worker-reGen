@@ -7,8 +7,12 @@ bookkeeping itself, so a change to a counter or an attribution rule is caught wh
 from __future__ import annotations
 
 from horde_worker_regen.process_management.scheduling.ledgers.dispatch_holds import (
+    DISPATCH_HOLD_LIVENESS_SECONDS,
     DispatchHoldLedger,
+    HoldLivenessEnd,
     HoldRelease,
+    HoldRemedy,
+    hold_remedy,
 )
 
 
@@ -31,9 +35,11 @@ class TestDispatchHolds:
     def test_first_hold_stamps_and_counts_once(self) -> None:
         """Repeated holds of one job count conflicts each pass but a single distinct hold."""
         ledger, clock = _ledger()
-        assert ledger.note_hold("j", reclaim_applied=False, room_inputs={"free_mb": 100}) is True
+        assert (
+            ledger.note_hold("j", reclaim_applied=False, room_inputs={"free_mb": 100}, remedy=HoldRemedy.PROBE) is True
+        )
         clock.now += 5.0
-        assert ledger.note_hold("j", reclaim_applied=False, room_inputs=None) is False
+        assert ledger.note_hold("j", reclaim_applied=False, room_inputs=None, remedy=HoldRemedy.PROBE) is False
         assert (ledger.holds, ledger.conflicts) == (1, 2)
         assert ledger.hold_since["j"] == 1_000.0
         assert ledger.room_inputs["j"] == {"free_mb": 100}, "a pass without inputs keeps the last breakdown"
@@ -43,9 +49,9 @@ class TestDispatchHolds:
     def test_release_attribution(self) -> None:
         """Measured attempt beats reclaim beats natural free, and each release folds its duration."""
         ledger, clock = _ledger()
-        ledger.note_hold("natural", reclaim_applied=False, room_inputs=None)
-        ledger.note_hold("reclaimed", reclaim_applied=True, room_inputs={"free_mb": 1})
-        ledger.note_hold("probed", reclaim_applied=True, room_inputs=None)
+        ledger.note_hold("natural", reclaim_applied=False, room_inputs=None, remedy=HoldRemedy.PROBE)
+        ledger.note_hold("reclaimed", reclaim_applied=True, room_inputs={"free_mb": 1}, remedy=HoldRemedy.RECLAIM)
+        ledger.note_hold("probed", reclaim_applied=True, room_inputs=None, remedy=HoldRemedy.RECLAIM)
         clock.now += 10.0
         natural = ledger.resolve_hold("natural", measured_attempt=False)
         reclaimed = ledger.resolve_hold("reclaimed", measured_attempt=False)
@@ -65,7 +71,7 @@ class TestDispatchHolds:
     def test_a_reroute_release_is_counted_as_a_reroute_even_after_reclaim(self) -> None:
         """A rerouted hold is attributed to the reroute, though the gate had reclaimed for it earlier."""
         ledger, _ = _ledger()
-        ledger.note_hold("rerouted", reclaim_applied=True, room_inputs={"free_mb": 2})
+        ledger.note_hold("rerouted", reclaim_applied=True, room_inputs={"free_mb": 2}, remedy=HoldRemedy.RECLAIM)
         released = ledger.resolve_hold("rerouted", measured_attempt=False, rerouted=True)
         assert released is not None and released.release is HoldRelease.REROUTE
         assert released.room_inputs == {"free_mb": 2}
@@ -81,8 +87,8 @@ class TestDispatchHolds:
     def test_prune_forgets_departed_jobs_without_counting_a_release(self) -> None:
         """A job that left the queue by another path is abandoned, not released, and its defer hold goes too."""
         ledger, clock = _ledger()
-        ledger.note_hold("gone", reclaim_applied=True, room_inputs={"free_mb": 7})
-        ledger.note_hold("kept", reclaim_applied=False, room_inputs=None)
+        ledger.note_hold("gone", reclaim_applied=True, room_inputs={"free_mb": 7}, remedy=HoldRemedy.RECLAIM)
+        ledger.note_hold("kept", reclaim_applied=False, room_inputs=None, remedy=HoldRemedy.PROBE)
         ledger.note_pp_defer("gone", deferred=True)
         ledger.note_pp_defer("kept", deferred=True)
         clock.now += 3.0
@@ -96,7 +102,7 @@ class TestDispatchHolds:
         """A hold is standing once it has stood the bound; an unheld job never is."""
         ledger, clock = _ledger()
         assert ledger.is_standing("j", 10.0) is False
-        ledger.note_hold("j", reclaim_applied=False, room_inputs=None)
+        ledger.note_hold("j", reclaim_applied=False, room_inputs=None, remedy=HoldRemedy.PROBE)
         clock.now += 9.0
         assert ledger.is_standing("j", 10.0) is False
         clock.now += 1.0
@@ -109,6 +115,100 @@ class TestDispatchHolds:
         assert ledger.pp_defer_holds == {"j"}
         ledger.note_pp_defer("j", deferred=False)
         assert ledger.pp_defer_holds == set()
+
+
+class TestHoldRemedy:
+    """Which remedy a hold pass left live, read from that pass's verdict."""
+
+    @staticmethod
+    def _remedy(
+        *,
+        denied: bool = False,
+        reroute_pending: bool = False,
+        reclaim_applied: bool = False,
+        teardown_grace_open: bool = False,
+        probe_pending: bool = False,
+    ) -> HoldRemedy:
+        return hold_remedy(
+            denied=denied,
+            reroute_pending=reroute_pending,
+            reclaim_applied=reclaim_applied,
+            teardown_grace_open=teardown_grace_open,
+            probe_pending=probe_pending,
+        )
+
+    def test_a_deny_with_no_other_card_has_no_remedy(self) -> None:
+        """No reclaim moves the ceiling and its attempt is refused or spent, so only another card is left."""
+        assert self._remedy(denied=True, reclaim_applied=True, probe_pending=True) is HoldRemedy.NONE
+        assert self._remedy(denied=True, reroute_pending=True) is HoldRemedy.REROUTE
+
+    def test_a_defer_keeps_each_remedy_until_it_is_spent(self) -> None:
+        """Reclaim, then the teardown grace, then the probe. A DEFER with all three spent has none."""
+        assert self._remedy(reclaim_applied=True, probe_pending=True) is HoldRemedy.RECLAIM
+        assert self._remedy(teardown_grace_open=True, probe_pending=True) is HoldRemedy.TEARDOWN_GRACE
+        assert self._remedy(probe_pending=True) is HoldRemedy.PROBE
+        assert self._remedy() is HoldRemedy.NONE
+
+
+class TestHoldLiveness:
+    """A hold keeps recovery waiting while its latest pass left a remedy live, up to the liveness bound."""
+
+    def test_a_hold_with_no_remedy_is_inactive_at_once(self) -> None:
+        """A terminal DENY on its first pass ends the deferral without waiting out any of the bound."""
+        ledger, _ = _ledger()
+        ledger.note_hold("dead", reclaim_applied=False, room_inputs=None, remedy=HoldRemedy.NONE)
+        liveness = ledger.liveness("dead")
+        assert liveness is not None
+        assert liveness.held_seconds == 0.0
+        assert liveness.active is False
+        assert liveness.ended_by is HoldLivenessEnd.NO_REMEDY
+
+    def test_a_defer_with_reclaim_accepted_stays_active_to_the_bound(self) -> None:
+        """Reclaim on the way keeps the hold live up to the bound, and the bound still ends it."""
+        ledger, clock = _ledger()
+        ledger.note_hold("reclaiming", reclaim_applied=True, room_inputs=None, remedy=HoldRemedy.RECLAIM)
+        clock.now += DISPATCH_HOLD_LIVENESS_SECONDS - 1.0
+        liveness = ledger.liveness("reclaiming")
+        assert liveness is not None and liveness.active is True and liveness.ended_by is None
+        clock.now += 1.0
+        lapsed = ledger.liveness("reclaiming")
+        assert lapsed is not None and lapsed.active is False
+        assert lapsed.ended_by is HoldLivenessEnd.BOUND_LAPSED, "a live remedy does not outlast the bound"
+
+    def test_a_ceiling_attempt_pending_convergence_stays_active(self) -> None:
+        """The arbiter holds back the ceiling DENY as a DEFER while the card converges; its probe keeps it live."""
+        remedy = hold_remedy(
+            denied=False,
+            reroute_pending=False,
+            reclaim_applied=False,
+            teardown_grace_open=False,
+            probe_pending=True,
+        )
+        ledger, clock = _ledger()
+        ledger.note_hold("converging", reclaim_applied=False, room_inputs=None, remedy=remedy)
+        clock.now += 60.0
+        liveness = ledger.liveness("converging")
+        assert liveness is not None and liveness.remedy is HoldRemedy.PROBE and liveness.active is True
+
+    def test_the_latest_pass_decides_the_remedy(self) -> None:
+        """A hold whose probe is spent on a later pass stops being live on that pass."""
+        ledger, clock = _ledger()
+        ledger.note_hold("j", reclaim_applied=False, room_inputs=None, remedy=HoldRemedy.PROBE)
+        clock.now += 30.0
+        ledger.note_hold("j", reclaim_applied=False, room_inputs=None, remedy=HoldRemedy.NONE)
+        liveness = ledger.liveness("j")
+        assert liveness is not None and liveness.held_seconds == 30.0 and liveness.active is False
+
+    def test_an_unheld_job_has_no_liveness_and_a_release_forgets_the_remedy(self) -> None:
+        """A released or pruned hold leaves no remedy behind for a later hold of the same job to inherit."""
+        ledger, _ = _ledger()
+        assert ledger.liveness("never") is None
+        ledger.note_hold("released", reclaim_applied=False, room_inputs=None, remedy=HoldRemedy.PROBE)
+        ledger.note_hold("pruned", reclaim_applied=False, room_inputs=None, remedy=HoldRemedy.PROBE)
+        ledger.resolve_hold("released", measured_attempt=False)
+        ledger.prune(set())
+        assert ledger.liveness("released") is None and ledger.liveness("pruned") is None
+        assert ledger.remedies == {}
 
 
 class TestClearanceHolds:

@@ -203,6 +203,10 @@ from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
 from horde_sdk.ai_horde_api import GENERATION_STATE
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 
+from horde_worker_regen.process_management.ipc.message_dispatcher import (
+    _MIN_STRUCTURAL_QUEUE_WEDGE_SECONDS,
+    DeadlockSnapshot,
+)
 from horde_worker_regen.process_management.ipc.messages import (
     HordeControlFlag,
     HordeControlMessage,
@@ -220,6 +224,7 @@ from horde_worker_regen.process_management.lifecycle.process_lifecycle import (
     PauseOwner,
 )
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
+from horde_worker_regen.process_management.lifecycle.worker_recovery_coordinator import WorkerRecoveryCoordinator
 from horde_worker_regen.process_management.resources import reclaim_ladder as reclaim_ladder_module
 from horde_worker_regen.process_management.resources.admission_identity import admission_noise_buffer_mb
 from horde_worker_regen.process_management.resources.device_free_governor import GovernorState
@@ -288,7 +293,12 @@ from horde_worker_regen.process_management.scheduling.ledgers.safety_placement i
 )
 from horde_worker_regen.process_management.scheduling.workload_flow import POST_PROCESS_RESERVE_FLOW
 from horde_worker_regen.process_management.workers import post_process_orchestrator
-from tests.process_management.conftest import make_job_pop_response, moss_card_below_recommended_minimum_mb
+from tests.process_management.conftest import (
+    FakeClock,
+    make_job_pop_response,
+    make_test_recovery_coordinator,
+    moss_card_below_recommended_minimum_mb,
+)
 from tests.process_management.liveness._dispatch_world import (
     _CARD_10GB,
     _CARD_16GB,
@@ -9226,3 +9236,155 @@ async def test_mixed_cards_a_ceiling_deny_on_the_small_card_reroutes_its_ram_sta
         f"{world.state_dump()}"
     )
     assert_never_idle_with_fitting_work(world, max_idle_ticks=_MIXED_CARD_TICK_CEILING, context=context)
+
+
+_TERMINAL_DENY_FLOOR_BEFORE_MB = 200.0
+"""Foreign memory on the card when Flux is staged, low enough that Flux fits the card's ceiling."""
+
+_TERMINAL_DENY_FLOOR_AFTER_MB = 6000.0
+"""Foreign memory on the card from shortly after staging. It lowers the achievable ceiling below the Flux
+candidate by more than the ceiling-attempt allowance, so the arbiter issues the terminal DENY."""
+
+_TERMINAL_DENY_FLOOR_RISE_TICK = 5
+"""The tick the foreign floor rises on, after Flux is staged at the row's start."""
+
+_TERMINAL_DENY_ROW_TICKS = 60
+"""Ticks the row runs once the head is queued. Well past the sustained-wedge minimum and far short of the hold
+liveness bound, so recovery reading the queue inside it can only be the hold ending its deferral at once."""
+
+
+@dataclass(frozen=True)
+class _WorldClockedDeadlock:
+    """The dispatcher's queue-deadlock latch, aged on the world's clock as the recovery coordinator ages it."""
+
+    snapshot: DeadlockSnapshot
+    now: float
+
+    def indicates_structural_wedge(self, now: float | None = None, *, measured_from: float | None = None) -> bool:
+        """Read the latch's age at the world's present unless the caller names a time."""
+        return self.snapshot.indicates_structural_wedge(
+            now=self.now if now is None else now, measured_from=measured_from
+        )
+
+
+class _WorldDeadlockSource:
+    """The world's deadlock detector presented to the recovery coordinator on the world's clock.
+
+    The detector stamps wall time, and the world measures each latch from the tick it was first seen, so the
+    coordinator reads the latch through the world's own stamp.
+    """
+
+    def __init__(self, world: _DispatchWorld) -> None:
+        self._world = world
+
+    def get_deadlock_snapshot(self) -> _WorldClockedDeadlock:
+        """The detector's latch, stamped with the world tick it was first seen on."""
+        latched_since = self._world._queue_deadlock_since
+        return _WorldClockedDeadlock(
+            snapshot=DeadlockSnapshot(
+                in_deadlock=False,
+                in_queue_deadlock=latched_since is not None,
+                deadlock_started_at=0.0,
+                queue_deadlock_started_at=latched_since if latched_since is not None else self._world.now,
+                queue_deadlock_model=None,
+                queue_deadlock_process_id=None,
+            ),
+            now=self._world.now,
+        )
+
+
+def _recovery_coordinator_over(world: _DispatchWorld) -> WorkerRecoveryCoordinator:
+    """A recovery coordinator reading the world's scheduler, process map, tracker and deadlock latch."""
+    coordinator = make_test_recovery_coordinator(job_tracker=world._job_tracker, clock=FakeClock(world.now))
+    coordinator._inference_scheduler = world.scheduler
+    coordinator._process_map = world._process_map
+    coordinator._message_dispatcher = _WorldDeadlockSource(world)  # type: ignore[assignment]
+    coordinator._clock = lambda: world.now
+    return coordinator
+
+
+async def test_a_terminal_ceiling_deny_on_the_only_card_reaches_recovery_without_the_hold_bound() -> None:
+    """A Flux head held in RAM on a card whose ceiling fell below it reaches recovery within the wedge minimum.
+
+    Flux is staged by name on the single card's only lane. The card's foreign floor then rises, so the Flux
+    candidate exceeds the achievable ceiling by more than the ceiling-attempt allowance, and no other card can
+    seat it. The arbiter issues the terminal DENY, the hold reclaims nothing, and no probe or teardown grace can
+    release it. Recovery therefore reads the idle card with pending work as a structural wedge once the
+    dispatcher's sustained-wedge minimum has passed, which is the state the soft reset and the give-up act on.
+    A hold that keeps recovery waiting for its 190 s liveness bound loses the head to the horde's deadline first.
+
+    Whole-card residency is off, so the residency's establish grace, a separate excuse with its own bound, does not
+    also hold recovery off and the row reads the dispatch hold's excuse alone.
+    """
+    world = _DispatchWorld(
+        card=_CARD_16GB,
+        lane_count=1,
+        max_threads=1,
+        queue_depth=1,
+        whole_card_enabled=False,
+        closed_loop=True,
+        tick_seconds=1.0,
+        foreign_vram_mb_by_tick={
+            1: _TERMINAL_DENY_FLOOR_BEFORE_MB,
+            _TERMINAL_DENY_FLOOR_RISE_TICK: _TERMINAL_DENY_FLOOR_AFTER_MB,
+        },
+        lane_reports_carry_context=True,
+    )
+    world.scheduler._foreign_floor_clock = lambda: world.now
+    lane = world.inference_lane_ids()[0]
+    world.seed_resident(lane, _FLUX, in_vram=False)
+    for _ in range(_TERMINAL_DENY_FLOOR_RISE_TICK + math.ceil(FOREIGN_FLOOR_WINDOW_SECONDS) + 2):
+        await world.step()
+    coordinator = _recovery_coordinator_over(world)
+    head = make_job_pop_response(_FLUX.name, width=1024, height=1024, ddim_steps=4)
+    await world.pop(head)
+    head_id = str(head.id_)
+    context = "Flux head RAM-staged on the only card, below its ceiling once the foreign floor rose"
+
+    hold_tick: int | None = None
+    wedge_tick: int | None = None
+    for _ in range(_TERMINAL_DENY_ROW_TICKS):
+        await world.step()
+        if hold_tick is None and world.scheduler.dispatch_holds.held_seconds(head_id) is not None:
+            hold_tick = world.tick
+        if coordinator.structural_queue_wedge_active() and wedge_tick is None:
+            wedge_tick = world.tick
+
+    denials = [
+        record.inputs
+        for record in world.decision_records
+        if record.decision_kind is DecisionKind.INFERENCE_DISPATCH
+        and record.subject == head_id
+        and record.verdict is DecisionVerdict.DEFER
+        and "achievable ceiling" in record.reason
+    ]
+    assert hold_tick is not None and denials, (
+        f"{context}: precondition: the dispatch gate must hold the head on the arbiter's ceiling DENY. "
+        f"{world.state_dump()}"
+    )
+    candidate_mb = denials[0]["candidate_delta_mb"]
+    noise_mb = denials[0]["noise_buffer_mb"]
+    floor_mb = world.scheduler.current_foreign_floor_mb(0)
+    assert isinstance(candidate_mb, float) and isinstance(noise_mb, float) and floor_mb is not None
+    ceiling_mb = _CARD_16GB.total_mb - noise_mb - floor_mb
+    assert candidate_mb - ceiling_mb > VramArbiter._ceiling_attempt_allowance_mb(ceiling_mb), (
+        f"{context}: precondition: the Flux candidate {candidate_mb:.0f} MB must exceed the {ceiling_mb:.0f} MB "
+        f"ceiling by more than the ceiling-attempt allowance. {world.state_dump()}"
+    )
+    assert world.dispatch_tick(head) is None, f"{context}: precondition: the head never samples. {world.state_dump()}"
+
+    assert wedge_tick is not None, (
+        f"{context}: recovery deferred to the head's hold for all {_TERMINAL_DENY_ROW_TICKS} ticks after it was "
+        f"queued, though the hold has no remedy left. {world.state_dump()}"
+    )
+    wedge_bound_ticks = math.ceil(_MIN_STRUCTURAL_QUEUE_WEDGE_SECONDS / world.tick_seconds) + 1
+    assert wedge_tick - hold_tick <= wedge_bound_ticks, (
+        f"{context}: recovery read the wedge on tick {wedge_tick}, {wedge_tick - hold_tick} ticks after the hold "
+        f"began on tick {hold_tick}, more than the {wedge_bound_ticks}-tick sustained-wedge minimum. "
+        f"{world.state_dump()}"
+    )
+    liveness = world.scheduler.dispatch_hold_liveness_seconds()
+    assert liveness is not None and not liveness.remedy.live, (
+        f"{context}: the hold ledger records {liveness} for the head, not a hold with no remedy left. "
+        f"{world.state_dump()}"
+    )

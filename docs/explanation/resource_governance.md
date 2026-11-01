@@ -314,6 +314,14 @@ a governance-baseline reset, and only if the hold re-latches despite a healthy h
 (all-idle) inference pool. It is deliberately not an `assess_wedge` trigger, because that would apply the
 soft reset's unconditional pool churn to a pool that is actually healthy.
 
+The structural-wedge assessment also excuses a head held by the dispatch gate's residency hold, but only while
+the hold has a live remedy. Each hold pass records which remedy its verdict left live (`HoldRemedy` in
+`scheduling/ledgers/dispatch_holds.py`). A hold with one is excused for `DISPATCH_HOLD_LIVENESS_SECONDS`
+(190 s). A hold with none, such as a ceiling DENY on a card with no other card able to seat the job, is not
+excused at all, and recovery acts once the dispatcher's 20 s sustained-wedge minimum has passed. The bound is
+longer than the 150 s deadline the horde sets on some jobs, so excusing a hold that cannot release would only
+lose the jobs behind it. See [the dispatch hold](vram_arbiter.md) for the remedies themselves.
+
 ## Decisions are values
 
 Remedies are expressed as inert command objects

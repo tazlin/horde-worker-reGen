@@ -509,6 +509,17 @@ _SIGNATURE_LIST: list[LogSignature] = [
         dry_run_reason=_NO_FAULT,
     ),
     _signature(
+        "dispatch_hold_deferral_end",
+        r"Recovery stopped deferring to the head's dispatch hold: (?P<ended>.+?), so the wedge assessment reads "
+        r"the queue on its own terms again",
+        emitter="process_management.lifecycle.worker_recovery_coordinator:_note_dispatch_hold_deferral",
+        sample=(
+            "Recovery stopped deferring to the head's dispatch hold: the hold has no remedy left after 34s, so the "
+            "wedge assessment reads the queue on its own terms again."
+        ),
+        dry_run_reason=_NO_FAULT,
+    ),
+    _signature(
         "pools_recovered",
         r"pools recovered.*limp-by cleared",
         emitter="process_management.lifecycle.worker_recovery_coordinator:run_recovery_supervisor",

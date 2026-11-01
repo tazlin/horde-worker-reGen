@@ -80,6 +80,7 @@ from horde_worker_regen.process_management.scheduling.inference_scheduler import
     _RESIDENCY_GRACE_SECONDS,
     InferenceScheduler,
 )
+from horde_worker_regen.process_management.scheduling.ledgers.dispatch_holds import HoldRemedy
 from horde_worker_regen.process_management.scheduling.ledgers.head_admission import (
     StagingDeferReason,
     format_staging_defer_tally,
@@ -586,7 +587,9 @@ class TestPreloadModels:
             two_cards=True,
             sibling_lane_card=1,
         )
-        inference_scheduler.dispatch_holds.note_hold(head_id, reclaim_applied=False, room_inputs=None)
+        inference_scheduler.dispatch_holds.note_hold(
+            head_id, reclaim_applied=False, room_inputs=None, remedy=HoldRemedy.PROBE
+        )
 
         assert inference_scheduler.preload_models() is True
         assert later_process.last_control_flag == HordeControlFlag.PRELOAD_MODEL
@@ -598,7 +601,9 @@ class TestPreloadModels:
             two_cards=True,
             sibling_lane_card=0,
         )
-        inference_scheduler.dispatch_holds.note_hold(head_id, reclaim_applied=False, room_inputs=None)
+        inference_scheduler.dispatch_holds.note_hold(
+            head_id, reclaim_applied=False, room_inputs=None, remedy=HoldRemedy.PROBE
+        )
 
         assert inference_scheduler.preload_models() is False
         assert later_process.last_control_flag != HordeControlFlag.PRELOAD_MODEL
@@ -609,7 +614,9 @@ class TestPreloadModels:
             two_cards=False,
             sibling_lane_card=0,
         )
-        inference_scheduler.dispatch_holds.note_hold(head_id, reclaim_applied=False, room_inputs=None)
+        inference_scheduler.dispatch_holds.note_hold(
+            head_id, reclaim_applied=False, room_inputs=None, remedy=HoldRemedy.PROBE
+        )
 
         assert inference_scheduler.preload_models() is False
         assert later_process.last_control_flag != HordeControlFlag.PRELOAD_MODEL

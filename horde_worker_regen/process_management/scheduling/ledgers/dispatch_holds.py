@@ -27,13 +27,120 @@ from horde_worker_regen.process_management.resources.run_metrics import FlatScal
 from horde_worker_regen.process_management.scheduling.slot_duty import SlotDutyBucket
 
 DISPATCH_HOLD_LIVENESS_SECONDS = 190.0
-"""How long a head's residency-reconciliation hold keeps the recovery supervisor from reading an idle card with
-pending work as a structural wedge.
+"""How long a head's residency-reconciliation hold with a live remedy keeps the recovery supervisor from reading
+an idle card with pending work as a structural wedge.
 
-The hold has its own escalation, and this is that escalation end to end: the head-starvation clock the
-measured-load probe is gated on, the idle-context teardown grace, and the heavy head's load window once admitted.
-A hold older than this has exhausted every remedy the gate owns, so the supervisor takes over as it would for
-any other wedge."""
+The bound is the gate's escalation end to end: the head-starvation clock the measured-load probe is gated on, the
+idle-context teardown grace, and the heavy head's load window once admitted. A hold older than this has exhausted
+every remedy the gate owns, so the supervisor takes over as it would for any other wedge. A hold whose latest
+pass left no remedy live (:attr:`HoldRemedy.NONE`) does not get the bound at all. Its remedies are already spent,
+and the bound is longer than the 150 s deadline the horde sets on some jobs, so waiting it out only loses the jobs
+queued behind the hold."""
+
+
+class HoldRemedy(enum.Enum):
+    """The remedy that the latest pass of a dispatch hold left live, derived from that pass's verdict.
+
+    Several remedies can be live at once. The ledger records the first live one in member order.
+    """
+
+    REROUTE = "reroute"
+    """The arbiter denied the job on this card and another card can seat it, but the copy that pins the job here
+    stays while its lane owns a job, is loading, or has an unload from RAM on the way."""
+    RECLAIM = "reclaim"
+    """An actuator accepted an eviction command for the hold on this pass."""
+    TEARDOWN_GRACE = "teardown_grace"
+    """The deficit is the head's own idle sibling contexts, which the arbiter tears down once the head has starved
+    past the teardown grace."""
+    PROBE = "probe"
+    """The measured-load probe on this card is not spent: it is waiting on the head-starvation clock, eligible, or
+    in progress."""
+    NONE = "none"
+    """No remedy is live. Either the verdict is a DENY and no other card can seat the job, or it is a DEFER whose
+    probe on this card is spent, with nothing reclaimed and no teardown grace open."""
+
+    @property
+    def live(self) -> bool:
+        """Whether this remedy can still release the hold."""
+        return self is not HoldRemedy.NONE
+
+    @property
+    def phrase(self) -> str:
+        """What the gate is doing about the hold, for a log line."""
+        return _HOLD_REMEDY_PHRASES[self]
+
+
+_HOLD_REMEDY_PHRASES: dict[HoldRemedy, str] = {
+    HoldRemedy.REROUTE: "waiting to retire the copy that pins the head to a card that cannot seat it",
+    HoldRemedy.RECLAIM: "reclaiming room for the head",
+    HoldRemedy.TEARDOWN_GRACE: "waiting out the grace before it tears down idle contexts",
+    HoldRemedy.PROBE: "waiting on its measured-load probe",
+    HoldRemedy.NONE: "holding the head with no remedy left",
+}
+
+
+def hold_remedy(
+    *,
+    denied: bool,
+    reroute_pending: bool,
+    reclaim_applied: bool,
+    teardown_grace_open: bool,
+    probe_pending: bool,
+) -> HoldRemedy:
+    """Return the remedy a hold's verdict left live on the pass that noted it.
+
+    A DENY is terminal on its card. The arbiter issues it only after the ceiling attempt is refused or spent, and
+    the achievable ceiling does not count the worker's own memory, so no reclaim on the card moves it. The only
+    way out of a DENY is another card. A DEFER keeps the gate's remedies until each is spent.
+
+    Args:
+        denied: Whether the verdict is a DENY.
+        reroute_pending: Whether another card can seat the denied job and the copy pinning it was kept this pass.
+        reclaim_applied: Whether an actuator accepted an eviction command for the hold this pass.
+        teardown_grace_open: Whether the verdict waits out the teardown grace for the head's idle sibling contexts.
+        probe_pending: Whether the measured-load probe on the hold's card is not yet spent.
+    """
+    if denied:
+        return HoldRemedy.REROUTE if reroute_pending else HoldRemedy.NONE
+    if reclaim_applied:
+        return HoldRemedy.RECLAIM
+    if teardown_grace_open:
+        return HoldRemedy.TEARDOWN_GRACE
+    if probe_pending:
+        return HoldRemedy.PROBE
+    return HoldRemedy.NONE
+
+
+class HoldLivenessEnd(enum.Enum):
+    """Why a hold stopped keeping the recovery supervisor from reading the queue as wedged."""
+
+    BOUND_LAPSED = "bound_lapsed"
+    """The hold has a live remedy but has stood past :data:`DISPATCH_HOLD_LIVENESS_SECONDS`."""
+    NO_REMEDY = "no_remedy"
+    """The hold's latest pass left no remedy live, so the bound does not apply."""
+
+
+@dataclass(frozen=True)
+class HoldLiveness:
+    """A dispatch hold's age, its liveness bound and the remedy its latest pass left live."""
+
+    held_seconds: float
+    bound_seconds: float
+    remedy: HoldRemedy
+
+    @property
+    def active(self) -> bool:
+        """Whether the hold keeps the recovery supervisor from reading the queue as wedged."""
+        return self.ended_by is None
+
+    @property
+    def ended_by(self) -> HoldLivenessEnd | None:
+        """Why the hold no longer keeps recovery waiting, or None while it does."""
+        if not self.remedy.live:
+            return HoldLivenessEnd.NO_REMEDY
+        if self.held_seconds >= self.bound_seconds:
+            return HoldLivenessEnd.BOUND_LAPSED
+        return None
 
 
 class HoldRelease(enum.Enum):
@@ -133,6 +240,8 @@ class DispatchHoldLedger:
         reclaim rather than to the card recovering on its own."""
         self.room_inputs: dict[str, FlatScalarMap] = {}
         """The room breakdown of the most recent hold verdict per held job."""
+        self.remedies: dict[str, HoldRemedy] = {}
+        """The remedy the most recent hold pass left live per held job."""
         self.holds = 0
         """Distinct held dispatches this session."""
         self.conflicts = 0
@@ -185,11 +294,19 @@ class DispatchHoldLedger:
 
     # ---- dispatch residency holds
 
-    def note_hold(self, job_id: str, *, reclaim_applied: bool, room_inputs: FlatScalarMap | None) -> bool:
-        """Count a held pass for ``job_id``; return whether this is the job's first hold."""
+    def note_hold(
+        self,
+        job_id: str,
+        *,
+        reclaim_applied: bool,
+        room_inputs: FlatScalarMap | None,
+        remedy: HoldRemedy,
+    ) -> bool:
+        """Count a held pass for ``job_id`` with the remedy it left live. Returns whether this is the first hold."""
         self.conflicts += 1
         if room_inputs is not None:
             self.room_inputs[job_id] = room_inputs
+        self.remedies[job_id] = remedy
         first = job_id not in self.hold_since
         if first:
             self.hold_since[job_id] = self._clock()
@@ -206,6 +323,7 @@ class DispatchHoldLedger:
         commands during the hold, otherwise to the card freeing on its own.
         """
         held_since = self.hold_since.pop(job_id, None)
+        self.remedies.pop(job_id, None)
         if held_since is None:
             self.reclaim_requested.discard(job_id)
             self.room_inputs.pop(job_id, None)
@@ -236,6 +354,7 @@ class DispatchHoldLedger:
         for job_id in [job_id for job_id in self.hold_since if job_id not in live]:
             held_since = self.hold_since.pop(job_id)
             self.reclaim_requested.discard(job_id)
+            self.remedies.pop(job_id, None)
             abandoned.append(
                 AbandonedHold(job_id, max(0.0, self._clock() - held_since), self.room_inputs.pop(job_id, {})),
             )
@@ -253,6 +372,17 @@ class DispatchHoldLedger:
         """Whether ``job_id``'s hold has stood at least ``bound_seconds``."""
         held = self.held_seconds(job_id)
         return held is not None and held >= bound_seconds
+
+    def liveness(self, job_id: str) -> HoldLiveness | None:
+        """``job_id``'s hold age against :data:`DISPATCH_HOLD_LIVENESS_SECONDS` and its live remedy, or None."""
+        held = self.held_seconds(job_id)
+        if held is None:
+            return None
+        return HoldLiveness(
+            held_seconds=held,
+            bound_seconds=DISPATCH_HOLD_LIVENESS_SECONDS,
+            remedy=self.remedies.get(job_id, HoldRemedy.NONE),
+        )
 
     # ---- utilities-lane holds
 

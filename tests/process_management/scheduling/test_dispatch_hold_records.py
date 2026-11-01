@@ -7,12 +7,20 @@ tests pin the two records a hold now produces (standing, released) and the room 
 
 from __future__ import annotations
 
+from unittest.mock import Mock
+
 from horde_worker_regen.process_management.resources.run_metrics import DecisionKind, ResourceStateKind
-from horde_worker_regen.process_management.scheduling.ledgers.dispatch_holds import DISPATCH_HOLD_LIVENESS_SECONDS
+from horde_worker_regen.process_management.resources.vram_arbiter import DeviceVramState, VramArbiter
+from horde_worker_regen.process_management.scheduling.ledgers.dispatch_holds import (
+    DISPATCH_HOLD_LIVENESS_SECONDS,
+    HoldRemedy,
+)
 from tests.process_management.scheduling.test_dispatch_residency_reconciliation import (
+    _card_below_any_candidate,
     _fitting_state,
     _install_cycle,
     _over_committed_state,
+    _scheduler_with_idle_sibling,
     _scheduler_without_sibling,
 )
 
@@ -97,7 +105,8 @@ async def test_the_hold_liveness_predicate_is_bounded_by_the_hold_age() -> None:
     assert scheduler._dispatch_residency_reconciliation_holds(job, target) is True
     assert scheduler.dispatch_hold_liveness_active() is True
     ages = scheduler.dispatch_hold_liveness_seconds()
-    assert ages is not None and ages[0] == 0.0 and ages[1] == DISPATCH_HOLD_LIVENESS_SECONDS
+    assert ages is not None and ages.held_seconds == 0.0 and ages.bound_seconds == DISPATCH_HOLD_LIVENESS_SECONDS
+    assert ages.remedy is HoldRemedy.PROBE, "a fresh hold's probe is still ahead"
 
     now = 1000.0 + DISPATCH_HOLD_LIVENESS_SECONDS - 1.0
     assert scheduler.dispatch_hold_liveness_active() is True
@@ -108,3 +117,98 @@ async def test_the_hold_liveness_predicate_is_bounded_by_the_hold_age() -> None:
     assert scheduler._dispatch_residency_reconciliation_holds(job, target) is False
     assert scheduler.dispatch_hold_liveness_active() is False
     assert scheduler.dispatch_hold_liveness_seconds() is None
+
+
+async def test_a_ceiling_deny_on_the_only_card_is_not_live_on_its_first_pass() -> None:
+    """A hold on a terminal DENY with no other card has no remedy, so recovery does not wait out the bound."""
+    scheduler, job, target = await _scheduler_without_sibling()
+    scheduler._clock = lambda: 1000.0
+    _install_cycle(scheduler, _card_below_any_candidate())
+
+    assert scheduler._dispatch_residency_reconciliation_holds(job, target) is True
+
+    liveness = scheduler.dispatch_hold_liveness_seconds()
+    assert liveness is not None and liveness.held_seconds == 0.0
+    assert liveness.remedy is HoldRemedy.NONE
+    assert scheduler.dispatch_hold_liveness_active() is False
+
+
+async def test_a_defer_with_reclaim_accepted_is_live_to_the_bound() -> None:
+    """A hold whose eviction an actuator accepted keeps recovery waiting until the bound, and no longer."""
+    scheduler, job, target, _sibling = await _scheduler_with_idle_sibling()
+    now = 1000.0
+    scheduler._clock = lambda: now
+    scheduler.unload_models_from_vram = Mock(return_value=True)  # type: ignore[method-assign]
+    _install_cycle(scheduler, _over_committed_state())
+
+    assert scheduler._dispatch_residency_reconciliation_holds(job, target) is True
+
+    liveness = scheduler.dispatch_hold_liveness_seconds()
+    assert liveness is not None and liveness.remedy is HoldRemedy.RECLAIM
+    now = 1000.0 + DISPATCH_HOLD_LIVENESS_SECONDS - 1.0
+    assert scheduler.dispatch_hold_liveness_active() is True
+    now = 1000.0 + DISPATCH_HOLD_LIVENESS_SECONDS + 1.0
+    assert scheduler.dispatch_hold_liveness_active() is False, "a live remedy does not outlast the bound"
+
+
+def _over_ceiling_by(
+    candidate_mb: float,
+    overshoot_mb: float,
+    *,
+    noise_buffer_mb: float,
+    total_mb: float = 16000.0,
+) -> DeviceVramState:
+    """A card whose foreign floor puts its achievable ceiling ``overshoot_mb`` below ``candidate_mb``.
+
+    Idle residents hold the rest of the card, so it is not converged-empty.
+    """
+    return DeviceVramState(
+        total_vram_mb=total_mb,
+        baseline_mb=0.0,
+        committed_vram_mb=total_mb,
+        planned_unmaterialized_mb=0.0,
+        committed_is_stale=False,
+        device_free_mb=200.0,
+        foreign_floor_mb=total_mb - noise_buffer_mb - (candidate_mb - overshoot_mb),
+    )
+
+
+async def test_a_ceiling_deny_pending_convergence_is_live() -> None:
+    """An over-ceiling head inside the attempt allowance on a card not yet converged keeps the hold live.
+
+    The arbiter holds the DENY back while the card still has reclaimable state, so the head can reach the
+    converged card its one real load is judged on. The probe has not been spent, so the hold has a remedy even
+    when no eviction was accepted on this pass.
+    """
+    scheduler, job, target, _sibling = await _scheduler_with_idle_sibling()
+    scheduler.unload_models_from_vram = Mock(return_value=False)  # type: ignore[method-assign]
+    decision_sink = Mock(return_value=None)
+    scheduler._decision_sink = decision_sink
+    _install_cycle(scheduler, _over_committed_state())
+    assert scheduler._dispatch_residency_reconciliation_holds(job, target) is True
+    candidate_mb = decision_sink.call_args.kwargs["inputs"]["candidate_delta_mb"]
+    assert isinstance(candidate_mb, float)
+
+    noise_buffer_mb = _over_committed_state().noise_buffer_mb
+    allowance_mb = VramArbiter._ceiling_attempt_allowance_mb(candidate_mb - noise_buffer_mb)
+    state = _over_ceiling_by(candidate_mb, allowance_mb / 2.0, noise_buffer_mb=noise_buffer_mb)
+    ceiling_mb = state.achievable_ceiling_mb()
+    assert ceiling_mb is not None and 0.0 < candidate_mb - ceiling_mb <= VramArbiter._ceiling_attempt_allowance_mb(
+        ceiling_mb
+    ), "precondition: the candidate sits above the ceiling, inside the attempt allowance"
+    _install_cycle(scheduler, state)
+
+    assert scheduler._dispatch_residency_reconciliation_holds(job, target) is True
+
+    reason = decision_sink.call_args.kwargs["reason"]
+    assert "achievable ceiling" not in reason, f"precondition: the arbiter issued the terminal DENY ({reason})"
+    liveness = scheduler.dispatch_hold_liveness_seconds()
+    assert liveness is not None and liveness.remedy is HoldRemedy.PROBE
+    assert scheduler.dispatch_hold_liveness_active() is True
+
+    _install_cycle(scheduler, _over_ceiling_by(candidate_mb, 4096.0, noise_buffer_mb=noise_buffer_mb))
+    assert scheduler._dispatch_residency_reconciliation_holds(job, target) is True
+    assert "achievable ceiling" in decision_sink.call_args.kwargs["reason"], (
+        "precondition: beyond the allowance the arbiter issues the terminal DENY"
+    )
+    assert scheduler.dispatch_hold_liveness_active() is False, "a terminal DENY on the only card has no remedy"

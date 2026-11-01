@@ -49,6 +49,7 @@ from horde_worker_regen.process_management.scheduling.admission import materiali
 from horde_worker_regen.process_management.scheduling.clearance_lease import CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS
 from horde_worker_regen.process_management.scheduling.governance.whole_card import DominanceRung
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
+from horde_worker_regen.process_management.scheduling.ledgers.dispatch_holds import HoldRemedy
 from tests.process_management.conftest import (
     make_job_pop_response,
     make_mock_model_reference_record,
@@ -522,6 +523,7 @@ class TestDominantRunCopy:
             str(jobs[0].id_),
             reclaim_applied=False,
             room_inputs={"room_closable": room_closable},
+            remedy=HoldRemedy.NONE,
         )
         return scheduler
 

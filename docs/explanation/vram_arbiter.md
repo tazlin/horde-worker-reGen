@@ -1193,9 +1193,19 @@ The room is also what the other frames read, so they cannot disagree with the ve
   (`ProcessLifecycleManager.model_has_crashed_a_child_natively`). A native crash is never classified as a
   resource failure, so under either one `clearance_admit_process` faults the job for reissue and replaces the
   lane deliberately. The native-crash record never feeds the model quarantine.
-- **Recovery defers to a standing hold** inside its liveness bound (the probe clock, the teardown grace and
-  the heavy head's load window end to end), logging the deferral once on each edge; past the bound the hold
-  is a wedge like any other.
+- **Recovery defers to a standing hold only while the hold has a live remedy.** Each hold pass records the
+  remedy its verdict left live (`HoldRemedy`, set by `hold_remedy` in `scheduling/ledgers/dispatch_holds.py`):
+  a reroute whose copy is still kept, an eviction an actuator accepted, the teardown grace for the head's own
+  idle contexts (`VramVerdict.teardown_grace_open`), or a measured-load probe not yet spent on the card. A hold
+  with a live remedy keeps recovery waiting for `DISPATCH_HOLD_LIVENESS_SECONDS` (190 s, the probe clock, the
+  teardown grace and the heavy head's load window end to end). A hold with none is a wedge at once, and
+  recovery still waits the dispatcher's 20 s sustained-wedge minimum before acting. A DENY with no other card
+  able to seat the job has no remedy. The arbiter issues it only after the ceiling attempt is refused or spent,
+  and the achievable ceiling does not count worker memory, so no reclaim moves it. The 190 s bound is longer
+  than the 150 s deadline the horde sets on some jobs, so waiting it out on a hold with no remedy loses the jobs
+  queued behind the hold. The deferral is logged once on each edge. The end line says whether the queue no
+  longer reads as deadlocked, the head is no longer held, the hold has no remedy left, or the hold outlived its
+  liveness bound.
 
 The admission margin itself is platform-aware (`vram_admission_noise_mb`): the physics buffer on WDDM, half
 of it where the NVML reading is device-wide, with the operator's override winning whole. The device-free

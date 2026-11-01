@@ -246,10 +246,12 @@ from horde_worker_regen.process_management.scheduling.governance.whole_card impo
 from horde_worker_regen.process_management.scheduling.host_commit import measure_available_commit_mb
 from horde_worker_regen.process_management.scheduling.ledgers import retention
 from horde_worker_regen.process_management.scheduling.ledgers.dispatch_holds import (
-    DISPATCH_HOLD_LIVENESS_SECONDS,
     DispatchDecline,
     DispatchHoldLedger,
+    HoldLiveness,
+    HoldRemedy,
     PostProcessingTurn,
+    hold_remedy,
 )
 from horde_worker_regen.process_management.scheduling.ledgers.head_admission import (
     DISPATCH_STALL_MIN_SECONDS,
@@ -4251,36 +4253,34 @@ class InferenceScheduler:
         return self._safety_footprint_mb()
 
     def dispatch_hold_liveness_active(self) -> bool:
-        """Whether the head's dispatch is held by the residency gate inside the hold's own liveness bound.
+        """Whether the head's residency hold has a live remedy and is inside its liveness bound.
 
         A residency-reconciliation hold is a deliberate scheduler state with its own escalation: the arbiter's
         reclaim rungs, the idle-context teardown after its grace, and the measured-load probe after the head
         starvation clock. An idle card with pending work is exactly the shape a structural wedge is read from,
         so without this the recovery supervisor answers a working hold with pool resets and, past its own
-        budget, faults the head the gate was about to admit. While true the wedge assessment must not act;
-        bounded by :data:`DISPATCH_HOLD_LIVENESS_SECONDS` (the probe clock, the teardown grace and the heavy
-        head's load window end to end) so a hold that never resolves still trips the supervisor. Public: read by
-        the recovery coordinator's wedge assessment.
+        budget, faults the head the gate was about to admit. While true the wedge assessment must not act.
+
+        Two things end it. A hold with a live remedy is bounded by
+        :data:`~horde_worker_regen.process_management.scheduling.ledgers.dispatch_holds.DISPATCH_HOLD_LIVENESS_SECONDS`,
+        so a hold that never resolves still reaches the supervisor. A hold whose latest pass left no remedy live
+        (:attr:`HoldRemedy.NONE`, recorded by the gate from that pass's verdict) ends it at once, since waiting
+        cannot release it and the bound is longer than the 150 s deadline the horde sets on some jobs. Public: read
+        by the recovery coordinator's wedge assessment.
         """
-        head = self._job_tracker.undispatched_head()
-        if head is None or head.id_ is None:
-            return False
-        held = self._dispatch_holds.held_seconds(str(head.id_))
-        return held is not None and held < DISPATCH_HOLD_LIVENESS_SECONDS
+        liveness = self.dispatch_hold_liveness_seconds()
+        return liveness is not None and liveness.active
 
-    def dispatch_hold_liveness_seconds(self) -> tuple[float, float] | None:
-        """The head's hold age and its liveness bound (seconds), or None when the head is not held.
+    def dispatch_hold_liveness_seconds(self) -> HoldLiveness | None:
+        """The head's hold age, its liveness bound and its live remedy, or None when the head is not held.
 
-        Read by the recovery coordinator to say, once per edge, how long it is deferring to the hold and when
-        that deferral lapses.
+        Read by the recovery coordinator to say, once per edge, how long it is deferring to the hold and why that
+        deferral ended.
         """
         head = self._job_tracker.undispatched_head()
         if head is None or head.id_ is None:
             return None
-        held = self._dispatch_holds.held_seconds(str(head.id_))
-        if held is None:
-            return None
-        return held, DISPATCH_HOLD_LIVENESS_SECONDS
+        return self._dispatch_holds.liveness(str(head.id_))
 
     def ram_reclaim_cycle_grace_active(self) -> bool:
         """Whether a deliberate RAM-reclaim process cycle is still inside its bounded respawn/preload window.
@@ -13520,6 +13520,7 @@ class InferenceScheduler:
         job: ImageGenerateJobPopResponse,
         *,
         reclaim_applied: bool,
+        remedy: HoldRemedy,
         room_inputs: FlatScalarMap | None = None,
     ) -> None:
         """Record that the dispatch of ``job`` was held this pass, stamping the first hold and its cause.
@@ -13528,12 +13529,18 @@ class InferenceScheduler:
         a distinct held dispatch, and records a standing-hold resource-state transition carrying the measured
         room the hold was judged against. A pass whose actuator accepted an eviction command marks the job so
         its eventual release is attributed to reclaim rather than to the card recovering on its own. The
-        latest room breakdown is kept so the release record can report what the card held at the start.
+        latest room breakdown is kept so the release record can report what the card held at the start, and
+        the latest remedy so the recovery supervisor reads whether waiting on the hold can still release it.
         """
         job_id = str(job.id_) if job.id_ is not None else None
         if job_id is None:
             return
-        if self._dispatch_holds.note_hold(job_id, reclaim_applied=reclaim_applied, room_inputs=room_inputs):
+        if self._dispatch_holds.note_hold(
+            job_id,
+            reclaim_applied=reclaim_applied,
+            room_inputs=room_inputs,
+            remedy=remedy,
+        ):
             self._record_dispatch_hold_state(
                 job_id,
                 state="standing",
@@ -13794,7 +13801,9 @@ class InferenceScheduler:
         card can seat the same request (:meth:`VramArbiter.any_other_device_can_seat`), the gate retires the copy
         and releases the hold as a reroute (:meth:`_retire_copy_for_reroute`). The next pass places the job through
         the preload path, which can choose another card. A DENY with no other card able to seat the job is held,
-        since the arbiter's ceiling attempt owns that case.
+        since the arbiter's ceiling attempt owns that case. The arbiter issues that DENY only once the attempt is
+        refused or spent, so the hold is recorded with no live remedy (:func:`hold_remedy`) and the recovery
+        supervisor reads the queue without waiting out the hold's liveness bound.
 
         ``is_head_of_queue`` is the truth of whether this dispatch is the genuine head of queue: a line-skip
         dispatch (a smaller ready job selected ahead of a downloading head) is not, so it presents
@@ -13868,9 +13877,21 @@ class InferenceScheduler:
                 device_index=device_index,
             )
 
+        reclaim_applied = bool(outcome.actuations_applied) or tenancy_reclaimed
+        remedy = hold_remedy(
+            denied=verdict.disposition is VramDisposition.DENY,
+            reroute_pending=outcome.other_card_can_seat,
+            reclaim_applied=reclaim_applied,
+            teardown_grace_open=verdict.teardown_grace_open,
+            probe_pending=(
+                self._job_tracker.is_measured_attempt_on_device(next_job, device_index)
+                or not self._job_tracker.has_spent_measured_attempt_on_device(next_job, device_index)
+            ),
+        )
         self._note_dispatch_hold(
             next_job,
-            reclaim_applied=bool(outcome.actuations_applied) or tenancy_reclaimed,
+            reclaim_applied=reclaim_applied,
+            remedy=remedy,
             room_inputs=room_inputs,
         )
 
@@ -13978,7 +13999,7 @@ class InferenceScheduler:
         self.unload_from_ram(process_info.process_id)
         # The hold is noted so the release is recorded with this verdict's room. The release is the pass's only
         # decision record.
-        self._note_dispatch_hold(job, reclaim_applied=False, room_inputs=room_inputs)
+        self._note_dispatch_hold(job, reclaim_applied=False, remedy=HoldRemedy.REROUTE, room_inputs=room_inputs)
         self._resolve_dispatch_hold(job, rerouted=True, decision_inputs=decision_inputs)
         logger.opt(colors=True).warning(
             f"<fg #f0beff>Rerouting {{}} job {str(job.id_)[:8]} off device {device_index}: {verdict.stated}. "

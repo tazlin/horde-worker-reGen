@@ -755,6 +755,9 @@ class VramVerdict:
     reserve_shortfall_mb: float | None = None
     """How far (MB) the measured free net of the outstanding reservations falls below the job's non-weight
     reserve, when that alone held a partial seat or a measured attempt; None for every other verdict."""
+    teardown_grace_open: bool = False
+    """True when this DEFER waits out :data:`_FIRST_PARTY_TEARDOWN_GRACE_SECONDS` for the head's own idle sibling
+    contexts, whose teardown the arbiter issues once the grace has passed. False for every other verdict."""
 
     @property
     def admits(self) -> bool:
@@ -1031,7 +1034,8 @@ class VramArbiter:
                 room=room,
             )
 
-        if self._has_first_party_context_reclaim(request):
+        teardown_grace_open = self._has_first_party_context_reclaim(request)
+        if teardown_grace_open:
             # The deficit is the head's own idle sibling contexts, still within the short teardown grace. The
             # head simply waits out the grace for the verified teardown above rather than routing weight reclaim
             # that frees nothing a bare context holds.
@@ -1048,6 +1052,7 @@ class VramArbiter:
             detail=measured.reason(),
             required_actuations=actuations,
             room=room,
+            teardown_grace_open=teardown_grace_open,
         )
 
     @staticmethod
