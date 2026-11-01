@@ -88,6 +88,10 @@ _WHOLE_CARD_NOT_EXERCISED = (
     "reachable only with a whole-card-class model (e.g. Flux fp8) and a multi-process pool, which the "
     "dry-run harness's fake models never trigger"
 )
+_MULTI_CARD_NOT_EXERCISED = (
+    "reachable only on a worker with two or more cards where one card's achievable ceiling is below a job another "
+    "card can seat, which the dry-run harness's fake models never produce"
+)
 _MALFORMED_POP_NOT_EXERCISED = "the dry-run harness never synthesizes a malformed pop response with a blank model name"
 _OFFER_NEVER_WITHHELD = (
     "the dry-run harness offers post-processing from its first pop and never withholds it, so neither edge occurs"
@@ -1012,6 +1016,20 @@ _SIGNATURE_LIST: list[LogSignature] = [
         sample="Inference dispatch stalled: head ddd85050 (Z-Image-Turbo) has been parked 10s:",
         dry_run_reason=_NOT_DETERMINISTIC,
         field_of="dispatch_stall",
+    ),
+    _signature(
+        "dispatch_reroute_retire",
+        r"Rerouting (?P<model>.+?) job (?P<job>\S+) off device (?P<device>\d+): .*Another card can seat it, so "
+        r"process (?P<process>\d+)'s copy is unloaded from RAM",
+        emitter="process_management.scheduling.inference_scheduler:_retire_copy_for_reroute",
+        sample=(
+            "Rerouting Flux.1-Schnell fp8 (Compact) job ac53cbde off device 1: candidate exceeds this card's "
+            "achievable ceiling; no reclaim on this card can seat it (candidate 14573 MB against an achievable "
+            "ceiling of 14061 MB (total 16275 - noise 814 - foreign floor 1400); candidate 14573 MB vs available "
+            "(device-free 13521 - reservations 0 - noise 814) = 12707 MB: does NOT fit). Another card can seat it, "
+            "so process 1's copy is unloaded from RAM and the job is placed again by preload."
+        ),
+        dry_run_reason=_MULTI_CARD_NOT_EXERCISED,
     ),
     _signature(
         "whole_card_wedge",

@@ -416,6 +416,9 @@ class SessionEndEvent(BaseModel):
     """Holds released because the card freed on its own (a finishing job, a foreign tenant leaving)."""
     dispatch_holds_released_by_measured_attempt: int = 0
     """Holds released by the one-real-load probe rather than by a fit."""
+    dispatch_holds_released_by_reroute: int = 0
+    """Holds released because the arbiter denied the job on the card holding its copy while another card could
+    seat it, so the gate retired the copy and the preload pass placed the job again."""
 
 
 class DecisionEvent(BaseModel):
@@ -768,6 +771,10 @@ class RunMetricsSnapshot(BaseModel):
     """Count of held dispatches released because the card freed on its own this run (a sibling finished or
     foreign pressure abated), without this gate having emitted an eviction for the held job. Calibration
     visibility only."""
+    dispatch_reconciliation_released_by_reroute: int = 0
+    """Count of held dispatches released this run because the arbiter denied the job on the card holding its copy
+    while another card could seat it, so the gate retired the copy for the preload pass to place the job again.
+    Calibration visibility only."""
     safety_placement_demotions: int = 0
     """Count of runtime safety-placement policy moves of the safety process off-GPU to CPU this run: the safety
     context did not fit beside the largest active sampling peak on its card for the consecutive-cycle streak.
@@ -1270,6 +1277,7 @@ class WorkerRunMetrics:
         dispatch_holds_released_by_reclaim: int = 0,
         dispatch_holds_released_by_natural_free: int = 0,
         dispatch_holds_released_by_measured_attempt: int = 0,
+        dispatch_holds_released_by_reroute: int = 0,
         timestamp: float | None = None,
     ) -> None:
         """Emit a ``session_end`` marker with terminal totals. Writes only when export is enabled.
@@ -1298,6 +1306,7 @@ class WorkerRunMetrics:
                 dispatch_holds_released_by_reclaim=dispatch_holds_released_by_reclaim,
                 dispatch_holds_released_by_natural_free=dispatch_holds_released_by_natural_free,
                 dispatch_holds_released_by_measured_attempt=dispatch_holds_released_by_measured_attempt,
+                dispatch_holds_released_by_reroute=dispatch_holds_released_by_reroute,
             ),
         )
 
@@ -1645,6 +1654,7 @@ class WorkerRunMetrics:
         dispatch_reconciliation_hold_seconds: float = 0.0,
         dispatch_reconciliation_released_by_reclaim: int = 0,
         dispatch_reconciliation_released_by_natural_free: int = 0,
+        dispatch_reconciliation_released_by_reroute: int = 0,
         safety_placement_demotions: int = 0,
         safety_placement_promotions: int = 0,
         safety_placement_card: int | None = None,
@@ -1696,6 +1706,7 @@ class WorkerRunMetrics:
             dispatch_reconciliation_hold_seconds=dispatch_reconciliation_hold_seconds,
             dispatch_reconciliation_released_by_reclaim=dispatch_reconciliation_released_by_reclaim,
             dispatch_reconciliation_released_by_natural_free=dispatch_reconciliation_released_by_natural_free,
+            dispatch_reconciliation_released_by_reroute=dispatch_reconciliation_released_by_reroute,
             safety_placement_demotions=safety_placement_demotions,
             safety_placement_promotions=safety_placement_promotions,
             safety_placement_card=safety_placement_card,

@@ -22,12 +22,17 @@ from horde_worker_regen.process_management.ipc.message_dispatcher import (
     DeadlockSnapshot,
 )
 from horde_worker_regen.process_management.ipc.messages import (
+    HeldComponentSnapshot,
+    HordeControlFlag,
+    HordeControlMessage,
     HordeProcessState,
     ModelLoadState,
 )
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
+from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.resources.admission_identity import evaluate_admission
+from horde_worker_regen.process_management.resources.run_metrics import DecisionVerdict
 from horde_worker_regen.process_management.resources.vram_arbiter import (
     _FIRST_PARTY_TEARDOWN_GRACE_SECONDS,
     DeviceVramState,
@@ -48,6 +53,7 @@ from tests.process_management.conftest import (
     make_job_pop_response,
     make_mock_bridge_data,
     make_mock_process_info,
+    make_test_card_runtimes,
     track_popped_job_async,
 )
 from tests.process_management.scheduling.test_inference_scheduling import _make_inference_scheduler
@@ -179,6 +185,178 @@ class TestGatePredicate:
 
         assert scheduler.dispatch_holds.released_by_reclaim == 0
         assert scheduler.dispatch_holds.released_by_natural_free == 1
+
+
+_SMALL_CARD_INDEX = 1
+"""The card holding the head's copy in the reroute tests."""
+
+
+def _card_below_any_candidate() -> DeviceVramState:
+    """A card whose foreign floor leaves an achievable ceiling below any candidate, so the arbiter DENIES there."""
+    return DeviceVramState(
+        total_vram_mb=16000.0,
+        baseline_mb=0.0,
+        committed_vram_mb=0.0,
+        planned_unmaterialized_mb=0.0,
+        committed_is_stale=False,
+        device_free_mb=500.0,
+        foreign_floor_mb=15500.0,
+    )
+
+
+def _install_two_card_cycle(scheduler, *, large: DeviceVramState, small: DeviceVramState) -> None:  # noqa: ANN001
+    """Freeze an arbiter cycle with a large card 0 and the small card holding the head's copy."""
+    arbiter = VramArbiter()
+    arbiter.begin_cycle(MeasuredVramSnapshot(devices={0: large, _SMALL_CARD_INDEX: small}))
+    scheduler._vram_arbiter = arbiter
+
+
+async def _scheduler_with_head_copy_on_the_small_card(  # noqa: ANN202
+    *,
+    queued_same_model: int = 0,
+    idle_tenant_on_small_card: bool = False,
+):
+    """A two-card scheduler whose head model is held in RAM by name on a small-card lane.
+
+    ``queued_same_model`` queues that many further jobs for the head's model behind it. With
+    ``idle_tenant_on_small_card`` a second small-card lane idles with device-warm components, the tenancy the
+    gate's standing-hold reclaim would ask for.
+    """
+    target = make_mock_process_info(
+        0,
+        model_name="model_a",
+        state=HordeProcessState.PRELOADED_MODEL,
+        device_index=_SMALL_CARD_INDEX,
+    )
+    large_card_lane = make_mock_process_info(1, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
+    processes = {0: target, 1: large_card_lane}
+    if idle_tenant_on_small_card:
+        tenant = make_mock_process_info(
+            2,
+            model_name=None,
+            state=HordeProcessState.WAITING_FOR_JOB,
+            device_index=_SMALL_CARD_INDEX,
+        )
+        tenant.held_components = [HeldComponentSnapshot(kind="unet", identity="idle-tenant", approx_ram_mb=1500.0)]
+        processes[2] = tenant
+    process_map = ProcessMap(processes)
+    job_tracker = JobTracker()
+    job = make_job_pop_response("model_a")
+    await track_popped_job_async(job_tracker, job)
+    for _ in range(queued_same_model):
+        await track_popped_job_async(job_tracker, make_job_pop_response("model_a"))
+    bridge_data = make_mock_bridge_data(image_models_to_load=["model_a"])
+    scheduler = _make_inference_scheduler(
+        process_map=process_map,
+        job_tracker=job_tracker,
+        bridge_data=bridge_data,
+        max_concurrent=1,
+        max_inference=2,
+        card_runtimes=make_test_card_runtimes(device_indices=(0, _SMALL_CARD_INDEX), config=bridge_data),
+    )
+    scheduler._horde_model_map.update_entry(
+        "model_a",
+        load_state=ModelLoadState.LOADED_IN_RAM,
+        process_id=target.process_id,
+    )
+    return scheduler, job, target
+
+
+def _sent_ram_unload(process_info: HordeProcessInfo) -> bool:
+    """Whether the parent sent ``process_info`` an unload-from-RAM control message."""
+    return any(
+        isinstance(message := call.args[0], HordeControlMessage)
+        and message.control_flag is HordeControlFlag.UNLOAD_MODELS_FROM_RAM
+        for call in process_info.pipe_connection.send.call_args_list
+    )
+
+
+class TestCeilingDenyWithAnotherCardRetiresTheCopy:
+    """A DENY on the card holding the head's copy, with another card able to seat it, retires that copy.
+
+    The copy pins the head to its card. Dispatch places a job on the lane holding its model by name, and only
+    the preload pass places a job across cards. A DENY is the same every pass, so a hold on that card cannot end
+    in a fit.
+    """
+
+    async def test_a_deny_with_another_card_able_to_seat_retires_the_copy_and_releases_the_hold(self) -> None:
+        """The copy is unloaded from RAM, the lane no longer records the model, and the hold releases as a reroute.
+
+        The hold has stood past the stall horizon and an idle tenant shares the denied card, so the standing-hold
+        reclaim would evict it on an ordinary hold. The reroute leaves the card, so nothing on it is reclaimed, and
+        the pass records the release alone.
+        """
+        scheduler, job, target = await _scheduler_with_head_copy_on_the_small_card(idle_tenant_on_small_card=True)
+        _install_two_card_cycle(scheduler, large=_fitting_state(), small=_card_below_any_candidate())
+        scheduler._dispatch_hold_is_standing = Mock(return_value=True)  # type: ignore[method-assign]
+        scheduler.unload_idle_model = Mock(return_value=True)  # type: ignore[method-assign]
+        scheduler.unload_models_from_vram = Mock(return_value=True)  # type: ignore[method-assign]
+        execute_actuations = Mock(wraps=scheduler._executor.execute_actuations)
+        scheduler._executor.execute_actuations = execute_actuations  # type: ignore[method-assign]
+        decision_sink = Mock(return_value=None)
+        scheduler._decision_sink = decision_sink
+
+        held = scheduler._dispatch_residency_reconciliation_holds(job, target)
+
+        assert held is True, "the head dispatched on the card where the arbiter denied it"
+        assert _sent_ram_unload(target), "the copy on the denied card was not unloaded from RAM"
+        assert target.loaded_horde_model_name is None, "the lane still records the head's model after the retire"
+        holds = scheduler.dispatch_holds
+        assert holds.released_by_reroute == 1
+        assert holds.held_seconds(str(job.id_)) is None, "the hold still stands after the reroute"
+        assert job in scheduler._job_tracker.jobs_pending_inference, "the rerouted head left the queue"
+        scheduler.unload_idle_model.assert_not_called()
+        scheduler.unload_models_from_vram.assert_not_called()
+        issued = [command for call in execute_actuations.call_args_list for command in call.args[0]]
+        assert not issued, f"the reroute tick issued reclaim commands {issued} on the card the head is leaving"
+        records = [call.kwargs for call in decision_sink.call_args_list if call.kwargs["subject"] == str(job.id_)]
+        assert [record["verdict"] for record in records] == [DecisionVerdict.NO_OP], (
+            f"the reroute tick recorded {records}, not the reroute release alone"
+        )
+        assert records[0]["reason"] == "dispatch_rerouted"
+
+    async def test_a_defer_keeps_the_hold_and_the_copy(self) -> None:
+        """A card short of room right now is held as before, and the parent does not unload the copy from RAM."""
+        scheduler, job, target = await _scheduler_with_head_copy_on_the_small_card()
+        _install_two_card_cycle(scheduler, large=_fitting_state(), small=_over_committed_state())
+
+        held = scheduler._dispatch_residency_reconciliation_holds(job, target)
+
+        assert held is True
+        assert not _sent_ram_unload(target)
+        assert target.loaded_horde_model_name == "model_a"
+        assert scheduler.dispatch_holds.held_seconds(str(job.id_)) is not None
+        assert scheduler.dispatch_holds.released_by_reroute == 0
+
+    async def test_a_deny_with_no_other_card_able_to_seat_keeps_the_hold_and_the_copy(self) -> None:
+        """With every card below the candidate there is no card to reroute to, so the hold and the copy stand."""
+        scheduler, job, target = await _scheduler_with_head_copy_on_the_small_card()
+        _install_two_card_cycle(scheduler, large=_card_below_any_candidate(), small=_card_below_any_candidate())
+
+        held = scheduler._dispatch_residency_reconciliation_holds(job, target)
+
+        assert held is True
+        assert not _sent_ram_unload(target)
+        assert target.loaded_horde_model_name == "model_a"
+        assert scheduler.dispatch_holds.held_seconds(str(job.id_)) is not None
+        assert scheduler.dispatch_holds.released_by_reroute == 0
+
+    async def test_a_further_queued_job_of_the_model_does_not_keep_the_copy(self) -> None:
+        """With a second job for the model queued, the copy is still retired and the hold released as a reroute.
+
+        The second job would be pinned to the same copy and denied on the same card, so keeping the copy for it
+        would hold both jobs where neither can run.
+        """
+        scheduler, job, target = await _scheduler_with_head_copy_on_the_small_card(queued_same_model=1)
+        _install_two_card_cycle(scheduler, large=_fitting_state(), small=_card_below_any_candidate())
+
+        held = scheduler._dispatch_residency_reconciliation_holds(job, target)
+
+        assert held is True
+        assert _sent_ram_unload(target), "the copy was kept for the second job of the model"
+        assert target.loaded_horde_model_name is None
+        assert scheduler.dispatch_holds.released_by_reroute == 1
+        assert len(scheduler._job_tracker.jobs_pending_inference) == 2, "a queued job of the model left the queue"
 
 
 def _starve_head(scheduler: InferenceScheduler, job: ImageGenerateJobPopResponse, *, seconds: float) -> None:

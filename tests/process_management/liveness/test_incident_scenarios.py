@@ -9174,14 +9174,6 @@ async def drive_flux_head_ram_staged_on_a_small_card_under_a_foreign_floor() -> 
     return CeilingDenyRow(world=world, head=head, siblings=siblings, queued_tick=queued_tick)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "the dispatch gate holds a ceiling DENY like a DEFER: the head's RAM copy pins it to the small card, the "
-        "arbiter refuses the ceiling attempt because the large card can seat it, and no path retires the copy, "
-        "so the head re-prices to the same DENY every pass and the queue wedges"
-    ),
-)
 async def test_mixed_cards_a_ceiling_deny_on_the_small_card_reroutes_its_ram_staged_head() -> None:
     """A Flux head held in RAM on a card below its whole need samples on the idle large card, and its siblings run.
 

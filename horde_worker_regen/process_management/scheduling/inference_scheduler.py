@@ -494,6 +494,9 @@ class _MaterializationOutcome:
     device_index: int | None
     actuations_requested: tuple[ActuatorCommand, ...]
     actuations_applied: tuple[ActuatorCommand, ...]
+    other_card_can_seat: bool = False
+    """True when the verdict is a DENY and another card's achievable ceiling covers the same request
+    (:meth:`VramArbiter.any_other_device_can_seat`). False for every other verdict."""
 
 
 @dataclass(frozen=True)
@@ -13525,18 +13528,26 @@ class InferenceScheduler:
                 extra={"hold_seconds": 0.0},
             )
 
-    def _resolve_dispatch_hold(self, job: ImageGenerateJobPopResponse, *, measured_attempt: bool = False) -> None:
-        """Close out any dispatch hold on ``job`` now that it fits, folding its duration and release cause.
+    def _resolve_dispatch_hold(
+        self,
+        job: ImageGenerateJobPopResponse,
+        *,
+        measured_attempt: bool = False,
+        rerouted: bool = False,
+        decision_inputs: FlatScalarMap | None = None,
+    ) -> None:
+        """Close out any dispatch hold on ``job`` now that it fits or is rerouted, folding its duration and cause.
 
         A no-op for a job that was never held (the common admit-first-pass case). A held job's accumulated
         wait folds into the cumulative hold seconds, and the release is attributed to the measured-load probe
-        when that is what admitted it, to reclaim when this gate emitted eviction commands during the hold,
-        otherwise to the card freeing on its own.
+        when that is what admitted it, to a reroute when the gate retired the job's copy on a card that cannot
+        seat it, to reclaim when this gate emitted eviction commands during the hold, otherwise to the card
+        freeing on its own.
         """
         job_id = str(job.id_) if job.id_ is not None else None
         if job_id is None:
             return
-        released = self._dispatch_holds.resolve_hold(job_id, measured_attempt=measured_attempt)
+        released = self._dispatch_holds.resolve_hold(job_id, measured_attempt=measured_attempt, rerouted=rerouted)
         if released is None:
             return
         self._job_tracker.note_dispatch_hold_seconds(job, released.hold_seconds)
@@ -13548,7 +13559,11 @@ class InferenceScheduler:
             room_inputs=released.room_inputs,
             extra={"hold_seconds": round(released.hold_seconds, 1)},
         )
-        self._resolve_dispatch_decision(job_id, reason="dispatch_admitted")
+        self._resolve_dispatch_decision(
+            job_id,
+            reason="dispatch_rerouted" if rerouted else "dispatch_admitted",
+            inputs=decision_inputs,
+        )
 
     def _record_dispatch_hold_state(
         self,
@@ -13651,11 +13666,12 @@ class InferenceScheduler:
         """The ids of the jobs held for the image-utilities lane, for the deadlock detector's exemption."""
         return set(self._dispatch_holds.utilities_lane_holds)
 
-    def _resolve_dispatch_decision(self, job_id: str, *, reason: str) -> None:
+    def _resolve_dispatch_decision(self, job_id: str, *, reason: str, inputs: FlatScalarMap | None = None) -> None:
         """Close any open dispatch-hold decision for ``job_id`` with a final resolving record.
 
         A resolving verdict for a subject the recorder is not tracking is dropped, so calling this for a
-        job that was never held is harmless.
+        job that was never held is harmless. ``inputs`` holds the verdict's terms when the resolving record is the
+        pass's only record, as a reroute's is.
         """
         if self._decision_sink is None:
             return
@@ -13664,6 +13680,7 @@ class InferenceScheduler:
             subject=job_id,
             verdict=DecisionVerdict.NO_OP,
             reason=reason,
+            inputs=inputs,
         )
 
     def _dispatch_hold_is_standing(self, job: ImageGenerateJobPopResponse) -> bool:
@@ -13755,8 +13772,14 @@ class InferenceScheduler:
         :meth:`PlanExecutor.execute_actuations` surface the arbiter's preload-DEFER path drives), never inline and
         never through a second ladder; the head's own target slot is protected. The hold releases only once the
         arbiter next verdicts FITS, matching the verified-reclaim doctrine that a demand is admitted into
-        measured reality rather than into hope. Can't-fit-ever models are excluded upstream by model
-        serviceability, so this gate only ever holds a can't-fit-now dispatch.
+        measured reality rather than into hope.
+
+        Model serviceability is decided per model across the worker, so a job can reach this gate pinned by its copy to
+        a card whose achievable ceiling it exceeds. A DENY there does not change from tick to tick. When another
+        card can seat the same request (:meth:`VramArbiter.any_other_device_can_seat`), the gate retires the copy
+        and releases the hold as a reroute (:meth:`_retire_copy_for_reroute`). The next pass places the job through
+        the preload path, which can choose another card. A DENY with no other card able to seat the job is held,
+        since the arbiter's ceiling attempt owns that case.
 
         ``is_head_of_queue`` is the truth of whether this dispatch is the genuine head of queue: a line-skip
         dispatch (a smaller ready job selected ahead of a downloading head) is not, so it presents
@@ -13789,12 +13812,34 @@ class InferenceScheduler:
             candidate_delta_override_mb=staging_charge_override,
         )
         verdict = outcome.verdict
-        candidate_delta_mb = outcome.candidate_delta_mb
         device_index = outcome.device_index
 
         if verdict.admits:
             self._resolve_dispatch_hold(next_job, measured_attempt=verdict.measured_attempt)
             return False
+
+        room = verdict.room
+        hold_context = self._dispatch_hold_context_inputs(next_job, device_index=device_index)
+        room_inputs: FlatScalarMap = dict(hold_context)
+        if room is not None:
+            room_inputs.update(room.as_inputs())
+
+        # A reroute leaves this card, so it runs before the tenancy reclaim. Evicting an idle sibling here would
+        # cost that sibling its warm cache for a head that is about to be placed elsewhere.
+        if outcome.other_card_can_seat and self._retire_copy_for_reroute(
+            next_job,
+            process_with_model,
+            device_index=device_index,
+            verdict=verdict,
+            room_inputs=room_inputs,
+            decision_inputs=self._dispatch_decision_inputs(
+                next_job,
+                outcome,
+                is_head_of_queue=is_head_of_queue,
+                room_inputs=room_inputs,
+            ),
+        ):
+            return True
 
         # The arbiter describes evictions in terms of resident checkpoints, so a card held by idle tenancy it
         # cannot name (a lane's component cache, a slot parked on a preload nothing dispatched) yields no
@@ -13808,11 +13853,6 @@ class InferenceScheduler:
                 device_index=device_index,
             )
 
-        room = verdict.room
-        hold_context = self._dispatch_hold_context_inputs(next_job, device_index=device_index)
-        room_inputs: FlatScalarMap = dict(hold_context)
-        if room is not None:
-            room_inputs.update(room.as_inputs())
         self._note_dispatch_hold(
             next_job,
             reclaim_applied=bool(outcome.actuations_applied) or tenancy_reclaimed,
@@ -13820,28 +13860,17 @@ class InferenceScheduler:
         )
 
         if self._decision_sink is not None and next_job.id_ is not None:
-            measured = verdict.measured
-            inputs: FlatScalarMap = {
-                "model": str(next_job.model),
-                "device_index": device_index,
-                "candidate_delta_mb": None if candidate_delta_mb is None else round(candidate_delta_mb, 1),
-                "device_free_mb": None if measured.device_free_mb is None else round(measured.device_free_mb, 1),
-                "available_mb": None if measured.available_mb is None else round(measured.available_mb, 1),
-                "outstanding_reservations_mb": round(measured.outstanding_reservations_mb, 1),
-                "noise_buffer_mb": round(measured.noise_buffer_mb, 1),
-                "is_head_of_queue": is_head_of_queue,
-                "reclaim_requested": bool(outcome.actuations_requested),
-                "reclaim_applied": bool(outcome.actuations_applied),
-                "reclaim_requested_kinds": ",".join(command.kind.value for command in outcome.actuations_requested),
-                "reclaim_applied_kinds": ",".join(command.kind.value for command in outcome.actuations_applied),
-            }
-            inputs.update(room_inputs)
             self._decision_sink(
                 decision_kind=DecisionKind.INFERENCE_DISPATCH,
                 subject=str(next_job.id_),
                 verdict=DecisionVerdict.DEFER,
                 reason=verdict.reason or verdict.disposition.value,
-                inputs=inputs,
+                inputs=self._dispatch_decision_inputs(
+                    next_job,
+                    outcome,
+                    is_head_of_queue=is_head_of_queue,
+                    room_inputs=room_inputs,
+                ),
             )
 
         suppressed = self._diagnostics.suppressed_count(
@@ -13867,6 +13896,81 @@ class InferenceScheduler:
                 f"{room_note} {self._dispatch_hold_context_phrase(hold_context)}</>",
                 next_job.model,
             )
+        return True
+
+    @staticmethod
+    def _dispatch_decision_inputs(
+        job: ImageGenerateJobPopResponse,
+        outcome: _MaterializationOutcome,
+        *,
+        is_head_of_queue: bool,
+        room_inputs: FlatScalarMap,
+    ) -> FlatScalarMap:
+        """Return the terms a dispatch-gate decision record reports for a verdict that does not admit."""
+        measured = outcome.verdict.measured
+        candidate_delta_mb = outcome.candidate_delta_mb
+        inputs: FlatScalarMap = {
+            "model": str(job.model),
+            "device_index": outcome.device_index,
+            "candidate_delta_mb": None if candidate_delta_mb is None else round(candidate_delta_mb, 1),
+            "device_free_mb": None if measured.device_free_mb is None else round(measured.device_free_mb, 1),
+            "available_mb": None if measured.available_mb is None else round(measured.available_mb, 1),
+            "outstanding_reservations_mb": round(measured.outstanding_reservations_mb, 1),
+            "noise_buffer_mb": round(measured.noise_buffer_mb, 1),
+            "is_head_of_queue": is_head_of_queue,
+            "reclaim_requested": bool(outcome.actuations_requested),
+            "reclaim_applied": bool(outcome.actuations_applied),
+            "reclaim_requested_kinds": ",".join(command.kind.value for command in outcome.actuations_requested),
+            "reclaim_applied_kinds": ",".join(command.kind.value for command in outcome.actuations_applied),
+        }
+        inputs.update(room_inputs)
+        return inputs
+
+    def _retire_copy_for_reroute(
+        self,
+        job: ImageGenerateJobPopResponse,
+        process_info: HordeProcessInfo,
+        *,
+        device_index: int | None,
+        verdict: VramVerdict,
+        room_inputs: FlatScalarMap,
+        decision_inputs: FlatScalarMap,
+    ) -> bool:
+        """Unload the copy that pins ``job`` to a card the arbiter denies, and release the job's hold as a reroute.
+
+        Dispatch places a job on the lane holding its model by name, and only the preload pass places a job across
+        cards. While the copy stands, the job is priced on this card every pass and denied every pass. The copy is
+        unloaded with :meth:`unload_from_ram`, the reclaim paths' RAM unload. A by-name copy whose weights are in
+        host RAM does not hold device memory, so a VRAM unload would not free any and would leave the lane recording
+        the model.
+
+        The copy is kept when the lane owns a job or is loading, or when an unload from RAM is already on the way.
+        Another queued job for the same model does not keep it, since that job would be pinned to the same copy on
+        the same card and denied the same way, while the preload pass can place both jobs on a card that seats them.
+
+        Returns True when the unload was sent and the hold was released.
+        """
+        model = process_info.loaded_horde_model_name
+        if model is None or model != job.model:
+            return False
+        if process_info.process_type != HordeProcessType.INFERENCE or not process_info.can_accept_job():
+            return False
+        if (
+            process_info.recently_unloaded_from_ram
+            or process_info.last_control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_RAM
+        ):
+            return False
+        self.unload_from_ram(process_info.process_id)
+        # The hold is noted so the release is recorded with this verdict's room. The release is the pass's only
+        # decision record.
+        self._note_dispatch_hold(job, reclaim_applied=False, room_inputs=room_inputs)
+        self._resolve_dispatch_hold(job, rerouted=True, decision_inputs=decision_inputs)
+        logger.opt(colors=True).warning(
+            f"<fg #f0beff>Rerouting {{}} job {str(job.id_)[:8]} off device {device_index}: {verdict.stated}. "
+            f"Another card can seat it, so process {process_info.process_id}'s copy is unloaded from RAM and the "
+            "job is placed again by preload.</>",
+            model,
+        )
         return True
 
     def _dispatch_hold_context_inputs(
@@ -13980,6 +14084,10 @@ class InferenceScheduler:
             device_index=priced.device_index,
             actuations_requested=() if verdict.admits else verdict.required_actuations,
             actuations_applied=applied,
+            other_card_can_seat=(
+                verdict.disposition is VramDisposition.DENY
+                and arbiter.any_other_device_can_seat(priced.request, exclude_device_index=priced.device_index)
+            ),
         )
 
     def _actuate_materialization_verdict(

@@ -45,6 +45,9 @@ class HoldRelease(enum.Enum):
     """The gate's own eviction commands freed the room."""
     NATURAL_FREE = "natural_free"
     """The card recovered on its own."""
+    REROUTE = "reroute"
+    """The arbiter denied the job on the card holding its copy, another card can seat it, and the gate retired
+    that copy so the preload pass can place the job on a card that seats it."""
 
 
 @dataclass(frozen=True)
@@ -139,6 +142,7 @@ class DispatchHoldLedger:
         self.released_by_measured_attempt = 0
         self.released_by_reclaim = 0
         self.released_by_natural_free = 0
+        self.released_by_reroute = 0
         self.pp_defer_holds: set[str] = set()
         """Heads the post-processing co-residency gate is deferring right now."""
         self.pp_turn: PostProcessingTurn | None = None
@@ -194,11 +198,12 @@ class DispatchHoldLedger:
             self.reclaim_requested.add(job_id)
         return first
 
-    def resolve_hold(self, job_id: str, *, measured_attempt: bool) -> ReleasedHold | None:
+    def resolve_hold(self, job_id: str, *, measured_attempt: bool, rerouted: bool = False) -> ReleasedHold | None:
         """Close ``job_id``'s hold, folding its duration into the counters; None when it was never held.
 
-        The release is attributed to the measured-load probe when that admitted the job, to reclaim when this
-        gate emitted eviction commands during the hold, otherwise to the card freeing on its own.
+        The release is attributed to the measured-load probe when that admitted the job, to a reroute when the
+        gate retired the job's copy on a card that cannot seat it, to reclaim when this gate emitted eviction
+        commands during the hold, otherwise to the card freeing on its own.
         """
         held_since = self.hold_since.pop(job_id, None)
         if held_since is None:
@@ -211,6 +216,10 @@ class DispatchHoldLedger:
             self.released_by_measured_attempt += 1
             self.reclaim_requested.discard(job_id)
             release = HoldRelease.MEASURED_ATTEMPT
+        elif rerouted:
+            self.released_by_reroute += 1
+            self.reclaim_requested.discard(job_id)
+            release = HoldRelease.REROUTE
         elif job_id in self.reclaim_requested:
             self.released_by_reclaim += 1
             self.reclaim_requested.discard(job_id)

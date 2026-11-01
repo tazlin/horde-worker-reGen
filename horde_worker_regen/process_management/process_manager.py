@@ -6608,6 +6608,7 @@ class HordeWorkerProcessManager:
             dispatch_reconciliation_released_by_natural_free=(
                 self._inference_scheduler.dispatch_holds.released_by_natural_free
             ),
+            dispatch_reconciliation_released_by_reroute=self._inference_scheduler.dispatch_holds.released_by_reroute,
             safety_placement_demotions=self._inference_scheduler.safety_placement.demotions,
             safety_placement_promotions=self._inference_scheduler.safety_placement.promotions,
             safety_placement_card=self._inference_scheduler.latest_safety_placement_card(),
@@ -9665,6 +9666,7 @@ class HordeWorkerProcessManager:
                 dispatch_holds_released_by_reclaim=scheduler.dispatch_holds.released_by_reclaim,
                 dispatch_holds_released_by_natural_free=scheduler.dispatch_holds.released_by_natural_free,
                 dispatch_holds_released_by_measured_attempt=scheduler.dispatch_holds.released_by_measured_attempt,
+                dispatch_holds_released_by_reroute=scheduler.dispatch_holds.released_by_reroute,
             )
         except Exception as end_error:  # noqa: BLE001 - session_end is best-effort; never block shutdown
             logger.debug(f"session_end record skipped: {type(end_error).__name__}: {end_error}")

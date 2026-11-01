@@ -62,6 +62,16 @@ class TestDispatchHolds:
         assert ledger.hold_seconds == 30.0
         assert ledger.hold_since == {} and ledger.reclaim_requested == set() and ledger.room_inputs == {}
 
+    def test_a_reroute_release_is_counted_as_a_reroute_even_after_reclaim(self) -> None:
+        """A rerouted hold is attributed to the reroute, though the gate had reclaimed for it earlier."""
+        ledger, _ = _ledger()
+        ledger.note_hold("rerouted", reclaim_applied=True, room_inputs={"free_mb": 2})
+        released = ledger.resolve_hold("rerouted", measured_attempt=False, rerouted=True)
+        assert released is not None and released.release is HoldRelease.REROUTE
+        assert released.room_inputs == {"free_mb": 2}
+        assert (ledger.released_by_reroute, ledger.released_by_reclaim) == (1, 0)
+        assert ledger.reclaim_requested == set()
+
     def test_resolving_an_unheld_job_is_a_silent_no_op(self) -> None:
         """The common admit-first-pass case leaves every counter untouched."""
         ledger, _ = _ledger()

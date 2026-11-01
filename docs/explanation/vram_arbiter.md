@@ -863,8 +863,15 @@ net of the proportional buffer that the identity's foreign-pressure branch enfor
 dispatch. A conflict holds it: the job keeps its head-of-queue position and is never faulted, the idle
 residents that tip the card over are evicted through the one reclaim owner (the head's own target slot is
 protected, so its staged weights are spared), and the dispatch re-asks each pass, releasing only once the
-arbiter next verdicts `FITS` on the governor's verified device-free reading. Can't-fit-ever jobs are already
-excluded by model serviceability, so this gate only ever holds a can't-fit-now dispatch.
+arbiter next verdicts `FITS` on the governor's verified device-free reading. Model serviceability is decided per model
+across the worker, so on a multi-card host a job can reach this gate pinned by its by-name copy to a card whose
+achievable ceiling it exceeds. That `DENY` is the same every pass. When the arbiter's `any_other_device_can_seat`
+reports another card for the same request, the gate unloads the copy from RAM and releases the hold as a reroute
+(`HoldRelease.REROUTE`), and the next pass places the job through the preload path, which can choose another
+card. The copy is kept when its lane owns a job or is loading, or when an unload from RAM is already on the way.
+A further queued job for the same model does not keep it, because that job would be denied on the same copy
+too. A `DENY` with no other card able to seat the job is held, since
+the arbiter's ceiling attempt owns that case.
 
 The dispatch head has the same two starved-head escapes the preload head does, so it can never wedge on a
 ledger fiction while its own idle sibling contexts hold the card. The dispatch candidate is an
