@@ -13976,15 +13976,57 @@ class InferenceScheduler:
 
         Dispatch places a job on the lane holding its model by name, and only the preload pass places a job across
         cards. While the copy stands, the job is priced on this card every pass and denied every pass. The copy is
-        unloaded with :meth:`unload_from_ram`, the reclaim paths' RAM unload. A by-name copy whose weights are in
-        host RAM does not hold device memory, so a VRAM unload would not free any and would leave the lane recording
-        the model.
+        retired by :meth:`_retire_pinning_copy`.
+
+        Returns True when the unload was sent and the hold was released.
+        """
+        if not self._retire_pinning_copy(job, process_info):
+            return False
+        # The hold is noted so the release is recorded with this verdict's room. The release is the pass's only
+        # decision record.
+        self._note_dispatch_hold(job, reclaim_applied=False, remedy=HoldRemedy.REROUTE, room_inputs=room_inputs)
+        self._resolve_dispatch_hold(job, rerouted=True, decision_inputs=decision_inputs)
+        logger.opt(colors=True).warning(
+            f"<fg #f0beff>Rerouting {{}} job {str(job.id_)[:8]} off device {device_index}: {verdict.stated}. "
+            f"Another card can seat it, so process {process_info.process_id}'s copy is unloaded from RAM and the "
+            "job is placed again by preload.</>",
+            job.model,
+        )
+        return True
+
+    def retire_copy_pinning_given_up_job(self, job: ImageGenerateJobPopResponse) -> bool:
+        """Unload the copy that pinned the held ``job``, as save-our-ship gives the job up.
+
+        The give-up calls this only for a job whose dispatch was held (:attr:`dispatch_holds`). It owns this because
+        faulting the job leaves its copy on the lane. A copy the scheduler could not
+        dispatch from would pin the next job of the same model to the same card, where it is held the same way.
+        Without the copy, the next job is placed by preload, which prices every card. The keep-rules are those of
+        the dispatch gate's reroute (:meth:`_retire_pinning_copy`).
+
+        Returns True when the unload was sent.
+        """
+        process_info = self.resident_process_for_job(job)
+        if process_info is None or not self._retire_pinning_copy(job, process_info):
+            return False
+        logger.warning(
+            f"Save-our-ship: gave up on {job.model} job {str(job.id_)[:8]}, so process {process_info.process_id}'s "
+            f"copy on device {process_info.device_index} is unloaded from RAM and the next job of the model is "
+            "placed by preload.",
+        )
+        return True
+
+    def _retire_pinning_copy(self, job: ImageGenerateJobPopResponse, process_info: HordeProcessInfo) -> bool:
+        """Unload from RAM the copy of ``job``'s model on ``process_info``, the lane where dispatch places ``job``.
+
+        The copy is unloaded with :meth:`unload_from_ram`, the reclaim paths' RAM unload. A by-name copy whose
+        weights are in host RAM does not hold device memory, so a VRAM unload would not free any and would leave
+        the lane recording the model.
 
         The copy is kept when the lane owns a job or is loading, or when an unload from RAM is already on the way.
         Another queued job for the same model does not keep it, since that job would be pinned to the same copy on
-        the same card and denied the same way, while the preload pass can place both jobs on a card that seats them.
+        the same card and held the same way.
 
-        Returns True when the unload was sent and the hold was released.
+        Returns True when the unload was sent.
         """
         model = process_info.loaded_horde_model_name
         if model is None or model != job.model:
@@ -13997,16 +14039,6 @@ class InferenceScheduler:
         ):
             return False
         self.unload_from_ram(process_info.process_id)
-        # The hold is noted so the release is recorded with this verdict's room. The release is the pass's only
-        # decision record.
-        self._note_dispatch_hold(job, reclaim_applied=False, remedy=HoldRemedy.REROUTE, room_inputs=room_inputs)
-        self._resolve_dispatch_hold(job, rerouted=True, decision_inputs=decision_inputs)
-        logger.opt(colors=True).warning(
-            f"<fg #f0beff>Rerouting {{}} job {str(job.id_)[:8]} off device {device_index}: {verdict.stated}. "
-            f"Another card can seat it, so process {process_info.process_id}'s copy is unloaded from RAM and the "
-            "job is placed again by preload.</>",
-            model,
-        )
         return True
 
     def _dispatch_hold_context_inputs(

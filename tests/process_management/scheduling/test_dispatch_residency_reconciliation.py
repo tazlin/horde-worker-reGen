@@ -12,6 +12,7 @@ transition, because it stays pending with its model resident and never enters in
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from unittest.mock import Mock
 
 import pytest
@@ -357,6 +358,81 @@ class TestCeilingDenyWithAnotherCardRetiresTheCopy:
         assert target.loaded_horde_model_name is None
         assert scheduler.dispatch_holds.released_by_reroute == 1
         assert len(scheduler._job_tracker.jobs_pending_inference) == 2, "a queued job of the model left the queue"
+
+
+def _retire_through_the_reroute(scheduler: InferenceScheduler, job: ImageGenerateJobPopResponse) -> None:
+    """Price ``job`` at the dispatch gate under a DENY on its copy's card that the large card can seat."""
+    _install_two_card_cycle(scheduler, large=_fitting_state(), small=_card_below_any_candidate())
+    target = scheduler.resident_process_for_job(job)
+    assert target is not None
+    scheduler._dispatch_residency_reconciliation_holds(job, target)
+
+
+def _retire_through_the_give_up(scheduler: InferenceScheduler, job: ImageGenerateJobPopResponse) -> None:
+    """Retire the copy that pins ``job`` as save-our-ship gives the job up."""
+    scheduler.retire_copy_pinning_given_up_job(job)
+
+
+def _lane_runs_a_job(process_info: HordeProcessInfo) -> None:
+    """Report the lane as starting a job."""
+    process_info.last_process_state = HordeProcessState.INFERENCE_STARTING
+
+
+def _lane_is_loading(process_info: HordeProcessInfo) -> None:
+    """Report the lane as loading a model."""
+    process_info.last_process_state = HordeProcessState.PRELOADING_MODEL
+
+
+def _ram_unload_sent(process_info: HordeProcessInfo) -> None:
+    """Record an unload from RAM as the lane's last control message."""
+    process_info.last_control_flag = HordeControlFlag.UNLOAD_MODELS_FROM_RAM
+
+
+def _ram_unload_recent(process_info: HordeProcessInfo) -> None:
+    """Mark the lane as recently unloaded from RAM."""
+    process_info.recently_unloaded_from_ram = True
+
+
+class TestPinningCopyKeepRules:
+    """The dispatch gate's reroute and the save-our-ship give-up retire a pinning copy under one set of rules."""
+
+    @pytest.mark.parametrize(
+        "retire",
+        [_retire_through_the_reroute, _retire_through_the_give_up],
+        ids=["reroute", "give_up"],
+    )
+    @pytest.mark.parametrize(
+        ("arrange_lane", "retired"),
+        [
+            (None, True),
+            (_lane_runs_a_job, False),
+            (_lane_is_loading, False),
+            (_ram_unload_sent, False),
+            (_ram_unload_recent, False),
+        ],
+        ids=["idle_copy", "lane_runs_a_job", "lane_is_loading", "ram_unload_sent", "ram_unload_recent"],
+    )
+    async def test_the_copy_is_unloaded_from_ram_unless_a_keep_rule_holds(
+        self,
+        retire: Callable[[InferenceScheduler, ImageGenerateJobPopResponse], None],
+        arrange_lane: Callable[[HordeProcessInfo], None] | None,
+        retired: bool,
+    ) -> None:
+        """An idle lane's copy is unloaded from RAM, and a lane that runs a job, loads or is unloading keeps it.
+
+        A further queued job of the same model does not keep the copy for either caller, so every case queues one.
+        """
+        scheduler, job, target = await _scheduler_with_head_copy_on_the_small_card(queued_same_model=1)
+        if arrange_lane is not None:
+            arrange_lane(target)
+        target.pipe_connection.send.reset_mock()
+
+        retire(scheduler, job)
+
+        assert _sent_ram_unload(target) is retired, (
+            f"the parent {'did not send' if retired else 'sent'} the copy's lane an unload from RAM"
+        )
+        assert (target.loaded_horde_model_name is None) is retired
 
 
 def _starve_head(scheduler: InferenceScheduler, job: ImageGenerateJobPopResponse, *, seconds: float) -> None:

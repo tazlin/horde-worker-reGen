@@ -1656,6 +1656,10 @@ class WorkerRecoveryCoordinator:
     def give_up_on_wedged_jobs(self, *, terminal: bool = False) -> None:
         """Fault unservable jobs and abort when no pool can recover.
 
+        For each faulted pending job whose dispatch was held, the copy that pinned the held job is retired first
+        (:meth:`InferenceScheduler.retire_copy_pinning_given_up_job`), so the next job of the model is placed by
+        preload rather than bound to the same copy. A faulted job that was never held keeps its lane's copy.
+
         Args:
             terminal: Whether the supervisor flagged this give-up as the deliberate abandon-ship escalation
                 (a wedge that outlived a fresh soft-reset cycle). A terminal give-up aborts even when the
@@ -1675,6 +1679,13 @@ class WorkerRecoveryCoordinator:
                 # faults it regardless, so this defers the drop by at most one cycle, it does not prevent it.
                 if not terminal and job.id_ is not None and self._job_tracker.retry_granted_by_recovery(job.id_):
                     continue
+                # Only a job whose dispatch was held was pinned to a copy the scheduler could not dispatch from. A
+                # sibling that was never held keeps its lane's copy, which can serve the next job of its model.
+                if (
+                    job.id_ is not None
+                    and self._inference_scheduler.dispatch_holds.held_seconds(str(job.id_)) is not None
+                ):
+                    self._inference_scheduler.retire_copy_pinning_given_up_job(job)
                 self._job_tracker.handle_job_fault_now(
                     job,
                     retryable=False,

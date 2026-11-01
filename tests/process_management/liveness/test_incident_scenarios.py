@@ -203,6 +203,7 @@ from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
 from horde_sdk.ai_horde_api import GENERATION_STATE
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 
+from horde_worker_regen.process_management.ipc.action_ledger import ActionLedger, LedgerEventType
 from horde_worker_regen.process_management.ipc.message_dispatcher import (
     _MIN_STRUCTURAL_QUEUE_WEDGE_SECONDS,
     DeadlockSnapshot,
@@ -224,7 +225,9 @@ from horde_worker_regen.process_management.lifecycle.process_lifecycle import (
     PauseOwner,
 )
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
-from horde_worker_regen.process_management.lifecycle.worker_recovery_coordinator import WorkerRecoveryCoordinator
+from horde_worker_regen.process_management.lifecycle.worker_recovery_coordinator import (
+    WorkerRecoveryCoordinator,
+)
 from horde_worker_regen.process_management.resources import reclaim_ladder as reclaim_ladder_module
 from horde_worker_regen.process_management.resources.admission_identity import admission_noise_buffer_mb
 from horde_worker_regen.process_management.resources.device_free_governor import GovernorState
@@ -9387,4 +9390,155 @@ async def test_a_terminal_ceiling_deny_on_the_only_card_reaches_recovery_without
     assert liveness is not None and not liveness.remedy.live, (
         f"{context}: the hold ledger records {liveness} for the head, not a hold with no remedy left. "
         f"{world.state_dump()}"
+    )
+
+
+_GIVE_UP_CARD_FOREIGN_FLOOR_MB = 5000.0
+"""Device memory another program holds on the row's only card.
+
+It puts the card's achievable ceiling below the Flux weights alone, so the head earns no measured attempt and the
+dispatch gate's DENY on the head's copy stands. No other card exists to reroute to."""
+
+_GIVE_UP_WAIT_TICKS = 400
+"""Ticks of one second the row waits for the first give-up: the structural-wedge horizon plus the longest
+dispatch-hold liveness bound, with room to spare."""
+
+_GIVE_UP_FOLLOW_TICKS = 400
+"""Ticks the row runs after the second head is queued, as long as the wait for the first give-up."""
+
+_GIVE_UP_HANDBACK_TICKS = 5
+"""Ticks within which the second head must leave the queue once queued."""
+
+
+@dataclass
+class GiveUpRow:
+    """The finished world after save-our-ship gave up on a head held on its own copy."""
+
+    world: _DispatchWorld
+    first_head: ImageGenerateJobPopResponse
+    second_head: ImageGenerateJobPopResponse
+    second_queued_tick: int
+    give_up_ticks: list[int]
+    second_head_left_queue_tick: int | None
+
+
+def _faulting_give_up_count(ledger: ActionLedger) -> int:
+    """How many give-ups in ``ledger`` faulted at least one job."""
+    return sum(
+        1
+        for event in ledger.recent(limit=1000)
+        if event.event_type is LedgerEventType.RECOVERY_ABANDONED
+        and isinstance(faulted := event.detail.get("jobs_faulted"), int)
+        and faulted > 0
+    )
+
+
+async def drive_give_up_on_a_head_held_on_its_ram_copy_on_one_card() -> GiveUpRow:
+    """Hold Flux by name in RAM on a single card whose foreign floor is past the ceiling, and let save-our-ship act.
+
+    A copy staged with no VRAM verdict pins the head to its lane, and the dispatch gate's DENY on the only card has
+    no reroute. The recovery coordinator runs over the world (:func:`_recovery_coordinator_over`) and gives up at
+    the first tick its wedge verdict allows, as the supervisor's last rung does. Once the first give-up has
+    faulted the head, a second Flux head is queued.
+    """
+    world = _DispatchWorld(
+        card=_CARD_16GB,
+        lane_count=2,
+        max_threads=1,
+        queue_depth=2,
+        whole_card_enabled=False,
+        closed_loop=True,
+        tick_seconds=1.0,
+        service_contexts=True,
+        foreign_vram_mb_by_tick={1: _GIVE_UP_CARD_FOREIGN_FLOOR_MB},
+        lane_reports_carry_context=True,
+    )
+    world.scheduler._foreign_floor_clock = lambda: world.now
+    for _ in range(_FOREIGN_FLOOR_WARMUP_TICKS):
+        await world.step()
+
+    coordinator = _recovery_coordinator_over(world)
+    ledger = coordinator._action_ledger
+    give_up_ticks: list[int] = []
+
+    async def step_with_recovery() -> None:
+        await world.step()
+        before = _faulting_give_up_count(ledger)
+        coordinator.give_up_on_wedged_jobs()
+        if _faulting_give_up_count(ledger) > before:
+            give_up_ticks.append(world.tick)
+
+    world.seed_resident(0, _FLUX, in_vram=False)
+    first_head = make_job_pop_response(_FLUX.name, width=1024, height=1024, ddim_steps=4)
+    await world.pop(first_head)
+    for _ in range(_GIVE_UP_WAIT_TICKS):
+        await step_with_recovery()
+        if give_up_ticks:
+            break
+
+    second_head = make_job_pop_response(_FLUX.name, width=1024, height=1024, ddim_steps=4)
+    await world.pop(second_head)
+    second_queued_tick = world.tick
+    second_head_left_queue_tick: int | None = None
+    for _ in range(_GIVE_UP_FOLLOW_TICKS):
+        await step_with_recovery()
+        if second_head_left_queue_tick is None and second_head not in world._job_tracker.jobs_pending_inference:
+            second_head_left_queue_tick = world.tick
+    return GiveUpRow(
+        world=world,
+        first_head=first_head,
+        second_head=second_head,
+        second_queued_tick=second_queued_tick,
+        give_up_ticks=give_up_ticks,
+        second_head_left_queue_tick=second_head_left_queue_tick,
+    )
+
+
+async def test_after_a_give_up_the_next_head_of_the_model_is_placed_by_preload() -> None:
+    """After save-our-ship gives up on a head held on its copy, the next head of the model is not held on it.
+
+    The card's foreign floor puts the Flux weights alone above its achievable ceiling, so the head earns no measured
+    attempt. The row has one card, so nothing can seat Flux. The first head is held on its by-name copy until
+    save-our-ship gives up on it. The give-up retires the copy, so the second head is placed by preload, whose gate
+    faults an unroutable head at once and holds the model off the offer while the ceiling stands. A copy left on the
+    lane pins the second head to it, the dispatch gate holds it on the same DENY, and the queue wedges into a second
+    give-up.
+    """
+    row = await drive_give_up_on_a_head_held_on_its_ram_copy_on_one_card()
+    world = row.world
+    context = "Flux head held on its RAM copy on a card below its whole need"
+
+    floor_mb = world.scheduler.current_foreign_floor_mb(0)
+    assert floor_mb is not None and floor_mb >= _GIVE_UP_CARD_FOREIGN_FLOOR_MB - 1.0, (
+        f"{context}: precondition: the card must hold a sustained foreign floor. {world.state_dump()}"
+    )
+    assert len(row.give_up_ticks) >= 1 and row.first_head not in world._job_tracker.jobs_pending_inference, (
+        f"{context}: precondition: save-our-ship must give up on the first head. {world.state_dump()}"
+    )
+    assert world.dispatch_tick(row.first_head) is None, (
+        f"{context}: precondition: the first head must not sample on a card below its whole need. {world.state_dump()}"
+    )
+
+    assert len(row.give_up_ticks) == 1, (
+        f"{context}: save-our-ship gave up on ticks {row.give_up_ticks}. The second head was held on the copy the "
+        f"first give-up left on its lane. {world.state_dump()}"
+    )
+    assert world.dispatch_tick(row.second_head) is None, (
+        f"{context}: the second head sampled on a card below its whole need. {world.state_dump()}"
+    )
+    assert row.second_head_left_queue_tick is not None, (
+        f"{context}: the second head was never handed back. {world.state_dump()}"
+    )
+    assert row.second_head_left_queue_tick <= row.second_queued_tick + _GIVE_UP_HANDBACK_TICKS, (
+        f"{context}: the second head left the queue on tick {row.second_head_left_queue_tick}, more than "
+        f"{_GIVE_UP_HANDBACK_TICKS} ticks after it was queued on tick {row.second_queued_tick}. {world.state_dump()}"
+    )
+    assert world._job_tracker.is_model_held_by_ceiling(_FLUX.name), (
+        f"{context}: the second head left the queue without the preload gate holding Flux off the offer. "
+        f"{world.state_dump()}"
+    )
+    late_wedges = [tick for tick in world.structural_queue_wedges if tick > row.second_queued_tick]
+    assert not late_wedges, (
+        f"{context}: the queue wedged past the structural horizon on tick(s) {late_wedges} after the second head "
+        f"was queued. {world.state_dump()}"
     )

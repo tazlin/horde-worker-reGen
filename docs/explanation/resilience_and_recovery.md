@@ -795,6 +795,17 @@ The escalation, in order:
    recording the pool as structurally broken would drop the queue on every cycle
    while the escalation read the pool as healthy.
 
+   When the give-up faults a pending job whose dispatch was held (the job is in the
+   dispatch-hold ledger), it also retires the copy that pinned the held job
+   (`InferenceScheduler.retire_copy_pinning_given_up_job`). That copy would otherwise
+   bind the next job of the same model to the same card, where it is held the same
+   way until another give-up. A faulted job that was never held keeps its lane's
+   copy, since nothing showed that copy could not serve. The copy is unloaded from RAM under the keep-rules of the dispatch
+   gate's reroute: a lane that owns a job, is loading, or already has an unload from
+   RAM on the way keeps it. With the copy gone, the next job of the model is placed
+   by the preload pass, which prices every card and faults a head that no card can
+   seat.
+
    The abort is gated on a reachable restart. When no supervisor is attached and
    `exit_on_unhandled_faults` is unset, the worker declines to exit and continues
    escalating in place instead, so a refused abort never freezes the escalation that

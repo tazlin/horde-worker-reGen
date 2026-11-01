@@ -547,6 +547,17 @@ _SIGNATURE_LIST: list[LogSignature] = [
         dry_run_reason=_NO_FAULT,
     ),
     _signature(
+        "giveup_copy_retire",
+        r"Save-our-ship: gave up on (?P<model>.+?) job (?P<job>\S+), so process (?P<process>\d+)'s copy on device "
+        r"(?P<device>\d+) is unloaded from RAM",
+        emitter="process_management.scheduling.inference_scheduler:retire_copy_pinning_given_up_job",
+        sample=(
+            "Save-our-ship: gave up on Flux.1-Schnell fp8 (Compact) job 8dc9287e, so process 1's copy on device 1 "
+            "is unloaded from RAM and the next job of the model is placed by preload."
+        ),
+        dry_run_reason=_NO_FAULT,
+    ),
+    _signature(
         "soft_reset_held_for_boot",
         r"Save-our-ship: holding the soft reset while a replacement child is still alive and booting "
         r"\(boot elapsed (?P<boot_elapsed>\d+)s, hard cap (?P<hard_cap>\d+)s\)",
