@@ -32,6 +32,8 @@ from horde_worker_regen.process_management.lifecycle.process_map import ProcessM
 from horde_worker_regen.process_management.resources.resource_budget import StreamForecast
 from horde_worker_regen.process_management.scheduling.admission.preload import decide_preload_gates
 from horde_worker_regen.process_management.scheduling.governance.preload_admission import AdmissionDecision
+from horde_worker_regen.process_management.scheduling.governance.whole_card import WHOLE_CARD_ESTABLISH_GRACE_SECONDS
+from horde_worker_regen.process_management.scheduling.ledgers.dispatch_holds import HoldRemedy
 from tests.process_management.conftest import (
     make_job_pop_response,
     make_mock_bridge_data,
@@ -218,6 +220,95 @@ class TestNeverConvergeReleaseClearsPendingAdmits:
 
         assert job_tracker.is_admitted_exclusive(running_job) is True
         assert job_tracker.is_admitted_exclusive(pending_job) is False
+
+
+def _establish_grace_active(scheduler) -> bool:  # noqa: ANN001
+    """Whether the card's establish grace is open, read apart from the restore window the release may open.
+
+    The restore window covers the respawns and lane restarts reported by the mocked lifecycle.
+    """
+    return scheduler._whole_card_ledger.grace_active(
+        now=scheduler._clock(),
+        establish_grace_seconds=WHOLE_CARD_ESTABLISH_GRACE_SECONDS,
+        restore_grace_seconds=0.0,
+    )
+
+
+class TestHoldWithNoRemedyReleasesResidency:
+    """A dispatch hold that cannot seat a residency's head releases that residency and its establish grace.
+
+    The dispatch gate prices the head only once the teardown has done all it can, so a hold with no remedy, or
+    with a reroute to another card, means the residency cannot seat its head. Kept, the residency's establish grace
+    would defer recovery for up to 120 s after the hold itself stopped deferring it.
+    """
+
+    @staticmethod
+    async def _scheduler_with_fresh_residency(job_tracker: JobTracker):  # noqa: ANN205
+        """A scheduler whose card holds a residency established now for a pending exclusive head."""
+        scheduler = _make_scheduler(job_tracker)
+        scheduler._process_lifecycle.scale_inference_processes = Mock(return_value=2)
+        head_job = make_job_pop_response(model=_CARD_DEMANDING_MODEL)
+        await job_tracker.record_popped_job(head_job)
+        job_tracker.mark_admitted_over_budget(head_job)
+        job_tracker.mark_admitted_exclusive(head_job, device_index=None)
+        now = scheduler._clock()
+        scheduler._whole_card_ledger.record_grant(
+            None,
+            model=_CARD_DEMANDING_MODEL,
+            forecast=None,
+            cooldown_until=now + 600.0,
+            now=now,
+            establish_grace_seconds=WHOLE_CARD_ESTABLISH_GRACE_SECONDS,
+        )
+        assert scheduler.whole_card_residency_grace_active(), "precondition: the establish grace is open"
+        return scheduler, head_job
+
+    async def test_no_remedy_hold_on_the_head_releases_the_residency(self, job_tracker: JobTracker) -> None:
+        """A hold with no remedy on the residency's head releases it inside its grace and its cooldown."""
+        scheduler, head_job = await self._scheduler_with_fresh_residency(job_tracker)
+
+        scheduler._note_dispatch_hold(head_job, reclaim_applied=False, remedy=HoldRemedy.NONE)
+        scheduler._restore_siblings_after_whole_card()
+
+        assert scheduler._whole_card_ledger.state_for(None).model is None
+        assert not _establish_grace_active(scheduler)
+        assert job_tracker.is_admitted_exclusive(head_job) is False
+
+    async def test_reroute_hold_on_the_head_releases_the_residency(self, job_tracker: JobTracker) -> None:
+        """A reroute takes the head to another card, so the residency it leaves is released as well."""
+        scheduler, head_job = await self._scheduler_with_fresh_residency(job_tracker)
+
+        scheduler._note_dispatch_hold(head_job, reclaim_applied=False, remedy=HoldRemedy.REROUTE)
+        scheduler._restore_siblings_after_whole_card()
+
+        assert scheduler._whole_card_ledger.state_for(None).model is None
+        assert not _establish_grace_active(scheduler)
+
+    async def test_hold_with_a_live_remedy_leaves_the_residency(self, job_tracker: JobTracker) -> None:
+        """A hold whose reclaim can still seat the head keeps the residency and its grace."""
+        scheduler, head_job = await self._scheduler_with_fresh_residency(job_tracker)
+
+        scheduler._note_dispatch_hold(head_job, reclaim_applied=True, remedy=HoldRemedy.RECLAIM)
+        scheduler._restore_siblings_after_whole_card()
+
+        assert scheduler._whole_card_ledger.state_for(None).model == _CARD_DEMANDING_MODEL
+        assert _establish_grace_active(scheduler)
+        assert job_tracker.is_admitted_exclusive(head_job) is True
+
+    async def test_no_remedy_hold_on_another_job_leaves_the_residency(self, job_tracker: JobTracker) -> None:
+        """A hold on a job the residency was not granted for leaves the residency and its grace standing."""
+        scheduler, _head_job = await self._scheduler_with_fresh_residency(job_tracker)
+        same_model_job = make_job_pop_response(model=_CARD_DEMANDING_MODEL)
+        await job_tracker.record_popped_job(same_model_job)
+        sibling_job = make_job_pop_response(model=_SIBLING_MODEL)
+        await job_tracker.record_popped_job(sibling_job)
+
+        scheduler._note_dispatch_hold(same_model_job, reclaim_applied=False, remedy=HoldRemedy.NONE)
+        scheduler._note_dispatch_hold(sibling_job, reclaim_applied=False, remedy=HoldRemedy.NONE)
+        scheduler._restore_siblings_after_whole_card()
+
+        assert scheduler._whole_card_ledger.state_for(None).model == _CARD_DEMANDING_MODEL
+        assert _establish_grace_active(scheduler)
 
 
 class TestOverbudgetAdmitLogContract:

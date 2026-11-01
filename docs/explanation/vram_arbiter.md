@@ -1206,6 +1206,15 @@ The room is also what the other frames read, so they cannot disagree with the ve
   queued behind the hold. The deferral is logged once on each edge. The end line says whether the queue no
   longer reads as deadlocked, the head is no longer held, the hold has no remedy left, or the hold outlived its
   liveness bound.
+- **A hold that cannot seat a whole-card head releases its residency.** The gate prices a whole-card head only
+  once the residency's teardown has done all it can. A hold with no remedy, or with a reroute to another card, on
+  the head that a residency was granted for therefore means the residency cannot seat it. `_note_dispatch_hold` marks
+  that residency (`WholeCardResidencyLedger.note_head_unseatable`), and the next release pass restores the card
+  through the normal path, inside the establish grace and the cooldown. The release clears the grant, so the
+  120 s establish grace ends with it. Neither the hold nor the residency then defers recovery. While the head's
+  latest hold has no remedy, neither whole-card demand path grants it a new residency. The release can open
+  the 60 s restore window when it respawns siblings or restarts a paused lane, and that window still defers
+  recovery for the respawn.
 
 The admission margin itself is platform-aware (`vram_admission_noise_mb`): the physics buffer on WDDM, half
 of it where the NVML reading is device-wide, with the operator's override winning whole. The device-free

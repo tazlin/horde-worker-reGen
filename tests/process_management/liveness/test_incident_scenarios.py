@@ -9316,15 +9316,31 @@ async def test_a_terminal_ceiling_deny_on_the_only_card_reaches_recovery_without
     dispatcher's sustained-wedge minimum has passed, which is the state the soft reset and the give-up act on.
     A hold that keeps recovery waiting for its 190 s liveness bound loses the head to the horde's deadline first.
 
-    Whole-card residency is off, so the residency's establish grace, a separate excuse with its own bound, does not
-    also hold recovery off and the row reads the dispatch hold's excuse alone.
+    Whole-card residency is off, so the row reads the dispatch hold's excuse alone.
     """
+    await _assert_terminal_ceiling_deny_reaches_recovery(whole_card_enabled=False)
+
+
+async def test_a_terminal_ceiling_deny_on_a_whole_card_head_releases_the_residency_and_its_grace() -> None:
+    """The same terminal DENY under whole-card residency reaches recovery within the wedge minimum.
+
+    The Flux head is granted a whole-card residency, which opens the 120 s establish grace. The dispatch gate then
+    holds the head with no remedy. A residency granted for a head that cannot be seated on its card can never
+    converge, so that hold releases the residency, and the establish grace ends with it. Recovery then reads the
+    wedge on the same bound as with whole-card off. A residency that kept its grace would hold recovery off for
+    120 s plus the sustained-wedge minimum.
+    """
+    await _assert_terminal_ceiling_deny_reaches_recovery(whole_card_enabled=True)
+
+
+async def _assert_terminal_ceiling_deny_reaches_recovery(*, whole_card_enabled: bool) -> None:
+    """Run the terminal-DENY row and assert recovery reads the wedge within the sustained-wedge minimum."""
     world = _DispatchWorld(
         card=_CARD_16GB,
         lane_count=1,
         max_threads=1,
         queue_depth=1,
-        whole_card_enabled=False,
+        whole_card_enabled=whole_card_enabled,
         closed_loop=True,
         tick_seconds=1.0,
         foreign_vram_mb_by_tick={
@@ -9346,12 +9362,20 @@ async def test_a_terminal_ceiling_deny_on_the_only_card_reaches_recovery_without
 
     hold_tick: int | None = None
     wedge_tick: int | None = None
+    residency_ticks: list[int] = []
     for _ in range(_TERMINAL_DENY_ROW_TICKS):
         await world.step()
         if hold_tick is None and world.scheduler.dispatch_holds.held_seconds(head_id) is not None:
             hold_tick = world.tick
+        if world.scheduler._whole_card_ledger.holder_for_model(_FLUX.name)[0]:
+            residency_ticks.append(world.tick)
         if coordinator.structural_queue_wedge_active() and wedge_tick is None:
             wedge_tick = world.tick
+    if whole_card_enabled:
+        context += ", whole-card residency on"
+        assert residency_ticks, (
+            f"{context}: precondition: the Flux head must be granted a whole-card residency. {world.state_dump()}"
+        )
 
     denials = [
         record.inputs
@@ -9391,6 +9415,11 @@ async def test_a_terminal_ceiling_deny_on_the_only_card_reaches_recovery_without
         f"{context}: the hold ledger records {liveness} for the head, not a hold with no remedy left. "
         f"{world.state_dump()}"
     )
+    if whole_card_enabled:
+        assert max(residency_ticks) <= hold_tick + 1, (
+            f"{context}: the residency was held on tick {max(residency_ticks)}, after the hold with no remedy on "
+            f"tick {hold_tick} should have released it for good. {world.state_dump()}"
+        )
 
 
 _GIVE_UP_CARD_FOREIGN_FLOOR_MB = 5000.0

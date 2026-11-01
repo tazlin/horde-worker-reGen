@@ -487,6 +487,14 @@ work, and the pending exclusive admits for its model lose their mark with it, si
 card was for that residency. The no-holder reading is only trusted past the establish grace, since a residency
 legitimately has no holder for as long as its pre-stage preload takes to land.
 
+The dispatch gate also ends a residency inside its establish grace. The gate prices the head only once the
+teardown has done all it can. A hold with no remedy, or with a reroute to another card, on the head that the
+residency was granted for therefore means that head cannot be seated on the card whatever the residency does.
+The gate marks the residency when it notes the hold, and the next release pass restores it through the same
+path, ignoring the cooldown. The release clears the grant, which ends the establish grace, so the grace does not
+defer recovery for up to 120 s after the hold has stopped deferring it. A head whose latest hold has no remedy
+is not granted a new residency. A later pass that leaves a remedy live lets it claim the card again.
+
 The dispatch gate releases the head either on a live free-VRAM reading that genuinely holds the weights, or,
 once the bounded drain window is spent, on the forecast's sole-residency guarantee. That guarantee is sized
 for a card every other context has left, safety included, so the scheduler passes in the charge of whatever

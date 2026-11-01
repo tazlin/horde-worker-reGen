@@ -2798,6 +2798,9 @@ class InferenceScheduler:
             # reserving the device on an over-counted-context phantom.
             self._log_whole_card_declined(job, forecast)
             return _WholeCardDemandOutcome.FALL_THROUGH
+        if self._dispatch_hold_has_no_remedy(job):
+            # A residency cannot seat a head held by the dispatch gate with no remedy, so none is granted.
+            return _WholeCardDemandOutcome.FALL_THROUGH
 
         held = self._whole_card_ledger.get(target_device_index)
         governor_hold = self._whole_card_governor_defers(
@@ -3377,6 +3380,10 @@ class InferenceScheduler:
         if not self._whole_card_warranted(forecast):
             self._log_whole_card_declined(job, forecast)
             return True
+        if self._dispatch_hold_has_no_remedy(job):
+            # The dispatch gate holds this head with no remedy, which released its residency. A new residency
+            # cannot seat it either, so the gate prices the head again and recovery reads its hold.
+            return True
 
         # The establish-rate limiter that defers a new establishment at preload admission defers it here. This
         # path otherwise claims the card for a head whose weights are already resident, cycling the siblings
@@ -3646,9 +3653,12 @@ class InferenceScheduler:
                 continue
             serving = model in active_models or self._job_tracker.has_exclusive_job_in_progress(device_index)
             # Checked separately from ``serving``, because the model's pending jobs keep it serving while they
-            # dispatch to the copy on the other card.
-            never_converges = self._residency_model_placed_on_another_card(device_index, state, now=now) or (
-                serving and self._residency_can_never_converge(device_index, state, now=now)
+            # dispatch to the copy on the other card. The same holds for a head that cannot be seated on the
+            # card, which stays pending until recovery acts or another card seats it.
+            never_converges = (
+                self._whole_card_ledger.head_unseatable(device_index)
+                or self._residency_model_placed_on_another_card(device_index, state, now=now)
+                or (serving and self._residency_can_never_converge(device_index, state, now=now))
             )
             if serving and not never_converges:
                 # Still serving the residency; keep it (refresh the cooldown so it survives the lull between
@@ -4281,6 +4291,17 @@ class InferenceScheduler:
         if head is None or head.id_ is None:
             return None
         return self._dispatch_holds.liveness(str(head.id_))
+
+    def _dispatch_hold_has_no_remedy(self, job: ImageGenerateJobPopResponse) -> bool:
+        """Whether the dispatch gate's latest pass held ``job`` with no remedy left.
+
+        The whole-card demand paths read this so a residency released for this head is not granted again. Each
+        gate pass records the remedy anew, so a later pass with a live remedy lets the head claim the card again.
+        """
+        if job.id_ is None:
+            return False
+        liveness = self._dispatch_holds.liveness(str(job.id_))
+        return liveness is not None and not liveness.remedy.live
 
     def ram_reclaim_cycle_grace_active(self) -> bool:
         """Whether a deliberate RAM-reclaim process cycle is still inside its bounded respawn/preload window.
@@ -13531,10 +13552,25 @@ class InferenceScheduler:
         its eventual release is attributed to reclaim rather than to the card recovering on its own. The
         latest room breakdown is kept so the release record can report what the card held at the start, and
         the latest remedy so the recovery supervisor reads whether waiting on the hold can still release it.
+
+        A hold with no remedy, or with a reroute to another card, on the head that a whole-card residency was
+        granted for marks that residency as unable to seat its head. The gate prices the head only after the teardown
+        has done all it can, so the residency can never converge, and the release path restores the card on its
+        next pass. The release also ends the establish grace, so neither the hold nor the residency defers
+        recovery.
         """
         job_id = str(job.id_) if job.id_ is not None else None
         if job_id is None:
             return
+        if remedy is HoldRemedy.NONE or remedy is HoldRemedy.REROUTE:
+            tracked = self._job_tracker.get_tracked_job(job.id_) if job.id_ is not None else None
+            if tracked is not None and tracked.admitted_exclusive:
+                # Both residency grants mark the head exclusive on the residency's own card key.
+                self._whole_card_ledger.note_head_unseatable(
+                    tracked.admitted_exclusive_device_index,
+                    model=job.model,
+                    now=self._clock(),
+                )
         if self._dispatch_holds.note_hold(
             job_id,
             reclaim_applied=reclaim_applied,

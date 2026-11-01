@@ -374,6 +374,13 @@ class WholeCardResidency:
     Distinct from the maximum hold, which is a clock on the grant: this is a finding that the resident model
     has no demand left, or that its jobs fail on the card, so continuing to hold the pool to it would starve the
     worker on its own claim."""
+    head_unseatable_at: float = 0.0
+    """When the dispatch gate held this residency's head with no remedy on this card, or with a reroute to
+    another card. 0.0 while no such hold was noted.
+
+    The gate prices the head only once the teardown has done all it can, so such a hold means the card cannot seat
+    the head whatever the residency does. The residency then can never converge, and the release path lets it go
+    at once, inside its establish grace and its cooldown."""
 
 
 class WholeCardGrantKind(StrEnum):
@@ -708,6 +715,29 @@ class WholeCardResidencyLedger:
         state.pop_claim_released_at = now
         return True
 
+    def note_head_unseatable(self, device_index: int | None, *, model: str | None, now: float) -> bool:
+        """Mark the residency on ``device_index`` as unable to seat its head, so the release path lets it go.
+
+        A card whose residency is held for another model, or holds none, is left alone. The mark ends retention
+        and makes the residency read as never converging, so the next release pass restores the card. The restore
+        clears the residency's grant, and with it the establish grace read by the recovery supervisor.
+
+        Returns:
+            True when this call marked a standing residency.
+        """
+        if model is None:
+            return False
+        state = self._residencies.get(device_index)
+        if state is None or state.model != model or state.head_unseatable_at != 0.0:
+            return False
+        state.head_unseatable_at = now
+        return True
+
+    def head_unseatable(self, device_index: int | None) -> bool:
+        """Return whether the dispatch gate marked this card's residency as unable to seat its head."""
+        state = self._residencies.get(device_index)
+        return state is not None and state.model is not None and state.head_unseatable_at != 0.0
+
     def pop_claim_retention_ended(
         self,
         device_index: int | None,
@@ -724,9 +754,16 @@ class WholeCardResidencyLedger:
 
         It ends retention, never an action in flight: a granted establish or restore window runs its full
         duration, and work already dispatched is left to finish.
+
+        A residency whose head cannot be seated on its card (:meth:`note_head_unseatable`) has no queued work
+        that can run on it, so its retention has ended whatever the maximum hold is.
         """
         state = self._residencies.get(device_index)
-        if state is None or state.model is None or max_hold_seconds <= 0.0:
+        if state is None or state.model is None:
+            return False
+        if state.head_unseatable_at != 0.0:
+            return True
+        if max_hold_seconds <= 0.0:
             return False
         if state.pop_claim_released_at != 0.0:
             return True
@@ -800,7 +837,7 @@ class WholeCardResidencyLedger:
     ) -> bool:
         """Return whether any residency sits inside a granted establish or restore window.
 
-        A granted window excuses a held queue for its whole duration and nothing shortens it. The teardown or
+        A granted window excuses a held queue for its whole duration, with the one exception below. The teardown or
         restore it covers is an action the scheduler itself commanded, so withdrawing the excuse part-way
         would have the recovery supervisor classify that deliberate action as a structural wedge. The
         liveness bound on a residency that never finishes loading (or a restore that never completes) is the
@@ -810,8 +847,11 @@ class WholeCardResidencyLedger:
 
         The grant condition is churn: a restore window covers siblings actually being respawned or a service
         lane actually being restarted, and a release that changed nothing is granted none (see
-        :meth:`close_restore_window`). Narrowing what earns a window is distinct from cutting one short, which
-        nothing does.
+        :meth:`close_restore_window`). Narrowing what earns a window is distinct from cutting one short.
+
+        One release ends an establish window early. A residency whose head cannot be seated on its card
+        (:meth:`note_head_unseatable`) is restored, and the restore clears the grant. The window excuses a teardown
+        that is making room for the head, and that teardown cannot seat it.
         """
         return any(
             self._window_active(
@@ -1254,6 +1294,7 @@ def _clear_grant(state: WholeCardResidency) -> None:
     state.pop_claim_empty_pops = 0
     state.pop_claim_empty_pop_since = 0.0
     state.pop_claim_released_at = 0.0
+    state.head_unseatable_at = 0.0
 
 
 def _prune_before(stamps: deque[float], *, cutoff: float) -> None:
