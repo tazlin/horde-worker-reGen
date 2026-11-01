@@ -496,7 +496,9 @@ These fail as interactions, not as units, so component tests stay green through 
   `load_moved_mb`, `load_returned_mb` and `decode_unloaded_mb`. `lane_reports_carry_context=True` has every
   process report its share of the card's context charge, so the scheduler's instantaneous foreign reading equals
   the tenancy a row scripts with `foreign_vram_mb_by_tick`; off, the reading exceeds it by the world's context
-  charge less the scheduler's resolved constant. Rows that state a true workload can also pass
+  charge less the scheduler's resolved constant. `foreign_vram_mb_by_tick` scripts the first card only, and
+  `foreign_vram_mb_by_card` takes the same per-tick script keyed by device index, so a multi-card row can put a
+  foreign floor on any card. Rows that state a true workload can also pass
   `extra_model_classes` (served classes resolve and are charged whatever the module lists), a `true_footprint_mb`
   hook (resident and transient per job), `sample_seconds_by_job` and `decode_seconds_by_job`, and a seeded
   `footprint_store`; `tests/process_management/liveness/replay/` holds a live session's job stream and learned

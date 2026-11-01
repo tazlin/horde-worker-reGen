@@ -223,6 +223,7 @@ from horde_worker_regen.process_management.lifecycle.process_map import ProcessM
 from horde_worker_regen.process_management.resources import reclaim_ladder as reclaim_ladder_module
 from horde_worker_regen.process_management.resources.admission_identity import admission_noise_buffer_mb
 from horde_worker_regen.process_management.resources.device_free_governor import GovernorState
+from horde_worker_regen.process_management.resources.foreign_vram_floor import FOREIGN_FLOOR_WINDOW_SECONDS
 from horde_worker_regen.process_management.resources.reclaim_ladder import ReclaimRungKind
 from horde_worker_regen.process_management.resources.resource_budget import (
     CommittedReserveLedger,
@@ -9074,3 +9075,162 @@ async def test_mixed_cards_a_head_staged_onto_an_unmeasured_card_still_reaches_t
             f"{context}: Flux sampled on the small card, but the store does not hold a {small_card_gb} GB Flux "
             f"sampling figure. {world.state_dump()}"
         )
+
+
+_SMALL_CARD_FOREIGN_FLOOR_MB = 1400.0
+"""Device memory another program holds on the small card, such as a display.
+
+It lowers the small card's achievable ceiling below the Flux seed's whole need, by less than the ceiling-attempt
+allowance."""
+
+_FOREIGN_FLOOR_WARMUP_TICKS = math.ceil(FOREIGN_FLOOR_WINDOW_SECONDS) + 2
+"""Ticks of one second the row idles before the head arrives, so the parent has a sustained foreign floor."""
+
+_CEILING_DENY_ROW_TICKS = 90
+"""Ticks the row runs once the queue is filled: the head and every sibling load and sample on an idle card."""
+
+_CEILING_DENY_SIBLINGS = (_SD15, _SDXL, _SD15, _SDXL)
+"""Cold siblings queued behind the head. No lane holds their models, so each needs a preload."""
+
+
+@dataclass
+class CeilingDenyRow:
+    """The finished world after a Flux head held in RAM on the small card meets that card's ceiling DENY."""
+
+    world: _DispatchWorld
+    head: ImageGenerateJobPopResponse
+    siblings: list[ImageGenerateJobPopResponse]
+    queued_tick: int
+
+
+def _head_dispatch_denials(world: _DispatchWorld, head: ImageGenerateJobPopResponse) -> list[dict[str, object]]:
+    """The dispatch-gate decisions that refused ``head`` on the small card for its achievable ceiling.
+
+    A hold records a DEFER with the ceiling DENY as its reason. A reroute records only its release, which holds the
+    same verdict terms, and the gate reroutes on a DENY alone.
+    """
+    return [
+        record.inputs
+        for record in world.decision_records
+        if record.decision_kind is DecisionKind.INFERENCE_DISPATCH
+        and record.subject == str(head.id_)
+        and record.inputs.get("device_index") == 1
+        and (
+            (record.verdict is DecisionVerdict.DEFER and "achievable ceiling" in record.reason)
+            or (record.verdict is DecisionVerdict.NO_OP and record.reason == "dispatch_rerouted")
+        )
+    ]
+
+
+async def drive_flux_head_ram_staged_on_a_small_card_under_a_foreign_floor() -> CeilingDenyRow:
+    """Hold Flux by name in RAM on the small card's only lane, then queue a Flux head and cold siblings.
+
+    The large card is idle with two empty lanes. The small card's foreign floor puts the Flux seed's whole need
+    above its achievable ceiling, and the large card can seat Flux, so the arbiter refuses the ceiling attempt
+    on the small card. A whole-card residency on the small card holds Flux there, as the whole-card pre-stage
+    leaves it.
+    """
+    world = _DispatchWorld(
+        card=_CARD_24GB,
+        lane_count=3,
+        max_threads=1,
+        queue_depth=len(_CEILING_DENY_SIBLINGS) + 1,
+        whole_card_enabled=True,
+        closed_loop=True,
+        tick_seconds=1.0,
+        card_max_pixels=_MIXED_CARD_PIXELS,
+        card_total_mb=_MIXED_CARD_TOTALS,
+        foreign_vram_mb_by_card={1: {1: _SMALL_CARD_FOREIGN_FLOOR_MB}},
+        lane_reports_carry_context=True,
+    )
+    assert [world.card_of_lane(lane) for lane in world.inference_lane_ids()] == [0, 1, 0], (
+        "precondition: the small card has one lane and the large card two"
+    )
+    world.scheduler._foreign_floor_clock = lambda: world.now
+    for _ in range(_FOREIGN_FLOOR_WARMUP_TICKS):
+        await world.step()
+    world.seed_resident(1, _FLUX, in_vram=False)
+    now = world.scheduler._clock()
+    world.scheduler._whole_card_ledger.record_grant(
+        1,
+        model=_FLUX.name,
+        forecast=None,
+        cooldown_until=now + world.scheduler._whole_card_max_hold_seconds(),
+        now=now,
+    )
+    head = make_job_pop_response(_FLUX.name, width=1024, height=1024, ddim_steps=4)
+    siblings = [
+        make_job_pop_response(
+            model.name, width=512 if model is _SD15 else 1024, height=512 if model is _SD15 else 1024
+        )
+        for model in _CEILING_DENY_SIBLINGS
+    ]
+    await world.pop(head)
+    for job in siblings:
+        await world.pop(job)
+    queued_tick = world.tick
+    for _ in range(_CEILING_DENY_ROW_TICKS):
+        await world.step()
+    return CeilingDenyRow(world=world, head=head, siblings=siblings, queued_tick=queued_tick)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "the dispatch gate holds a ceiling DENY like a DEFER: the head's RAM copy pins it to the small card, the "
+        "arbiter refuses the ceiling attempt because the large card can seat it, and no path retires the copy, "
+        "so the head re-prices to the same DENY every pass and the queue wedges"
+    ),
+)
+async def test_mixed_cards_a_ceiling_deny_on_the_small_card_reroutes_its_ram_staged_head() -> None:
+    """A Flux head held in RAM on a card below its whole need samples on the idle large card, and its siblings run.
+
+    The small card's foreign floor puts the Flux candidate above its achievable ceiling by less than the
+    ceiling-attempt allowance. The arbiter refuses the attempt because the large card can seat Flux, so the
+    reroute is the only way out. The large card is idle, so the head reaches it within the tick ceiling, and the
+    cold siblings queued behind the head load and sample there. A head left pinned to the small card by its RAM
+    copy re-prices to the same DENY every tick, no job loads, and the queue deadlocks into save-our-ship.
+    """
+    row = await drive_flux_head_ram_staged_on_a_small_card_under_a_foreign_floor()
+    world = row.world
+    context = "Flux head RAM-staged on a card below its whole need"
+
+    denials = _head_dispatch_denials(world, row.head)
+    assert denials, (
+        f"{context}: precondition: the dispatch gate must price the head on the small card and refuse it for "
+        f"the achievable ceiling. {world.state_dump()}"
+    )
+    candidate_mb = denials[0]["candidate_delta_mb"]
+    noise_mb = denials[0]["noise_buffer_mb"]
+    floor_mb = world.scheduler.current_foreign_floor_mb(1)
+    assert isinstance(candidate_mb, float) and isinstance(noise_mb, float) and floor_mb is not None
+    ceiling_mb = _MIXED_CARD_TOTALS[1] - noise_mb - floor_mb
+    overshoot_mb = candidate_mb - ceiling_mb
+    assert 0.0 < overshoot_mb <= VramArbiter._ceiling_attempt_allowance_mb(ceiling_mb), (
+        f"{context}: precondition: the Flux candidate {candidate_mb:.0f} MB must exceed the small card's "
+        f"{ceiling_mb:.0f} MB ceiling by no more than the ceiling-attempt allowance. {world.state_dump()}"
+    )
+
+    assert not world.structural_queue_wedges, (
+        f"{context}: the queue-deadlock detector reported a wedge past the horizon on tick(s) "
+        f"{world.structural_queue_wedges[:6]}, which makes save-our-ship soft-reset the pools or drop the queue. "
+        f"{world.state_dump()}"
+    )
+    dispatch_tick = world.dispatch_tick(row.head)
+    assert dispatch_tick is not None, (
+        f"{context}: the Flux head never sampled, though the large card was idle and can seat it. {world.state_dump()}"
+    )
+    head_lanes = [lane for model, lane in world.dispatch_lanes if model == _FLUX.name]
+    assert head_lanes and all(world._card_of(lane) == 0 for lane in head_lanes), (
+        f"{context}: the Flux head was dispatched to lane(s) {head_lanes}, not on the large card. {world.state_dump()}"
+    )
+    assert dispatch_tick <= row.queued_tick + _MIXED_CARD_TICK_CEILING, (
+        f"{context}: the Flux head reached sampling on tick {dispatch_tick}, more than {_MIXED_CARD_TICK_CEILING} "
+        f"ticks after it was queued on tick {row.queued_tick} beside an idle large card. {world.state_dump()}"
+    )
+    unserved = [f"{job.model}:{str(job.id_)[:8]}" for job in row.siblings if world.dispatch_tick(job) is None]
+    assert not unserved, (
+        f"{context}: sibling job(s) {unserved} never ran, though the large card can seat each of them. "
+        f"{world.state_dump()}"
+    )
+    assert_never_idle_with_fitting_work(world, max_idle_ticks=_MIXED_CARD_TICK_CEILING, context=context)

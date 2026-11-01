@@ -922,6 +922,7 @@ class _DispatchWorld:
         staged_encode_mb_by_model: Mapping[str, float] | None = None,
         service_lane_exit_seconds: float | None = None,
         foreign_vram_mb_by_tick: Mapping[int, float] | None = None,
+        foreign_vram_mb_by_card: Mapping[int, Mapping[int, float]] | None = None,
         safety_check_growth_mb: float | None = None,
         safety_check_ticks: int = 1,
         safety_check_allocation_lag_ticks: int = 1,
@@ -983,6 +984,10 @@ class _DispatchWorld:
                 scripted for a tick from that tick on. It stands for a residue the parent cannot attribute, or for
                 another program.
                 It is in the device-free reading and in no lane's report. None keeps the card the lanes' alone.
+            foreign_vram_mb_by_card: The same script for any card, keyed by device index and then by tick, so a
+                multi-card row can put foreign memory on a card other than the first. A card it does not list
+                holds no foreign memory, unless it is the first card and ``foreign_vram_mb_by_tick`` scripts it.
+                Scripting the first card in both is an error.
             disaggregated: Whether the row's jobs are disaggregation-class, so a sampler is priced for the
                 UNet it holds alone rather than for a whole job.
             closed_loop: Whether to close the loop between policy and the card: the device-free governor and
@@ -1236,10 +1241,10 @@ class _DispatchWorld:
                 context of any process the parent's ledger no longer counts. That lane carries it because the
                 world charges the premium once per card for its inference pool. The sum then equals the
                 card's context charge less the constant per counted process, and the parent's instantaneous
-                foreign reading equals ``foreign_vram_mb_by_tick``. A counted process with no context on the card
-                (safety paused but not yet exited) reports zero, so the constant it is charged reads as
-                foreign. Off, a process reports its tenants alone, and the parent's foreign reading runs above
-                the scripted figure by the gap between the two context accounts.
+                foreign reading on each card equals that card's scripted foreign figure. A counted process
+                with no context on the card (safety paused but not yet exited) reports zero, so the constant
+                it is charged reads as foreign. Off, a process reports its tenants alone, and the parent's
+                foreign reading runs above the scripted figure by the gap between the two context accounts.
             load_seconds_per_gb: Seconds a lane spends moving one gigabyte of weights from host RAM onto the
                 card, so a row calibrated against a measured session can state its host's transfer rate. The
                 default is the consumer PCIe figure every other row is written against.
@@ -1558,9 +1563,6 @@ class _DispatchWorld:
         """What each tick looked like to the verdicts that judge whether the card was earning."""
 
         self._service_contexts = service_contexts
-        self._foreign_vram_mb_by_tick = dict(foreign_vram_mb_by_tick or {})
-        self._foreign_vram_mb = 0.0
-        """The first card's device memory no lane holds, as last scripted."""
         self.service_lane_exit_seconds = service_lane_exit_seconds
         """How long a paused service lane's process takes to exit, or None when lanes are not modelled exiting."""
         self._service_lane_exits_at: dict[int, float] = {}
@@ -1603,6 +1605,17 @@ class _DispatchWorld:
         reading is once the tenants charged to it are taken off. Cards are independent memory domains, so
         every figure derived from the ledger is derived per index; a single-card row holds one entry and every
         such derivation collapses to the whole-pool figure it was before."""
+        foreign_scripts = {index: dict(script) for index, script in (foreign_vram_mb_by_card or {}).items()}
+        if not set(foreign_scripts) <= set(card_indices):
+            raise ValueError("foreign_vram_mb_by_card lists a card that card_max_pixels does not list")
+        if foreign_vram_mb_by_tick is not None:
+            if card_indices[0] in foreign_scripts:
+                raise ValueError("foreign_vram_mb_by_tick and foreign_vram_mb_by_card both script the first card")
+            foreign_scripts[card_indices[0]] = dict(foreign_vram_mb_by_tick)
+        self._foreign_vram_mb_by_card_tick = foreign_scripts
+        """Each card's foreign VRAM script, keyed by device index and then by the tick each figure lands on."""
+        self._foreign_vram_mb: dict[int, float] = {}
+        """Each card's device memory that no lane holds, as last scripted."""
         self._safety_card_index = safety_card_index if safety_card_index in self._card_totals else card_indices[0]
         """The card safety's charge lands on, and the card its placement policy is told it occupies."""
         self._lane_cards = {lane_id: card_indices[lane_id % len(card_indices)] for lane_id in range(lane_count)}
@@ -2206,7 +2219,7 @@ class _DispatchWorld:
             for lane_id, charge_mb in charges.items()
             if self._card_of(lane_id) == device_index
         )
-        foreign_mb = self._foreign_vram_mb if device_index == min(self._card_totals) else 0.0
+        foreign_mb = self._foreign_vram_mb.get(device_index, 0.0)
         return self._context_charge_mb(device_index) + held + foreign_mb
 
     def card_free_mb(self, device_index: int) -> float:
@@ -5222,7 +5235,9 @@ class _DispatchWorld:
         """
         self.tick += 1
         self.now += self.tick_seconds
-        self._foreign_vram_mb = self._foreign_vram_mb_by_tick.get(self.tick, self._foreign_vram_mb)
+        for device_index, script in self._foreign_vram_mb_by_card_tick.items():
+            if self.tick in script:
+                self._foreign_vram_mb[device_index] = script[self.tick]
         if self.host_ram is not None:
             # Host pressure moves on its own clock, and the reclaim it forces lands before any child acts.
             self.host_ram.apply_foreign_script(self.tick)
