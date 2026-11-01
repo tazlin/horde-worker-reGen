@@ -252,6 +252,7 @@ from horde_worker_regen.process_management.scheduling.ledgers.dispatch_holds imp
     HoldRemedy,
     PostProcessingTurn,
     hold_remedy,
+    residency_hold_detail,
 )
 from horde_worker_regen.process_management.scheduling.ledgers.head_admission import (
     DISPATCH_STALL_MIN_SECONDS,
@@ -4734,44 +4735,40 @@ class InferenceScheduler:
             )
 
         # Resident on an idle process: the interesting case. Name the gate that is holding dispatch.
-        # A card is its own concurrency domain, so on a multi-card host the head is parked by its *own*
-        # card's cap while every other card keeps dispatching. Naming that first stops a per-card park
-        # reading as a worker-wide one and sending an operator after max_threads.
-        head_card = self._card_runtimes.get(process.device_index) if self._multi_gpu_routing_active else None
-        if head_card is not None:
-            jobs_on_head_card = len(self._jobs_in_progress_on_card(head_card.device_index))
-            head_card_cap = self._max_jobs_in_progress_allowed(card=head_card, job=head)
-            if jobs_on_head_card >= head_card_cap:
-                if self._job_tracker.has_exclusive_job_in_progress(head_card.device_index) and not (
-                    self._job_tracker.is_admitted_exclusive(head)
-                ):
-                    return SlotDutyBucket.EXCLUSIVE_ISOLATION, (
-                        f"its model is resident and idle on process {process.process_id}, but an exclusively-"
-                        f"admitted over-budget job has card {head_card.device_index} to itself "
-                        f"(on_card={jobs_on_head_card})"
-                    )
-                return SlotDutyBucket.CONCURRENCY_CAP, (
-                    f"its model is resident and idle on process {process.process_id}, but card "
-                    f"{head_card.device_index} is at its own concurrency cap (on_card={jobs_on_head_card}, "
-                    f"cap={head_card_cap}); the worker's other cards are free to dispatch"
-                )
-
-        in_progress = len(self._job_tracker.jobs_in_progress)
-        cap = self._max_jobs_in_progress_allowed(job=head)
-        if in_progress >= cap:
-            # The exclusive-admit hold collapses the cap to the running job; name it distinctly so the
-            # serialization is attributed to the admit, not to a generic cap the operator would chase
-            # through max_threads.
-            if self._job_tracker.has_exclusive_job_in_progress(process.device_index) and not (
+        # The cap is read in the scope the dispatch uses (:meth:`_dispatch_cap_card`). On a multi-card host that
+        # is the head's own card, and every other card keeps dispatching, so the text says which card. A worker-wide
+        # figure there would describe a cap that did not hold the head and send an operator after max_threads.
+        cap_card = self._dispatch_cap_card(head, process)
+        in_scope = self._jobs_in_progress_in_cap_scope(cap_card)
+        cap = self._max_jobs_in_progress_allowed(card=cap_card, job=head)
+        held_card = f"card {process.device_index}" if self._multi_gpu_routing_active else "the card"
+        if in_scope >= cap:
+            # The exclusive-admit hold collapses the cap to the running jobs. It is named distinctly so the
+            # serialization is attributed to the admit, not to a generic cap the operator would chase through
+            # max_threads.
+            exclusive_scope = cap_card.device_index if cap_card is not None else None
+            if self._job_tracker.has_exclusive_job_in_progress(exclusive_scope) and not (
                 self._job_tracker.is_admitted_exclusive(head)
             ):
+                if self._multi_gpu_routing_active:
+                    return SlotDutyBucket.EXCLUSIVE_ISOLATION, (
+                        f"its model is resident and idle on process {process.process_id}, but an exclusively-"
+                        f"admitted over-budget job holds {held_card}, so the head's dispatch is capped at the jobs "
+                        f"already in progress across the worker (in_progress={in_scope}, cap={cap})"
+                    )
                 return SlotDutyBucket.EXCLUSIVE_ISOLATION, (
                     f"its model is resident and idle on process {process.process_id}, but an exclusively-"
-                    f"admitted over-budget job has the device to itself (in_progress={in_progress})"
+                    f"admitted over-budget job has the device to itself (in_progress={in_scope})"
+                )
+            if cap_card is not None:
+                return SlotDutyBucket.CONCURRENCY_CAP, (
+                    f"its model is resident and idle on process {process.process_id}, but card "
+                    f"{cap_card.device_index} is at its own concurrency cap (on_card={in_scope}, cap={cap}); the "
+                    "worker's other cards are free to dispatch"
                 )
             return SlotDutyBucket.CONCURRENCY_CAP, (
                 f"its model is resident and idle on process {process.process_id}, but the concurrency cap is "
-                f"reached (in_progress={in_progress}, cap={cap})"
+                f"reached (in_progress={in_scope}, cap={cap})"
             )
         # Below the cap the same admit still holds dispatch whenever it holds a live claim on the card (a
         # running over-budget job, or a staged one whose whole-card residency is up). Attribute that slot to the
@@ -4781,7 +4778,7 @@ class InferenceScheduler:
         ):
             return SlotDutyBucket.EXCLUSIVE_ISOLATION, (
                 f"its model is resident and idle on process {process.process_id}, but an exclusively-admitted "
-                f"over-budget job holds the card (in_progress={in_progress}, cap={cap})"
+                f"over-budget job holds {held_card} (in_progress={in_scope}, cap={cap})"
             )
         if not self._concurrent_overlap_allowed(head, target_device_index=process.device_index):
             return SlotDutyBucket.OVERLAP_HEADWAY, (
@@ -4840,16 +4837,14 @@ class InferenceScheduler:
                 f"degraded/isolated and is waiting for the card to clear of other work"
             )
 
-        # The dispatch-time residency-reconciliation gate holds an already-resident head while it evicts idle
-        # sibling VRAM so the head's on-device materialisation fits before it commits. The gate stamps the held
-        # job in the hold ledger and self-clears within a few ticks once the eviction frees room, so a
-        # head parked here is a benign swap-churn wait, not the gate-less scheduler stall the fall-through
-        # reports. Read the hold ledger directly rather than re-deriving the fit so the two never disagree.
+        # The dispatch-time residency-reconciliation gate holds an already-resident head whose on-device
+        # materialisation would over-commit the card. The gate stamps the held job in the hold ledger with the
+        # remedy its latest pass left live (:class:`HoldRemedy`). The text reads that remedy from the ledger
+        # rather than re-deriving it, so the summary and the hold line agree on whether anything is reclaimed.
         if head.id_ is not None and str(head.id_) in self._dispatch_holds.hold_since:
             return SlotDutyBucket.RESIDENCY_RECONCILIATION, (
                 f"its model is resident and idle on process {process.process_id}, but dispatch is held to "
-                "reconcile residency (evicting idle VRAM): its materialisation would over-commit the card until "
-                "an idle resident is evicted, and it dispatches once that eviction frees room"
+                f"reconcile residency: {residency_hold_detail(self._dispatch_holds.remedies.get(str(head.id_)))}"
             )
 
         # The same reconciliation in the retention direction: weights a sibling slot holds across jobs occupy
@@ -10269,20 +10264,37 @@ class InferenceScheduler:
         if process_with_model is None or not process_with_model.can_accept_job():
             return False
 
-        target_card: CardRuntime | None = None
-        if self._multi_gpu_routing_active:
-            candidate_card = self._card_runtimes.get(process_with_model.device_index)
-            if candidate_card is not None and (
-                self._job_tracker.is_admitted_exclusive(job)
-                or not self._job_tracker.has_exclusive_job_in_progress(candidate_card.device_index)
-            ):
-                target_card = candidate_card
-
-        if target_card is not None:
-            jobs_in_progress_count = len(self._jobs_in_progress_on_card(target_card.device_index))
-        else:
-            jobs_in_progress_count = len(self._job_tracker.jobs_in_progress)
+        target_card = self._dispatch_cap_card(job, process_with_model)
+        jobs_in_progress_count = self._jobs_in_progress_in_cap_scope(target_card)
         return jobs_in_progress_count < self._max_jobs_in_progress_allowed(card=target_card, job=job)
+
+    def _dispatch_cap_card(
+        self,
+        job: ImageGenerateJobPopResponse,
+        process: HordeProcessInfo | None,
+    ) -> CardRuntime | None:
+        """The card whose concurrency cap scopes ``job``'s dispatch onto ``process``, or None for the whole worker.
+
+        On a multi-GPU host the resident process gives the card the dispatch would land on. An exclusive job on
+        that card other than ``job`` widens the scope to the whole worker, where the job tracker's conservative
+        fallback suppresses every card. The dispatch and the stall classifier both read the scope here.
+        """
+        if not self._multi_gpu_routing_active or process is None:
+            return None
+        card = self._card_runtimes.get(process.device_index)
+        if card is None:
+            return None
+        if self._job_tracker.is_admitted_exclusive(job) or not self._job_tracker.has_exclusive_job_in_progress(
+            card.device_index,
+        ):
+            return card
+        return None
+
+    def _jobs_in_progress_in_cap_scope(self, card: CardRuntime | None) -> int:
+        """The in-progress count the concurrency cap is compared against: ``card``'s jobs, or the worker's."""
+        if card is not None:
+            return len(self._jobs_in_progress_on_card(card.device_index))
+        return len(self._job_tracker.jobs_in_progress)
 
     def pending_inference_in_placement_order(self) -> tuple[ImageGenerateJobPopResponse, ...]:
         """The pending-inference queue in the order the scheduler places work from, retained copies first.
@@ -11623,22 +11635,11 @@ class InferenceScheduler:
             process_with_model = retention_retainer
         line_skip: LineSkip | None = None
 
-        # On a multi-GPU host the head's resident process names the card this dispatch would land on, so the
+        # On a multi-GPU host the head's resident process gives the card this dispatch would land on, so the
         # concurrency cap and exclusive hold are scoped to that card. An unattributed exclusive job still
         # suppresses every card through JobTracker's conservative fallback.
-        target_card: CardRuntime | None = None
-        if self._multi_gpu_routing_active and process_with_model is not None:
-            candidate_card = self._card_runtimes.get(process_with_model.device_index)
-            if candidate_card is not None and (
-                self._job_tracker.is_admitted_exclusive(next_job)
-                or not self._job_tracker.has_exclusive_job_in_progress(candidate_card.device_index)
-            ):
-                target_card = candidate_card
-
-        if target_card is not None:
-            jobs_in_progress_count = len(self._jobs_in_progress_on_card(target_card.device_index))
-        else:
-            jobs_in_progress_count = len(self._job_tracker.jobs_in_progress)
+        target_card = self._dispatch_cap_card(next_job, process_with_model)
+        jobs_in_progress_count = self._jobs_in_progress_in_cap_scope(target_card)
         max_jobs_allowed = self._max_jobs_in_progress_allowed(card=target_card, job=next_job)
         if jobs_in_progress_count >= max_jobs_allowed:
             exclusive_scope = target_card.device_index if target_card is not None else None
@@ -13959,7 +13960,14 @@ class InferenceScheduler:
                 else (
                     " Reclaim was proposed but no actuator accepted it; the hold remains eligible for escalation."
                     if outcome.actuations_requested
-                    else " Nothing is being reclaimed for this hold; it releases when the arbiter next verdicts a fit."
+                    else (
+                        " Nothing is being reclaimed for this hold; it releases when the arbiter next verdicts a fit."
+                        if remedy.live
+                        else (
+                            " Nothing is being reclaimed for this hold and no remedy is left on this card, so "
+                            "recovery reads the queue on its own terms."
+                        )
+                    )
                 )
             )
             room_note = f" Room: {room.describe()}." if room is not None else ""
@@ -14503,15 +14511,16 @@ class InferenceScheduler:
                 )
             ),
         ):
-            # The staged job's VRAM materialisation would over-commit the card against an idle sibling's
-            # still-resident weights: hold the dispatch (the job keeps its head-of-queue position) while the
-            # single reclaim owner evicts the idle residents, and re-ask next pass once the arbiter verifies the
-            # reclaimed room fits it. This is the seam where RAM-staged weights actually commit to VRAM, which
-            # neither the preload nor the second-sampler admission consult.
+            # The staged job's VRAM materialisation would over-commit the card. The job keeps its head-of-queue
+            # position and re-asks next pass. The decline reports the remedy the gate recorded for the hold, since a
+            # DENY on this card has no reclaim and a DEFER may be waiting on a grace or the probe rather than an
+            # eviction. This is the seam where RAM-staged weights commit to VRAM, which neither the preload nor
+            # the second-sampler admission consult.
             return withheld(
                 SlotDutyBucket.RESIDENCY_RECONCILIATION,
-                "its materialisation would over-commit the card until an idle resident is evicted, and it "
-                "dispatches once that eviction frees room",
+                residency_hold_detail(
+                    self._dispatch_holds.remedies.get(str(next_job.id_)) if next_job.id_ is not None else None,
+                ),
             )
 
         if self._retained_resident_dispatch_holds(next_job, process_with_model):

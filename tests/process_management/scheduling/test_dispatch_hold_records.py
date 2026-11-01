@@ -9,6 +9,9 @@ from __future__ import annotations
 
 from unittest.mock import Mock
 
+from loguru import logger
+
+from horde_worker_regen.analysis.log_signatures import SIGNATURES
 from horde_worker_regen.process_management.resources.run_metrics import DecisionKind, ResourceStateKind
 from horde_worker_regen.process_management.resources.vram_arbiter import DeviceVramState, VramArbiter
 from horde_worker_regen.process_management.scheduling.ledgers.dispatch_holds import (
@@ -131,6 +134,30 @@ async def test_a_ceiling_deny_on_the_only_card_is_not_live_on_its_first_pass() -
     assert liveness is not None and liveness.held_seconds == 0.0
     assert liveness.remedy is HoldRemedy.NONE
     assert scheduler.dispatch_hold_liveness_active() is False
+
+
+async def test_a_deny_hold_line_and_its_stall_summary_agree_that_nothing_is_reclaimed() -> None:
+    """The hold line and the stall summary read one ledger, so neither describes an eviction on a terminal DENY."""
+    scheduler, job, target = await _scheduler_without_sibling()
+    _install_cycle(scheduler, _card_below_any_candidate())
+    captured: list[str] = []
+    handler_id = logger.add(lambda message: captured.append(message.record["message"]), level="WARNING")
+    try:
+        assert scheduler._dispatch_residency_reconciliation_holds(job, target) is True
+    finally:
+        logger.remove(handler_id)
+
+    hold_lines = [match for line in captured if (match := SIGNATURES["dispatch_residency_hold"].pattern.search(line))]
+    assert len(hold_lines) == 1, captured
+    assert hold_lines[0].group("model") == "model_a"
+    assert hold_lines[0].group("reclaim") == (
+        "Nothing is being reclaimed for this hold and no remedy is left on this card"
+    )
+    assert "next verdicts a fit" not in hold_lines[0].string, "a hold with no remedy does not release on a verdict"
+
+    _bucket, reason = scheduler._classify_dispatch_stall(job, {})
+    assert SIGNATURES["dispatch_stall_reconcile_no_remedy"].pattern.search(reason) is not None, reason
+    assert "evict" not in reason
 
 
 async def test_a_defer_with_reclaim_accepted_is_live_to_the_bound() -> None:

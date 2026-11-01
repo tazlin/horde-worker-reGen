@@ -1500,6 +1500,20 @@ _DISPATCH_RECONCILE_REASON = (
     "VRAM): its materialisation would over-commit the card until an idle resident is evicted, and it "
     "dispatches once that eviction frees room"
 )
+# The same attribution for a hold whose latest pass left no remedy on its card, as the classifier words it from
+# the hold ledger's remedy (HoldRemedy.NONE): nothing is being freed there.
+_DISPATCH_RECONCILE_NO_REMEDY_REASON = (
+    "its model is resident and idle on process 1, but dispatch is held to reconcile residency: its "
+    "materialisation would over-commit the card, and the residency gate is holding the head with no remedy left "
+    "on this card"
+)
+_DISPATCH_REROUTE_LINE = (
+    "Rerouting Flux.1-Schnell fp8 (Compact) job ac53cbde off device 1: candidate exceeds this card's achievable "
+    "ceiling; no reclaim on this card can seat it (candidate 14573 MB against an achievable ceiling of 14061 MB "
+    "(total 16275 - noise 814 - foreign floor 1400); candidate 14573 MB vs available (device-free 13521 - "
+    "reservations 0 - noise 814) = 12707 MB: does NOT fit). Another card can seat it, so process 1's copy is "
+    "unloaded from RAM and the job is placed again by preload."
+)
 # The post-processing co-residency defer attribution (inference_scheduler._classify_dispatch_stall): the head
 # is resident and idle but an in-flight post-processing chain's committed VRAM and this job's sampling peak
 # cannot share the card, so dispatch is held until the chain finishes. A real named head-park (worth seeing as
@@ -2420,6 +2434,42 @@ class TestResidencyReconciliationHolds:
             ],
         )
         assert "residency_reconciliation_holds" not in _diagnose(tmp_path, bridge)
+
+    def test_a_hold_with_no_remedy_is_a_warning_and_not_read_as_unloading(self, tmp_path: Path) -> None:
+        """A hold that frees nothing on its card is not swap churn, so even one is a warning with its own headline."""
+        bridge = "\n".join(
+            [
+                f"2026-06-25 13:00:00.000 | DEBUG | hordelib.utils.logger:set_sinks:269 - {_STARTUP}",
+                self._reconcile("13:10:00.000"),
+                _dispatch_stall(
+                    "13:20:00.000",
+                    reason=_DISPATCH_RECONCILE_NO_REMEDY_REASON,
+                    model="Flux.1-Schnell fp8 (Compact)",
+                ),
+                "2026-06-25 13:50:00.000 | INFO | x:y:1 - Submitted generation abcd1234 for 50.00 kudos.",
+            ],
+        )
+        finding = _diagnose(tmp_path, bridge)["residency_reconciliation_holds"]
+        assert finding.severity is Severity.WARNING
+        assert finding.headline == (
+            "The worker paused 2 times before the next job, and in 1 pause it had nothing left to free on the card."
+        )
+        assert "report it" in finding.action
+        quoted = [line for line in finding.evidence if "Inference dispatch stalled" in line]
+        assert [line.split()[0] for line in quoted] == ["13:20:00"], "the evidence quotes the hold that frees nothing"
+
+    def test_reroutes_are_counted_in_the_evidence(self, tmp_path: Path) -> None:
+        """A held job moved to another card is counted, so the reader sees the hold ended by a reroute."""
+        bridge = "\n".join(
+            [
+                f"2026-06-25 13:00:00.000 | DEBUG | hordelib.utils.logger:set_sinks:269 - {_STARTUP}",
+                self._reconcile("13:10:00.000"),
+                f"2026-06-25 13:10:05.000 | WARNING | x:y:1 - {_DISPATCH_REROUTE_LINE}",
+                "2026-06-25 13:50:00.000 | INFO | x:y:1 - Submitted generation abcd1234 for 50.00 kudos.",
+            ],
+        )
+        finding = _diagnose(tmp_path, bridge)["residency_reconciliation_holds"]
+        assert "A held job was moved to another card once." in finding.evidence
 
 
 class TestPostProcessingVramStall:

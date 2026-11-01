@@ -17,7 +17,9 @@ from unittest.mock import Mock
 
 import pytest
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
+from loguru import logger
 
+from horde_worker_regen.analysis.log_signatures import SIGNATURES
 from horde_worker_regen.process_management.ipc.message_dispatcher import (
     _MIN_STRUCTURAL_QUEUE_WEDGE_SECONDS,
     DeadlockSnapshot,
@@ -531,8 +533,19 @@ class TestHeadProtectionIsBounded:
         scheduler._head_starved_seconds = Mock(  # type: ignore[method-assign]
             return_value=HEAD_PROTECTION_MAX_STARVE_SECONDS + 1.0,
         )
+        captured: list[str] = []
+        handler_id = logger.add(lambda message: captured.append(message.record["message"]), level="WARNING")
+        try:
+            assert scheduler._displaced_head_outstanding_mb(job, device_index=None) is None
+        finally:
+            logger.remove(handler_id)
 
-        assert scheduler._displaced_head_outstanding_mb(job, device_index=None) is None
+        releases = [
+            match for line in captured if (match := SIGNATURES["head_protection_released"].pattern.search(line))
+        ]
+        assert len(releases) == 1, captured
+        assert releases[0].group("model") == job.model
+        assert int(releases[0].group("parked")) == int(HEAD_PROTECTION_MAX_STARVE_SECONDS + 1.0)
 
 
 class TestHeadOnABusyLaneStopsReservingRoom:

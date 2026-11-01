@@ -1196,11 +1196,21 @@ class VramArbiter:
         if impossible:
             ceiling_mb = state.achievable_ceiling_mb() or 0.0
             whole_need_mb = _whole_need_mb(request)
+            overshoot_mb = whole_need_mb - ceiling_mb
+            allowance_mb = self._ceiling_attempt_allowance_mb(ceiling_mb)
+            # The two admitting branches of _ceiling_attempt_candidate_eligible, in its order.
+            admitted_by = (
+                f"within the {allowance_mb:.0f} MB allowance"
+                if overshoot_mb <= allowance_mb
+                else (
+                    f"past the {allowance_mb:.0f} MB allowance, admitted because the job is accepted work whose "
+                    f"resident weights ({request.candidate_weights_mb or 0.0:.0f} MB) fit the ceiling"
+                )
+            )
             logger.warning(
                 f"VRAM: attempting a measured load of head-of-queue {request.job_label}: predicted candidate "
                 f"{whole_need_mb:.0f} MB is above this card's achievable ceiling "
-                f"{ceiling_mb:.0f} MB by {whole_need_mb - ceiling_mb:.0f} MB, within the "
-                f"{self._ceiling_attempt_allowance_mb(ceiling_mb):.0f} MB allowance; the card is empty with "
+                f"{ceiling_mb:.0f} MB by {overshoot_mb:.0f} MB, {admitted_by}; the card is empty with "
                 "nothing left to reclaim, so one real load decides whether the prediction or the card is wrong. "
                 f"measured: {measured.reason()}",
             )

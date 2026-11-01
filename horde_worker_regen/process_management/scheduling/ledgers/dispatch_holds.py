@@ -75,8 +75,19 @@ _HOLD_REMEDY_PHRASES: dict[HoldRemedy, str] = {
     HoldRemedy.RECLAIM: "reclaiming room for the head",
     HoldRemedy.TEARDOWN_GRACE: "waiting out the grace before it tears down idle contexts",
     HoldRemedy.PROBE: "waiting on its measured-load probe",
-    HoldRemedy.NONE: "holding the head with no remedy left",
+    HoldRemedy.NONE: "holding the head with no remedy left on this card",
 }
+
+
+def residency_hold_detail(remedy: HoldRemedy | None) -> str:
+    """Why a residency-held job does not dispatch, for the dispatch decline and the stall summary.
+
+    ``remedy`` is the one the ledger recorded for the hold's latest pass. It is None when that pass did not leave a
+    hold standing, as when the gate unloaded the job's copy for a reroute.
+    """
+    if remedy is None:
+        return "its materialisation would over-commit the card"
+    return f"its materialisation would over-commit the card, and the residency gate is {remedy.phrase}"
 
 
 def hold_remedy(

@@ -568,6 +568,17 @@ _SIGNATURE_LIST: list[LogSignature] = [
         ),
         dry_run_reason=_NO_FAULT,
     ),
+    _signature(
+        "dispatch_hold_deferral_start",
+        r"Recovery is deferring to the head's dispatch hold \(held (?P<held>\d+)s of a (?P<bound>\d+)s liveness "
+        r"bound\): the residency gate is (?P<activity>.+?), so the idle card with pending work is not a wedge yet",
+        emitter="process_management.lifecycle.worker_recovery_coordinator:_note_dispatch_hold_deferral",
+        sample=(
+            "Recovery is deferring to the head's dispatch hold (held 44s of a 190s liveness bound): the residency "
+            "gate is waiting on its measured-load probe, so the idle card with pending work is not a wedge yet."
+        ),
+        dry_run_reason=_NO_FAULT,
+    ),
     # --- Inference process replacement ---
     _signature(
         "inference_lane_cuda_context_fault",
@@ -1002,9 +1013,8 @@ _SIGNATURE_LIST: list[LogSignature] = [
         emitter="process_management.scheduling.inference_scheduler:_log_dispatch_stall_if_needed",
         sample=(
             "Inference dispatch stalled: head ddd85050 (Z-Image-Turbo) has been parked 10s: its model is "
-            "resident and idle on process 10, but dispatch is held to reconcile residency (evicting idle "
-            "VRAM): its materialisation would over-commit the card until an idle resident is evicted, and it "
-            "dispatches once that eviction frees room."
+            "resident and idle on process 10, but dispatch is held to reconcile residency: its materialisation "
+            "would over-commit the card, and the residency gate is reclaiming room for the head."
         ),
         dry_run_reason=_NOT_DETERMINISTIC,
     ),
@@ -1024,9 +1034,8 @@ _SIGNATURE_LIST: list[LogSignature] = [
         r"held to reconcile residency",
         emitter="process_management.scheduling.inference_scheduler:_classify_dispatch_stall",
         sample=(
-            "its model is resident and idle on process 10, but dispatch is held to reconcile residency "
-            "(evicting idle VRAM): its materialisation would over-commit the card until an idle resident is "
-            "evicted, and it dispatches once that eviction frees room"
+            "its model is resident and idle on process 10, but dispatch is held to reconcile residency: its "
+            "materialisation would over-commit the card, and the residency gate is reclaiming room for the head"
         ),
         dry_run_reason=_NOT_DETERMINISTIC,
         field_of="dispatch_stall",
@@ -1130,6 +1139,51 @@ _SIGNATURE_LIST: list[LogSignature] = [
             "pool again."
         ),
         dry_run_reason=_WHOLE_CARD_NOT_EXERCISED,
+    ),
+    # The stall summary for a residency hold whose latest pass left no remedy on its card: the remedy phrase is
+    # HoldRemedy.NONE's, so a detector can tell a hold that frees nothing from swap churn.
+    _signature(
+        "dispatch_stall_reconcile_no_remedy",
+        r"held to reconcile residency: .*no remedy left on this card",
+        emitter="process_management.scheduling.inference_scheduler:_classify_dispatch_stall",
+        sample=(
+            "its model is resident and idle on process 1, but dispatch is held to reconcile residency: its "
+            "materialisation would over-commit the card, and the residency gate is holding the head with no "
+            "remedy left on this card"
+        ),
+        dry_run_reason=_MULTI_CARD_NOT_EXERCISED,
+        field_of="dispatch_stall",
+    ),
+    _signature(
+        "dispatch_residency_hold",
+        r"Holding dispatch of (?P<model>.+?) to reconcile residency: (?P<verdict>.+?)\. "
+        r"(?P<reclaim>Evicting idle VRAM|Reclaim was proposed but no actuator accepted it|"
+        r"Nothing is being reclaimed for this hold and no remedy is left on this card|"
+        r"Nothing is being reclaimed for this hold)",
+        emitter="process_management.scheduling.inference_scheduler:_dispatch_residency_reconciliation_holds",
+        sample=(
+            "Holding dispatch of Flux.1-Schnell fp8 (Compact) to reconcile residency: candidate exceeds this card's "
+            "achievable ceiling; no reclaim on this card can seat it (candidate 14548 MB against an achievable "
+            "ceiling of 14130 MB (total 16275 - noise 814 - foreign floor 1331); candidate 14548 MB vs available "
+            "(device-free 14388 - reservations 0 - noise 814) = 13574 MB: does NOT fit). Nothing is being "
+            "reclaimed for this hold and no remedy is left on this card, so recovery reads the queue on its own "
+            "terms. Room: short 974 MB (not "
+            "closable); tenancy MB: inference_target 398, foreign 1489; noise 814; rungs MB: none; unpausable "
+            "1489. Held 0.0s, head starved 0.0s, probe waiting_10s, whole-card intent standing."
+        ),
+        dry_run_reason=_NOT_DETERMINISTIC,
+    ),
+    _signature(
+        "head_protection_released",
+        r"Head (?P<job>\S+) \((?P<model>.+?)\) has been parked (?P<parked>\d+)s without dispatching, so it no "
+        r"longer reserves card room from the jobs behind it",
+        emitter="process_management.scheduling.inference_scheduler:_note_head_protection_released",
+        sample=(
+            "Head 8dc9287e (Flux.1-Schnell fp8 (Compact)) has been parked 120s without dispatching, so it no "
+            "longer reserves card room from the jobs behind it; a fitting sibling may dispatch. The head keeps its "
+            "queue position."
+        ),
+        dry_run_reason=_NOT_DETERMINISTIC,
     ),
     # --- Stream forecast ---
     _signature(

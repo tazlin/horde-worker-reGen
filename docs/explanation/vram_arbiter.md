@@ -1215,6 +1215,17 @@ The room is also what the other frames read, so they cannot disagree with the ve
   latest hold has no remedy, neither whole-card demand path grants it a new residency. The release can open
   the 60 s restore window when it respawns siblings or restarts a paused lane, and that window still defers
   recovery for the respawn.
+- **Every log line about a hold states the remedy recorded in the hold ledger.** The dispatch decline, the
+  `Inference dispatch stalled` summary and the recovery deferral line all use `HoldRemedy.phrase` (the first
+  two through `residency_hold_detail`). A hold whose latest pass reclaimed nothing never reads as an eviction
+  under way, and a hold with no remedy says so. The `Holding dispatch of ... to reconcile residency` line says
+  that a later verdict releases the hold only while a remedy is live. The stall summary reads the concurrency cap in the scope the
+  dispatch used (`InferenceScheduler._dispatch_cap_card`). On a multi-card worker that is the head's own card,
+  or the whole worker while another job's exclusive admit holds that card. The text gives the card number in
+  either case.
+- **The measured-attempt line states which branch admitted the attempt.** An overshoot inside the ceiling
+  allowance reads "within the allowance". An accepted job whose resident weights fit the ceiling earns its
+  attempt past the allowance, and the line says so.
 
 The admission margin itself is platform-aware (`vram_admission_noise_mb`): the physics buffer on WDDM, half
 of it where the NVML reading is device-wide, with the operator's override winning whole. The device-free

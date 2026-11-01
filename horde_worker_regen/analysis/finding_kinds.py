@@ -625,7 +625,8 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
             "model. The worker unloads that neighbour first and waits for the room to appear. Each pause is a "
             "swap paid for holding more models than the card fits at peak. A few are normal. Many are a "
             "throughput cost, and a pause that never clears means the room never came and something else "
-            "had to break the stall."
+            "had to break the stall. A pause with nothing left to free ends only when the card frees room by "
+            "itself or the job moves to another card."
         ),
         see_also=FindingKind.HEAD_DISPATCH_STALL,
     ),

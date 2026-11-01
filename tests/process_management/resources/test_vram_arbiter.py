@@ -9,6 +9,7 @@ those quantities are physically inside the device-free reading.
 from __future__ import annotations
 
 import pytest
+from loguru import logger
 
 from horde_worker_regen.process_management.resources.admission_identity import (
     admission_noise_buffer_mb,
@@ -1601,6 +1602,46 @@ class TestCeilingMeasuredAttempt:
 
         assert verdict.disposition == VramDisposition.FITS
         assert verdict.measured_attempt is True
+
+    @pytest.mark.parametrize(
+        ("overshoot_mb", "accepted_work", "expected"),
+        [
+            pytest.param(320.0, False, "by 320 MB, within the 768 MB allowance;", id="allowance"),
+            pytest.param(
+                1768.0,
+                True,
+                "by 1768 MB, past the 768 MB allowance, admitted because the job is accepted work whose resident "
+                "weights (6680 MB) fit the ceiling;",
+                id="accepted_work",
+            ),
+        ],
+    )
+    def test_the_attempt_line_names_the_branch_that_admitted_it(
+        self,
+        overshoot_mb: float,
+        accepted_work: bool,
+        expected: str,
+    ) -> None:
+        """An overshoot past the allowance is not described as within it when accepted work's weights admitted it."""
+        captured: list[str] = []
+        handler_id = logger.add(lambda message: captured.append(message.record["message"]), level="WARNING")
+        try:
+            arbiter = VramArbiter()
+            arbiter.begin_cycle(_snapshot(self._card()))
+            verdict = arbiter.evaluate(
+                self._head(
+                    candidate_delta_mb=self._CEILING_MB + overshoot_mb,
+                    candidate_weights_mb=self._CEILING_MB - 1000.0,
+                    accepted_work=accepted_work,
+                )
+            )
+        finally:
+            logger.remove(handler_id)
+
+        assert verdict.measured_attempt is True
+        attempts = [line for line in captured if line.startswith("VRAM: attempting a measured load")]
+        assert len(attempts) == 1, captured
+        assert expected in attempts[0], attempts[0]
 
     def test_tracker_owned_spent_receipt_survives_arbiter_replacement(self) -> None:
         """A fresh arbiter still refuses a job/card pair whose tracker receipt says the attempt was spent."""

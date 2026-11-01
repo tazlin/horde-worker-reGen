@@ -23,8 +23,13 @@ import pytest
 
 from horde_worker_regen.analysis.finding_kinds import FINDING_SPECS, Finding, FindingKind
 from horde_worker_regen.bridge_data.data_model import reGenBridgeData
-from tests.analysis.test_detector_contract import CONTRACTS
-from tests.analysis.test_detectors import _diagnose
+from tests.analysis.test_detector_contract import CONTRACTS, _bridge
+from tests.analysis.test_detectors import (
+    _DISPATCH_RECONCILE_NO_REMEDY_REASON,
+    _DISPATCH_REROUTE_LINE,
+    _diagnose,
+    _dispatch_stall,
+)
 
 _MAX_WORDS_PLAIN = 25
 _MAX_WORDS_DETAIL = 30
@@ -239,6 +244,21 @@ def test_the_emitted_copy_follows_the_guide(detector_name: str, tmp_path: Path) 
         pytest.skip(f"{detector_name}: no emitted kind rewritten yet")
     problems = [f"{finding.id}: {problem}" for finding in checked for problem in _emit_problems(finding)]
     assert not problems, "\n".join(problems)
+
+
+def test_the_no_remedy_hold_copy_follows_the_guide(tmp_path: Path) -> None:
+    """The residency-hold finding's headline for a hold with nothing left to free reads as the guide asks.
+
+    The golden fixture covers the swap-churn wording only, so the no-remedy wording and the reroute evidence are
+    run here on their own fixture.
+    """
+    bridge = _bridge(
+        _dispatch_stall("18:30:00.000", reason=_DISPATCH_RECONCILE_NO_REMEDY_REASON, parked=40),
+        f"2026-06-25 18:30:05.000 | WARNING | x:y:1 - {_DISPATCH_REROUTE_LINE}",
+    )
+    finding = _diagnose(tmp_path, bridge)["residency_reconciliation_holds"]
+    assert "nothing left to free" in finding.headline
+    assert not _emit_problems(finding), "\n".join(_emit_problems(finding))
 
 
 def test_the_pending_list_names_only_declared_kinds() -> None:

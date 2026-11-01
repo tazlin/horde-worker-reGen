@@ -202,7 +202,9 @@ _DISPATCH_STALL_BUG_RE = pattern_for("dispatch_stall_no_gate")
 # clearing swap-churn wait, not a scheduler bug, so it is excluded from the gate-less-stall detector and
 # surfaced on its own as a GPU-uptime duty cost. The model and parked seconds ride the stall wrapper.
 _DISPATCH_STALL_RECONCILE_RE = pattern_for("dispatch_stall_reconcile")
+_DISPATCH_STALL_RECONCILE_NO_REMEDY_RE = pattern_for("dispatch_stall_reconcile_no_remedy")
 _DISPATCH_STALL_FIELDS_RE = pattern_for("dispatch_stall_fields")
+_DISPATCH_REROUTE_RE = pattern_for("dispatch_reroute_retire")
 # The whole-card residency convergence deadlock: a heavy head is pre-staged and waiting for sole residency,
 # but an idle sibling holds a model that is still queued behind it, so the scale-down guard protects that
 # sibling from the teardown and the residency never collapses. The head is parked until the recovery
@@ -4036,6 +4038,10 @@ def detect_residency_reconciliation_holds(context: SessionContext) -> list[Findi
     :data:`_RECONCILE_HOLD_PARKED_FRACTION_WARNING`). The per-hold parked seconds are read off the stall
     wrapper; because the parked-head log is throttled, the cumulative figure is a sample of the true parked
     time, not an exact total.
+
+    A stall line whose hold has no remedy left on its card is also a warning, with its own headline. Those holds
+    do not free anything, so the swap-churn reading does not apply to them. Reroutes off a card that cannot seat
+    the job are counted in the evidence.
     """
     holds = [
         r
@@ -4076,27 +4082,35 @@ def detect_residency_reconciliation_holds(context: SessionContext) -> list[Findi
         else []
     )
     wedged = bool(wedge_lines)
-    escalated = escalated or wedged
+    # A hold recorded with no remedy left does not free anything on its card. Those pauses were not unloading
+    # idle models, so they get their own headline and the report-it advice.
+    no_remedy = [record for record in holds if _DISPATCH_STALL_RECONCILE_NO_REMEDY_RE.search(record.message)]
+    reroutes = _matching(context.session.records, _DISPATCH_REROUTE_RE)
+    escalated = escalated or wedged or bool(no_remedy)
 
     model_breakdown = ", ".join(
         f"{model} x{count}" for model, count in sorted(per_model.items(), key=lambda kv: -kv[1])
     )
+    if no_remedy:
+        headline = (
+            f"The worker paused {_times_text(len(holds))} before the next job, and in "
+            f"{_count_text(len(no_remedy), 'pause')} it had nothing left to free on the card."
+        )
+    else:
+        headline = f"The worker paused {_times_text(len(holds))} to unload an idle model before the next job" + (
+            f", with {_count_text(len(wedge_lines), 'stall or recovery line')} logged in that time."
+            if wedged
+            else f", about {holds_per_hour:.0f} an hour and {parked_seconds_total:.0f} seconds in total."
+        )
     return [
         Finding(
             kind=FindingKind.RESIDENCY_RECONCILIATION_HOLDS,
             severity=Severity.WARNING if escalated else Severity.INFO,
-            headline=(
-                f"The worker paused {_times_text(len(holds))} to unload an idle model before the next job"
-                + (
-                    f", with {_count_text(len(wedge_lines), 'stall or recovery line')} logged in that time."
-                    if wedged
-                    else f", about {holds_per_hour:.0f} an hour and {parked_seconds_total:.0f} seconds in total."
-                )
-            ),
+            headline=headline,
             action_addendum=(
                 "Something held the card that no job finishing gives back. Capture the log around the pause "
                 "and report it."
-                if wedged
+                if wedged or no_remedy
                 else (
                     "Serve fewer models at once, or lower `max_threads` or `queue_size`, so the card is not "
                     "packed past what fits at peak."
@@ -4116,7 +4130,12 @@ def detect_residency_reconciliation_holds(context: SessionContext) -> list[Findi
                 if wedged
                 else []
             )
-            + [_evidence(r) for r in holds[:3]],
+            + (
+                [f"A held job was moved to another card {_times_text(len(reroutes))}.", _evidence(reroutes[0])]
+                if reroutes
+                else []
+            )
+            + [_evidence(r) for r in (no_remedy or holds)[:3]],
         ),
     ]
 

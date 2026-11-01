@@ -13,6 +13,7 @@ from unittest.mock import Mock
 import pytest
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 
+from horde_worker_regen.analysis.log_signatures import SIGNATURES
 from horde_worker_regen.process_management.config.worker_state import WorkerState
 from horde_worker_regen.process_management.ipc.messages import (
     HordeControlFlag,
@@ -36,7 +37,7 @@ from horde_worker_regen.process_management.scheduling.dispatch_affinity import (
     record_affinity_skip,
 )
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
-from horde_worker_regen.process_management.scheduling.ledgers.dispatch_holds import DispatchDecline
+from horde_worker_regen.process_management.scheduling.ledgers.dispatch_holds import DispatchDecline, HoldRemedy
 from horde_worker_regen.process_management.scheduling.slot_duty import SlotDutyBucket
 from tests.process_management.conftest import (
     make_job_pop_response,
@@ -946,6 +947,79 @@ class TestWorkerWideConcurrencyCeiling:
             card.target_process_count for card in manager._card_runtimes.values()
         )
         assert manager._inference_scheduler.snapshot().max_inference_processes == manager.max_inference_processes
+
+
+class TestStallTextNamesTheCapThatHeldTheHead:
+    """On a multi-card worker the stall text reads the cap in the scope the dispatch used, and names the card.
+
+    A worker-wide figure on a two-card host with one thread per card described a cap of 1 that the dispatch never
+    applied to the head. The dispatch scopes the cap to the head's card, so the text has to as well.
+    """
+
+    async def test_an_exclusive_head_on_an_idle_card_is_not_reported_at_a_worker_wide_cap(self) -> None:
+        """A job running on card 0 does not cap an exclusively-admitted head whose own card 1 runs nothing."""
+        sibling_lane = _lane(0, device_index=0, model="model_a")
+        process_map = ProcessMap({0: sibling_lane, 1: _lane(1, device_index=1, model="model_b")})
+        scheduler = _make_scheduler(process_map=process_map, card_runtimes=_uniform_cards(2), max_threads=1)
+        sibling, head = await _queue(scheduler, "model_a", "model_b")
+        await _seat(scheduler, sibling, sibling_lane)
+        scheduler._job_tracker.mark_admitted_exclusive(head, device_index=1)
+        scheduler.dispatch_holds.note_hold(
+            str(head.id_),
+            reclaim_applied=False,
+            room_inputs=None,
+            remedy=HoldRemedy.NONE,
+        )
+
+        bucket, reason = scheduler._classify_dispatch_stall(head, {})
+
+        assert bucket is SlotDutyBucket.RESIDENCY_RECONCILIATION, reason
+        assert "concurrency cap" not in reason
+        assert SIGNATURES["dispatch_stall_reconcile_no_remedy"].pattern.search(reason) is not None, reason
+
+    async def test_an_exclusive_job_on_the_heads_card_is_named_with_that_card(self) -> None:
+        """Another job's exclusive admit on the head's card widens the scope, and the text names the card."""
+        exclusive_lane = _lane(2, device_index=1, model="model_c")
+        process_map = ProcessMap(
+            {
+                0: _lane(0, device_index=0, model="model_a"),
+                1: _lane(1, device_index=1, model="model_b"),
+                2: exclusive_lane,
+            },
+        )
+        scheduler = _make_scheduler(
+            process_map=process_map,
+            card_runtimes=_uniform_cards(2, max_concurrent_inference=2),
+            max_threads=2,
+        )
+        exclusive_job, head = await _queue(scheduler, "model_c", "model_b")
+        await _seat(scheduler, exclusive_job, exclusive_lane)
+        scheduler._job_tracker.mark_admitted_exclusive(exclusive_job, device_index=1)
+
+        bucket, reason = scheduler._classify_dispatch_stall(head, {})
+
+        assert bucket is SlotDutyBucket.EXCLUSIVE_ISOLATION, reason
+        assert "an exclusively-admitted over-budget job holds card 1" in reason
+        assert "(in_progress=1, cap=1)" in reason
+
+    async def test_a_full_card_is_named_at_its_own_cap(self) -> None:
+        """A head whose own card is at its cap is reported against that card's count and cap."""
+        busy_lane = _lane(2, device_index=1, model="model_c")
+        process_map = ProcessMap(
+            {
+                0: _lane(0, device_index=0, model="model_a"),
+                1: _lane(1, device_index=1, model="model_b"),
+                2: busy_lane,
+            },
+        )
+        scheduler = _make_scheduler(process_map=process_map, card_runtimes=_uniform_cards(2), max_threads=1)
+        running, head = await _queue(scheduler, "model_c", "model_b")
+        await _seat(scheduler, running, busy_lane)
+
+        bucket, reason = scheduler._classify_dispatch_stall(head, {})
+
+        assert bucket is SlotDutyBucket.CONCURRENCY_CAP, reason
+        assert "card 1 is at its own concurrency cap (on_card=1, cap=1)" in reason
 
 
 class TestCrossCardDispatch:

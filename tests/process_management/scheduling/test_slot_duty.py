@@ -17,8 +17,10 @@ import dataclasses
 import time
 from unittest.mock import Mock, patch
 
+import pytest
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse, LorasPayloadEntry
 
+from horde_worker_regen.analysis.log_signatures import SIGNATURES
 from horde_worker_regen.process_management.ipc.messages import HordeProcessState
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
@@ -27,6 +29,7 @@ from horde_worker_regen.process_management.scheduling import inference_scheduler
 from horde_worker_regen.process_management.scheduling.dispatch_affinity import AffinitySkipState
 from horde_worker_regen.process_management.scheduling.governance.preload_admission import AdmissionDecision
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
+from horde_worker_regen.process_management.scheduling.ledgers.dispatch_holds import HoldRemedy
 from horde_worker_regen.process_management.scheduling.slot_duty import SlotDutyAccumulator, SlotDutyBucket
 from tests.process_management.conftest import (
     make_job_pop_response,
@@ -258,6 +261,39 @@ class TestSchedulerClassifierBuckets:
         assert bucket is SlotDutyBucket.RESIDENCY_RECONCILIATION
         assert "reconcile residency" in text
         assert "no matching gate" not in text
+
+    @pytest.mark.parametrize("remedy", list(HoldRemedy), ids=lambda remedy: remedy.value)
+    async def test_reconcile_text_names_the_remedy_the_ledger_recorded(self, remedy: HoldRemedy) -> None:
+        """The stall text says what the gate is doing about the hold, read from the hold ledger.
+
+        A hold with nothing reclaimed must not read as an eviction under way, and the registered signatures
+        must still read the formatted line: the reconcile phrase for every remedy, and the no-remedy phrase only
+        for a hold with no remedy left.
+        """
+        job_tracker = JobTracker()
+        head = make_job_pop_response(model="model-a")
+        await job_tracker.record_popped_job(head)
+        holder = make_mock_process_info(1, model_name="model-a", state=HordeProcessState.PRELOADED_MODEL)
+        horde_model_map = HordeModelMap(root={})
+        horde_model_map.update_entry(horde_model_name="model-a", load_state=ModelLoadState.LOADED_IN_RAM, process_id=1)
+        scheduler = self._scheduler(ProcessMap({1: holder}), horde_model_map, job_tracker)
+        scheduler.dispatch_holds.note_hold(
+            str(head.id_),
+            reclaim_applied=remedy is HoldRemedy.RECLAIM,
+            room_inputs=None,
+            remedy=remedy,
+        )
+
+        bucket, text = scheduler._classify_dispatch_stall(head, {})
+        line = f"Inference dispatch stalled: head {str(head.id_)[:8]} (model-a) has been parked 30s: {text}."
+
+        assert bucket is SlotDutyBucket.RESIDENCY_RECONCILIATION
+        assert text.endswith(remedy.phrase), text
+        assert "evicting idle VRAM" not in text
+        assert SIGNATURES["dispatch_stall"].pattern.search(line) is not None
+        assert SIGNATURES["dispatch_stall_reconcile"].pattern.search(line) is not None
+        no_remedy = SIGNATURES["dispatch_stall_reconcile_no_remedy"].pattern.search(line) is not None
+        assert no_remedy is (remedy is HoldRemedy.NONE)
 
     async def test_post_processing_deferred_head_classifies_post_processing_defer(self) -> None:
         """A PP-deferred resident head is named POST_PROCESSING_DEFER, not gate-less UNEXPLAINED.

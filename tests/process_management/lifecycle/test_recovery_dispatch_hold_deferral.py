@@ -168,6 +168,10 @@ def test_the_deferral_line_names_the_live_remedy() -> None:
     started = [line for line in captured if line.startswith("Recovery is deferring")]
     assert len(started) == 1
     assert HoldRemedy.RECLAIM.phrase in started[0]
+    match = SIGNATURES["dispatch_hold_deferral_start"].pattern.search(started[0])
+    assert match is not None and match.group("activity") == HoldRemedy.RECLAIM.phrase, (
+        "the registered signature no longer reads the line"
+    )
 
 
 @pytest.mark.parametrize(
