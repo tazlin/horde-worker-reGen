@@ -14,7 +14,7 @@ import subprocess
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
-from worker_bootstrap import paths, utilities_env
+from worker_bootstrap import paths, utilities_env, uvbin
 
 
 def build_child_env(root: Path | None = None) -> dict[str, str]:
@@ -49,6 +49,12 @@ def build_child_env(root: Path | None = None) -> dict[str, str]:
     git_cmd_dir = paths.git_cmd_dir(root)
     if git_cmd_dir.is_dir():
         env["PATH"] = os.pathsep.join([str(git_cmd_dir), env.get("PATH", "")])
+    # Put the pinned bundled uv first on PATH under the plain name `uv`. A shell script run through `uv run`
+    # (install_amd_go_fast.sh) or a dependency's subprocess that calls a bare `uv` would otherwise reach a
+    # system uv, which then refuses the project's exact required-version pin.
+    shim_dir = uvbin.ensure_uv_shim(root)
+    if shim_dir is not None:
+        env["PATH"] = os.pathsep.join([str(shim_dir), env.get("PATH", "")])
     return env
 
 

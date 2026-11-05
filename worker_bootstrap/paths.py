@@ -37,6 +37,16 @@ def bin_dir(root: Path | None = None) -> Path:
     return (root or install_root()) / "bin"
 
 
+def uv_shim_dir(root: Path | None = None) -> Path:
+    """Return the directory (``bin/uv-shim``) that holds only the resolved uv under the plain name ``uv``.
+
+    It is prepended to every child's PATH so a bare ``uv`` in a script or a dependency's subprocess
+    resolves to the pinned bundled binary. ``bin/`` itself is never put on PATH, because a managed update can
+    leave a stale ``bin/uv`` next to the versioned sidecar that the bootstrap actually runs.
+    """
+    return bin_dir(root) / "uv-shim"
+
+
 def uv_cache_dir(root: Path | None = None) -> Path:
     """Return uv's package cache directory, in the peered data dir (preserved across worker reinstalls)."""
     return data_root(root) / "uv_cache"

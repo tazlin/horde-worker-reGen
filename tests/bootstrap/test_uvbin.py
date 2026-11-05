@@ -183,3 +183,45 @@ def test_publish_filesystem_failure_becomes_actionable_error(
 
     with pytest.raises(uvbin.UvCompatibilityError, match="Could not publish the worker's private uv"):
         uvbin._download_verified_uv("0.12.1", blocked_parent / "uv.exe", probe_directory=tmp_path)
+
+
+def _shim_path(root: Path) -> Path:
+    """Return the platform-specific shim path under ``bin/uv-shim``."""
+    return root / "bin" / "uv-shim" / ("uv.exe" if os.name == "nt" else "uv")
+
+
+def test_ensure_uv_shim_publishes_the_versioned_sidecar(tmp_path: Path) -> None:
+    """The shim resolves to the pinned sidecar, never the stale plain ``bin/uv`` beside it."""
+    _write_project(tmp_path)
+    bundled = _bundled_path(tmp_path)
+    bundled.parent.mkdir(parents=True)
+    bundled.write_bytes(b"stale-private-uv")
+    sidecar = bundled.parent / ("uv-0.12.1.exe" if os.name == "nt" else "uv-0.12.1")
+    sidecar.write_bytes(b"pinned-sidecar")
+
+    assert uvbin.ensure_uv_shim(tmp_path) == tmp_path / "bin" / "uv-shim"
+    assert _shim_path(tmp_path).read_bytes() == b"pinned-sidecar"
+
+
+def test_ensure_uv_shim_follows_a_changed_resolution(tmp_path: Path) -> None:
+    """When the resolved uv changes, the shim is replaced on the next call."""
+    _write_project(tmp_path)
+    bundled = _bundled_path(tmp_path)
+    bundled.parent.mkdir(parents=True)
+    bundled.write_bytes(b"first")
+    assert uvbin.ensure_uv_shim(tmp_path) is not None
+    assert _shim_path(tmp_path).read_bytes() == b"first"
+
+    sidecar = bundled.parent / ("uv-0.12.1.exe" if os.name == "nt" else "uv-0.12.1")
+    sidecar.write_bytes(b"second-and-longer")
+    assert uvbin.ensure_uv_shim(tmp_path) is not None
+    assert _shim_path(tmp_path).read_bytes() == b"second-and-longer"
+
+
+def test_ensure_uv_shim_skips_a_path_resolved_uv(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A dev checkout that resolves uv from PATH does not get a shim, since a bare ``uv`` already reaches it."""
+    _write_project(tmp_path)
+    monkeypatch.setattr(uvbin.shutil, "which", lambda name: str(tmp_path / "developer-uv"))
+
+    assert uvbin.ensure_uv_shim(tmp_path) is None
+    assert not _shim_path(tmp_path).exists()

@@ -269,3 +269,46 @@ def uv_executable(root: Path | None = None) -> str:
     if bundled.exists():
         return str(bundled)
     return shutil.which("uv") or name
+
+
+def _shim_matches(shim: Path, target: Path) -> bool:
+    """Return True when *shim* already resolves to *target* (a link to it, or a byte-identical copy)."""
+    try:
+        if shim.is_symlink():
+            return shim.resolve() == target.resolve()
+        shim_stat = shim.stat()
+        target_stat = target.stat()
+    except OSError:
+        return False
+    return shim_stat.st_size == target_stat.st_size and int(shim_stat.st_mtime) == int(target_stat.st_mtime)
+
+
+def ensure_uv_shim(root: Path | None = None) -> Path | None:
+    """Publish the resolved bundled uv as ``<uv_shim_dir>/uv[.exe]`` and return the shim directory.
+
+    Returns None when uv is resolved from PATH (a dev checkout), since a bare ``uv`` already reaches that
+    binary and a copy would only go stale. The shim is a symlink where the platform allows one and a copy
+    otherwise, replaced atomically whenever the resolved binary changes, so a version bump is reflected on
+    the next child launch. Any failure to publish returns None rather than failing the launch. The shim only
+    serves bare ``uv`` callers, and every bootstrap call still uses the resolved path directly.
+    """
+    install_root = paths.install_root() if root is None else root
+    target = Path(uv_executable(install_root))
+    if not target.is_absolute() or paths.bin_dir(install_root) not in target.parents:
+        return None
+    shim_dir = paths.uv_shim_dir(install_root)
+    shim = shim_dir / ("uv.exe" if os.name == "nt" else "uv")
+    if _shim_matches(shim, target):
+        return shim_dir
+    try:
+        shim_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=shim_dir) as tmp:
+            staged = Path(tmp) / shim.name
+            try:
+                staged.symlink_to(target)
+            except OSError:
+                shutil.copy2(target, staged)
+            os.replace(staged, shim)
+    except OSError:
+        return None
+    return shim_dir

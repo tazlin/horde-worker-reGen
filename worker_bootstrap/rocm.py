@@ -169,5 +169,5 @@ def sync_rocm(uv: str, *, root: Path | None = None, hold: bool = False, token: s
 
     amd_go_fast = root / "horde_worker_regen" / "amd_go_fast" / "install_amd_go_fast.sh"
     if amd_go_fast.exists():
-        return runner.uv_run(uv, [str(amd_go_fast)], root=root)
+        return runner.uv_run(uv, [str(amd_go_fast), uv], root=root)
     return 0

@@ -330,3 +330,15 @@ def test_run_uv_keeps_waiting_through_keyboard_interrupt(
 
     assert rc == 0  # the child's real exit code, returned after the interrupts were absorbed
     assert fake.wait_calls == 3  # two interrupted waits, then the one that returned
+
+
+def test_build_child_env_prepends_uv_shim(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A bundled uv is published under the plain name `uv` and put first on PATH for every child."""
+    monkeypatch.setenv("PATH", "/existing/path")
+    monkeypatch.setattr(runner.uvbin, "ensure_uv_shim", lambda root: None)
+    assert str(paths.uv_shim_dir(tmp_path)) not in runner.build_child_env(tmp_path)["PATH"]
+
+    monkeypatch.setattr(runner.uvbin, "ensure_uv_shim", lambda root: paths.uv_shim_dir(root))
+    path = runner.build_child_env(tmp_path)["PATH"]
+    assert path.split(os.pathsep)[0] == str(paths.uv_shim_dir(tmp_path))
+    assert "/existing/path" in path

@@ -23,8 +23,11 @@ def test_linux_rocm_install_keeps_stable_overlay_shape(monkeypatch: pytest.Monke
     calls: list[tuple[str, object]] = []
     monkeypatch.setattr(rocm.runner, "uv_sync", lambda uv, extra, **kw: calls.append(("sync", extra)) or 0)
     monkeypatch.setattr(rocm.runner, "run_uv", lambda uv, args, **kw: calls.append(("pip", args)) or 0)
-    monkeypatch.setattr(rocm.runner, "uv_run", lambda uv, command, **kw: 0)
+    monkeypatch.setattr(rocm.runner, "uv_run", lambda uv, command, **kw: calls.append(("run", command)) or 0)
     monkeypatch.setattr(rocm, "_patch_wsl_libhsa", lambda root: None)
+    amd_go_fast = tmp_path / "horde_worker_regen" / "amd_go_fast" / "install_amd_go_fast.sh"
+    amd_go_fast.parent.mkdir(parents=True)
+    amd_go_fast.write_text("", encoding="utf-8")
 
     assert rocm.sync_rocm("UV", root=tmp_path, token=detect.ROCM) == 0
 
@@ -45,6 +48,8 @@ def test_linux_rocm_install_keeps_stable_overlay_shape(monkeypatch: pytest.Monke
             ],
         ),
         ("pip", ["pip", "uninstall", "pynvml", "nvidia-ml-py"]),
+        # The resolved uv is handed to the script so its own `uv pip` calls never reach a system uv.
+        ("run", [str(amd_go_fast), "UV"]),
     ]
 
 
