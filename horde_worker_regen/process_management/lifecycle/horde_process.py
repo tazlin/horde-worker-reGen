@@ -556,13 +556,15 @@ class HordeProcess(abc.ABC):
         ram_private_peak_bytes: int | None = None,
         *,
         clearance_wait_entry: bool = False,
+        clearance_wait_job_id: str | None = None,
     ) -> bool:
         """Send a memory report message to the main process.
 
         Args:
             include_vram (bool, optional): Whether to include VRAM usage in the message. Defaults to False.
             ram_private_peak_bytes (int | None, optional): The private-RAM peak of a load this report completes.
-            clearance_wait_entry (bool, optional): Whether the report marks the start of a clearance wait.
+            clearance_wait_entry (bool, optional): Whether the report is the job's encode boundary.
+            clearance_wait_job_id (str | None, optional): The job of that boundary, or None.
         """
         process = psutil.Process()
         private_bytes = private_ram_usage_bytes(process)
@@ -580,6 +582,7 @@ class HordeProcess(abc.ABC):
             device_index=self.device_index,
             sampled_at=time.time(),
             clearance_wait_entry=clearance_wait_entry,
+            clearance_wait_job_id=clearance_wait_job_id,
         )
 
         try:

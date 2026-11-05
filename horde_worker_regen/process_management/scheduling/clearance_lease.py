@@ -141,9 +141,11 @@ class ClearanceLeaseProxy:
     the room the parent priced. The child reads it on the same acquire and serves it once through
     :meth:`take_cleared_sampling_reserve_mb`. The parent does not refresh it, since the figure belongs to the job.
 
-    The child can also register a wait-entry callback (:meth:`set_wait_entry_callback`), run before a job's first
-    acquire of each permit blocks. The parent prices a staged child net of its last reported reservation, so the
-    child reports memory there rather than leaving the parent on a reading from before it staged.
+    The child can also register a wait-entry callback (:meth:`set_wait_entry_callback`), run once per job on the
+    first acquire of either permit, before the permit is probed. hordelib releases the text encoder just before
+    that acquire, so the callback's report is the job's encode boundary. The parent books the job's
+    sampling charge against that report, and the report arrives whether the acquire then waits or takes a waiting
+    grant.
 
     Built with a ``stage`` semaphore, the proxy also exposes :attr:`stage_lease`, the view the child registers
     as hordelib's stage lease. The stage permit, its consumed flag and its shared figure follow the clearance
@@ -155,9 +157,11 @@ class ClearanceLeaseProxy:
     """
 
     _wait_entry_callback: Callable[[], None] | None = None
-    """Child-local hook run before a job's first acquire blocks. A class-level default rather than an
-    ``__init__`` field, so a proxy pickled across the spawn boundary never carries it and one built before it
-    existed still reads None."""
+    """Child-local hook run on a job's first acquire. A class-level default, so
+    a proxy pickled across the spawn boundary does not include it and one built before it existed still reads
+    None."""
+    _boundary_reported: bool = False
+    """Whether the wait-entry callback has run for the current job. Child-local and reset by :meth:`begin_job`."""
 
     def __init__(
         self,
@@ -231,9 +235,8 @@ class ClearanceLeaseProxy:
         proceeds to sample unpriced (hordelib's degraded path), and its remaining samples must not each pay
         the timeout again. :meth:`begin_job` clears the flag for the next job.
 
-        A blocking first acquire probes for a permit before it waits: a grant already waiting is taken at once,
-        and otherwise the wait-entry callback runs and the acquire blocks for what is left of ``timeout``, so
-        the callback never lengthens the total wait.
+        The job's first acquire of either permit runs the wait-entry callback before it takes the permit, and the
+        acquire then blocks for what is left of ``timeout``, so the callback does not lengthen the total wait.
         """
         if self._grant_consumed:
             return True
@@ -248,18 +251,18 @@ class ClearanceLeaseProxy:
         return acquired
 
     def set_wait_entry_callback(self, callback: Callable[[], None] | None) -> None:
-        """Register (or clear) the child-local callback run before a job's first acquire of either permit blocks.
+        """Register (or clear) the child-local callback run once per job on the first acquire of either permit.
 
-        Set in the child after the proxy crossed the spawn boundary; it is never pickled.
+        Set in the child after the proxy crossed the spawn boundary. It is not pickled.
         """
         self._wait_entry_callback = callback
 
     def _acquire_clearance(self, block: bool, timeout: float | None) -> bool:
-        """Take the clearance permit, running the wait-entry callback only when the acquire is about to block."""
+        """Take the clearance permit, running the wait-entry callback first if the job has not run it yet."""
         return self._acquire_with_wait_entry(self._clearance, block, timeout)
 
     def _acquire_with_wait_entry(self, permit: _ClearanceSemaphore, block: bool, timeout: float | None) -> bool:
-        """Take ``permit``, running the wait-entry callback only when the acquire is about to block.
+        """Take ``permit``, running the wait-entry callback first if the job has not run it yet.
 
         A blocking acquire adds its duration to the job's lease wait, and one that returns without a permit marks
         the job timed out.
@@ -273,25 +276,24 @@ class ClearanceLeaseProxy:
         return acquired
 
     def _take_permit(self, permit: _ClearanceSemaphore, block: bool, timeout: float | None) -> bool:
-        """Take ``permit``, probing first so the wait-entry callback runs only before a real wait.
+        """Take ``permit`` after the job's boundary report, within what is left of ``timeout`` after the report.
 
-        Without a callback the permit is taken in the single call the semaphore was always given; the probe
-        exists only to tell a waiting grant from a wait.
+        The report goes out before the permit is probed. A grant already waiting would otherwise be taken with
+        no report, and the parent would keep booking the job as though it were still encoding.
         """
-        if not block or self._wait_entry_callback is None:
-            return bool(permit.acquire(block, timeout))
         started_at = time.monotonic()
-        if permit.acquire(False):
-            return True
         self._notify_wait_entry()
-        remaining = None if timeout is None else max(0.0, timeout - (time.monotonic() - started_at))
+        if not block or timeout is None:
+            return bool(permit.acquire(block, timeout))
+        remaining = max(0.0, timeout - (time.monotonic() - started_at))
         return bool(permit.acquire(True, remaining))
 
     def _notify_wait_entry(self) -> None:
-        """Run the wait-entry callback; a failure is logged and never reaches the acquire."""
+        """Run the wait-entry callback once per job. A failure is logged and does not reach the acquire."""
         callback = self._wait_entry_callback
-        if callback is None:
+        if callback is None or self._boundary_reported:
             return
+        self._boundary_reported = True
         try:
             callback()
         except Exception as e:  # noqa: BLE001 - a reporting hook must never stop the child sampling
@@ -355,8 +357,8 @@ class ClearanceLeaseProxy:
 
         The shared figure is unset here too. A permit the parent released after the previous job had already
         timed out is still available to this job's acquire, and the figure written with it describes the card
-        before the previous job sampled. The reserve figures, the stage permit's flag and figures, and the job's
-        lease wait are reset by the same rules.
+        before the previous job sampled. The reserve figures, the stage permit's flag and figures, the job's
+        lease wait and the boundary report's once-per-job flag are reset by the same rules.
 
         The parent may grant this job before the child calls here. The parent's next step rewrites the device free and
         reserve figures of a grant the child has not consumed, so a grant issued before job start reaches the
@@ -378,6 +380,7 @@ class ClearanceLeaseProxy:
         _unset_shared_figure(self._staged_sampling_reserve)
         self._job_lease_wait_seconds = 0.0
         self._job_lease_timed_out = False
+        self._boundary_reported = False
 
     def _read_cleared_device_free_mb(self) -> float | None:
         """Child-side: the figure the parent wrote with the grant just acquired, or None when unset."""
@@ -386,9 +389,8 @@ class ClearanceLeaseProxy:
     def _acquire_stage(self, block: bool, timeout: float | None) -> bool:
         """Child-side: take the stage permit once per job; see :meth:`ClearanceStageLease.acquire`.
 
-        A blocking acquire runs the wait-entry callback before it waits, as the clearance acquire does, since
-        under two-phase clearance the child's first wait is here and the parent prices the stage against the
-        report it sends.
+        The job's first acquire runs the wait-entry callback, as the clearance acquire does. hordelib takes the
+        stage permit first, so under two-phase clearance the boundary report is sent here.
         """
         if self._stage_consumed:
             return True

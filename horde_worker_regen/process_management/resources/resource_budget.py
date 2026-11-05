@@ -1528,6 +1528,15 @@ class _PlannedReserve:
     no growth, and the charge stays outstanding beside the allocation it describes."""
     materialized_watermark_mb: float = 0.0
     """The greatest reserved-growth (MB) past the baseline ever observed for this entry. It only ever rises."""
+    floor_mb: float = 0.0
+    """The part of the charge (MB) that growth does not consume until the entry is registered again.
+
+    A sampling charge booked while the target is still encoding is held at this floor, since the encoder's growth
+    and release are not the sampling allocation the charge describes."""
+
+    def outstanding_mb(self, materialised_mb: float) -> float:
+        """Return the charge (MB) still outstanding once ``materialised_mb`` of it has landed, held at the floor."""
+        return max(min(self.floor_mb, self.vram_mb), self.vram_mb - materialised_mb)
 
     def materialised_mb(self, process_reserved_by_pid: Mapping[int, float]) -> float:
         """Return how much of the charge has materialised against these readings, without recording anything.
@@ -1608,6 +1617,7 @@ class CommittedReserveLedger:
         vram_mb: float,
         target_process_id: int,
         reserved_at_admit_mb: float,
+        floor_mb: float = 0.0,
     ) -> None:
         """Register a *planned* (admitted but not-yet-materialised) VRAM charge for the ledger-driven identity.
 
@@ -1629,13 +1639,25 @@ class CommittedReserveLedger:
             reserved_at_admit_mb: The target's measured allocator reservation (MB) at admit time; growth beyond
                 this figure, or beyond any lower reading the target reports later, is treated as the planned
                 charge materialising.
+            floor_mb: The part of the charge that growth does not consume while this registration stands. The default
+                of zero lets all of it decay.
         """
         self._planned[(flow, unit)] = _PlannedReserve(
             vram_mb=max(0.0, vram_mb),
             target_process_id=target_process_id,
             reserved_at_admit_mb=max(0.0, reserved_at_admit_mb),
             growth_baseline_mb=max(0.0, reserved_at_admit_mb),
+            floor_mb=max(0.0, floor_mb),
         )
+
+    def planned_growth_baseline_mb(self, flow: str, unit: str) -> float | None:
+        """Return the lowest reservation (MB) reported by a planned unit's target since it was registered.
+
+        None when the unit has no planned charge. The figure moves only when the per-cycle
+        :meth:`effective_planned_vram_mb` observes the target.
+        """
+        entry = self._planned.get((flow, unit))
+        return entry.growth_baseline_mb if entry is not None else None
 
     def effective_planned_vram_mb(
         self,
@@ -1671,7 +1693,7 @@ class CommittedReserveLedger:
             if target_process_ids is not None and entry.target_process_id not in target_process_ids:
                 continue
             entry.observe(process_reserved_by_pid)
-            total += max(0.0, entry.vram_mb - entry.materialized_watermark_mb)
+            total += entry.outstanding_mb(entry.materialized_watermark_mb)
         return total
 
     def planned_charge_for_unit(self, flow: str, unit: str, process_reserved_by_pid: dict[int, float]) -> float:
@@ -1692,7 +1714,7 @@ class CommittedReserveLedger:
         entry = self._planned.get((flow, unit))
         if entry is None:
             return 0.0
-        return max(0.0, entry.vram_mb - entry.materialised_mb(process_reserved_by_pid))
+        return entry.outstanding_mb(entry.materialised_mb(process_reserved_by_pid))
 
     def effective_planned_vram_mb_for_flow(
         self,
@@ -1723,7 +1745,7 @@ class CommittedReserveLedger:
                 continue
             if target_process_ids is not None and entry.target_process_id not in target_process_ids:
                 continue
-            total += max(0.0, entry.vram_mb - entry.materialised_mb(process_reserved_by_pid))
+            total += entry.outstanding_mb(entry.materialised_mb(process_reserved_by_pid))
         return total
 
     def outstanding_planned_units(
@@ -1741,7 +1763,7 @@ class CommittedReserveLedger:
         for (flow, unit), entry in self._planned.items():
             if target_process_ids is not None and entry.target_process_id not in target_process_ids:
                 continue
-            outstanding = max(0.0, entry.vram_mb - entry.materialised_mb(process_reserved_by_pid))
+            outstanding = entry.outstanding_mb(entry.materialised_mb(process_reserved_by_pid))
             if outstanding > 0.0:
                 rows.append((flow, unit, entry.target_process_id, outstanding))
         return rows

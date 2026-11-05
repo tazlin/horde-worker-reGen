@@ -49,10 +49,40 @@ class ClearanceDecision(StrEnum):
     BUDGET_INACTIVE = "budget_inactive"
     """The VRAM budget is off: grant without pricing."""
     ADMIT = "admit"
-    """The full materialisation or the job's partial-load seat fits: grant and re-book the dispatch reservation at
-    what is left to materialise, capped at the granted room for a seat."""
+    """The full materialisation or the job's partial-load seat fits. Grant, and re-book the dispatch reservation at
+    what is left to materialise against the job's encode boundary report, capped at the granted room for a seat."""
     HOLD = "hold"
     """The materialisation does not fit yet: withhold, run the verdict's evictions, and re-ask next pass."""
+
+
+@dataclass(frozen=True)
+class ClearanceBooking:
+    """What a grant books for the job, as a function of the lane report it is netted against.
+
+    The lane's report at the grant can include an encoder not yet released by the child, so the scheduler books
+    the figure against the job's encode boundary report, at the grant when that report has arrived and on the
+    report's arrival otherwise.
+    """
+
+    need_mb: float
+    """The job's whole need (MB) for the granted window before the job's holdings are netted."""
+    nets_holdings: bool
+    """Whether what the lane holds of the job is netted from the need. A sample grant nets it. A stage grant books
+    the weights it uploads, which are already net of any resident copy."""
+    other_models_weights_mb: float = 0.0
+    """Weights (MB) of other models on the lane, which stay beside the job and are not the job's holdings."""
+    cap_mb: float | None = None
+    """The room a partial-seat grant loads into, which caps the booking, or None for any other grant."""
+
+    def booking_mb_at(self, reported_mb: float | None) -> float:
+        """Return the booking (MB) against a lane report of ``reported_mb``. With no report it is the whole need."""
+        booking_mb = self.need_mb
+        if self.nets_holdings and reported_mb is not None:
+            held_mb = max(0.0, reported_mb - self.other_models_weights_mb)
+            booking_mb -= min(self.need_mb, held_mb)
+        if self.cap_mb is not None:
+            booking_mb = min(booking_mb, max(0.0, self.cap_mb))
+        return booking_mb
 
 
 @dataclass(frozen=True)
@@ -66,6 +96,9 @@ class ClearancePlan:
     priced: MaterializationRequest | None
     """The priced request when the decision went through the arbiter, else None."""
     verdict: VramVerdict | None
+    booking: ClearanceBooking | None = None
+    """What an admitted grant books, as a function of the lane report. None for any other plan, and for a grant
+    whose need cannot be priced."""
 
     @property
     def grants(self) -> bool:
@@ -389,8 +422,40 @@ def decide_clearance_admit(
         sibling_staging_relief_mb=sibling_staging_relief_mb(snapshot, job_id, process_id),
     )
     verdict = arbiter.evaluate(priced.request)
-    decision = ClearanceDecision.ADMIT if verdict.admits else ClearanceDecision.HOLD
-    return ClearancePlan(decision, process_id, job_id, job.model, priced, verdict)
+    if not verdict.admits:
+        return ClearancePlan(ClearanceDecision.HOLD, process_id, job_id, job.model, priced, verdict)
+    return ClearancePlan(
+        ClearanceDecision.ADMIT,
+        process_id,
+        job_id,
+        job.model,
+        priced,
+        verdict,
+        booking=_sample_grant_booking(snapshot, job_id, process_id, verdict),
+    )
+
+
+def _sample_grant_booking(
+    snapshot: SchedulingSnapshot,
+    job_id: str,
+    process_id: int,
+    verdict: VramVerdict,
+) -> ClearanceBooking | None:
+    """Return the booking of an admitted sample grant, or None when the job's need cannot be priced.
+
+    Against the snapshot's lane report it equals :attr:`ClearancePlan.booking_mb`.
+    """
+    job = snapshot.queue.jobs[job_id]
+    peak_mb = staged_sampling_peak_mb(snapshot, job_id, process_id)
+    if peak_mb is None or job.model is None:
+        return None
+    cap_mb = verdict.measured.available_mb if verdict.partial_seat else None
+    return ClearanceBooking(
+        need_mb=peak_mb,
+        nets_holdings=True,
+        other_models_weights_mb=_other_models_weights_mb(snapshot, process_id, job.model),
+        cap_mb=cap_mb,
+    )
 
 
 def stage_weights_delta_mb(snapshot: SchedulingSnapshot, job_id: str, process_id: int) -> float | None:
@@ -457,5 +522,11 @@ def decide_clearance_stage_admit(
     )
     verdict = arbiter.evaluate(priced.request)
     priced_fit = verdict.admits and not verdict.measured_attempt
-    decision = ClearanceDecision.ADMIT if priced_fit else ClearanceDecision.HOLD
-    return ClearancePlan(decision, process_id, job_id, job.model, priced, verdict)
+    if not priced_fit:
+        return ClearancePlan(ClearanceDecision.HOLD, process_id, job_id, job.model, priced, verdict)
+    booking = ClearanceBooking(
+        need_mb=weights_mb,
+        nets_holdings=False,
+        cap_mb=verdict.measured.available_mb if verdict.partial_seat else None,
+    )
+    return ClearancePlan(ClearanceDecision.ADMIT, process_id, job_id, job.model, priced, verdict, booking=booking)

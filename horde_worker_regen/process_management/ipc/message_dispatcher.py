@@ -59,7 +59,7 @@ from horde_worker_regen.process_management.jobs.job_tracker import (
     PostProcessingFaultCause,
 )
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
-from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
+from horde_worker_regen.process_management.lifecycle.process_info import ClearanceBoundaryReport, HordeProcessInfo
 from horde_worker_regen.process_management.lifecycle.process_lifecycle import InferenceLaneOutcome
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap, RetiredProcessLaunch
 from horde_worker_regen.process_management.models.component_residency_map import ComponentResidencyMap
@@ -1272,12 +1272,24 @@ class MessageDispatcher:
         """Stamp the child's clearance wait entry on its record, at the instant the child sampled the report.
 
         The child's sample time is compared against the parent's ownership stamp on the same host clock. The
-        receipt time would lag by however long the report sat in the queue.
+        receipt time would lag by however long the report sat in the queue. A report with a job is also kept as
+        that job's encode boundary, with the report's reservation and the sending launch.
         """
         process_info = self._process_map.get(message.process_id)
         if process_info is None:
             return
-        process_info.note_clearance_wait_entered(message.sampled_at if message.sampled_at is not None else time.time())
+        sampled_at = message.sampled_at if message.sampled_at is not None else time.time()
+        process_info.note_clearance_wait_entered(sampled_at)
+        if message.clearance_wait_job_id is None:
+            return
+        process_info.note_clearance_boundary(
+            ClearanceBoundaryReport(
+                job_id=message.clearance_wait_job_id,
+                process_launch_identifier=message.process_launch_identifier,
+                reserved_mb=float(message.process_reserved_mb) if message.process_reserved_mb is not None else None,
+                sampled_at=sampled_at,
+            ),
+        )
 
     def _observe_footprint_peak(self, message: HordeProcessMemoryMessage) -> None:
         """Fold a reported VRAM peak into its running job's sampling figure, if cleanly attributable.

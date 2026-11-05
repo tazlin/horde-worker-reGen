@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import math
 import multiprocessing
+import time
 from collections.abc import Callable
 from multiprocessing.sharedctypes import Synchronized
 
@@ -21,6 +22,7 @@ from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 from horde_worker_regen.process_management.ipc.messages import HordeControlFlag
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessState, HordeProcessType
+from horde_worker_regen.process_management.lifecycle.process_info import ClearanceBoundaryReport, HordeProcessInfo
 from horde_worker_regen.process_management.resources.admission_identity import admission_noise_buffer_mb
 from horde_worker_regen.process_management.scheduling import inference_scheduler as _sched_mod
 from horde_worker_regen.process_management.scheduling.admission import materialization as _materialization_mod
@@ -207,8 +209,11 @@ class TestHeadNotStarvedBySiblingStaging:
 class TestClearanceAdmission:
     """The clearance admit function prices the full materialisation and upgrades the reservation on a grant."""
 
-    async def test_admits_and_upgrades_when_device_has_ample_room(self) -> None:
-        """An ample card admits the staged child's clearance and upgrades its reservation to the full peak."""
+    @staticmethod
+    async def _staged_job_on_an_ample_card() -> tuple[
+        InferenceScheduler, HordeProcessInfo, ImageGenerateJobPopResponse
+    ]:
+        """A primed child with a staged dispatch reservation on a card with room for the whole peak."""
         scheduler = _make_inference_scheduler(
             bridge_data=make_mock_bridge_data(
                 gpu_sampling_lease_enabled=True,
@@ -225,12 +230,35 @@ class TestClearanceAdmission:
         await track_popped_job_async(scheduler._job_tracker, job)
         await mark_job_in_progress_async(scheduler._job_tracker, job)
         scheduler._record_dispatch_reservation(job, proc, baseline=None, staging_only=True)
+        return scheduler, proc, job
+
+    async def test_admits_and_upgrades_when_device_has_ample_room(self) -> None:
+        """An ample card admits the staged child's clearance and books the full peak once the encode boundary is in."""
+        scheduler, proc, job = await self._staged_job_on_an_ample_card()
+        proc.note_clearance_boundary(
+            ClearanceBoundaryReport(
+                job_id=str(job.id_),
+                process_launch_identifier=proc.process_launch_identifier,
+                reserved_mb=float(proc.process_reserved_mb) if proc.process_reserved_mb is not None else None,
+                sampled_at=time.time(),
+            ),
+        )
 
         assert scheduler.clearance_admit_process(0) is True
         full_mb = scheduler._measured_admission_candidate_delta_mb(job, None, process_id=0, disaggregated=False)
         assert full_mb is not None
         reserved = scheduler._reserve_ledger.effective_planned_vram_mb_for_flow(DISPATCH_ADMISSION_FLOW, {})
-        assert reserved == full_mb  # upgraded from the encode charge on the grant
+        assert reserved == full_mb
+
+    async def test_a_grant_before_the_encode_boundary_holds_the_encode_charge_and_the_peak(self) -> None:
+        """Without the boundary report the grant keeps the encode charge and adds the whole peak as a floor."""
+        scheduler, _proc, job = await self._staged_job_on_an_ample_card()
+
+        assert scheduler.clearance_admit_process(0) is True
+        full_mb = scheduler._measured_admission_candidate_delta_mb(job, None, process_id=0, disaggregated=False)
+        assert full_mb is not None
+        reserved = scheduler._reserve_ledger.effective_planned_vram_mb_for_flow(DISPATCH_ADMISSION_FLOW, {})
+        assert reserved == _ENCODE_MB + full_mb
 
     def test_missing_job_admits_rather_than_wedging(self) -> None:
         """A primed process with no referenced job is admitted rather than held (liveness over pricing)."""

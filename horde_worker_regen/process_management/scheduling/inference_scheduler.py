@@ -151,6 +151,7 @@ from horde_worker_regen.process_management.resources.vram_footprints import (
 )
 from horde_worker_regen.process_management.scheduling.admission import pricing
 from horde_worker_regen.process_management.scheduling.admission.clearance import (
+    ClearanceBooking,
     ClearanceDecision,
     ClearancePlan,
     StagedWaiterClock,
@@ -513,6 +514,54 @@ class _ClearanceRungAwaitingRoom:
     """The card's measured free (MB) when the first unrealised rung was sent, or None when it was unread."""
 
 
+class _ClearanceBookingMoment(enum.StrEnum):
+    """When a cleared job's dispatch booking is re-booked, as the booking log line reports it."""
+
+    STAGE_GRANT = "stage grant"
+    SAMPLE_GRANT = "sample grant"
+    ENCODE_BOUNDARY = "encode boundary"
+
+
+class _EncodeBoundaryState(enum.Enum):
+    """Where a granted job stands against the encode boundary report at the grant."""
+
+    ARRIVED = enum.auto()
+    """The boundary report had arrived, so the grant books against it."""
+    PENDING = enum.auto()
+    """The child is still encoding, so the booking holds the window's charge until the report arrives."""
+    NOT_AWAITED = enum.auto()
+    """The grant books against the lane's current report, because the encode ran on another lane or the need cannot
+    be priced."""
+
+
+@dataclass(frozen=True)
+class _PendingBoundaryBooking:
+    """A granted job whose booking is held until the encode boundary report arrives."""
+
+    process_id: int
+    """The lane the job was granted on."""
+    process_launch_identifier: int
+    """The launch the grant was issued to. The pending booking is dropped once that launch is replaced."""
+    booking: ClearanceBooking
+    """What the grant books once the boundary report arrives."""
+    pre_encode_reserved_mb: float | None
+    """The lane's lowest reservation (MB) since dispatch, which does not include encoder bytes. None when unknown."""
+    floor_mb: float
+    """The window's charge (MB) held whole until the boundary report arrives."""
+
+
+@dataclass(frozen=True)
+class _ClearanceBookingChange:
+    """The effect of one grant on the job's dispatch booking, for the decision record."""
+
+    before_mb: float
+    """The job's outstanding dispatch booking (MB) before the grant."""
+    after_mb: float
+    """The job's outstanding dispatch booking (MB) after the grant."""
+    boundary_arrived: bool
+    """Whether the job's encode boundary report had arrived at the grant."""
+
+
 def _round_or_none(value: float | None) -> float | None:
     """``value`` rounded to one decimal for a decision record, or None when there is no figure."""
     return None if value is None else round(value, 1)
@@ -750,6 +799,9 @@ class InferenceScheduler:
         # When each staged job's child first asked for clearance, which bounds the waiter's measured-load probe. A
         # reclaim never stops it, since the child's lease-acquire timeout runs from the start of its wait.
         self._clearance_held_since: dict[str, float] = {}
+        # Granted jobs whose child was still encoding at the grant, keyed by job id. Each is re-booked when the job's
+        # encode boundary report arrives, since the lane's report before then includes the encoder.
+        self._pending_boundary_bookings: dict[str, _PendingBoundaryBooking] = {}
         # The lane rung last applied per staged job in its current starvation episode. The next rung is spaced by
         # this rung's grade. It ends with the episode, wherever the clock is stopped for anything other than the
         # job's own reclaim.
@@ -7328,13 +7380,16 @@ class InferenceScheduler:
         decides who samples next; the process id breaks ties deterministically.
 
         It also stops the clearance clock of every waiter on the card that waiting can now help, every tick,
-        because a waiter behind another grant is not offered to :meth:`clearance_admit_process` at all.
+        because a waiter behind another grant is not offered to :meth:`clearance_admit_process` at all. It also
+        re-books every job on the card that was granted while the child encoded and whose encode boundary report
+        has since arrived (:meth:`_rebook_granted_jobs_at_encode_boundary`).
 
         Each waiter carries its job's priced non-weight term (:func:`pricing.sampling_reserve_mb`), which the
         controller writes with the child's grants, and the weights its grant puts on the card, from which the
         controller nets one child's take out of the free figure it hands the next child cleared in the same step.
         """
         self._settle_staged_waiter_clocks(device_index)
+        self._rebook_granted_jobs_at_encode_boundary(device_index)
         snapshot: SchedulingSnapshot | None = None
         waiters: list[ClearanceWaiter] = []
         samplers: list[ActiveSampler] = []
@@ -7402,9 +7457,10 @@ class InferenceScheduler:
         """Full-price fit-or-evict for a staged child's job at the clearance VRAM moment.
 
         The injected ``admit_fn`` the clearance controller calls before granting a child its load-and-sample
-        window. The decision is :func:`decide_clearance_admit` over this cycle's snapshot; this executes it: a
-        fit re-books the job's dispatch reservation at the full peak and clears the clearance-hold record, a
-        non-fit runs the described eviction through the single reclaim owner and records the hold, so the child
+        window. The decision is :func:`decide_clearance_admit` over this cycle's snapshot, and this method executes
+        it. A fit books the job's dispatch reservation through :meth:`_book_granted_job` and clears the
+        clearance-hold record. A non-fit runs the described eviction through the single reclaim owner and records
+        the hold, so the child
         stays staged until room frees (or samples via hordelib's lease-acquire timeout, liveness over pricing).
         The co-residency mutex is read here too, since clearance is the VRAM moment for a leased job.
 
@@ -7457,14 +7513,25 @@ class InferenceScheduler:
                 self._mark_measured_attempt(job, plan.priced.request, device_index=plan.priced.device_index)
             self._resolve_clearance_hold(job)
             self._note_clearance_granted(job)
-            self._upgrade_dispatch_reservation_to_full(job, process_info, remaining_mb=plan.booking_mb)
+            booking_change = self._book_granted_job(
+                job,
+                process_info,
+                plan,
+                moment=_ClearanceBookingMoment.SAMPLE_GRANT,
+            )
             if plan.verdict.measured_attempt:
                 granted_as = "granted a measured load attempt"
             elif plan.verdict.partial_seat:
                 granted_as = "granted at its partial-load seat"
             else:
                 granted_as = "granted by price"
-            self._record_clearance_decision(job, plan, DecisionVerdict.ADMIT, granted_as)
+            self._record_clearance_decision(
+                job,
+                plan,
+                DecisionVerdict.ADMIT,
+                granted_as,
+                booking_change=booking_change,
+            )
             return True
 
         applied = self._actuate_materialization_verdict(
@@ -7532,8 +7599,9 @@ class InferenceScheduler:
 
         The injected ``stage_admit_fn`` the clearance controller calls for the head waiter of a card whose sampler
         is running. The decision is :func:`decide_clearance_stage_admit` over this cycle's snapshot. A fit re-books
-        the job's dispatch reservation from its encode charge to the weights against the lane's current report,
-        so the booking decays as the weights land and the sample clearance then books the activation. The job is
+        the job's dispatch reservation from the encode charge to the weights against the job's encode boundary
+        report (:meth:`_book_granted_job`), so the booking decays as the weights land and the sample clearance then
+        books the activation. The job is
         also recorded as granted, so another waiter priced beside it keeps its whole charge rather than netting it
         as an encode already inside the device-free reading.
 
@@ -7549,8 +7617,19 @@ class InferenceScheduler:
         plan = decide_clearance_stage_admit(self.snapshot(), process_id, arbiter=self._ensure_preload_arbiter())
         if plan.decision is ClearanceDecision.ADMIT:
             self._dispatch_holds.note_clearance_granted(str(job.id_))
-            self._upgrade_dispatch_reservation_to_full(job, process_info, remaining_mb=plan.booking_mb)
-            self._record_clearance_decision(job, plan, DecisionVerdict.ADMIT, "stage granted by price")
+            booking_change = self._book_granted_job(
+                job,
+                process_info,
+                plan,
+                moment=_ClearanceBookingMoment.STAGE_GRANT,
+            )
+            self._record_clearance_decision(
+                job,
+                plan,
+                DecisionVerdict.ADMIT,
+                "stage granted by price",
+                booking_change=booking_change,
+            )
             return True
         if plan.decision is ClearanceDecision.HOLD and plan.verdict is not None:
             self._log_clearance_hold(
@@ -7571,19 +7650,25 @@ class InferenceScheduler:
         *,
         applied: tuple[ActuatorCommand, ...] = (),
         waiting_can_help: bool | None = None,
+        booking_change: _ClearanceBookingChange | None = None,
     ) -> None:
         """Record one clearance pass for ``job`` with the figures and clocks it was decided on.
 
         A held waiter idles the card while nothing samples, so a bundle has to be able to say which term held it:
         the price against the room, the starved clock against the probe delay, the lease wait against the
         deadline, or a card that still reads as having something to reclaim. Repeats of an unchanged hold coalesce
-        in the sink.
+        in the sink. A grant also records the job's dispatch booking before and after it, and whether the encode
+        boundary report had arrived.
         """
         if self._decision_sink is None or job.id_ is None:
             return
         inputs: FlatScalarMap = {"model": str(job.model), "process_id": plan.process_id}
         if waiting_can_help is not None:
             inputs["waiting_can_help"] = waiting_can_help
+        if booking_change is not None:
+            inputs["booking_before_mb"] = round(booking_change.before_mb, 1)
+            inputs["booking_after_mb"] = round(booking_change.after_mb, 1)
+            inputs["encode_boundary_arrived"] = booking_change.boundary_arrived
         if applied:
             inputs["reclaim_applied_kinds"] = ",".join(command.kind.value for command in applied)
         if plan.priced is not None:
@@ -9018,19 +9103,27 @@ class InferenceScheduler:
         process_info: HordeProcessInfo,
         *,
         charge_mb: float | None,
+        reserved_at_admit_mb: float | None = None,
+        floor_mb: float = 0.0,
     ) -> None:
-        """Book ``charge_mb`` as the job's dispatch reservation, decaying by growth past the lane's current report.
+        """Book ``charge_mb`` as the job's dispatch reservation, decaying by growth past a lane report.
 
-        None (an unpriceable job) books nothing rather than a fabricated figure.
+        The report is ``reserved_at_admit_mb``, or the lane's current report when that is None. Growth does not
+        consume the ``floor_mb`` part of the charge until the entry is booked again. None (an unpriceable job)
+        books zero.
         """
         if job.id_ is None:
             return
+        baseline_mb = (
+            reserved_at_admit_mb if reserved_at_admit_mb is not None else float(process_info.process_reserved_mb or 0)
+        )
         self._reserve_ledger.set_planned(
             DISPATCH_ADMISSION_FLOW,
             str(job.id_),
             vram_mb=charge_mb if charge_mb is not None else 0.0,
             target_process_id=process_info.process_id,
-            reserved_at_admit_mb=float(process_info.process_reserved_mb or 0),
+            reserved_at_admit_mb=baseline_mb,
+            floor_mb=floor_mb,
         )
         self._reserve_ledger.set_planned_ram(
             DISPATCH_ADMISSION_FLOW,
@@ -9047,20 +9140,191 @@ class InferenceScheduler:
         process_info: HordeProcessInfo,
         *,
         remaining_mb: float | None,
+        reserved_at_admit_mb: float | None = None,
     ) -> None:
         """Re-book a staged job's dispatch reservation at what clearance priced it to materialise.
 
-        ``remaining_mb`` is the clearance price, ``staged_materialization_delta_mb``: the full peak net of
-        what the lane already reports, capped at the granted room for a job admitted at its partial-load seat.
-        A stage grant books its weights (``stage_weights_delta_mb``) here first, and the sample clearance
-        re-books the same entry at the peak net of the report that by then carries them.
+        ``remaining_mb`` is the clearance price, ``staged_materialization_delta_mb``. It is the full peak net of
+        what the lane reports holding, capped at the granted room for a job admitted at a partial-load seat.
+        ``reserved_at_admit_mb`` is that report, the job's encode boundary report for a monolithic job, and None
+        reads the lane's current report. A stage grant books its weights (``stage_weights_delta_mb``) here first,
+        and the sample clearance re-books the same entry at the peak net of the report that by then includes them.
         The booking decays by growth past that same report, so it reaches zero as the job reaches its peak.
         Booked gross against that baseline, the staged holdings would stay outstanding
         through the whole sample and be charged against the next waiter. Re-registering the same
         ``(DISPATCH_ADMISSION_FLOW, job id)`` entry refreshes it in place and resets its watermark, so the upgrade
         is not a second, additive booking.
         """
-        self._book_dispatch_reservation(job, process_info, charge_mb=remaining_mb)
+        self._book_dispatch_reservation(
+            job,
+            process_info,
+            charge_mb=remaining_mb,
+            reserved_at_admit_mb=reserved_at_admit_mb,
+        )
+
+    def _dispatch_booking_outstanding_mb(self, job_id: str, device_index: int | None) -> float:
+        """Return the job's dispatch booking (MB) still outstanding against the lanes' current reports."""
+        return self._reserve_ledger.planned_charge_for_unit(
+            DISPATCH_ADMISSION_FLOW,
+            job_id,
+            self._process_map.reserved_by_pid(device_index),
+        )
+
+    def _book_granted_job(
+        self,
+        job: ImageGenerateJobPopResponse,
+        process_info: HordeProcessInfo,
+        plan: ClearancePlan,
+        *,
+        moment: _ClearanceBookingMoment,
+    ) -> _ClearanceBookingChange | None:
+        """Book an admitted grant's window for ``job``, at the job's encode boundary report or held until it arrives.
+
+        hordelib releases the text encoder just before the child's first lease acquire of the job, and the child
+        reports memory there (``clearance_wait_entry``). A grant can reach the child before that, while the
+        lane's report still includes encoder bytes that the diffusion weights will replace. Netted against that
+        report the window's charge is under-booked, and the encoder's growth past it consumes the charge.
+
+        With the boundary report in, the grant books against it. Without it, the booking is the encode charge
+        still outstanding plus the window's charge netted against the lane's lowest report since dispatch, and
+        the window's charge is held whole until :meth:`_rebook_granted_jobs_at_encode_boundary` books against
+        the report on arrival. A disaggregated sampler encoded on another lane, and a job whose need cannot be
+        priced, book against the lane's current report. Returns the booking change for the decision
+        record, or None for a job without an id.
+        """
+        if job.id_ is None:
+            return None
+        job_id = str(job.id_)
+        device_index = process_info.device_index
+        before_mb = self._dispatch_booking_outstanding_mb(job_id, device_index)
+        ownership = process_info.inference_ownership
+        encoded_elsewhere = ownership is not None and ownership.disaggregated
+        boundary = process_info.clearance_boundary_for(job_id)
+        booking = plan.booking
+        if booking is None or encoded_elsewhere:
+            state = _EncodeBoundaryState.NOT_AWAITED
+            self._pending_boundary_bookings.pop(job_id, None)
+            self._upgrade_dispatch_reservation_to_full(job, process_info, remaining_mb=plan.booking_mb)
+        elif boundary is not None:
+            state = _EncodeBoundaryState.ARRIVED
+            self._pending_boundary_bookings.pop(job_id, None)
+            self._upgrade_dispatch_reservation_to_full(
+                job,
+                process_info,
+                remaining_mb=booking.booking_mb_at(boundary.reserved_mb),
+                reserved_at_admit_mb=boundary.reserved_mb,
+            )
+        else:
+            state = _EncodeBoundaryState.PENDING
+            self._hold_booking_until_encode_boundary(job, process_info, booking)
+        after_mb = self._dispatch_booking_outstanding_mb(job_id, device_index)
+        self._log_clearance_booking(job_id, process_info.process_id, before_mb, after_mb, moment=moment, state=state)
+        return _ClearanceBookingChange(
+            before_mb=before_mb,
+            after_mb=after_mb,
+            boundary_arrived=boundary is not None,
+        )
+
+    def _hold_booking_until_encode_boundary(
+        self,
+        job: ImageGenerateJobPopResponse,
+        process_info: HordeProcessInfo,
+        booking: ClearanceBooking,
+    ) -> None:
+        """Book a grant issued while the child still encodes, holding the window's charge whole.
+
+        The window's charge is netted against the lane's lowest report since dispatch, which does not include
+        encoder bytes, so weights the lane already holds are not charged twice. The encode charge still outstanding
+        is added on top and decays with growth. The window's charge is the entry's floor, so encoder growth past the
+        encode charge does not consume it, and neither does the encoder's release. A second grant for the job
+        before the boundary (a sample grant after a stage grant) replaces the first grant's charge and keeps the
+        same pre-encode report. A job without a dispatch booking is booked the grant's whole need.
+        """
+        assert job.id_ is not None
+        job_id = str(job.id_)
+        outstanding_mb = self._dispatch_booking_outstanding_mb(job_id, process_info.device_index)
+        previous = self._pending_boundary_bookings.get(job_id)
+        if previous is not None:
+            encode_outstanding_mb = max(0.0, outstanding_mb - previous.floor_mb)
+            pre_encode_reserved_mb = previous.pre_encode_reserved_mb
+        else:
+            encode_outstanding_mb = outstanding_mb
+            pre_encode_reserved_mb = self._reserve_ledger.planned_growth_baseline_mb(DISPATCH_ADMISSION_FLOW, job_id)
+        floor_mb = booking.booking_mb_at(pre_encode_reserved_mb)
+        self._book_dispatch_reservation(
+            job,
+            process_info,
+            charge_mb=encode_outstanding_mb + floor_mb,
+            floor_mb=floor_mb,
+        )
+        self._pending_boundary_bookings[job_id] = _PendingBoundaryBooking(
+            process_id=process_info.process_id,
+            process_launch_identifier=process_info.process_launch_identifier,
+            booking=booking,
+            pre_encode_reserved_mb=pre_encode_reserved_mb,
+            floor_mb=floor_mb,
+        )
+
+    def _rebook_granted_jobs_at_encode_boundary(self, device_index: int) -> None:
+        """Re-book each job on ``device_index`` granted before the encode boundary, once the report arrives.
+
+        The booking is the grant's, netted against the boundary report and decaying by growth past it, so weights
+        uploaded by the child after the report count as landed. A pending booking whose lane was replaced, or whose
+        lane does not own the job, is dropped without a booking. The ledger drops that job's entry by omission.
+        """
+        for job_id, pending in list(self._pending_boundary_bookings.items()):
+            process_info = self._process_map.get(pending.process_id)
+            if process_info is None or process_info.process_launch_identifier != pending.process_launch_identifier:
+                self._pending_boundary_bookings.pop(job_id, None)
+                continue
+            job = process_info.current_inference_job()
+            if job is None or job.id_ is None or str(job.id_) != job_id:
+                self._pending_boundary_bookings.pop(job_id, None)
+                continue
+            if process_info.device_index != device_index:
+                continue
+            boundary = process_info.clearance_boundary_for(job_id)
+            if boundary is None:
+                continue
+            self._pending_boundary_bookings.pop(job_id, None)
+            before_mb = self._dispatch_booking_outstanding_mb(job_id, device_index)
+            self._upgrade_dispatch_reservation_to_full(
+                job,
+                process_info,
+                remaining_mb=pending.booking.booking_mb_at(boundary.reserved_mb),
+                reserved_at_admit_mb=boundary.reserved_mb,
+            )
+            after_mb = self._dispatch_booking_outstanding_mb(job_id, device_index)
+            self._log_clearance_booking(
+                job_id,
+                process_info.process_id,
+                before_mb,
+                after_mb,
+                moment=_ClearanceBookingMoment.ENCODE_BOUNDARY,
+                state=_EncodeBoundaryState.ARRIVED,
+            )
+
+    @staticmethod
+    def _log_clearance_booking(
+        job_id: str,
+        process_id: int,
+        before_mb: float,
+        after_mb: float,
+        *,
+        moment: _ClearanceBookingMoment,
+        state: _EncodeBoundaryState,
+    ) -> None:
+        """Log one re-booking of a cleared job's dispatch reservation, once per grant and once per boundary."""
+        if state is _EncodeBoundaryState.ARRIVED:
+            detail = "It is booked against the encode boundary report."
+        elif state is _EncodeBoundaryState.PENDING:
+            detail = "The encode boundary report has not arrived, so the grant's charge is held whole until it does."
+        else:
+            detail = "It is booked against the lane's current report."
+        logger.debug(
+            f"Clearance booking for job {job_id[:8]} on process {process_id} went from {before_mb:.0f} MB to "
+            f"{after_mb:.0f} MB at the {moment}. {detail}",
+        )
 
     def release_dispatch_reservation(self, job: ImageGenerateJobPopResponse) -> None:
         """Drop a dispatch's outstanding reservation on clean finalization (a latency tightener over omission).

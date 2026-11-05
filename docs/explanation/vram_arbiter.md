@@ -480,6 +480,18 @@ the job's own model in it, whole or partial, are netted from the peak before any
 partial copy is not priced as a whole one. A grant books the job's dispatch reservation at this same figure,
 decaying by growth past the same reading (`staged_materialization_delta_mb`). Booked at the gross peak, the
 staged holdings would stay outstanding through the whole sample and be charged against the next waiter.
+The booking is netted against the job's encode boundary report. hordelib releases the text
+encoder and then makes the first lease acquire of the job, and the child's proxy sends a marked memory report on
+that acquire before it probes the permit. A grant can reach the child before the encode is done, while the
+lane's report still includes encoder bytes that the diffusion weights will replace. Netted against that report,
+the booking would be short by the encoder, and the rest of the encoder's growth would consume what was left. A
+grant therefore books against the boundary report when it has arrived. Otherwise the grant books the encode
+charge still outstanding plus the window's charge netted against the lane's lowest report since dispatch, which
+includes any retained weights and does not include encoder bytes. The window's charge is the entry's floor until
+the boundary report arrives and the entry is booked against it. The grant's timing does not depend on the
+boundary report. The encode itself runs before either acquire and is covered only by the dispatch staging
+charge, whether clearance
+grants early, late or not at all.
 The request also carries the figure it netted (`candidate_held_mb`, from `staged_held_mb`). An emptied card
 releases those holdings too, so the achievable-ceiling test compares the outstanding charge plus them, the
 job's whole need, with what the emptied card offers. Every test against the card as it stands reads the
@@ -487,10 +499,10 @@ outstanding charge alone. Without the held figure a job whose whole need exceeds
 possible on it, defers against a reading that never moves, and samples unpriced at its lease-acquire timeout.
 The clearance re-price also nets the part of other staged waiters' staging charges that describes nothing still
 to come (`sibling_staging_relief_mb`). A staging charge stands for the encode a staged job has yet to allocate.
-A waiter whose child has entered its clearance wait has finished its encode: the child marks the memory report
-it sends at that moment (`clearance_wait_entry`), and the parent stamps it on the slot, valid only at or after
-the slot's current ownership. Everything such a waiter holds is already inside the device-free reading, so its
-whole outstanding charge is netted. A waiter still encoding stays charged the staging charge less what it
+A waiter whose child has entered the clearance wait has finished encoding. The child marks the memory report
+it sends on the job's first lease acquire (`clearance_wait_entry`), and the parent stamps it on the slot, valid
+only at or after the slot's current ownership. Everything such a waiter holds is already inside the device-free
+reading, so the waiter's whole outstanding charge is netted. A waiter still encoding stays charged the staging charge less what it
 already holds. The primed state cannot stand in for the wait entry, because a child reports it on receiving the
 job, before the encode runs. A waiter the clearance gate has granted keeps its charge, since it is about to load
 its weights, and so does a slot past its staging. Charged the flat staging charge, a light sibling staged behind
@@ -541,7 +553,8 @@ grant prices the job's predicted diffusion weights (`stage_weights_delta_mb`), z
 queue, with its own dispatch reservation netted and the staged-sibling relief applied. The running sampler's
 outstanding reservation stays in the overlay, so a stage is never priced against room the running job will
 still take, and a measured-load attempt never grants a stage. A granted stage re-books the job's dispatch
-reservation from the encode charge to the weights and records the job as granted, so a sibling waiter priced
+reservation from the encode charge to the weights, against the encode boundary report as a sample grant does,
+and records the job as granted, so a sibling waiter priced
 beside it keeps the staged job's whole charge as it would a cleared one. The sample grant that follows is the
 clearance re-price above: the slot's reported reservation now carries the landed weights and is netted from
 the peak, so the sample grant prices the activation. Retention credit therefore lands at the stage. A

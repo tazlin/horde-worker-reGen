@@ -81,7 +81,7 @@ from horde_worker_regen.process_management.jobs.large_model_pop_governor import 
     LargeModelPopGovernor,
 )
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
-from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
+from horde_worker_regen.process_management.lifecycle.process_info import ClearanceBoundaryReport, HordeProcessInfo
 from horde_worker_regen.process_management.lifecycle.process_lifecycle import (
     SAFETY_READINESS_LATENCY_FLOOR_SECONDS,
     PauseOwner,
@@ -3816,6 +3816,19 @@ class _DispatchWorld:
                     proxy.begin_job()
                 self._begin_staged_prefetch(admitted, lane_id=lanes[0])
                 self._sync_reported_vram()
+                # The same report is the job's encode boundary, sent with the lane's reservation once
+                # the encoder is released, as the production dispatcher records it.
+                lane_info = self._process_map[lanes[0]]
+                lane_info.note_clearance_boundary(
+                    ClearanceBoundaryReport(
+                        job_id=job_id,
+                        process_launch_identifier=lane_info.process_launch_identifier,
+                        reserved_mb=(
+                            float(lane_info.process_reserved_mb) if lane_info.process_reserved_mb is not None else None
+                        ),
+                        sampled_at=time.time(),
+                    ),
+                )
                 continue
             # Dispatch is the moment staged weights commit to VRAM, so this is where the card is charged.
             self._commit_staged_weights(admitted, lane_id=lanes[0], encode_seconds=encode_seconds)

@@ -1851,6 +1851,17 @@ _SIGNATURE_LIST: list[LogSignature] = [
         dry_run_reason=_CLEARANCE_LEASE_NOT_EXERCISED,
     ),
     _signature(
+        "clearance_booking_rebooked",
+        r"Clearance booking for job (?P<job>\S+) on process (?P<process>\d+) went from (?P<before_mb>\d+) MB to "
+        r"(?P<after_mb>\d+) MB at the (?P<moment>stage grant|sample grant|encode boundary)\.",
+        emitter="process_management.scheduling.inference_scheduler:InferenceScheduler._log_clearance_booking",
+        sample=(
+            "Clearance booking for job a7e54dd6 on process 2 went from 2048 MB to 9214 MB at the sample grant. The "
+            "encode boundary report has not arrived, so the grant's charge is held whole until it does."
+        ),
+        dry_run_reason=_CLEARANCE_LEASE_NOT_EXERCISED,
+    ),
+    _signature(
         "clearance_stage_refused",
         r"Clearance lease on device (?P<device>\d+): stage grant for process (?P<process>\d+) refused by admission",
         emitter="process_management.scheduling.clearance_lease:ClearanceController._note_stage_refusal",

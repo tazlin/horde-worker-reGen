@@ -119,7 +119,10 @@ allocation is held in exactly one place:
 
 A planned entry decays as its target's private working set grows past its admit-time reading, and the
 decay only rises, so pages a load later releases cannot resurrect its charge. Re-booking a dispatch at
-clearance keeps the entry's progress. Without a dedicated post-processing lane, post-processing RAM is
+clearance keeps the entry's progress. A planned VRAM entry can also hold a floor that growth does not consume
+until the entry is booked again. A clearance grant issued while the child still encodes holds the window's charge
+there, so the encoder's growth and release do not consume it before the job's encode boundary report arrives
+([VRAM arbiter](vram_arbiter.md)). Without a dedicated post-processing lane, post-processing RAM is
 booked on the inference process with the rest of the job's features. The post-processing entry stays
 flat while it runs, so its RAM is counted twice once the lane's reading shows it.
 

@@ -137,6 +137,20 @@ class InferenceExecutionOwnership:
     through a window in which it has nothing of its own to stage."""
 
 
+@dataclass(frozen=True)
+class ClearanceBoundaryReport:
+    """One job's encode boundary report, sent after the child released the text encoder."""
+
+    job_id: str
+    """The job of the boundary reported by the child."""
+    process_launch_identifier: int
+    """The launch that sent the report."""
+    reserved_mb: float | None
+    """The child's allocator reservation (MB) in the report, or None when the report had no device reading."""
+    sampled_at: float
+    """Wall-clock time the child sampled the report."""
+
+
 class HordeProcessInfo:
     """Contains information about a horde child process."""
 
@@ -240,6 +254,10 @@ class HordeProcessInfo:
     The child reports it as its encode finishes and its first acquire is about to block, which is the only
     point at which the parent can tell a staged child that still allocates from one that holds all it will
     until cleared: the primed state is reported on receipt of the job, before the encode runs."""
+    clearance_boundary: ClearanceBoundaryReport | None
+    """The last encode boundary report that has a job, or None if the child has not sent one.
+
+    Read through :meth:`clearance_boundary_for`, which returns it only for the job this launch owns."""
 
     current_inference_started_at: float | None
     """Epoch time inference was dispatched to this slot for its current job, or None when not inferring.
@@ -494,6 +512,7 @@ class HordeProcessInfo:
         self.inference_ownership = None
         self.utilities_work_sent_at = None
         self.clearance_wait_entered_at = None
+        self.clearance_boundary = None
         self.current_inference_started_at = None
         self.current_first_step_at = None
         self.current_job_expected_sampling_seconds = None
@@ -659,6 +678,28 @@ class HordeProcessInfo:
     def note_clearance_wait_entered(self, entered_at: float) -> None:
         """Record that the child began waiting on its clearance permit at wall-clock ``entered_at``."""
         self.clearance_wait_entered_at = entered_at
+
+    def note_clearance_boundary(self, report: ClearanceBoundaryReport) -> None:
+        """Record the child's encode boundary report for ``report.job_id``."""
+        self.clearance_boundary = report
+
+    def clearance_boundary_for(self, job_id: str) -> ClearanceBoundaryReport | None:
+        """Return the encode boundary report for ``job_id``, or None when this launch has not sent one for it.
+
+        A report is the job's only while this launch owns the job, the report came from this launch and it was
+        sampled at or after the ownership was recorded. An earlier job's report, a replaced launch's report and an
+        earlier attempt's report for the same job all return None.
+        """
+        report = self.clearance_boundary
+        ownership = self.inference_ownership
+        job = self.current_inference_job()
+        if report is None or ownership is None or job is None or job.id_ is None or str(job.id_) != job_id:
+            return None
+        if report.job_id != job_id or report.process_launch_identifier != self.process_launch_identifier:
+            return None
+        if report.sampled_at < ownership.recorded_at:
+            return None
+        return report
 
     def is_waiting_on_clearance(self) -> bool:
         """Return whether this slot is staged short of sampling and its child has entered its clearance wait.

@@ -35,7 +35,7 @@ from horde_worker_regen.process_management.ipc.messages import (
 from horde_worker_regen.process_management.ipc.supervisor_channel import WorkerEventKind
 from horde_worker_regen.process_management.jobs.job_tracker import JobStage, JobTracker
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
-from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
+from horde_worker_regen.process_management.lifecycle.process_info import ClearanceBoundaryReport, HordeProcessInfo
 from horde_worker_regen.process_management.lifecycle.process_lifecycle import InferenceLaneOutcome
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
@@ -595,6 +595,28 @@ class TestReceiveAndHandleProcessMessages:
         _enqueue(message_dispatcher, wait_entry)
         await message_dispatcher.receive_and_handle_process_messages()
         assert process_info.clearance_wait_entered_at == 1_234.5
+        assert process_info.clearance_boundary is None, "a report without a job is not a job's boundary"
+
+    async def test_a_boundary_report_with_a_job_is_kept_with_its_reservation_and_launch(self) -> None:
+        """The encode boundary report of a job is kept with the reservation it reports and the launch that sent it."""
+        process_info = make_mock_process_info(0, state=HordeProcessState.INFERENCE_PRIMED)
+        process_info.process_launch_identifier = 0
+        message_dispatcher = _make_dispatcher(process_map=ProcessMap({0: process_info}))
+
+        boundary = _make_memory_message(0, ram_usage_bytes=1024)
+        boundary.sampled_at = 1_234.5
+        boundary.process_reserved_mb = 3_100
+        boundary.clearance_wait_entry = True
+        boundary.clearance_wait_job_id = "job-a"
+        _enqueue(message_dispatcher, boundary)
+        await message_dispatcher.receive_and_handle_process_messages()
+
+        assert process_info.clearance_boundary == ClearanceBoundaryReport(
+            job_id="job-a",
+            process_launch_identifier=0,
+            reserved_mb=3_100.0,
+            sampled_at=1_234.5,
+        )
 
     async def test_process_ending_calls_on_process_ending(self) -> None:
         """When a process is ending, the process map's on_process_ending callback is called."""

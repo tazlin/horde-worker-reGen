@@ -557,15 +557,15 @@ class TestFakeInferenceClearanceLease:
         assert clearance.acquires == [True]
 
     def test_every_sample_stage_waits_for_its_own_grant(self) -> None:
-        """The second stage waits again rather than passing through on the first stage's consumed grant."""
+        """The second stage waits again and does not pass through on the first stage's consumed grant."""
         process, _queue, clearance = _leased_fake(grants=1)
 
         process._receive_and_handle_control_message(_sample_message())
         process._receive_and_handle_control_message(_sample_message())
 
-        # The first stage took the granted permit at its probe. The second probed, found none, waited and
-        # degraded into unpriced sampling rather than silently reusing the first stage's grant.
-        assert clearance.acquires == [True, False, False]
+        # The first stage took the granted permit. The second acquired once, found no permit within the wait,
+        # and sampled unpriced. The first stage's grant was not reused.
+        assert clearance.acquires == [True, False]
 
     def test_leased_whole_job_primes_rather_than_reporting_itself_sampling(self) -> None:
         """A leased monolithic dispatch reports IN_USE at PRIMED; the parent advances it on the first step."""
@@ -584,10 +584,10 @@ class TestFakeInferenceClearanceLease:
         assert [m.process_state for m in in_use] == [HordeProcessState.INFERENCE_PRIMED]
         assert clearance.acquires == [True]
 
-    def test_a_job_that_waits_for_its_grant_reports_memory_once_more(self) -> None:
-        """The wait-entry report is sent only when the job has to wait, as the real child's callback is."""
+    def test_a_job_reports_the_encode_boundary_whether_or_not_it_waits(self) -> None:
+        """One boundary report per job on the first acquire, with a grant waiting and without, as the real child."""
 
-        def memory_reports(grants: int) -> int:
+        def memory_reports(grants: int) -> tuple[int, int]:
             process, queue, _clearance = _leased_fake(grants=grants)
             process._receive_and_handle_control_message(
                 HordeInferenceControlMessage(
@@ -596,9 +596,13 @@ class TestFakeInferenceClearanceLease:
                     sdk_api_job_info=make_job_pop_response(model="Deliberate"),
                 ),
             )
-            return len(queue.of_type(HordeProcessMemoryMessage))
+            reports = queue.of_type(HordeProcessMemoryMessage)
+            return len(reports), sum(1 for report in reports if report.clearance_wait_entry)
 
-        assert memory_reports(grants=0) == memory_reports(grants=1) + 1
+        waited_total, waited_boundaries = memory_reports(grants=0)
+        granted_total, granted_boundaries = memory_reports(grants=1)
+        assert waited_boundaries == granted_boundaries == 1
+        assert waited_total == granted_total
 
     def test_unleased_whole_job_reports_sampling_directly(self) -> None:
         """With no lease the fake keeps its original sequence: IN_USE at INFERENCE_STARTING, no priming."""

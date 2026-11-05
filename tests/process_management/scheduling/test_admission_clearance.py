@@ -18,7 +18,7 @@ from horde_worker_regen.process_management.ipc.messages import HordeControlFlag,
 from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
-from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
+from horde_worker_regen.process_management.lifecycle.process_info import ClearanceBoundaryReport, HordeProcessInfo
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.model_metadata import ModelMetadata
 from horde_worker_regen.process_management.resources.resource_budget import (
@@ -115,6 +115,30 @@ async def _staged_waiter(
     waiter.last_job_referenced = job
     scheduler._record_dispatch_reservation(job, waiter, baseline=None, staging_only=True)  # type: ignore[attr-defined]
     return scheduler, job, waiter
+
+
+def _report_encode_boundary(
+    waiter: HordeProcessInfo,
+    job: ImageGenerateJobPopResponse,
+    *,
+    job_id: str | None = None,
+    launch_identifier: int | None = None,
+    sampled_at: float | None = None,
+) -> None:
+    """Record the child's encode boundary report for ``job`` at the lane's current reservation, as the dispatcher does.
+
+    The overrides build a stale report: another job's, another launch's, or one sampled before the ownership.
+    """
+    waiter.note_clearance_boundary(
+        ClearanceBoundaryReport(
+            job_id=job_id if job_id is not None else str(job.id_),
+            process_launch_identifier=(
+                launch_identifier if launch_identifier is not None else waiter.process_launch_identifier
+            ),
+            reserved_mb=float(waiter.process_reserved_mb) if waiter.process_reserved_mb is not None else None,
+            sampled_at=sampled_at if sampled_at is not None else time.time(),
+        ),
+    )
 
 
 def _decide(scheduler: InferenceScheduler, process_id: int, *, deferred: bool = False):  # noqa: ANN202
@@ -261,12 +285,13 @@ async def test_a_cleared_job_books_what_clearance_priced_and_spends_it_at_its_pe
     Booked at the gross peak against a baseline that already holds the staged set, that set stays outstanding
     through the whole sample and is charged against the next waiter.
     """
-    scheduler, job, _waiter = await _staged_waiter(device_free_mb=24000.0)
+    scheduler, job, waiter = await _staged_waiter(device_free_mb=24000.0)
     job_id = str(job.id_)
     snapshot = scheduler.snapshot()
     gross = staged_sampling_peak_mb(snapshot, job_id, 0)
     remaining = staged_materialization_delta_mb(snapshot, job_id, 0)
     assert gross is not None and remaining is not None and remaining == gross - 900.0
+    _report_encode_boundary(waiter, job)
 
     assert scheduler.clearance_admit_process(0) is True
 
@@ -1110,13 +1135,16 @@ async def test_a_seat_admit_books_no_more_than_the_room_the_child_was_granted() 
     Booked at the full outstanding charge, the part above the granted room would stay outstanding through the
     whole sample, because the child only grows into what it was given.
     """
-    scheduler, job, _waiter = await _krea2_staged_waiter()
+    scheduler, job, waiter = await _krea2_staged_waiter()
     plan = _decide(scheduler, 0)
     assert plan.verdict is not None and plan.verdict.partial_seat is True
     available_mb = plan.verdict.measured.available_mb
     assert available_mb is not None and plan.candidate_delta_mb is not None
     assert available_mb < plan.candidate_delta_mb
     assert plan.booking_mb == pytest.approx(available_mb)
+    assert plan.booking is not None
+    assert plan.booking.booking_mb_at(waiter.process_reserved_mb) == pytest.approx(available_mb)
+    _report_encode_boundary(waiter, job)
 
     assert scheduler.clearance_admit_process(0) is True
 
@@ -1421,7 +1449,7 @@ async def test_a_stage_that_fits_is_granted_and_books_the_weights() -> None:
 
     The booking decays against the lane's report, so it is spent once the weights land.
     """
-    scheduler, job, _waiter = await _staged_waiter(device_free_mb=24000.0, model_metadata=_two_model_metadata())
+    scheduler, job, waiter = await _staged_waiter(device_free_mb=24000.0, model_metadata=_two_model_metadata())
     job_id = str(job.id_)
     weights_mb = stage_weights_delta_mb(scheduler.snapshot(), job_id, 0)
     assert weights_mb is not None and weights_mb > 0.0
@@ -1431,6 +1459,7 @@ async def test_a_stage_that_fits_is_granted_and_books_the_weights() -> None:
     assert plan.decision is ClearanceDecision.ADMIT
     assert plan.candidate_delta_mb == weights_mb
     assert plan.priced is not None and plan.priced.request.own_dispatch_unmaterialized_mb > 0.0
+    _report_encode_boundary(waiter, job)
 
     assert scheduler.clearance_stage_admit_process(0) is True
 
@@ -1509,6 +1538,7 @@ async def test_a_retention_resident_model_stages_at_no_charge() -> None:
     plan = _decide_stage(scheduler, 0)
     assert plan.decision is ClearanceDecision.ADMIT
     assert plan.candidate_delta_mb == 0.0
+    _report_encode_boundary(waiter, job)
 
     assert scheduler.clearance_stage_admit_process(0) is True
     assert _dispatch_charge_mb(scheduler, job_id, {0: 900.0}) == 0.0
@@ -1526,6 +1556,7 @@ async def test_the_sample_clearance_after_a_stage_prices_the_activation_alone() 
     gross_mb = staged_sampling_peak_mb(snapshot, job_id, 0)
     weights_mb = predict_job_weight_mb(job, baseline)
     assert gross_mb is not None and weights_mb is not None
+    _report_encode_boundary(waiter, job)
     assert scheduler.clearance_stage_admit_process(0) is True
 
     landed_mb = 900 + int(weights_mb)
@@ -1541,6 +1572,312 @@ async def test_the_sample_clearance_after_a_stage_prices_the_activation_alone() 
     assert plan.candidate_delta_mb == activation_mb
     assert scheduler.clearance_admit_process(0) is True
     assert _dispatch_charge_mb(scheduler, job_id, {0: float(landed_mb)}) == activation_mb
+
+
+_ENCODED_SO_FAR_MB = 1000.0
+"""How far the child's encode has grown the lane when an early grant reaches it, below the encode charge."""
+
+
+def _observe(scheduler: InferenceScheduler, reserved_mb: float) -> None:
+    """Run the per-cycle ledger observation at one lane report, as every admission pass does."""
+    scheduler._reserve_ledger.effective_planned_vram_mb({0: reserved_mb})  # type: ignore[attr-defined]
+
+
+async def test_an_early_sample_grant_holds_the_sampling_charge_until_the_encode_boundary() -> None:
+    """A grant that reaches a child mid-encode keeps the sampling charge whole until the boundary report arrives.
+
+    Netted against a report that includes encoder bytes, the charge would be short by those bytes and then consumed
+    by the rest of the encoder's growth, so a competing admission would see room the sample is about to take. The
+    encode charge still outstanding stays on top and decays with growth. At the boundary the booking is the
+    peak net of the boundary report, it decays as the weights and activation land, and the job's end releases it.
+    """
+    scheduler, job, waiter = await _staged_waiter(device_free_mb=24000.0)
+    job_id = str(job.id_)
+    staging_mb = pricing.staging_charge_mb(None)
+    peak_mb = staged_sampling_peak_mb(scheduler.snapshot(), job_id, 0)
+    assert peak_mb is not None
+    sampling_mb = peak_mb - 900.0
+    encoding_mb = 900.0 + _ENCODED_SO_FAR_MB
+    waiter.process_reserved_mb = int(encoding_mb)
+    _observe(scheduler, encoding_mb)
+    assert _dispatch_charge_mb(scheduler, job_id, {0: encoding_mb}) == staging_mb - _ENCODED_SO_FAR_MB
+
+    assert scheduler.clearance_admit_process(0) is True
+
+    held_mb = staging_mb - _ENCODED_SO_FAR_MB + sampling_mb
+    assert _dispatch_charge_mb(scheduler, job_id, {0: encoding_mb}) == pytest.approx(held_mb)
+    netted_at_the_grant_mb = peak_mb - encoding_mb
+    assert held_mb - netted_at_the_grant_mb == pytest.approx(staging_mb), "the encoder is not netted from the peak"
+
+    overrun_mb = encoding_mb + staging_mb + 500.0
+    _observe(scheduler, overrun_mb)
+    assert _dispatch_charge_mb(scheduler, job_id, {0: overrun_mb}) == pytest.approx(sampling_mb)
+    waiter.process_reserved_mb = 900
+    _observe(scheduler, 900.0)
+    assert _dispatch_charge_mb(scheduler, job_id, {0: 900.0}) == pytest.approx(sampling_mb)
+
+    scheduler._rebook_granted_jobs_at_encode_boundary(0)  # type: ignore[attr-defined]
+    assert _dispatch_charge_mb(scheduler, job_id, {0: 900.0}) == pytest.approx(sampling_mb), "no report yet"
+
+    _report_encode_boundary(waiter, job)
+    scheduler._rebook_granted_jobs_at_encode_boundary(0)  # type: ignore[attr-defined]
+
+    assert scheduler._pending_boundary_bookings == {}  # type: ignore[attr-defined]
+    assert _dispatch_charge_mb(scheduler, job_id, {0: 900.0}) == pytest.approx(sampling_mb)
+    assert _dispatch_charge_mb(scheduler, job_id, {0: 900.0 + sampling_mb / 2}) == pytest.approx(sampling_mb / 2)
+    assert _dispatch_charge_mb(scheduler, job_id, {0: peak_mb}) == 0.0
+    scheduler.release_dispatch_reservation(job)
+    assert _dispatch_charge_mb(scheduler, job_id, {0: 900.0}) == 0.0
+
+
+async def test_an_early_sample_grant_refuses_a_competing_admission_the_netted_booking_would_admit() -> None:
+    """A sibling priced beside an early grant is charged the grant's whole sampling demand.
+
+    The free reading fits the sibling only if the granted job is charged the peak net of the encoder-inflated
+    report, which is the room a booking netted against that report leaves to a competitor.
+    """
+    scheduler, job, _sibling_job, _sibling = await _head_beside_staged_sibling(device_free_mb=24000.0)
+    head = scheduler._process_map[0]  # type: ignore[attr-defined]
+    job_id = str(job.id_)
+    encoding_mb = 900.0 + _ENCODED_SO_FAR_MB
+    head.process_reserved_mb = int(encoding_mb)
+    peak_mb = staged_sampling_peak_mb(scheduler.snapshot(), job_id, 0)
+    assert peak_mb is not None
+    assert scheduler.clearance_admit_process(0) is True
+    held_mb = _dispatch_charge_mb(scheduler, job_id, {0: encoding_mb})
+    netted_mb = peak_mb - encoding_mb
+    assert held_mb > netted_mb
+
+    ample = _decide(scheduler, 1)
+    assert ample.verdict is not None and ample.candidate_delta_mb is not None
+    in_flight_mb = ample.verdict.measured.outstanding_reservations_mb
+    noise_mb = ample.verdict.measured.noise_buffer_mb
+    assert in_flight_mb >= held_mb
+    shortfall_mb = (held_mb - netted_mb) / 2
+    scheduler.set_device_reading_provider(
+        device_wide_reading_provider(
+            lambda _device_index: ample.candidate_delta_mb + noise_mb + in_flight_mb - shortfall_mb,  # type: ignore[operator]
+        ),
+    )
+
+    plan = _decide(scheduler, 1)
+
+    assert plan.decision is ClearanceDecision.HOLD
+    assert plan.verdict is not None and plan.verdict.measured.available_mb is not None
+    available_with_netted_booking_mb = plan.verdict.measured.available_mb + (held_mb - netted_mb)
+    assert available_with_netted_booking_mb >= ample.candidate_delta_mb, "the netted booking admits the sibling"
+
+
+async def test_an_early_stage_grant_holds_the_weights_until_the_encode_boundary() -> None:
+    """A stage grant mid-encode keeps the weights booked whole, and the boundary books them against the report.
+
+    The sample grant after the upload then books the activation alone against the same boundary report.
+    """
+    scheduler, job, waiter = await _staged_waiter(device_free_mb=24000.0, model_metadata=_two_model_metadata())
+    job_id = str(job.id_)
+    staging_mb = pricing.staging_charge_mb(None)
+    snapshot = scheduler.snapshot()
+    weights_mb = stage_weights_delta_mb(snapshot, job_id, 0)
+    peak_mb = staged_sampling_peak_mb(snapshot, job_id, 0)
+    assert weights_mb is not None and weights_mb > 0.0 and peak_mb is not None
+    encoding_mb = 900.0 + _ENCODED_SO_FAR_MB
+    waiter.process_reserved_mb = int(encoding_mb)
+    _observe(scheduler, encoding_mb)
+
+    assert scheduler.clearance_stage_admit_process(0) is True
+
+    held_mb = staging_mb - _ENCODED_SO_FAR_MB + weights_mb
+    assert _dispatch_charge_mb(scheduler, job_id, {0: encoding_mb}) == pytest.approx(held_mb)
+    _observe(scheduler, encoding_mb + staging_mb + 500.0)
+    _observe(scheduler, 900.0)
+    assert _dispatch_charge_mb(scheduler, job_id, {0: 900.0}) == pytest.approx(weights_mb)
+
+    waiter.process_reserved_mb = 900
+    _report_encode_boundary(waiter, job)
+    scheduler._rebook_granted_jobs_at_encode_boundary(0)  # type: ignore[attr-defined]
+    assert _dispatch_charge_mb(scheduler, job_id, {0: 900.0}) == pytest.approx(weights_mb)
+    landed_mb = 900.0 + weights_mb
+    assert _dispatch_charge_mb(scheduler, job_id, {0: landed_mb}) == 0.0
+
+    waiter.process_reserved_mb = int(landed_mb)
+    assert scheduler.clearance_admit_process(0) is True
+    assert _dispatch_charge_mb(scheduler, job_id, {0: float(int(landed_mb))}) == pytest.approx(
+        peak_mb - int(landed_mb),
+    )
+
+
+async def test_a_boundary_report_before_the_grant_books_at_the_grant_from_the_stored_report() -> None:
+    """A boundary report that arrived before the grant prices the grant's booking, and no entry is left pending."""
+    scheduler, job, waiter = await _staged_waiter(device_free_mb=24000.0)
+    job_id = str(job.id_)
+    peak_mb = staged_sampling_peak_mb(scheduler.snapshot(), job_id, 0)
+    assert peak_mb is not None
+    _report_encode_boundary(waiter, job)
+    waiter.process_reserved_mb = 1400
+
+    assert scheduler.clearance_admit_process(0) is True
+
+    assert scheduler._pending_boundary_bookings == {}  # type: ignore[attr-defined]
+    assert _dispatch_charge_mb(scheduler, job_id, {0: 900.0}) == pytest.approx(peak_mb - 900.0)
+    assert _dispatch_charge_mb(scheduler, job_id, {0: 1400.0}) == pytest.approx(peak_mb - 1400.0)
+    assert _dispatch_charge_mb(scheduler, job_id, {0: peak_mb}) == 0.0
+
+
+@pytest.mark.parametrize("staleness", ["another_job", "another_launch", "before_the_ownership"])
+async def test_a_stale_boundary_report_does_not_move_the_booking(staleness: str) -> None:
+    """A boundary report from another job, a replaced launch or an earlier attempt neither books nor releases.
+
+    The grant holds the job's charge as a mid-encode grant does, and the boundary pass leaves it pending.
+    """
+    scheduler, job, waiter = await _staged_waiter(device_free_mb=24000.0)
+    job_id = str(job.id_)
+    peak_mb = staged_sampling_peak_mb(scheduler.snapshot(), job_id, 0)
+    assert peak_mb is not None
+    ownership = waiter.inference_ownership
+    assert ownership is not None
+    if staleness == "another_job":
+        _report_encode_boundary(waiter, job, job_id="previous-job")
+    elif staleness == "another_launch":
+        _report_encode_boundary(waiter, job, launch_identifier=waiter.process_launch_identifier + 1)
+    else:
+        _report_encode_boundary(waiter, job, sampled_at=ownership.recorded_at - 1.0)
+    assert waiter.clearance_boundary_for(job_id) is None
+
+    assert scheduler.clearance_admit_process(0) is True
+    scheduler._rebook_granted_jobs_at_encode_boundary(0)  # type: ignore[attr-defined]
+
+    assert job_id in scheduler._pending_boundary_bookings  # type: ignore[attr-defined]
+    staging_mb = pricing.staging_charge_mb(None)
+    assert _dispatch_charge_mb(scheduler, job_id, {0: 900.0}) == pytest.approx(staging_mb + peak_mb - 900.0)
+
+
+async def test_a_grant_on_retained_weights_nets_them_before_the_encode_boundary() -> None:
+    """A Krea-shaped lane keeps the job's weights between jobs, and an early grant does not charge them twice.
+
+    The pre-encode report holds the retained weights, so the held sampling charge is the peak net of them, and the
+    boundary report, which holds them too, books the same figure.
+    """
+    scheduler, job, waiter = await _staged_waiter(device_free_mb=24000.0, model_metadata=_two_model_metadata())
+    job_id = str(job.id_)
+    waiter.retained_resident_model = _JOB_MODEL
+    weights_mb = predict_job_weight_mb(job, scheduler.snapshot().queue.jobs[job_id].baseline)
+    assert weights_mb is not None
+    retained_mb = 900.0 + int(weights_mb)
+    waiter.process_reserved_mb = int(retained_mb)
+    scheduler._record_dispatch_reservation(job, waiter, baseline=None, staging_only=True)  # type: ignore[attr-defined]
+    peak_mb = staged_sampling_peak_mb(scheduler.snapshot(), job_id, 0)
+    assert peak_mb is not None
+    staging_mb = pricing.staging_charge_mb(None)
+    encoding_mb = retained_mb + _ENCODED_SO_FAR_MB
+    waiter.process_reserved_mb = int(encoding_mb)
+    _observe(scheduler, encoding_mb)
+
+    assert scheduler.clearance_admit_process(0) is True
+
+    sampling_mb = peak_mb - retained_mb
+    assert sampling_mb < peak_mb - 900.0
+    assert _dispatch_charge_mb(scheduler, job_id, {0: encoding_mb}) == pytest.approx(
+        staging_mb - _ENCODED_SO_FAR_MB + sampling_mb,
+    )
+    waiter.process_reserved_mb = int(retained_mb)
+    _observe(scheduler, retained_mb)
+    _report_encode_boundary(waiter, job)
+    scheduler._rebook_granted_jobs_at_encode_boundary(0)  # type: ignore[attr-defined]
+    assert _dispatch_charge_mb(scheduler, job_id, {0: retained_mb}) == pytest.approx(sampling_mb)
+
+
+async def test_a_refused_clearance_leaves_the_encode_covered_only_by_its_staging_charge() -> None:
+    """A Flux-shaped job refused at clearance encodes with only the dispatch staging charge booked.
+
+    The encode runs before either acquire, so the refusal does not protect it. The staging charge decays with the
+    encoder's growth, and growth past it is not booked at all. This is the separate before-clearance sizing problem,
+    which the boundary booking does not change.
+    """
+    tracker = JobTracker()
+    flux_model = "flux_checkpoint"
+    scheduler = _make_inference_scheduler(
+        bridge_data=make_mock_bridge_data(
+            gpu_sampling_lease_enabled=True,
+            enable_vram_budget=True,
+            vram_reserve_mb=2048,
+            ram_reserve_mb=4096,
+        ),
+        job_tracker=tracker,
+        device_free_mb=100.0,
+        model_metadata=make_test_model_metadata(
+            {flux_model: make_mock_model_reference_record(flux_model, baseline=_FLUX_BASELINE)},
+        ),
+    )
+    waiter = make_mock_process_info(0, model_name=flux_model, state=HordeProcessState.INFERENCE_PRIMED)
+    waiter.total_vram_mb = 16000
+    waiter.process_reserved_mb = 900
+    scheduler._process_map = ProcessMap({0: waiter})  # type: ignore[attr-defined]
+    job = make_job_pop_response(flux_model)
+    await track_popped_job_async(tracker, job)
+    await mark_job_in_progress_async(tracker, job)
+    waiter.last_job_referenced = job
+    scheduler._record_dispatch_reservation(job, waiter, baseline=_FLUX_BASELINE, staging_only=True)  # type: ignore[attr-defined]
+    job_id = str(job.id_)
+    flux_staging_mb = pricing.staging_charge_mb(_FLUX_BASELINE)
+    scheduler._actuate_materialization_verdict = Mock(return_value=())  # type: ignore[method-assign]
+
+    assert scheduler.clearance_admit_process(0) is False
+
+    assert scheduler._pending_boundary_bookings == {}  # type: ignore[attr-defined]
+    assert _dispatch_charge_mb(scheduler, job_id, {0: 900.0}) == flux_staging_mb
+    encoder_overrun_mb = 900.0 + flux_staging_mb + 700.0
+    _observe(scheduler, encoder_overrun_mb)
+    assert _dispatch_charge_mb(scheduler, job_id, {0: encoder_overrun_mb}) == 0.0
+    _report_encode_boundary(waiter, job)
+    scheduler._rebook_granted_jobs_at_encode_boundary(0)  # type: ignore[attr-defined]
+    assert _dispatch_charge_mb(scheduler, job_id, {0: encoder_overrun_mb}) == 0.0
+
+
+async def test_a_disaggregated_sampler_books_at_its_grant_without_a_boundary() -> None:
+    """A pinned sampler's encode ran on another lane, so the grant books against the lane's report at once."""
+    scheduler, job, waiter = await _staged_waiter(device_free_mb=24000.0)
+    job_id = str(job.id_)
+    waiter.record_inference_ownership(job, attempt_ordinal=1, disaggregated=True)
+    snapshot = scheduler.snapshot()
+    plan = _decide(scheduler, 0)
+    assert plan.decision is ClearanceDecision.ADMIT and plan.booking_mb is not None
+    assert snapshot.slots[0].reserved_mb == 900
+
+    assert scheduler.clearance_admit_process(0) is True
+
+    assert scheduler._pending_boundary_bookings == {}  # type: ignore[attr-defined]
+    assert _dispatch_charge_mb(scheduler, job_id, {0: 900.0}) == pytest.approx(plan.booking_mb)
+
+
+async def test_a_grant_records_the_booking_change_and_whether_the_boundary_had_arrived() -> None:
+    """The clearance decision record includes the booking before and after the grant and the boundary's arrival."""
+    scheduler, job, waiter = await _staged_waiter(device_free_mb=24000.0)
+    job_id = str(job.id_)
+    sink = Mock()
+    scheduler._decision_sink = sink  # type: ignore[attr-defined]
+    staging_mb = pricing.staging_charge_mb(None)
+    peak_mb = staged_sampling_peak_mb(scheduler.snapshot(), job_id, 0)
+    assert peak_mb is not None
+
+    messages, handler_id = _capture_log_messages()
+    try:
+        assert scheduler.clearance_admit_process(0) is True
+        _report_encode_boundary(waiter, job)
+        scheduler._rebook_granted_jobs_at_encode_boundary(0)  # type: ignore[attr-defined]
+    finally:
+        logger.remove(handler_id)
+
+    (record,) = _clearance_records(sink)
+    inputs = record["inputs"]
+    assert isinstance(inputs, dict)
+    assert inputs["booking_before_mb"] == round(staging_mb, 1)
+    assert inputs["booking_after_mb"] == round(staging_mb + peak_mb - 900.0, 1)
+    assert inputs["encode_boundary_arrived"] is False
+    bookings = [message for message in messages if message.startswith("Clearance booking for job")]
+    assert len(bookings) == 2
+    assert "at the sample grant" in bookings[0] and "has not arrived" in bookings[0]
+    assert "at the encode boundary" in bookings[1]
+    assert f"to {peak_mb - 900.0:.0f} MB" in bookings[1]
 
 
 @pytest.mark.parametrize("two_phase", [True, False])

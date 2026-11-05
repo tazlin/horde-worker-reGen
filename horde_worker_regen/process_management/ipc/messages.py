@@ -345,10 +345,17 @@ class HordeProcessMemoryMessage(HordeProcessMessage):
     The weights return to host RAM, so this is what the component stopped claiming on the card rather
     than memory handed back to the system; the card only sees it once the allocator cache is released."""
     clearance_wait_entry: bool = False
-    """Whether this report was sent as the child began waiting on its clearance permit.
+    """Whether this report is the job's encode boundary, sent after the child released the text encoder as it
+    requests the first lease permit of the job.
 
-    The child's encode is done by then, so the reservation this report carries is all the staged job holds
-    until it is cleared. An additive field: an older child never sets it."""
+    Sent once per job, before the child probes the permit, so it arrives whether the acquire then waits, takes a
+    waiting grant or times out. The reservation in this report is what the job holds once the encoder is off the
+    card. An additive field, left unset by a child that does not send the boundary."""
+    clearance_wait_job_id: str | None = None
+    """The job of the encode boundary, or None on any other report and on a disaggregated sample stage.
+
+    The parent books a granted job's sampling charge against this report only while the sending launch still owns
+    this job, so a late report from a previous job or launch does not move the booking."""
 
 
 class HordeHeartbeatType(enum.Enum):

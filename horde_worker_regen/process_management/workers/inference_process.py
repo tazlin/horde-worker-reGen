@@ -329,6 +329,8 @@ class HordeInferenceProcess(HordeProcess):
         # The per-process GPU denoise clearance proxy (hordelib's sampling lease), or None when the lease is
         # disabled. Retained so each job can reset its per-job grant at start (see :meth:`start_inference`).
         self._gpu_sampling_lease = gpu_sampling_lease
+        # The job of the next encode boundary report, set at each job start.
+        self._clearance_boundary_job_id: str | None = None
 
         if dry_run_skip_inference:
             logger.info("Dry-run mode: skipping HordeLib/SharedModelManager initialisation")
@@ -389,8 +391,8 @@ class HordeInferenceProcess(HordeProcess):
                     else:
                         set_gpu_stage_lease(stage_lease)
                         logger.info("Registered GPU weight-stage lease for two-phase clearance")
-                # A staged child blocks holding its encode working set, and clearance prices the job net of the
-                # child's last reported reservation; a report as the wait begins keeps that reading current.
+                # hordelib releases the text encoder just before the first lease acquire of a job. The report sent
+                # there is the encode boundary that the parent books the job's sampling charge against.
                 gpu_sampling_lease.set_wait_entry_callback(self._send_clearance_wait_entry_report)
                 logger.info("Registered GPU denoise clearance proxy for cross-process pipelining")
 
@@ -633,6 +635,7 @@ class HordeInferenceProcess(HordeProcess):
         ram_private_peak_bytes: int | None = None,
         *,
         clearance_wait_entry: bool = False,
+        clearance_wait_job_id: str | None = None,
     ) -> bool:
         """Send a memory report message to the main process.
 
@@ -642,7 +645,8 @@ class HordeInferenceProcess(HordeProcess):
         Args:
             include_vram (bool, optional): Whether or not to include VRAM usage in the report. Defaults to False.
             ram_private_peak_bytes (int | None, optional): A load peak to report instead of the pending one.
-            clearance_wait_entry (bool, optional): Whether the report marks the start of a clearance wait.
+            clearance_wait_entry (bool, optional): Whether the report is the job's encode boundary.
+            clearance_wait_job_id (str | None, optional): The job of that boundary, or None.
 
         Returns:
             bool: Whether or not the message was sent successfully.
@@ -653,6 +657,7 @@ class HordeInferenceProcess(HordeProcess):
             include_vram=include_vram,
             ram_private_peak_bytes=ram_private_peak_bytes,
             clearance_wait_entry=clearance_wait_entry,
+            clearance_wait_job_id=clearance_wait_job_id,
         ):
             self._end_process = True
 
@@ -1110,12 +1115,17 @@ class HordeInferenceProcess(HordeProcess):
         self.send_memory_report_message(include_vram=True)
 
     def _send_clearance_wait_entry_report(self) -> None:
-        """Send the boundary VRAM report as a clearance wait begins, marked as that report.
+        """Send the job's encode boundary report, marked with the job of the report.
 
-        The parent prices a staged sibling beside the clearance head by whether its encode is done, and this
-        is the one report that says so.
+        The proxy runs this once per job on the first lease acquire, after hordelib released the text encoder.
+        The parent books a granted job's sampling charge against this report, and it is the one report that shows
+        a staged sibling's encode is done.
         """
-        self.send_memory_report_message(include_vram=True, clearance_wait_entry=True)
+        self.send_memory_report_message(
+            include_vram=True,
+            clearance_wait_entry=True,
+            clearance_wait_job_id=self._clearance_boundary_job_id,
+        )
 
     def _release_inference_slot(self) -> None:
         """Release this job's sampling-concurrency slot, at most once per job.
@@ -1384,6 +1394,7 @@ class HordeInferenceProcess(HordeProcess):
         """
         # Reset the clearance grant for this job before the pipeline runs: one grant covers a whole job (a
         # multi-sample workflow passes through after the first), and the next job must wait for its own grant.
+        self._clearance_boundary_job_id = str(job_info.id_) if job_info.id_ is not None else None
         if self._gpu_sampling_lease is not None:
             self._gpu_sampling_lease.begin_job()
 
@@ -1549,7 +1560,9 @@ class HordeInferenceProcess(HordeProcess):
         # The proxy's per-job flag latches on the first acquire and only this call clears it, so without it a
         # sampler blocks for its first disaggregated stage and every later stage passes straight through: the
         # parent's grant would stop bracketing the denoise loops it is meant to price. One grant covers the
-        # whole control message, so a multi-slice batch never waits twice.
+        # whole control message, so a multi-slice batch never waits twice. The encode ran on another lane, so the
+        # boundary report of a sample stage is not tied to a job.
+        self._clearance_boundary_job_id = None
         if self._gpu_sampling_lease is not None:
             self._gpu_sampling_lease.begin_job()
 

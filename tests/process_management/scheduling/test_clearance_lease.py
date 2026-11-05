@@ -135,10 +135,11 @@ class _TimeoutRecordingSemaphore(_FakeSemaphore):
 
 
 class TestProxyWaitEntryCallback:
-    """The child's wait-entry callback runs once per job, just before the first acquire blocks.
+    """The child's wait-entry callback runs once per job, on the first acquire of either permit, before the probe.
 
-    The child reports memory there, because clearance prices a staged job net of the child's last reported
-    reservation and a reading taken before the child staged counts the staged set twice.
+    hordelib releases the text encoder just before that acquire, so the child's report there is the job's
+    encode boundary. The parent books a granted job's sampling charge against it, so the report has to arrive
+    whether the acquire waits or a grant is ready.
     """
 
     def test_the_callback_runs_before_a_blocking_wait(self) -> None:
@@ -153,17 +154,83 @@ class TestProxyWaitEntryCallback:
         assert calls == [0]
         assert len(clearance.blocking_timeouts) == 1, "the acquire must still block after the callback"
 
-    def test_a_waiting_grant_runs_no_callback(self) -> None:
-        """A permit already released is taken at once, with no report and no blocking wait."""
-        clearance = _TimeoutRecordingSemaphore(1, bound=1)
+    def test_a_waiting_grant_still_sends_the_report_and_returns_at_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A permit released before the acquire is taken at once, and the boundary report is sent before it.
+
+        The report is sent while the permit is still available, so it goes out before the probe. Without it a
+        child granted early would be booked as still encoding for the whole job.
+        """
+        import horde_worker_regen.process_management.scheduling.clearance_lease as clearance_lease_module
+
+        now = [100.0]
+        monkeypatch.setattr(clearance_lease_module.time, "monotonic", lambda: now[0])
+        clearance = _ClockedSemaphore(now)
+        clearance.release()
         proxy = ClearanceLeaseProxy(clearance=clearance, done=_FakeSemaphore())
+        calls: list[int] = []
+        proxy.set_wait_entry_callback(lambda: calls.append(clearance.value))
+        proxy.begin_job()
+
+        assert proxy.acquire(True, 5.0) is True
+        assert calls == [1], "the report goes out before the waiting permit is taken"
+        assert clearance.value == 0
+        lease_wait = proxy.take_job_lease_wait()
+        assert lease_wait.seconds == pytest.approx(0.0)
+        assert lease_wait.timed_out is False
+
+    def test_a_stage_then_sample_job_sends_one_report(self) -> None:
+        """Under two-phase clearance the stage acquire sends the report, and the sample acquire does not resend it."""
+        stage = _TimeoutRecordingSemaphore(1, bound=1)
+        clearance = _TimeoutRecordingSemaphore(1, bound=1)
+        proxy = ClearanceLeaseProxy(clearance=clearance, done=_FakeSemaphore(), stage=stage)
+        stage_lease = proxy.stage_lease
+        assert stage_lease is not None
+        calls: list[str] = []
+        proxy.set_wait_entry_callback(lambda: calls.append("boundary"))
+        proxy.begin_job()
+
+        assert stage_lease.acquire(True, 5.0) is True
+        assert proxy.acquire(True, 5.0) is True
+        assert proxy.acquire(True, 5.0) is True
+
+        assert calls == ["boundary"]
+
+    def test_a_second_job_on_the_same_lease_sends_a_new_report(self) -> None:
+        """Each job sends a boundary report, whichever permit its first acquire takes."""
+        stage = _TimeoutRecordingSemaphore(1, bound=1)
+        clearance = _TimeoutRecordingSemaphore(1, bound=1)
+        proxy = ClearanceLeaseProxy(clearance=clearance, done=_FakeSemaphore(), stage=stage)
+        calls: list[None] = []
+        proxy.set_wait_entry_callback(lambda: calls.append(None))
+        proxy.begin_job()
+        assert proxy.acquire(True, 5.0) is True
+
+        proxy.begin_job()
+        clearance.release()
+        assert proxy.acquire(True, 5.0) is True
+
+        assert len(calls) == 2
+
+    def test_a_timed_out_acquire_sends_the_report_and_marks_the_wait_timed_out(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A child that waits out the timeout still sends the boundary report first, and samples unpriced."""
+        import horde_worker_regen.process_management.scheduling.clearance_lease as clearance_lease_module
+
+        now = [100.0]
+        monkeypatch.setattr(clearance_lease_module.time, "monotonic", lambda: now[0])
+        proxy = ClearanceLeaseProxy(clearance=_ClockedSemaphore(now), done=_FakeSemaphore())
         calls: list[None] = []
         proxy.set_wait_entry_callback(lambda: calls.append(None))
         proxy.begin_job()
 
-        assert proxy.acquire(True, 5.0) is True
-        assert calls == []
-        assert clearance.blocking_timeouts == []
+        assert proxy.acquire(True, 60.0) is False
+
+        assert len(calls) == 1
+        lease_wait = proxy.take_job_lease_wait()
+        assert lease_wait.seconds == pytest.approx(60.0)
+        assert lease_wait.timed_out is True
 
     def test_a_later_sample_of_the_same_job_runs_no_callback(self) -> None:
         """One report per job: the pass-through acquire of a second sample calls nothing."""
@@ -248,6 +315,83 @@ class TestProxyWaitEntryCallback:
         assert stage_lease.acquire(True, 5.0) is False
         assert calls == [0]
         assert len(stage.blocking_timeouts) == 1, "the stage acquire must still block after the callback"
+
+
+class TestHordelibReleasesTheEncoderBeforeTheBoundaryReport:
+    """hordelib's sampling hook releases the text encoder before the first acquire on the worker's proxy.
+
+    The parent books a granted job against the boundary report as a reading without the encoder, which holds only
+    while the release comes first. The hook's helpers are replaced, so the order is read without ComfyUI.
+    """
+
+    @pytest.fixture
+    def hook_events(self, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+        """Replace the hook's device-touching helpers with ones that record the order they run in."""
+        from hordelib.execution import sampling_lease as hordelib_sampling_lease
+
+        events: list[str] = []
+        monkeypatch.setattr(hordelib_sampling_lease, "_prefetch_sampling_model_weights", lambda _guider: None)
+        monkeypatch.setattr(
+            hordelib_sampling_lease,
+            "_release_text_encoders_before_wait",
+            lambda _guider: events.append("encoder released"),
+        )
+        monkeypatch.setattr(hordelib_sampling_lease, "_rebase_clamp_on_grant", lambda _lease: None)
+        monkeypatch.setattr(hordelib_sampling_lease, "_take_sampling_reserve_on_grant", lambda _lease: None)
+        monkeypatch.setattr(hordelib_sampling_lease, "_acquire_timeout_seconds", 0.0)
+        return events
+
+    @staticmethod
+    def _run_hook(events: list[str]) -> None:
+        from hordelib.execution import sampling_lease as hordelib_sampling_lease
+
+        hordelib_sampling_lease._sample_under_lease(
+            SimpleNamespace(),
+            lambda _guider, *_args, **_kwargs: events.append("sampled"),
+            (),
+            {},
+        )
+
+    def test_the_encoder_release_precedes_the_boundary_report_on_the_sample_lease(
+        self,
+        hook_events: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """With a grant already waiting, the release still runs before the report and the report before the sample."""
+        from hordelib.execution import sampling_lease as hordelib_sampling_lease
+
+        clearance = _FakeSemaphore(1, bound=1)
+        proxy = ClearanceLeaseProxy(clearance=clearance, done=_FakeSemaphore())
+        proxy.set_wait_entry_callback(lambda: hook_events.append("boundary reported"))
+        proxy.begin_job()
+        monkeypatch.setattr(hordelib_sampling_lease, "_sampling_lease", proxy)
+        monkeypatch.setattr(hordelib_sampling_lease, "_stage_lease", None)
+
+        self._run_hook(hook_events)
+
+        assert hook_events == ["encoder released", "boundary reported", "sampled"]
+
+    def test_the_encoder_release_precedes_the_boundary_report_on_the_stage_lease(
+        self,
+        hook_events: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Under two-phase clearance the stage acquire comes first and sends the one report of the job."""
+        from hordelib.execution import sampling_lease as hordelib_sampling_lease
+
+        proxy = ClearanceLeaseProxy(
+            clearance=_FakeSemaphore(1, bound=1),
+            done=_FakeSemaphore(),
+            stage=_FakeSemaphore(0, bound=1),
+        )
+        proxy.set_wait_entry_callback(lambda: hook_events.append("boundary reported"))
+        proxy.begin_job()
+        monkeypatch.setattr(hordelib_sampling_lease, "_sampling_lease", proxy)
+        monkeypatch.setattr(hordelib_sampling_lease, "_stage_lease", proxy.stage_lease)
+
+        self._run_hook(hook_events)
+
+        assert hook_events == ["encoder released", "boundary reported", "sampled"]
 
 
 class _ClockedSemaphore(_FakeSemaphore):

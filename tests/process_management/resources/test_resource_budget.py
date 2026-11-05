@@ -211,6 +211,33 @@ class TestCommittedReserveLedger:
         assert ledger.total_vram_mb() == 0.0
         assert ledger.effective_planned_vram_mb({}) == 0.0
 
+    def test_a_planned_floor_is_not_consumed_by_growth_until_booked_again(self) -> None:
+        """Growth decays the charge down to the floor and no further, in every reader, until the unit is re-booked.
+
+        The floor holds a sampling charge whole while the target still encodes, so the encoder's growth and its
+        release do not consume it. Re-booking the unit without a floor lets the whole charge decay again.
+        """
+        ledger = CommittedReserveLedger()
+        ledger.set_planned(
+            "dispatch",
+            "job-1",
+            vram_mb=5000.0,
+            target_process_id=3,
+            reserved_at_admit_mb=1000.0,
+            floor_mb=4000.0,
+        )
+        assert ledger.planned_growth_baseline_mb("dispatch", "job-1") == 1000.0
+        assert ledger.effective_planned_vram_mb({3: 4000.0}) == 4000.0
+        assert ledger.planned_charge_for_unit("dispatch", "job-1", {3: 4000.0}) == 4000.0
+        assert ledger.effective_planned_vram_mb_for_flow("dispatch", {3: 4000.0}) == 4000.0
+        assert ledger.outstanding_planned_units({3: 4000.0}) == [("dispatch", "job-1", 3, 4000.0)]
+        assert ledger.effective_planned_vram_mb({3: 600.0}) == 4000.0
+        assert ledger.planned_growth_baseline_mb("dispatch", "job-1") == 600.0
+
+        ledger.set_planned("dispatch", "job-1", vram_mb=4000.0, target_process_id=3, reserved_at_admit_mb=600.0)
+        assert ledger.planned_charge_for_unit("dispatch", "job-1", {3: 4600.0}) == 0.0
+        assert ledger.planned_growth_baseline_mb("dispatch", "missing") is None
+
     def test_release_drops_planned_charge(self) -> None:
         """Releasing a unit self-heals its planned charge as well as its flat reserve."""
         ledger = CommittedReserveLedger()

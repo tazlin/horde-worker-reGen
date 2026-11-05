@@ -330,9 +330,10 @@ class FakeInferenceProcess(HordeProcess):
         self._inference_semaphore = inference_semaphore
         self._job_delay_seconds = job_delay_seconds
         self._gpu_sampling_lease = gpu_sampling_lease
+        self._clearance_boundary_job_id: str | None = None
         if gpu_sampling_lease is not None:
-            # The real child reports memory as its lease wait begins; registering the same hook keeps the
-            # fake's report traffic identical.
+            # The real child sends its encode boundary report on a job's first lease acquire. Registering the
+            # same hook keeps the fake's report traffic identical.
             gpu_sampling_lease.set_wait_entry_callback(self._send_wait_entry_memory_report)
         self._fail_every_n = fail_every_n
         self._fault_profile = fault_profile if fault_profile is not None else FaultProfile()
@@ -510,19 +511,25 @@ class FakeInferenceProcess(HordeProcess):
             ),
         )
 
-    def _begin_lease_job(self) -> None:
+    def _begin_lease_job(self, job_id: str | None) -> None:
         """Reset the clearance grant for the job or sample stage about to run, as the real child does.
 
         One grant covers one dispatched unit of work; without this reset the first acquire latches the
         proxy open and every later window passes straight through, which is the failure mode a harness
-        run under the lease exists to catch.
+        run under the lease exists to catch. ``job_id`` is the job of the boundary report, None for a
+        sample stage as in the real child.
         """
+        self._clearance_boundary_job_id = job_id
         if self._gpu_sampling_lease is not None:
             self._gpu_sampling_lease.begin_job()
 
     def _send_wait_entry_memory_report(self) -> None:
-        """Report memory as a job's clearance wait begins, marked as the real child's wait-entry report is."""
-        self.send_memory_report_message(include_vram=True, clearance_wait_entry=True)
+        """Send the job's encode boundary report on the job's first lease acquire, as the real child does."""
+        self.send_memory_report_message(
+            include_vram=True,
+            clearance_wait_entry=True,
+            clearance_wait_job_id=self._clearance_boundary_job_id,
+        )
 
     def _await_clearance(self) -> None:
         """Block where hordelib blocks the real child: at the sample call, until the parent grants clearance.
@@ -591,7 +598,7 @@ class FakeInferenceProcess(HordeProcess):
         """Pretend to run inference and send the result messages for it, honoring any fault profile."""
         self._jobs_started += 1
         profile = self._fault_profile
-        self._begin_lease_job()
+        self._begin_lease_job(str(job_info.id_) if job_info.id_ is not None else None)
 
         if profile.crash_on_job_n == self._jobs_started:
             # Acquire the semaphore first, then die holding it: exercises the parent's semaphore-orphan
@@ -710,7 +717,7 @@ class FakeInferenceProcess(HordeProcess):
         the configured job delay so a sampler has a denoise tail for the parent to hand off against; an
         unleased run keeps the original immediate, position-free sequence.
         """
-        self._begin_lease_job()
+        self._begin_lease_job(None)
         if self._gpu_sampling_lease is not None:
             self.send_process_state_change_message(HordeProcessState.INFERENCE_PRIMED, info="Priming")
             self._await_clearance()
