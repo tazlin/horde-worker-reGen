@@ -184,8 +184,11 @@ class TestSchedulerClassifierBuckets:
         assert bucket is SlotDutyBucket.PRELOAD_DEFERRED
         assert "candidate 9576 MB vs available 2472 MB: does NOT fit" in text
 
-    async def test_an_admission_record_for_another_model_is_not_quoted(self) -> None:
-        """The record holds the latest decision for any job, so it is only quoted when it names this head."""
+    async def test_a_pass_that_returns_before_the_head_quotes_no_earlier_decision(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A decision from an earlier pass is not quoted once a later pass returns before reaching the head."""
         job_tracker = JobTracker()
         head = make_job_pop_response(model="model-a")
         await job_tracker.record_popped_job(head)
@@ -194,13 +197,35 @@ class TestSchedulerClassifierBuckets:
         )
         scheduler._record_preload_admission(
             AdmissionDecision.DEFER_BUDGET,
-            job=make_job_pop_response(model="model-b"),
-            reason="a decision about a different model",
+            job=head,
+            reason="an earlier pass's arithmetic",
+        )
+        monkeypatch.setattr(scheduler, "_pending_post_processing_should_hold_preload", lambda: True)
+
+        assert scheduler.preload_models() is False
+
+        _bucket, text = scheduler._classify_dispatch_stall(head, {})
+        assert "an earlier pass's arithmetic" not in text
+        assert "no preload has been attempted" in text
+
+    async def test_an_admission_record_for_another_job_is_not_quoted(self) -> None:
+        """A decision recorded for another job is not quoted for this head, even when both jobs share a model."""
+        job_tracker = JobTracker()
+        head = make_job_pop_response(model="model-a")
+        await job_tracker.record_popped_job(head)
+        scheduler = self._scheduler(
+            ProcessMap({1: make_mock_process_info(1, model_name=None)}), HordeModelMap(root={}), job_tracker
+        )
+        scheduler._record_preload_admission(
+            AdmissionDecision.DEFER_BUDGET,
+            job=make_job_pop_response(model="model-a"),
+            reason="a decision about another job",
         )
 
         _bucket, text = scheduler._classify_dispatch_stall(head, {})
 
-        assert "a different model" not in text
+        assert "another job" not in text
+        assert "no preload has been attempted" in text
 
     async def test_busy_resident_slot_classifies_resident_slot_busy(self) -> None:
         """A head whose model is resident only on a busy process prices as RESIDENT_SLOT_BUSY."""

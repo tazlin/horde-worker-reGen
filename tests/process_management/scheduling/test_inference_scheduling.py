@@ -2744,7 +2744,7 @@ class TestDominantRunJobPassesABudgetDeclinedColdHead:
         self,
         *,
         decision: AdmissionDecision = AdmissionDecision.DEFER_BUDGET,
-        declined_model: str = "head-model",
+        declined_job_id: str | None = None,
         run_device_index: int = 0,
         max_concurrent: int = 1,
     ) -> tuple[InferenceScheduler, ImageGenerateJobPopResponse, ImageGenerateJobPopResponse, HordeProcessInfo]:
@@ -2775,7 +2775,8 @@ class TestDominantRunJobPassesABudgetDeclinedColdHead:
         )
         scheduler._head_admission.record_preload_admission(
             decision,
-            model=declined_model,
+            job_id=declined_job_id if declined_job_id is not None else str(head.id_),
+            model="head-model",
             process_id=0,
             reason="candidate does not fit the measured room",
         )
@@ -2809,11 +2810,29 @@ class TestDominantRunJobPassesABudgetDeclinedColdHead:
 
         assert await scheduler.get_next_job_and_process() is None
 
-    async def test_a_decline_for_another_model_seats_nothing(self) -> None:
-        """The decline record is the most recent one for any job; one naming another model says nothing here."""
-        scheduler, _head, _run_job, _run_lane = await self._cold_head_behind_run(declined_model="third-model")
+    async def test_a_decline_for_another_job_does_not_seat_a_run(self) -> None:
+        """A budget decline recorded for another job of the head's model does not seat a run ahead of this head."""
+        scheduler, _head, _run_job, _run_lane = await self._cold_head_behind_run(declined_job_id="another-job")
 
         assert await scheduler.get_next_job_and_process() is None
+
+    async def test_a_later_jobs_decision_leaves_the_heads_decline_in_force(self) -> None:
+        """The head's budget decline still seats the run after the pass decides a job on another card."""
+        scheduler, head, run_job, _run_lane = await self._cold_head_behind_run()
+        scheduler._head_admission.record_preload_admission(
+            AdmissionDecision.ADMIT,
+            job_id="a-job-on-another-card",
+            model="other-model",
+            process_id=5,
+            reason="fits",
+        )
+
+        selection = await scheduler.get_next_job_and_process()
+
+        assert selection is not None
+        assert selection.next_job is run_job
+        assert selection.line_skip is not None
+        assert selection.line_skip.displaced_job is head
 
     async def test_a_run_on_another_card_seats_nothing(self) -> None:
         """The head waits on the card its declined preload targeted, which a run elsewhere does not hold."""
@@ -4485,6 +4504,25 @@ class TestPreloadPassContinuesPastACardScopedStop:
 
         assert sent is True
         assert _preloaded_processes(scheduler._process_map) == [1]
+
+    async def test_the_stall_line_quotes_the_heads_decision_after_the_other_card_decides(self) -> None:
+        """The head's stop on card 0 stays readable although card 1's job is decided after it in the same pass."""
+        scheduler = await self._two_card_scheduler()
+        scheduler.set_vram_growth_hold(0, True)
+        head = scheduler._job_tracker.undispatched_head()
+        assert head is not None and head.model == "model_a"
+
+        scheduler.preload_models()
+
+        last = scheduler.head_admission.last_preload_admission
+        assert last is not None and last.model == "model_b", "card 1's job is decided last in the pass"
+        head_decision = scheduler.preload_admission_for_job(head)
+        assert head_decision is not None
+        assert head_decision.decision is AdmissionDecision.DEFER_VRAM_GROWTH_HOLD
+        bucket, text = scheduler._classify_dispatch_stall(head, {})
+        assert bucket is _sched_mod.SlotDutyBucket.PRELOAD_DEFERRED
+        assert "no preload has been attempted" not in text
+        assert AdmissionDecision.DEFER_VRAM_GROWTH_HOLD.value in text
 
     async def test_without_the_hold_the_head_is_the_one_that_loads(self) -> None:
         """The control: with card 0 free the head takes the cycle's one preload and the pass stops there."""

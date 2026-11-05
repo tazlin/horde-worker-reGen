@@ -317,10 +317,15 @@ flowchart LR
 
 Every exit of the pass is recorded once, as the final decision the job ended on:
 
-- **The head-admission ledger** keeps the latest record
-  (`InferenceScheduler.head_admission.last_preload_admission`: decision, model, target process, reason). The
-  dispatch-stall line quotes it when it names the parked head's model, and the harness reads the budget
-  defer reason from it.
+- **The head-admission ledger** keeps two records of the same shape (decision, model, target process,
+  reason). `preload_admissions_by_job` holds each job's decision in the latest pass, keyed by job id, and
+  `begin_preload_pass` empties it at the top of every pass, so when a pass returns before reaching a job, that
+  job does not have an entry. The dispatch-stall line, the `dominant_run` seat and the status surface read the
+  head's entry through `InferenceScheduler.preload_admission_for_job`, and the stall line reports that no
+  preload was attempted only when the head does not have one. A multi-card pass goes on past a stop on the
+  head's card and decides jobs on other cards, so the pass's last decision is often about another job.
+  `last_preload_admission` is that last decision, for any job, and the harness reads the budget defer reason
+  from it.
 - **The decision sink** receives a `VRAM_ADMISSION` event per job whose verdict is the decision's kind:
   `ADMIT` for a sent preload, `NO_OP` for an already-resident model, `DENY` for a faulted (unserviceable or
   quarantined) job, `WITHHOLD` for a pass that moved on or stopped, and `DEFER` for every hold (RAM floor,

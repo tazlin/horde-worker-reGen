@@ -8345,7 +8345,7 @@ class HordeWorkerProcessManager:
                 per_process_ceiling_mb=self._round_optional_mb(ram_snapshot.per_process_ceiling_mb),
             )
 
-        preload_status = self._inference_scheduler.head_admission.last_preload_admission
+        preload_status = self._inference_scheduler.preload_admission_for_job(self._job_tracker.undispatched_head())
         if preload_status is None:
             preload = PreloadAdmissionSnapshot()
         else:

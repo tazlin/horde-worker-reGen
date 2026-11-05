@@ -368,7 +368,7 @@ class TestRecordsAndThrottles:
     def test_preload_admission_record_and_overlay(self) -> None:
         """The last decision is kept with the clock's stamp; the overlay reads worker-wide under key 0."""
         ledger, clock = _ledger()
-        ledger.record_preload_admission(AdmissionDecision.ADMIT, model="m", process_id=3, reason="fits")
+        ledger.record_preload_admission(AdmissionDecision.ADMIT, job_id="j", model="m", process_id=3, reason="fits")
         record = ledger.last_preload_admission
         assert record is not None
         assert (record.decision, record.model, record.process_id, record.reason, record.timestamp) == (
@@ -382,6 +382,42 @@ class TestRecordsAndThrottles:
         ledger.note_admission_headroom(None, 512.0)
         assert ledger.admission_headroom_mb(0) == 512.0
         assert ledger.admission_denials(None) == 0
+
+    def test_a_later_jobs_decision_leaves_the_heads_decision_readable(self) -> None:
+        """A later job's decision replaces the last record and leaves the head's decision readable by job id."""
+        ledger, _clock = _ledger()
+        ledger.begin_preload_pass()
+        ledger.record_preload_admission(
+            AdmissionDecision.EXCLUSIVE_IN_PROGRESS,
+            job_id="head",
+            model="m",
+            process_id=0,
+            reason="card 0 is held for an exclusive admit",
+        )
+        ledger.record_preload_admission(AdmissionDecision.ADMIT, job_id="next", model="m", process_id=1, reason="fits")
+
+        head_record = ledger.preload_admission_for("head")
+        assert head_record is not None
+        assert head_record.decision is AdmissionDecision.EXCLUSIVE_IN_PROGRESS
+        assert ledger.last_preload_admission is not None
+        assert ledger.last_preload_admission.decision is AdmissionDecision.ADMIT
+
+    def test_a_new_pass_forgets_the_previous_passes_decisions(self) -> None:
+        """Beginning a pass drops the previous pass's decisions, so an earlier decision for a job is not readable."""
+        ledger, _clock = _ledger()
+        ledger.begin_preload_pass()
+        ledger.record_preload_admission(
+            AdmissionDecision.DEFER_BUDGET,
+            job_id="head",
+            model="m",
+            process_id=0,
+            reason="does not fit",
+        )
+
+        ledger.begin_preload_pass()
+
+        assert ledger.preload_admission_for("head") is None
+        assert ledger.last_preload_admission is not None, "the last record is kept for the harness's budget reason"
 
     def test_staging_defers_tally_and_throttle(self) -> None:
         """Every deferral is tallied; an unchanged reason is restated only after the repeat window."""

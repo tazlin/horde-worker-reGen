@@ -18,12 +18,14 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     RECENT_EVENTS_IN_SNAPSHOT,
     ModelPoolSeatReadiness,
     PopLivenessSnapshot,
+    PreloadAdmissionSnapshot,
     SupervisorCommand,
     SupervisorControlMessage,
     WorkerEventKind,
 )
 from horde_worker_regen.process_management.jobs.pool_lanes import LaneDecision, PoolLaneState
 from horde_worker_regen.process_management.jobs.text_generation_coordinator import TextJobInFlight
+from horde_worker_regen.process_management.scheduling.governance.preload_admission import AdmissionDecision
 from horde_worker_regen.process_management.scheduling.model_demand_poller import DemandSnapshot
 from horde_worker_regen.process_management.scheduling.model_pool import (
     ModelPool,
@@ -32,7 +34,12 @@ from horde_worker_regen.process_management.scheduling.model_pool import (
     RankedCandidate,
 )
 from horde_worker_regen.process_management.scheduling.workload_kind import WorkloadKind
-from tests.process_management.conftest import make_mock_process_info, make_testable_process_manager
+from tests.process_management.conftest import (
+    make_job_pop_response,
+    make_mock_process_info,
+    make_testable_process_manager,
+    track_popped_job_async,
+)
 
 
 class _Recorder:
@@ -491,3 +498,31 @@ def test_the_run_record_counts_every_flows_delivered_work() -> None:
 
     assert record.jobs_submitted == 6
     assert record.jobs_faulted == 1
+
+
+async def test_the_published_preload_decision_is_the_heads() -> None:
+    """The published preload decision is the head's, although a later job's decision was recorded after it."""
+    manager = make_testable_process_manager()
+    head = await track_popped_job_async(manager._job_tracker, make_job_pop_response("head-model"))
+    later = await track_popped_job_async(manager._job_tracker, make_job_pop_response("later-model"))
+    scheduler = manager._inference_scheduler
+    scheduler._record_preload_admission(AdmissionDecision.DEFER_BUDGET, job=head, reason="the head does not fit")
+    scheduler._record_preload_admission(AdmissionDecision.ADMIT, job=later, reason="fits on the other card")
+
+    preload = manager._build_worker_state_snapshot().scheduling_governance.preload
+
+    assert preload.model == "head-model"
+    assert preload.decision == str(AdmissionDecision.DEFER_BUDGET)
+    assert preload.reason == "the head does not fit"
+
+
+def test_no_published_preload_decision_when_the_head_was_not_decided() -> None:
+    """With an empty queue the published preload decision is empty, whatever the record for an earlier job holds."""
+    manager = make_testable_process_manager()
+    manager._inference_scheduler._record_preload_admission(
+        AdmissionDecision.DEFER_BUDGET,
+        job=make_job_pop_response("departed-model"),
+        reason="a job no longer queued",
+    )
+
+    assert manager._build_worker_state_snapshot().scheduling_governance.preload == PreloadAdmissionSnapshot()

@@ -265,6 +265,7 @@ from horde_worker_regen.process_management.scheduling.ledgers.head_admission imp
     SAFETY_RECOVERY_HOLD_TTL_SECONDS,
     HeadAdmissionLedger,
     HeadRamDeferStep,
+    LatestPreloadAdmission,
     SafetyRecoveryHoldStep,
     StagingDeferReason,
     head_waits_behind_work,
@@ -4480,6 +4481,12 @@ class InferenceScheduler:
         """Clocks, latches and records about the head of the queue's admission."""
         return self._head_admission
 
+    def preload_admission_for_job(self, job: ImageGenerateJobPopResponse | None) -> LatestPreloadAdmission | None:
+        """Return the latest preload pass's decision for ``job``, or None when that pass did not decide one."""
+        if job is None or job.id_ is None:
+            return None
+        return self._head_admission.preload_admission_for(str(job.id_))
+
     def _update_head_starvation_timer(self, head_job: ImageGenerateJobPopResponse | None) -> None:
         """Track how long the current head-of-queue job has been stuck with a card it may use idle.
 
@@ -4829,10 +4836,10 @@ class InferenceScheduler:
                 )
             # Quote the admission gate's own verdict rather than pointing at budget lines that may not exist:
             # the defer notice is coalesced on an unchanged reason, so a head that has been declined for the
-            # same arithmetic all along has no live line to read. The record is only quoted when it names this
-            # head's model, since it holds the most recent decision for any job.
-            admission = self._head_admission.last_preload_admission
-            if admission is not None and admission.model == head.model and admission.reason:
+            # same arithmetic all along has no live line to read. The record is the head's decision in the latest
+            # pass, since a multi-card pass goes on to decide other cards' jobs after the head's card stops.
+            admission = self.preload_admission_for_job(head)
+            if admission is not None and admission.reason:
                 return SlotDutyBucket.PRELOAD_DEFERRED, (
                     f"its model is not resident and its preload was declined ({admission.decision.value}): "
                     f"{admission.reason}"
@@ -10434,6 +10441,7 @@ class InferenceScheduler:
         Returns:
             True if a model was preloaded, False otherwise.
         """
+        self._head_admission.begin_preload_pass()
         self._grant_dominant_runs_at_first_step()
         self._restore_siblings_after_whole_card()
         self._converge_whole_card_residency()
@@ -11026,12 +11034,13 @@ class InferenceScheduler:
     ) -> None:
         """Remember one preload-admission decision for operator diagnostics, and record it as a decision.
 
-        The stored record answers "why is this head not loading?" for the status surfaces; the decision event
-        gives the same answer to offline analysis, which previously saw nothing at all from this gate. The
-        sink coalesces repeats, so a head declined for the same reason every cycle costs one event.
+        The stored record, kept per job for the pass, is what the status surfaces show for a head that is not
+        loading. The decision event gives offline analysis the same reason. The sink coalesces repeats, so a head
+        declined for the same reason every cycle costs one event.
         """
         self._head_admission.record_preload_admission(
             decision,
+            job_id=str(job.id_) if job is not None and job.id_ is not None else None,
             model=job.model if job is not None else None,
             process_id=process.process_id if process is not None else None,
             reason=reason,
@@ -11250,19 +11259,15 @@ class InferenceScheduler:
         head_job: ImageGenerateJobPopResponse,
         candidates: list[ImageGenerateJobPopResponse],
     ) -> tuple[ImageGenerateJobPopResponse, HordeProcessInfo] | None:
-        """The ``dominant_run`` seat for a cold head whose last preload the budget declined, or None.
+        """The ``dominant_run`` seat for a cold head whose preload the budget declined in the latest pass, or None.
 
         The sweep spares a run's copy while the run has a next job, so the room the declined preload needs can be
         held by the run itself. The run's queued jobs are then the only work that can end the run before the
         anti-starvation bound does. The seat is scoped to the card the declined preload targeted. On a multi-card
         host a decline with no target process is not tied to a card, so no seat is offered.
         """
-        admission = self._head_admission.last_preload_admission
-        if (
-            admission is None
-            or admission.model != head_job.model
-            or admission.decision is not AdmissionDecision.DEFER_BUDGET
-        ):
+        admission = self.preload_admission_for_job(head_job)
+        if admission is None or admission.decision is not AdmissionDecision.DEFER_BUDGET:
             return None
         target = self._process_map.get(admission.process_id) if admission.process_id is not None else None
         if target is None and self._multi_gpu_routing_active:

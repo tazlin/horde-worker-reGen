@@ -1382,7 +1382,7 @@ class RamGovernanceSnapshot(BaseModel):
 
 
 class PreloadAdmissionSnapshot(BaseModel):
-    """The most recent preload-admission decision the scheduler made for a queued image job."""
+    """The latest preload pass's decision for the undispatched head of the image queue, empty when none was made."""
 
     decision: str = ""
     """Stable decision key from ``AdmissionDecision`` (e.g. ``admit``, ``defer_budget``)."""

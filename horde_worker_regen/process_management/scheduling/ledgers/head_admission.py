@@ -110,7 +110,7 @@ def head_waits_behind_work(eligible_cards: AbstractSet[int], cards_with_work: Ab
 
 @dataclass(frozen=True)
 class LatestPreloadAdmission:
-    """Operator-facing record of the most recent preload-admission decision."""
+    """Operator-facing record of one preload-admission decision."""
 
     decision: AdmissionDecision
     model: str | None
@@ -173,6 +173,13 @@ class HeadAdmissionLedger:
         self.recovery_hold_expired: bool = False
         """The hold gave up at its TTL and must not re-engage until the crash-loop condition clears."""
         self.last_preload_admission: LatestPreloadAdmission | None = None
+        """The most recent preload-admission decision for any job."""
+        self.preload_admissions_by_job: dict[str, LatestPreloadAdmission] = {}
+        """Each job's decision in the latest preload pass, keyed by job id.
+
+        A multi-card pass decides jobs on other cards after a stop on the head's card, so the decision for one job
+        is read here by its id. ``last_preload_admission`` can hold another job's decision.
+        """
         self.admission_denials_by_device: dict[int, int] = {}
         self.admission_headroom_mb_by_device: dict[int, float | None] = {}
         """The last measured-floor admission headroom per card (worker-wide under key 0); None when unapplied."""
@@ -329,22 +336,37 @@ class HeadAdmissionLedger:
 
     # ---- admission records
 
+    def begin_preload_pass(self) -> None:
+        """Forget the previous pass's per-job decisions.
+
+        When a pass returns before it reaches a job, an earlier pass's decision for that job is not quoted.
+        """
+        self.preload_admissions_by_job = {}
+
     def record_preload_admission(
         self,
         decision: AdmissionDecision,
         *,
+        job_id: str | None,
         model: str | None,
         process_id: int | None,
         reason: str,
     ) -> None:
-        """Remember one preload-admission decision for the status surfaces."""
-        self.last_preload_admission = LatestPreloadAdmission(
+        """Remember one preload-admission decision for the status surfaces, and as the job's decision this pass."""
+        record = LatestPreloadAdmission(
             decision=decision,
             model=model,
             process_id=process_id,
             reason=reason,
             timestamp=self._clock(),
         )
+        self.last_preload_admission = record
+        if job_id is not None:
+            self.preload_admissions_by_job[job_id] = record
+
+    def preload_admission_for(self, job_id: str) -> LatestPreloadAdmission | None:
+        """Return the latest preload pass's decision for ``job_id``, or None when that pass did not decide one."""
+        return self.preload_admissions_by_job.get(job_id)
 
     def admission_denials(self, device_index: int | None) -> int:
         """Measured-floor admission denials on a card this run (worker-wide under key 0)."""
