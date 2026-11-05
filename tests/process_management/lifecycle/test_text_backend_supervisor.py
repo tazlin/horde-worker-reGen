@@ -233,6 +233,21 @@ async def wait_until(predicate: Callable[[], bool], *, timeout: float = 5.0) -> 
         await asyncio.sleep(0.02)
 
 
+def detail_collected(supervisor: TextBackendSupervisor, *, launch_count: int = 1) -> bool:
+    """Return True once launch ``launch_count`` is serving and its buffer sizes have been parsed.
+
+    Serving does not wait for the display-only launch detail, which the supervisor collects after it
+    becomes ready, so a row read on ``is_serving`` alone can still miss the description and buffer sizes.
+    """
+    detail = supervisor.to_process_snapshot().text_backend
+    return (
+        supervisor.is_serving
+        and supervisor.launch_count == launch_count
+        and detail is not None
+        and detail.model_buffer_mb is not None
+    )
+
+
 def test_port_is_free_reports_a_held_port() -> None:
     """A bound port reads as held while the holder lives and free once it is closed."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as holder:
@@ -725,13 +740,7 @@ async def test_the_ready_row_carries_the_description_footprint_pid_and_buffer_si
     )
     task = asyncio.create_task(supervisor.run())
 
-    def detail_collected() -> bool:
-        # Serving does not wait for the display-only launch detail, which the supervisor collects after it
-        # becomes ready, so the row is read once the buffer sizes have landed.
-        detail = supervisor.to_process_snapshot().text_backend
-        return supervisor.is_serving and detail is not None and detail.model_buffer_mb is not None
-
-    await wait_until(detail_collected)
+    await wait_until(lambda: detail_collected(supervisor))
     row = supervisor.to_process_snapshot()
 
     assert row.display_state == "ready"
@@ -909,10 +918,10 @@ async def test_each_launch_describes_once_and_reads_only_its_own_output(tmp_path
     )
     task = asyncio.create_task(supervisor.run())
 
-    await wait_until(lambda: supervisor.is_serving)
+    await wait_until(lambda: detail_collected(supervisor))
     assert backend.describe_calls == 1
     first.exit(3)
-    await wait_until(lambda: supervisor.launch_count == 2 and supervisor.is_serving)
+    await wait_until(lambda: detail_collected(supervisor, launch_count=2))
     row = supervisor.to_process_snapshot()
 
     assert backend.describe_calls == 2
