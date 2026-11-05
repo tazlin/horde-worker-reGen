@@ -562,9 +562,37 @@ class _ClearanceBookingChange:
     """Whether the job's encode boundary report had arrived at the grant."""
 
 
+_WorkerFootprintSource = Literal[
+    "the driver's per-process usage",
+    "the ledger, since the driver reports no per-process usage",
+    "the ledger, since the driver lists no worker pid",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class _WorkerFootprintReading:
+    """The worker's device memory that one foreign reading subtracts, with where the figure came from.
+
+    The source is logged with each floor move. A floor that rises when a job ends, while the ledger figure is
+    far below the card's use, shows the ledger branch missing memory the worker's processes hold.
+    """
+
+    footprint_mb: float
+    """The worker's device memory (MB) subtracted from the card's use."""
+    source: _WorkerFootprintSource
+    """Which figure the footprint is."""
+    listed_pids: int
+    """How many of the worker's pids on the card the driver listed with a usage figure."""
+
+
 def _round_or_none(value: float | None) -> float | None:
     """``value`` rounded to one decimal for a decision record, or None when there is no figure."""
     return None if value is None else round(value, 1)
+
+
+def _mb_or_none(value: float | None) -> str:
+    """``value`` as a whole-megabyte figure for a log line, or ``None`` when there is no figure."""
+    return "None" if value is None else f"{value:.0f}MB"
 
 
 class InferenceScheduler:
@@ -933,6 +961,8 @@ class InferenceScheduler:
         # _foreign_floor_clock so tests can hand-advance the observation window.
         self._foreign_vram_floor = ForeignVramFloorTracker()
         self._foreign_floor_clock: Callable[[], float] = time.monotonic
+        # The last sustained floor logged per card, so a move is logged once with the reading that produced it.
+        self._logged_foreign_floor_mb: dict[int, float | None] = {}
         # The worker's managed text backend is a known tenant of its card: its measured footprint is a standing
         # floor there before the learned window has observed it. Wired by the manager; no tenant until then and
         # in standalone unit tests. The charged map holds each card's charged footprint so the charge and its
@@ -6197,17 +6227,27 @@ class InferenceScheduler:
         # The foreign floor is what other programs hold, read as total less free less the worker's share.
         # Only a device-wide figure has other programs inside it, so no other reading feeds a sample.
         device_wide_free_mb = device_free_mb if device_reading is not None and device_reading.is_device_wide else None
+        worker_footprint = self._foreign_reading_worker_footprint(
+            device_index,
+            device_reading=device_reading,
+            ledger_footprint_mb=committed_mb,
+        )
+        sustained_floor_mb = self._sustained_foreign_floor_mb(
+            device_index,
+            total_vram_mb=raw_total_mb,
+            device_free_mb=device_wide_free_mb,
+            worker_footprint_mb=worker_footprint.footprint_mb,
+        )
+        self._log_foreign_floor_move(
+            device_index,
+            sustained_floor_mb,
+            total_vram_mb=raw_total_mb,
+            device_free_mb=device_wide_free_mb,
+            footprint=worker_footprint,
+            ledger_footprint_mb=committed_mb,
+        )
         foreign_floor_mb = floor_with_known_tenant_mb(
-            self._sustained_foreign_floor_mb(
-                device_index,
-                total_vram_mb=raw_total_mb,
-                device_free_mb=device_wide_free_mb,
-                worker_footprint_mb=self._foreign_reading_worker_footprint_mb(
-                    device_index,
-                    device_reading=device_reading,
-                    ledger_footprint_mb=committed_mb,
-                ),
-            ),
+            sustained_floor_mb,
             self._managed_tenant_footprint_mb(device_index),
         )
         oldest_report_age = self._process_map.oldest_committed_report_age_seconds(
@@ -6360,9 +6400,32 @@ class InferenceScheduler:
         context on the card and counts nothing. Otherwise (WDDM gives no per-process figure, or no worker pid is
         listed, as in a separate pid namespace) the ledger estimate stands. Admission prices the ledger either way.
         """
+        return self._foreign_reading_worker_footprint(
+            device_index,
+            device_reading=device_reading,
+            ledger_footprint_mb=ledger_footprint_mb,
+        ).footprint_mb
+
+    def _foreign_reading_worker_footprint(
+        self,
+        device_index: int | None,
+        *,
+        device_reading: DeviceMemoryReading | None,
+        ledger_footprint_mb: float,
+    ) -> _WorkerFootprintReading:
+        """Return the worker footprint the foreign reading subtracts, with the branch that produced it.
+
+        See :meth:`_foreign_reading_worker_footprint_mb` for the figure. The source is kept for the floor-move log
+        line, since the ledger branch can under-count memory the worker's processes hold between jobs, and the
+        floor then learns that memory as foreign.
+        """
         process_used_mb = None if device_reading is None else device_reading.process_used_mb
         if process_used_mb is None:
-            return ledger_footprint_mb
+            return _WorkerFootprintReading(
+                footprint_mb=ledger_footprint_mb,
+                source="the ledger, since the driver reports no per-process usage",
+                listed_pids=0,
+            )
         worker_pids = {
             process_info.os_pid
             for process_info in self._process_map.values()
@@ -6370,8 +6433,53 @@ class InferenceScheduler:
         }
         listed_worker_pids = worker_pids.intersection(process_used_mb)
         if not listed_worker_pids:
-            return ledger_footprint_mb
-        return sum(process_used_mb[pid] for pid in listed_worker_pids)
+            return _WorkerFootprintReading(
+                footprint_mb=ledger_footprint_mb,
+                source="the ledger, since the driver lists no worker pid",
+                listed_pids=0,
+            )
+        return _WorkerFootprintReading(
+            footprint_mb=sum(process_used_mb[pid] for pid in listed_worker_pids),
+            source="the driver's per-process usage",
+            listed_pids=len(listed_worker_pids),
+        )
+
+    def _log_foreign_floor_move(
+        self,
+        device_index: int | None,
+        floor_mb: float | None,
+        *,
+        total_vram_mb: float | None,
+        device_free_mb: float | None,
+        footprint: _WorkerFootprintReading,
+        ledger_footprint_mb: float,
+    ) -> None:
+        """Log a card's sustained foreign floor once each time it moves, with the reading that moved it.
+
+        The floor is the minimum over a trailing window, so it rises only when the lowest samples age out and falls
+        only on a new low. Logging the move with the worker footprint, the footprint's source and the ledger
+        figure shows whether a rise is a new foreign tenant or memory held by the worker's processes that the
+        subtracted footprint missed.
+        """
+        device_key = device_index if device_index is not None else 0
+        previous = self._logged_foreign_floor_mb.get(device_key)
+        if device_key in self._logged_foreign_floor_mb and (
+            previous == floor_mb or (previous is not None and floor_mb is not None and abs(previous - floor_mb) < 1.0)
+        ):
+            return
+        self._logged_foreign_floor_mb[device_key] = floor_mb
+        reading_mb = (
+            total_vram_mb - device_free_mb - footprint.footprint_mb
+            if total_vram_mb is not None and device_free_mb is not None
+            else None
+        )
+        # Log contract: analysis/log_signatures.py (foreign_floor_moved).
+        logger.debug(
+            f"Foreign floor on device {device_key} moved from {_mb_or_none(previous)} to {_mb_or_none(floor_mb)}: "
+            f"total {_mb_or_none(total_vram_mb)}, device free {_mb_or_none(device_free_mb)}, worker footprint "
+            f"{footprint.footprint_mb:.0f}MB from {footprint.source} ({footprint.listed_pids} pids listed), ledger "
+            f"{ledger_footprint_mb:.0f}MB, reading {_mb_or_none(reading_mb)}.",
+        )
 
     def achievable_ceiling_mb(
         self,

@@ -1243,6 +1243,20 @@ _SIGNATURE_LIST: list[LogSignature] = [
         ),
         dry_run_reason=_WHOLE_CARD_NOT_EXERCISED,
     ),
+    _signature(
+        "foreign_floor_moved",
+        r"Foreign floor on device (?P<device>\d+) moved from (?P<previous>\d+MB|None) to (?P<floor>\d+MB|None): "
+        r"total (?P<total>\d+MB|None), device free (?P<free>\d+MB|None), worker footprint "
+        r"(?P<footprint>\d+)MB from (?P<source>.+?) \((?P<pids>\d+) pids listed\), ledger (?P<ledger>\d+)MB, "
+        r"reading (?P<reading>\d+MB|None)\.",
+        emitter="process_management.scheduling.inference_scheduler:_log_foreign_floor_move",
+        sample=(
+            "Foreign floor on device 0 moved from 2953MB to 3272MB: total 24074MB, device free 11500MB, worker "
+            "footprint 9302MB from the ledger, since the driver lists no worker pid (0 pids listed), ledger "
+            "9302MB, reading 3272MB."
+        ),
+        dry_run_reason="the dry-run harness holds the device reading steady, so the sustained floor does not move",
+    ),
     # --- Blank/malformed model-name pop cascade ---
     _signature(
         "empty_model_pop",
