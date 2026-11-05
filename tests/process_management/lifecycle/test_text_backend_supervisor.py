@@ -725,7 +725,13 @@ async def test_the_ready_row_carries_the_description_footprint_pid_and_buffer_si
     )
     task = asyncio.create_task(supervisor.run())
 
-    await wait_until(lambda: supervisor.is_serving)
+    def detail_collected() -> bool:
+        # Serving does not wait for the display-only launch detail, which the supervisor collects after it
+        # becomes ready, so the row is read once the buffer sizes have landed.
+        detail = supervisor.to_process_snapshot().text_backend
+        return supervisor.is_serving and detail is not None and detail.model_buffer_mb is not None
+
+    await wait_until(detail_collected)
     row = supervisor.to_process_snapshot()
 
     assert row.display_state == "ready"
