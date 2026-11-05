@@ -1658,6 +1658,17 @@ _SIGNATURE_LIST: list[LogSignature] = [
         dry_run_reason=_TEXT_FLOW_NOT_EXERCISED,
     ),
     _signature(
+        "alchemy_already_submitted",
+        r"Alchemy form (?P<form>\S+) was already submitted on the horde\. Recorded as delivered with no reward\.",
+        emitter="process_management.jobs.alchemy_popper:AlchemyCoordinator._submit_single_form",
+        sample=(
+            "Alchemy form 5c3e8f1a-2b4d-4f6e-8a0c-1e3f5a7b9d2c was already submitted on the horde. Recorded as "
+            "delivered with no reward. Horde response: Processing Generation with ID "
+            "5c3e8f1a-2b4d-4f6e-8a0c-1e3f5a7b9d2c already submitted."
+        ),
+        dry_run_reason="a dry run does not submit to the horde, so no submit is refused as already submitted",
+    ),
+    _signature(
         "hordelib_identity",
         r"hordelib: (?P<version>\S+) \((?P<source>[^)]+)\)",
         emitter="process_management.resources.run_metrics:WorkerRunMetrics.record_session_start",

@@ -85,7 +85,11 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeControlFlag,
 )
 from horde_worker_regen.process_management.ipc.supervisor_channel import WorkerEventKind
-from horde_worker_regen.process_management.jobs.job_models import PendingAlchemySubmitJob
+from horde_worker_regen.process_management.jobs.job_models import (
+    PendingAlchemySubmitJob,
+    is_already_submitted,
+    is_stale_generation,
+)
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType, WorkerCapability
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
@@ -1691,8 +1695,23 @@ class AlchemyCoordinator:
             return
 
         if isinstance(response, RequestErrorResponse):
-            message_lower = response.message.lower()
-            if "does not exist" in message_lower or "already submitted" in message_lower:
+            if is_already_submitted(response):
+                # The horde already holds a result for this form, so the form counts as delivered. Either the
+                # response to an earlier attempt was lost, or the horde settled the form before this submit. The
+                # response does not show which, so no reward is recorded.
+                logger.warning(
+                    f"Alchemy form {submit.form_id} was already submitted on the horde. Recorded as delivered with "
+                    f"no reward. Horde response: {response.message}",
+                )
+                submit.succeed(kudos_reward=None)
+                self.num_forms_submitted += 1
+                self._record_form_metrics(
+                    submit,
+                    faulted=submit.result_message.state == GENERATION_STATE.faulted,
+                    kudos_reward=None,
+                )
+                return
+            if is_stale_generation(response):
                 logger.warning(f"Alchemy form {submit.form_id} stale on submit: {response.message}")
                 submit.fault()
                 self.num_forms_faulted += 1

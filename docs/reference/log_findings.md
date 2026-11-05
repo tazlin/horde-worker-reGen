@@ -33,8 +33,9 @@ critical (the worker is losing work or will be paused). `Check` is warning (some
 wasteful). `Try` is suggestion (nothing is wrong, and a change would likely earn more). `Note` is info
 (context, no action). The JSON output carries both, as `severity` and `badge`. Some detectors pick their
 severity from the evidence, such as a one-off against a sustained pattern. Those are marked *varies*.
-Findings are for problems, so a healthy subsystem emits nothing. A report with no `parent_loop_stall`
-means the main process kept reading its workers' messages.
+Findings report problems. Some also give advisory or informational notes that are useful to an operator
+or maintainer. A report with no `parent_loop_stall` means the main process kept reading messages from the
+workers.
 
 Where acting on a remedy needs background the finding cannot carry, its spec gives a reference page
 (`FindingSpec.reference_page`). The text output prints it after the finding as a `more:` line, and the JSON
@@ -118,6 +119,7 @@ For how the detectors, the log lines they read, and the dashboard stay in step, 
 | `lane_double_dispatch_signature` | critical | Any line saying an inference result was lost while its job was in progress, or a result arrived for a job no longer tracked. The evidence counts each, and counts the jobs released after ending with no result as context. A process that sampled without a recorded memory grant is `unpriced_sampling_windows`. | Send the log with `horde-log bundle` to the worker maintainers. |
 | `faulted_job_census` | warning | Any job failed this session. The evidence lists each one's model and cause. | Take the largest cause first. Each cause maps to one of the other findings. |
 | `model_reference_sample_fault` | warning | A job failed because the model list could not be read while it ran. | The job is retried on its own. If it repeats, report it as a worker bug, because the model list was being refreshed while the job ran. |
+| `alchemy_already_submitted` | info | The horde refused one or more alchemy submits as already submitted. The worker recorded each form as delivered with no reward. The headline gives the count, and the evidence quotes up to three of the log lines. | No action needed. The response does not show whether an earlier attempt or the horde settled the form. |
 
 ## Session context
 

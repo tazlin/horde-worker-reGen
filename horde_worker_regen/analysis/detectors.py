@@ -165,6 +165,7 @@ _TEXT_BUSY_REOFFER_RE = pattern_for("text_backend_busy_reoffer")
 _TEXT_BUSY_FAULT_LEGACY_RE = pattern_for("text_backend_busy_fault_legacy")
 _TEXT_JOB_FAULT_REPORTED_RE = pattern_for("text_job_fault_reported")
 _TEXT_JOB_SUBMITTED_RE = pattern_for("text_job_submitted")
+_ALCHEMY_ALREADY_SUBMITTED_RE = pattern_for("alchemy_already_submitted")
 _TEXT_BUSY_FAULT_RUN_MIN_JOBS = 5
 """Busy-refused text jobs faulted in a row, with no text job submitted between them, that make a stuck backend.
 
@@ -2550,7 +2551,7 @@ def _describe_drops(records: list[LogRecord]) -> str:
         )
     if giveups:
         return f"Just before, the worker gave up on {given_up}."
-    return "The log does not say which jobs were dropped."
+    return "The log does not show which jobs were dropped."
 
 
 def detect_forced_maintenance(context: SessionContext) -> list[Finding]:
@@ -4503,6 +4504,28 @@ def detect_model_reference_sample_fault(context: SessionContext) -> list[Finding
     ]
 
 
+def detect_alchemy_already_submitted(context: SessionContext) -> list[Finding]:
+    """Return a note counting the alchemy submits refused by the horde as already submitted.
+
+    The worker records each such form as delivered with no reward. The refusal does not show whether an
+    earlier attempt or the horde settled the form, so the note does not claim a lost reward.
+    """
+    refusals = [record for record in context.session.records if _ALCHEMY_ALREADY_SUBMITTED_RE.search(record.message)]
+    if not refusals:
+        return []
+    return [
+        Finding(
+            kind=FindingKind.ALCHEMY_ALREADY_SUBMITTED,
+            severity=Severity.INFO,
+            headline=(
+                f"The horde refused {_count_text(len(refusals), 'alchemy submit')} as already submitted, and the "
+                "worker recorded them as delivered with no reward."
+            ),
+            evidence=[_evidence(record) for record in refusals[:3]],
+        ),
+    ]
+
+
 def detect_empty_model_pop_cascade(context: SessionContext) -> list[Finding]:
     """A pop that named no model, and how far into the worker it travelled.
 
@@ -5672,6 +5695,7 @@ DETECTORS: list[Detector] = [
     detect_residency_reconciliation_holds,
     detect_faulted_job_census,
     detect_model_reference_sample_fault,
+    detect_alchemy_already_submitted,
     detect_consecutive_failure_pause,
     detect_text_backend_wedged,
     detect_pop_governor_dominance,

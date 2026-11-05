@@ -246,6 +246,15 @@ def _stage_refused(ts: str, *, process: int = 2) -> str:
     )
 
 
+def _alchemy_already_submitted(ts: str, *, form_id: str) -> str:
+    """AlchemyCoordinator._submit_single_form: the horde refused a form's submit as already submitted."""
+    return (
+        f"2026-11-05 {ts} | WARNING  | horde_worker_regen.process_management.jobs.alchemy_popper:"
+        f"_submit_single_form:1702 - Alchemy form {form_id} was already submitted on the horde. Recorded as "
+        f"delivered with no reward. Horde response: Processing Generation with ID {form_id} already submitted."
+    )
+
+
 def _bridge(*lines: str) -> str:
     """A single-session bridge log: the startup boundary followed by the given lines."""
     return "\n".join([_startup_line(), *lines])
@@ -715,6 +724,10 @@ CONTRACTS: dict[str, Contract] = {
         },
         severity=Severity.WARNING,
     ),
+    "detect_alchemy_already_submitted": Contract(
+        bridge=_bridge(_alchemy_already_submitted("18:31:00.000", form_id="5c3e8f1a-2b4d-4f6e-8a0c-1e3f5a7b9d2c")),
+        severity=Severity.INFO,
+    ),
     "detect_model_economics": Contract(
         bridge=_bridge(
             "2026-06-24 18:01:00.000 | SUCCESS | x:y:1 - Submitted generation 9c46c418 (model: "
@@ -849,6 +862,24 @@ def test_stages_that_were_all_granted_report_no_refusals(tmp_path: Path) -> None
         ),
     )
     assert "stage_refusals" not in findings
+
+
+def test_the_already_submitted_note_counts_every_refusal_in_the_session(tmp_path: Path) -> None:
+    """Each alchemy submit refused as already submitted adds one to the count in the headline."""
+    findings = _diagnose(
+        tmp_path,
+        _bridge(
+            _alchemy_already_submitted("18:31:00.000", form_id="5c3e8f1a-2b4d-4f6e-8a0c-1e3f5a7b9d2c"),
+            _alchemy_already_submitted("18:32:00.000", form_id="7d1b9e2c-4a6f-4c8e-9b0d-2f4a6c8e0b1d"),
+        ),
+    )
+    assert "refused 2 alchemy submits as already submitted" in findings["alchemy_already_submitted"].headline
+
+
+def test_a_session_without_already_submitted_refusals_has_no_note(tmp_path: Path) -> None:
+    """A session where the horde refused no alchemy submit as already submitted gets no note."""
+    findings = _diagnose(tmp_path, _bridge())
+    assert "alchemy_already_submitted" not in findings
 
 
 def test_every_detector_has_a_contract_fixture() -> None:

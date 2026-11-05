@@ -77,6 +77,7 @@ from loguru import logger
 
 from horde_worker_regen.bridge_data.data_model import derive_text_generation_timeout_seconds, reGenBridgeData
 from horde_worker_regen.process_management.ipc.supervisor_channel import WorkerEventKind
+from horde_worker_regen.process_management.jobs.job_models import is_already_submitted, is_stale_generation
 from horde_worker_regen.process_management.scheduling.workload_flow import WorkloadKind
 from horde_worker_regen.process_management.simulation._canned_scenarios import CannedTextSource
 from horde_worker_regen.runtime_version import runtime_version
@@ -223,16 +224,6 @@ The refusal is a standing state only the operator clears, so probing it at the r
 would spend a request every few seconds to be told the same thing. It is re-checked at all because the
 correction arrives by hot reload, and nothing else would notice a `text_backend_password` that now works.
 """
-
-ALREADY_SUBMITTED_PHRASES: Final = ("already submitted", "already been submitted")
-"""How the horde says it already holds this generation's result, in both the spellings it uses.
-
-Neither phrasing contains the other verbatim, so both are matched. The answer arrives when a submit's
-response was lost in transit and the retry reached a server that had already recorded the first one.
-"""
-
-STALE_JOB_PHRASE: Final = "does not exist"
-"""How the horde says it has no record of this generation, having written it off before the submit."""
 
 FAULTED_GENERATION_TEXT: Final = "Faulted"
 """What a faulted text submit carries in place of a generation.
@@ -1906,14 +1897,14 @@ class TextGenerationCoordinator:
                 continue
 
             if isinstance(response, RequestErrorResponse):
-                if _is_already_submitted(response.message):
-                    # The first attempt's answer was lost rather than its submit: the horde holds this
-                    # result already, so the outcome is the one that was delivered, whichever attempt
-                    # carried it. Counting it as a fault would report a fault the requester never got.
+                if is_already_submitted(response):
+                    # The horde already holds this result, usually because the response to an earlier
+                    # attempt was lost. The outcome is the one already delivered. Counting it as a fault
+                    # would report a fault the requester did not get.
                     logger.debug(f"Text job {job.job_id[:8]} was already submitted: {response.message}")
                     self._note_submitted(job, kudos_reward=None, is_faulted=is_faulted)
                     return
-                if STALE_JOB_PHRASE in response.message.lower():
+                if is_stale_generation(response):
                     logger.warning(f"Text job {job.job_id[:8]} stale on submit: {response.message}")
                     self.num_jobs_faulted += 1
                     return
@@ -2107,17 +2098,6 @@ class TextGenerationCoordinator:
                 f"The horde did not accept every fault report within {SHUTDOWN_FAULT_TIMEOUT_SECONDS:.0f}s; "
                 f"{len(self._in_flight)} text job(s) are left for the server to time out",
             )
-
-
-def _is_already_submitted(message: str) -> bool:
-    """Return whether a submit refusal says the horde already holds this generation's result.
-
-    The image flow (`job_submitter.py`) reads the same answer the same way and treats it as a delivery;
-    it spells the test out at its own site rather than exposing a predicate, so this is the second
-    spelling of one rule rather than a second rule.
-    """
-    message_lower = message.lower()
-    return any(phrase in message_lower for phrase in ALREADY_SUBMITTED_PHRASES)
 
 
 def _ttl_is_spent(job: TextJobInFlight) -> bool:

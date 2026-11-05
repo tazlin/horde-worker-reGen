@@ -29,6 +29,7 @@ from horde_worker_regen.process_management.config.worker_state import WorkerStat
 from horde_worker_regen.process_management.ipc.api_sessions import ApiSessions
 from horde_worker_regen.process_management.jobs.job_models import (
     PendingSubmitJob,
+    is_already_submitted,
 )
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.models.model_metadata import ModelMetadata
@@ -367,12 +368,9 @@ class JobSubmitter:
                 self._record_failed_submit_attempt()
                 return new_submit
 
-            # The horde confirming it already holds this result (a timed-out submit that actually landed) is a
-            # delivery, not a failure: the job leaves the queue without counting, and clears the submit-health
-            # signal. Both phrasings the server uses are matched, since one does not contain the other verbatim.
-            if "already submitted" in job_submit_response.message or "already been submitted" in (
-                job_submit_response.message
-            ):
+            # The horde already holds this result, usually from a timed-out submit that landed. The job is
+            # delivered. It leaves the queue without counting as a failure and clears the submit-health signal.
+            if is_already_submitted(job_submit_response):
                 logger.debug(
                     f"Job {new_submit.job_id} was already submitted; treating as delivered and removing it",
                 )

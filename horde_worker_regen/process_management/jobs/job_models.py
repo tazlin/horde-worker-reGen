@@ -5,11 +5,13 @@ from __future__ import annotations
 import enum
 import random
 from enum import auto
-from typing import Literal, override
+from typing import Final, Literal, override
 
 from horde_sdk.ai_horde_api import GENERATION_STATE
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
+from horde_sdk.ai_horde_api.consts import RC
 from horde_sdk.ai_horde_api.fields import GenerationID
+from horde_sdk.generic_api.apimodels import RequestErrorResponse
 from loguru import logger
 from pydantic import BaseModel, ConfigDict
 
@@ -76,6 +78,48 @@ class JobSubmitState(enum.Enum):
     """The job submit finished succesfully."""
     FAULTED = auto()
     """The job submit faulted for some reason."""
+
+
+ALREADY_SUBMITTED_PHRASES: Final = ("already submitted", "already been submitted")
+"""The two spellings of the horde's refusal for a generation it has already recorded.
+
+Neither phrasing contains the other verbatim, so both are matched."""
+
+STALE_JOB_PHRASE: Final = "does not exist"
+"""The horde's refusal wording for an unknown generation, usually one written off before the submit."""
+
+
+def is_already_submitted(response: RequestErrorResponse) -> bool:
+    """Return whether a submit refusal means the horde already holds this generation's result.
+
+    The return code is checked first. The phrasings cover a server that does not send the code.
+
+    Args:
+        response: The horde's error response to a submit.
+
+    Returns:
+        True for an already-submitted refusal.
+    """
+    if response.rc == RC.DuplicateGen:
+        return True
+    message_lower = response.message.lower()
+    return any(phrase in message_lower for phrase in ALREADY_SUBMITTED_PHRASES)
+
+
+def is_stale_generation(response: RequestErrorResponse) -> bool:
+    """Return whether a submit refusal means the horde has no record of this generation.
+
+    The return code is checked first. The phrase covers a server that does not send the code.
+
+    Args:
+        response: The horde's error response to a submit.
+
+    Returns:
+        True for a refusal of an unknown generation.
+    """
+    if response.rc == RC.InvalidJobID:
+        return True
+    return STALE_JOB_PHRASE in response.message.lower()
 
 
 class PendingJob(BaseModel):
@@ -190,7 +234,11 @@ class PendingAlchemySubmitJob(PendingJob):
     r2_upload: str | None = None
     """The R2 URL to upload the image result to, when applicable."""
     time_popped: float
-    kudos_reward: float = 0.0
+    kudos_reward: float | None = None
+    """The reward the horde's submit response paid for this form, or None when no reward is known.
+
+    None covers a form that has not been delivered and one the horde reported as already submitted, whose
+    reward went to an earlier submit or to no one."""
 
     @property
     def form_id(self) -> str:
@@ -208,10 +256,15 @@ class PendingAlchemySubmitJob(PendingJob):
     @override
     def succeed(
         self,
-        kudos_reward: int = 0,
+        kudos_reward: float | None = None,
         **kwargs: int | float,
     ) -> None:
-        """Mark the form as successfully submitted, recording the kudos reward."""
+        """Mark the form as successfully submitted, recording the kudos reward.
+
+        Args:
+            kudos_reward: The reward the submit response paid, or None when no figure is known.
+            **kwargs: Additional keyword arguments.
+        """
         self.kudos_reward = kudos_reward
         super().succeed(**kwargs)
 

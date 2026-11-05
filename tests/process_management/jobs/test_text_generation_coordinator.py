@@ -1419,6 +1419,25 @@ async def test_a_submit_answered_already_submitted_is_the_delivery_it_describes(
     assert state.kudos_generated_this_session == 0.0
 
 
+async def test_a_duplicate_generation_code_is_a_delivery_whatever_the_message() -> None:
+    """The horde's `DuplicateGen` return code marks a delivery even when the message has neither phrasing."""
+    run_metrics = WorkerRunMetrics()
+    session = _FakeHordeClientSession(
+        submit_errors=[RequestErrorResponse(message="Unexpected refusal", rc=RC.DuplicateGen)],
+    )
+    coordinator, _backend, _session = _make_coordinator(session=session, run_metrics=run_metrics)
+    await coordinator.await_backend_ready()
+    job = TextJobInFlight(job_id=_job_id(), payload={}, time_popped=time.time(), model_name=_DESCRIPTION.model_name)
+    coordinator._in_flight[job.job_id] = job
+
+    await coordinator.submit_job(job, generation="an answer", state=GENERATION_STATE.ok)
+
+    assert coordinator.num_jobs_submitted == 1
+    assert coordinator.num_jobs_faulted == 0
+    assert len(session.submit_requests) == 1
+    assert run_metrics.snapshot().jobs[0].kudos_reward is None
+
+
 async def test_a_faulted_submit_answered_already_submitted_is_a_delivered_fault() -> None:
     """The retry of a fault report that landed is still a fault report that landed."""
     run_metrics = WorkerRunMetrics()

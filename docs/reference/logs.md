@@ -217,6 +217,7 @@ inferring it from throughput. All are registered in `analysis/log_signatures.py`
 | `Whole-card governor deferral of <model> on card <d> cleared after <n>s held.` | INFO | The establish-rate limiter let a head through that it had deferred, at preload admission or at dispatch. `<n>` is the time since the first deferral of that head. `<d>` is `None` on a single-GPU worker, whose one residency state is keyed worker-wide. |
 | `Save-our-ship: holding the soft reset while a replacement child is still alive and booting (boot elapsed <n>s, hard cap <c>s). Rebuilding the pool now would replace the replacement.` | INFO | The recovery supervisor would rebuild the pool, but a replacement child is still booting inside the hard cap. Once per hold. |
 | `Reclaim ladder: restoring the <lane> lane while job <id> still waits, since the job waits on that lane.` | DEBUG | A lane pause booked for a job is restored although the job still waits, because the job waits on the paused lane itself. In practice the post-processing lane. |
+| `Alchemy form <id> was already submitted on the horde. Recorded as delivered with no reward. Horde response: <message>` | WARNING | The horde refused an alchemy submit because it already holds a result for the form. The form counts as submitted. No reward is recorded, because the response does not show whether an earlier attempt or the horde settled the form. |
 
 ## Action-ledger events for runs and safety replacement
 

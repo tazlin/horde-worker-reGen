@@ -5,17 +5,22 @@ import uuid
 from collections import deque
 from io import BytesIO
 from typing import cast, override
+from unittest.mock import AsyncMock, Mock
 
 import PIL.Image
 import pytest
+from horde_sdk import RequestErrorResponse
 from horde_sdk.ai_horde_api import GENERATION_STATE
 from horde_sdk.ai_horde_api.apimodels.alchemy.pop import AlchemyPopFormPayload
+from horde_sdk.ai_horde_api.apimodels.alchemy.submit import AlchemyJobSubmitResponse
+from horde_sdk.ai_horde_api.consts import RC
 from horde_sdk.generation_parameters.alchemy.consts import KNOWN_ALCHEMY_FORMS, KNOWN_ALCHEMY_TYPES
 from loguru import logger
 from pydantic import ValidationError
 
 from horde_worker_regen.bridge_data.data_model import reGenBridgeData
 from horde_worker_regen.process_management._internal._aliased_types import ProcessQueue
+from horde_worker_regen.process_management.config.worker_state import WorkerState
 from horde_worker_regen.process_management.ipc.messages import (
     AlchemyFormSpec,
     HordeAlchemyControlMessage,
@@ -1599,3 +1604,121 @@ class TestShouldPopPolicy:
             job_tracker=_StubJobTracker(pending=0),
         )
         assert idle._should_pop() is True
+
+
+class _SubmitHarness:
+    """A coordinator with one queued text form and a horde session that returns one scripted response."""
+
+    def __init__(self, response: AlchemyJobSubmitResponse | RequestErrorResponse) -> None:
+        self.state = WorkerState()
+        self.run_metrics = Mock()
+        self.submit_request = AsyncMock(return_value=response)
+        horde_session = Mock()
+        horde_session.submit_request = self.submit_request
+        api_sessions = Mock()
+        api_sessions.require_horde_client_session = Mock(return_value=horde_session)
+        self.submit = PendingAlchemySubmitJob(
+            result_message=_result_message("caption", result_payload={"caption": "a test image"}),
+            time_popped=time.time(),
+        )
+        coordinator = AlchemyCoordinator.__new__(AlchemyCoordinator)
+        coordinator._runtime_config = _StubRuntimeConfig(  # type: ignore[assignment]
+            reGenBridgeData(api_key="0" * 22, alchemist=True),  # type: ignore[arg-type]
+        )
+        coordinator._api_sessions = api_sessions
+        coordinator._state = self.state
+        coordinator._run_metrics = self.run_metrics
+        coordinator._form_resolution = {}
+        coordinator._canned_alchemy_source = None
+        coordinator._pending_submits = deque([self.submit])
+        coordinator.num_forms_submitted = 0
+        coordinator.num_forms_faulted = 0
+        self.coordinator = coordinator
+
+    async def submit_twice(self) -> None:
+        """Run two submit passes, so a form that is not released would be submitted again."""
+        await self.coordinator.api_submit_alchemy()
+        await self.coordinator.api_submit_alchemy()
+
+
+class TestAlchemySubmitOutcome:
+    """Each horde response to an alchemy submit settles the form once, with the matching counters."""
+
+    @pytest.mark.parametrize(
+        "response",
+        [
+            RequestErrorResponse(message="Unexpected refusal", rc=RC.DuplicateGen),
+            RequestErrorResponse(message="Processing Generation with ID abc already submitted."),
+            RequestErrorResponse(message="This generation has already been submitted."),
+        ],
+        ids=["duplicate_generation_code", "already_submitted_phrase", "already_been_submitted_phrase"],
+    )
+    async def test_an_already_submitted_form_is_delivered_with_no_reward(
+        self,
+        response: RequestErrorResponse,
+    ) -> None:
+        """The horde holds a result for the form, so it counts as delivered and no reward is recorded."""
+        harness = _SubmitHarness(response)
+
+        await harness.submit_twice()
+
+        assert harness.submit_request.await_count == 1, "a delivered form was submitted again"
+        assert harness.coordinator.num_forms_submitted == 1
+        assert harness.coordinator.num_forms_faulted == 0
+        assert harness.submit.is_finished
+        assert not harness.submit.is_faulted
+        assert harness.submit.kudos_reward is None
+        harness.run_metrics.record_alchemy_form.assert_called_once()
+        metrics_kwargs = harness.run_metrics.record_alchemy_form.call_args.kwargs
+        assert metrics_kwargs["faulted"] is False
+        assert metrics_kwargs["kudos_reward"] is None
+        assert harness.state.kudos_generated_this_session == 0.0
+        assert not harness.state.kudos_events
+
+    @pytest.mark.parametrize(
+        "response",
+        [
+            RequestErrorResponse(message="Unexpected refusal", rc=RC.InvalidJobID),
+            RequestErrorResponse(message="Processing Generation with ID abc does not exist."),
+        ],
+        ids=["invalid_job_code", "does_not_exist_phrase"],
+    )
+    async def test_a_form_unknown_to_the_horde_is_faulted(self, response: RequestErrorResponse) -> None:
+        """A form the horde has no record of is a fault, settled once."""
+        harness = _SubmitHarness(response)
+
+        await harness.submit_twice()
+
+        assert harness.submit_request.await_count == 1
+        assert harness.coordinator.num_forms_faulted == 1
+        assert harness.coordinator.num_forms_submitted == 0
+        assert harness.submit.is_faulted
+        harness.run_metrics.record_alchemy_form.assert_called_once()
+        assert harness.run_metrics.record_alchemy_form.call_args.kwargs["faulted"] is True
+        assert harness.state.kudos_generated_this_session == 0.0
+
+    async def test_an_accepted_form_records_its_reward(self) -> None:
+        """An accepted submit counts the form as submitted and adds its reward to the session's kudos."""
+        harness = _SubmitHarness(AlchemyJobSubmitResponse(reward=4.0))
+
+        await harness.submit_twice()
+
+        assert harness.submit_request.await_count == 1
+        assert harness.coordinator.num_forms_submitted == 1
+        assert harness.coordinator.num_forms_faulted == 0
+        assert harness.submit.kudos_reward == 4
+        assert harness.run_metrics.record_alchemy_form.call_args.kwargs["kudos_reward"] == 4.0
+        assert harness.state.kudos_generated_this_session == 4.0
+        assert len(harness.state.kudos_events) == 1
+
+    async def test_an_unrecognised_refusal_is_retried(self) -> None:
+        """A refusal that is neither already-submitted nor unknown-form keeps the form queued for another try."""
+        harness = _SubmitHarness(RequestErrorResponse(message="Internal server error"))
+
+        await harness.coordinator.api_submit_alchemy()
+
+        assert not harness.submit.is_finished
+        assert list(harness.coordinator._pending_submits) == [harness.submit]
+        assert harness.coordinator.num_forms_submitted == 0
+        assert harness.coordinator.num_forms_faulted == 0
+        harness.run_metrics.record_alchemy_form.assert_not_called()

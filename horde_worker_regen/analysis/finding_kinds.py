@@ -123,6 +123,7 @@ class FindingKind(enum.StrEnum):
     POP_GOVERNOR_DOMINANCE = "pop_governor_dominance"
     FAULTED_JOB_CENSUS = "faulted_job_census"
     MODEL_REFERENCE_SAMPLE_FAULT = "model_reference_sample_fault"
+    ALCHEMY_ALREADY_SUBMITTED = "alchemy_already_submitted"
     TEXT_BACKEND_WEDGED = "text_backend_wedged"
 
     MODEL_ECONOMICS = "model_economics"
@@ -984,6 +985,16 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
             "rewriting. The job then fails on a read error unrelated to the model, the card or the prompt."
         ),
         see_also=FindingKind.FAULTED_JOB_CENSUS,
+    ),
+    FindingSpec(
+        kind=FindingKind.ALCHEMY_ALREADY_SUBMITTED,
+        title="Alchemy forms already submitted on the horde",
+        action="No action needed.",
+        detail=(
+            "The horde already held a result for each of these forms. Either the response to an earlier submit "
+            "was lost, or the horde settled the form before this submit. The response does not show which, so "
+            "the worker counts each form as delivered and records no reward for it."
+        ),
     ),
     # --- Session context ---
     FindingSpec(

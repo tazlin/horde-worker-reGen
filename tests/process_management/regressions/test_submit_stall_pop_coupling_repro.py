@@ -22,6 +22,7 @@ import PIL.Image
 import pytest
 from horde_sdk.ai_horde_api import GENERATION_STATE
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
+from horde_sdk.ai_horde_api.consts import RC
 from horde_sdk.generic_api.apimodels import RequestErrorResponse
 
 from horde_worker_regen.bridge_data.data_model import reGenBridgeData
@@ -306,6 +307,26 @@ async def test_already_submitted_ack_does_not_count_as_failure(message: str) -> 
     tracker = JobTracker()
     tracker.set_retry_policy(1)
     horde = _error_response_session(message)
+    submitter = _make_submitter(state, tracker, horde_client_session=horde, aiohttp_session=_r2_ok_session())
+
+    job = _image_job()
+    await _queue_for_submit(tracker, job)
+    await submitter.api_submit_job()
+
+    remaining_ids = [pending.sdk_api_job_info.id_ for pending in tracker.jobs_pending_submit]
+    assert job.id_ not in remaining_ids, "a duplicate-submit job was left in the pending-submit queue"
+    assert state.consecutive_failed_jobs == 0, "a duplicate-submit acknowledgement counted as a job failure"
+
+
+async def test_duplicate_generation_code_does_not_count_as_failure() -> None:
+    """The horde's `DuplicateGen` return code marks a delivery even when the message has neither phrasing."""
+    state = WorkerState()
+    tracker = JobTracker()
+    tracker.set_retry_policy(1)
+    horde = AsyncMock()
+    horde.submit_request = AsyncMock(
+        return_value=RequestErrorResponse(message="Unexpected refusal", rc=RC.DuplicateGen),
+    )
     submitter = _make_submitter(state, tracker, horde_client_session=horde, aiohttp_session=_r2_ok_session())
 
     job = _image_job()
