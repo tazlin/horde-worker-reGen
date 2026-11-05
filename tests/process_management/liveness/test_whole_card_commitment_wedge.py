@@ -17,6 +17,11 @@ Under the clearance lease, a head whose full charge does not fit the card its te
 seat once the card reads converged-empty. That read needs the post-processing lane's served VRAM unload to stand.
 A lane whose unload flag is cleared after it is served reads reclaimable again on the next pass, so the card never
 converges and the head waits out its lease-acquire timeout to sample unpriced.
+
+A card can be granted to a whole-card head queued behind jobs waiting for auxiliary files, since preload and
+dispatch both step past such jobs. When the files land during the teardown, those jobs come first in the preload
+pass and are refused for the head's exclusive claim. The pass goes on over the held card for the head alone, so
+the head is preloaded and samples, and the jobs ahead of it run once the residency drains.
 """
 
 from __future__ import annotations
@@ -391,6 +396,257 @@ async def test_a_whole_card_head_whose_weights_do_not_fit_beside_safety_moves_sa
         f"the residency did not move safety off the card; pause events {world.safety_pause_events}. "
         f"{world.state_dump()}"
     )
+    assert not world.structural_queue_wedges, (
+        f"the queue-deadlock detector reported a wedge on tick(s) {world.structural_queue_wedges}. "
+        f"{world.state_dump()}"
+    )
+
+
+_AUX_HELD_JOB_COUNT = 3
+"""How many jobs waiting for LoRA files are queued ahead of the whole-card head."""
+_BENEFICIARY_ROW_TICKS = 150
+"""Ticks the beneficiary row runs after the files land: the head's load and sample, then the three jobs."""
+_ARRIVAL_ROW_TICKS = 420
+"""Ticks the arrivals row runs after the files land: past the maximum hold, the drain and the three jobs."""
+_MAX_HOLD_SECONDS = 180
+"""The world's default maximum hold for one residency, the bound on how long the head's model owns the card."""
+
+
+def _beneficiary_world() -> _DispatchWorld:
+    """Three lanes on a 24 GB card under two-phase clearance with a foreign tenant, safety and the service lanes."""
+    return _DispatchWorld(
+        card=_CARD_24GB,
+        lane_count=3,
+        max_threads=2,
+        queue_depth=6,
+        whole_card_enabled=True,
+        closed_loop=True,
+        tick_seconds=_TICK_SECONDS,
+        service_contexts=True,
+        safety_off_gpu_allowed=True,
+        foreign_vram_mb_by_tick={1: _FOREIGN_VRAM_MB},
+        extra_model_classes=(_QWEN,),
+        clearance_lease=True,
+        two_phase=True,
+        partial_loads=True,
+        cooldown_seconds=45,
+        max_hold_seconds=_MAX_HOLD_SECONDS,
+    )
+
+
+async def _grant_head_behind_aux_held_jobs(
+    world: _DispatchWorld,
+) -> tuple[list[ImageGenerateJobPopResponse], ImageGenerateJobPopResponse]:
+    """Queue three LoRA jobs held on LoRA files ahead of a Qwen-class head and step until the head is granted.
+
+    Returns the held jobs and the head. On return the head holds the exclusive claim and has not been preloaded,
+    and the held jobs' files have just landed.
+    """
+    held = [
+        make_job_pop_response(
+            _SDXL.name,
+            width=1024,
+            height=1024,
+            ddim_steps=20,
+            loras=[LorasPayloadEntry(name=f"a_lora_still_downloading_{index}", model=1.0, clip=1.0)],
+        )
+        for index in range(_AUX_HELD_JOB_COUNT)
+    ]
+    for job in held:
+        await _pop_aux_held(world, job)
+    head = make_job_pop_response(_QWEN.name, width=1024, height=1024, ddim_steps=8)
+    await world.pop(head)
+    for _ in range(_SETUP_TICKS):
+        await world.step()
+        if world._job_tracker.is_admitted_exclusive(head):
+            break
+    assert world._job_tracker.is_admitted_exclusive(head), (
+        f"precondition: the head was never admitted to the card exclusively. {world.state_dump()}"
+    )
+    assert not any(lane.loaded_horde_model_name == _QWEN.name for lane in world.scheduler._process_map.values()), (
+        f"precondition: the head must not be preloaded before the held jobs' files land. {world.state_dump()}"
+    )
+    for job in held:
+        _land_aux(world, job)
+    return held, head
+
+
+async def test_a_whole_card_head_behind_jobs_whose_files_land_during_the_teardown_preloads_and_completes() -> None:
+    """The head is preloaded and samples although the jobs ahead of it are refused for the head's claim.
+
+    The card is granted to the Qwen-class head while three SDXL jobs ahead of it wait for LoRA files. The
+    files land before the head is preloaded, so the SDXL jobs come first in every preload pass and are refused with
+    ``EXCLUSIVE_IN_PROGRESS``. A pass that stops at that refusal does not reach the head, and the card idles with
+    all four jobs pending until the residency is released as unable to converge, past the 120 s establish grace.
+    The SDXL jobs run once the head's residency drains, and no job faults.
+    """
+    world = _beneficiary_world()
+    held, head = await _grant_head_behind_aux_held_jobs(world)
+    landed_at = world.now
+    for _ in range(_BENEFICIARY_ROW_TICKS):
+        await world.step()
+        if world.submitted_jobs == len(held) + 1:
+            break
+
+    head_sampled_at = _tick_time(world, world.dispatch_tick(head))
+    assert head_sampled_at is not None and head_sampled_at - landed_at < _ESCAPE_BOUND_SECONDS, (
+        f"the head did not sample within {_ESCAPE_BOUND_SECONDS:.0f}s of the held jobs' files landing (sampled at "
+        f"tick {world.dispatch_tick(head)}). {world.state_dump()}"
+    )
+    first_held_sampled_at = _tick_time(world, world.dispatch_tick(held[0]))
+    assert first_held_sampled_at is not None and first_held_sampled_at - landed_at < _ESCAPE_BOUND_SECONDS, (
+        f"the first held job did not sample within {_ESCAPE_BOUND_SECONDS:.0f}s of the file landing (sampled at "
+        f"tick {world.dispatch_tick(held[0])}). {world.state_dump()}"
+    )
+    assert world.submitted_jobs == len(held) + 1, (
+        f"{world.submitted_jobs} of {len(held) + 1} jobs were finalized. {world.state_dump()}"
+    )
+    assert world._job_tracker.num_jobs_faulted == 0, f"a job faulted. {world.state_dump()}"
+    assert not world.structural_queue_wedges, (
+        f"the queue-deadlock detector reported a wedge on tick(s) {world.structural_queue_wedges}. "
+        f"{world.state_dump()}"
+    )
+    assert not world._job_tracker.has_exclusive_job_in_progress(), (
+        f"an exclusive admit outlived the job. {world.state_dump()}"
+    )
+
+
+async def test_arriving_head_model_work_does_not_keep_the_jobs_ahead_of_it_off_the_card() -> None:
+    """Qwen jobs offered every tick do not hold the SDXL jobs ahead of them past the residency's maximum hold.
+
+    On the held card the pass preloads only the card's exclusive admit. The other Qwen jobs ride the residency,
+    and the maximum hold ends the claim over the offer, so the residency drains and the SDXL jobs run. The
+    row counts completed jobs and accepted-job faults.
+    """
+    world = _beneficiary_world()
+    held, head = await _grant_head_behind_aux_held_jobs(world)
+    granted_at = world.now
+    offered_head_model_jobs = 0
+    for _ in range(_ARRIVAL_ROW_TICKS):
+        arrival = make_job_pop_response(_QWEN.name, width=1024, height=1024, ddim_steps=8)
+        if await world.offer_job(arrival):
+            offered_head_model_jobs += 1
+        await world.step()
+        if all(job_id in world.completed_job_ids for job_id in (str(job.id_) for job in held)):
+            break
+
+    held_ids = [str(job.id_) for job in held]
+    assert offered_head_model_jobs > 0, f"precondition: a Qwen job must arrive after the grant. {world.state_dump()}"
+    assert world.dispatch_tick(head) is not None, f"the head never sampled. {world.state_dump()}"
+    assert all(job_id in world.completed_job_ids for job_id in held_ids), (
+        f"{sum(job_id in world.completed_job_ids for job_id in held_ids)} of {len(held)} held jobs completed while "
+        f"{offered_head_model_jobs} Qwen jobs arrived. {world.state_dump()}"
+    )
+    bound_seconds = _MAX_HOLD_SECONDS + _ESCAPE_BOUND_SECONDS
+    for job in held:
+        sampled_at = _tick_time(world, world.dispatch_tick(job))
+        assert sampled_at is not None and sampled_at - granted_at < bound_seconds, (
+            f"a held job sampled {sampled_at}s, past {bound_seconds:.0f}s after the grant at {granted_at}. "
+            f"{world.state_dump()}"
+        )
+    assert world._job_tracker.num_jobs_faulted == 0, f"an accepted job faulted. {world.state_dump()}"
+
+
+async def test_a_whole_card_head_that_is_the_undispatched_head_is_preloaded_and_completes() -> None:
+    """The granted job is the queue's first job, and the jobs behind it run once the head's residency drains.
+
+    The undispatched head is the residency's model, so the residency never reads as unable to converge. The
+    pass is the only route to running the head, and it reaches the head on every cycle.
+    """
+    world = _beneficiary_world()
+    head = make_job_pop_response(_QWEN.name, width=1024, height=1024, ddim_steps=8)
+    await world.pop(head)
+    held = [
+        make_job_pop_response(
+            _SDXL.name,
+            width=1024,
+            height=1024,
+            ddim_steps=20,
+            loras=[LorasPayloadEntry(name=f"a_lora_still_downloading_{index}", model=1.0, clip=1.0)],
+        )
+        for index in range(_AUX_HELD_JOB_COUNT)
+    ]
+    for job in held:
+        await _pop_aux_held(world, job)
+    tracker = world._job_tracker
+    for _ in range(_SETUP_TICKS):
+        await world.step()
+        if tracker.is_admitted_exclusive(head):
+            break
+    assert tracker.is_admitted_exclusive(head), f"precondition: the head was never admitted. {world.state_dump()}"
+    assert tracker.undispatched_head() == head, (
+        f"precondition: the granted job must be the undispatched head. {world.state_dump()}"
+    )
+    for job in held:
+        _land_aux(world, job)
+    landed_at = world.now
+    for _ in range(_BENEFICIARY_ROW_TICKS):
+        await world.step()
+        if world.submitted_jobs == len(held) + 1:
+            break
+
+    head_sampled_at = _tick_time(world, world.dispatch_tick(head))
+    assert head_sampled_at is not None and head_sampled_at - landed_at < _ESCAPE_BOUND_SECONDS, (
+        f"the head did not sample within {_ESCAPE_BOUND_SECONDS:.0f}s of the held jobs' files landing (sampled at "
+        f"tick {world.dispatch_tick(head)}). {world.state_dump()}"
+    )
+    assert world.submitted_jobs == len(held) + 1, (
+        f"{world.submitted_jobs} of {len(held) + 1} jobs were finalized. {world.state_dump()}"
+    )
+    assert world._job_tracker.num_jobs_faulted == 0, f"a job faulted. {world.state_dump()}"
+    assert not world.structural_queue_wedges, (
+        f"the queue-deadlock detector reported a wedge on tick(s) {world.structural_queue_wedges}. "
+        f"{world.state_dump()}"
+    )
+
+
+_ORPHAN_ROW_TICKS = 90
+"""Ticks the orphaned-mark row runs before the marked job's file lands, and again after it."""
+
+
+async def test_an_exclusive_mark_left_without_a_residency_is_released_and_the_job_is_admitted_again() -> None:
+    """A pending exclusive mark whose card does not hold a residency does not keep the card from other jobs.
+
+    A soft reset rebuilds the lanes and leaves the ledger and the marks as they were, so a Qwen job can stay marked
+    for a card whose residency has ended. The row starts from that state, with the Qwen job still waiting for the
+    LoRA file, so the pass cannot reach it through the held card. While the mark stands, the SDXL job's preload is
+    refused on every pass. Released, the SDXL job runs at once. When the Qwen job's file lands, the demand path
+    grants it a new residency and marks it again, and it completes.
+    """
+    world = _beneficiary_world()
+    tracker = world._job_tracker
+    marked = make_job_pop_response(
+        _QWEN.name,
+        width=1024,
+        height=1024,
+        ddim_steps=8,
+        loras=[LorasPayloadEntry(name="a_lora_still_downloading", model=1.0, clip=1.0)],
+    )
+    await _pop_aux_held(world, marked)
+    tracker.mark_admitted_exclusive(marked, device_index=None)
+    other = make_job_pop_response(_SDXL.name, width=1024, height=1024, ddim_steps=20)
+    await world.pop(other)
+    assert not world.scheduler._whole_card_ledger.held(), "precondition: the card must not hold a residency"
+
+    for _ in range(_ORPHAN_ROW_TICKS):
+        await world.step()
+        if str(other.id_) in world.completed_job_ids:
+            break
+    assert str(other.id_) in world.completed_job_ids, (
+        f"the SDXL job did not complete while a mark without a residency stood. {world.state_dump()}"
+    )
+    assert world.dispatch_tick(marked) is None, "precondition: the marked job must still wait for the file"
+
+    _land_aux(world, marked)
+    for _ in range(_ORPHAN_ROW_TICKS):
+        await world.step()
+        if world.submitted_jobs == 2:
+            break
+    assert str(marked.id_) in world.completed_job_ids, (
+        f"the released job did not complete once the file landed. {world.state_dump()}"
+    )
+    assert world.submitted_jobs == 2, f"{world.submitted_jobs} of 2 jobs were finalized. {world.state_dump()}"
+    assert world._job_tracker.num_jobs_faulted == 0, f"a job faulted. {world.state_dump()}"
     assert not world.structural_queue_wedges, (
         f"the queue-deadlock detector reported a wedge on tick(s) {world.structural_queue_wedges}. "
         f"{world.state_dump()}"

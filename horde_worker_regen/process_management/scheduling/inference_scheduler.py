@@ -172,6 +172,7 @@ from horde_worker_regen.process_management.scheduling.admission.preload import (
     decide_preload_gates,
     decide_ram_admission,
     every_pending_model_accounted_for,
+    is_exclusive_beneficiary,
     loaded_or_loading_models,
     pass_control_for,
     preload_candidate_delta_mb,
@@ -3600,7 +3601,9 @@ class InferenceScheduler:
         jobs reuses one residency. The operator's maximum hold and the empty-pop release end that retention. A
         rung-1 run also ends, with its own work still pending or in progress, once the undispatched head is for a
         different model and has waited past the anti-starvation bound. A ready different-model head may cut a
-        rung-2 cooldown short once the minimum hold has amortised the teardown.
+        rung-2 cooldown short once the minimum hold has amortised the teardown. A residency that can never converge
+        is released without waiting for either. Each pass also releases the pending exclusive admits whose card does
+        not hold a residency for the admit's model.
         The restore's wedge-grace window is granted before the churn is ordered and withdrawn again when the
         release turns out to have changed nothing, so the supervisor is never told to ignore a wedge for free.
         """
@@ -3672,7 +3675,8 @@ class InferenceScheduler:
                 # once its own work has drained, and its end regrows nothing.
                 head = self._job_tracker.undispatched_head()
                 different_model_head = head is not None and head.model is not None and head.model != model
-                if now < state.cooldown_until and not different_model_head and not retention_ended:
+                run_cooldown_waived = different_model_head or retention_ended or never_converges
+                if now < state.cooldown_until and not run_cooldown_waived:
                     continue
                 self._end_dominant_run(
                     device_index,
@@ -3688,7 +3692,9 @@ class InferenceScheduler:
             # A ready head for a different model may cut the cooldown short, but not before the residency has
             # held long enough to amortize the teardown and the regrowth the release itself will pay for;
             # otherwise a queue alternating heavy and light heads rebuilds the pool on every job.
-            ready_different_model_head = self._ready_different_model_head_on_device(
+            # A residency that can never converge is released without waiting for the cooldown or the minimum
+            # hold. Jobs of the residency's model cannot reach the card, so a longer hold only idles the card.
+            ready_different_model_head = not never_converges and self._ready_different_model_head_on_device(
                 residency_model=model,
                 device_index=device_index,
             )
@@ -3700,7 +3706,8 @@ class InferenceScheduler:
             if min_hold_disclosure is not None:
                 self._disclose_whole_card_min_hold(device_index, model, min_hold_disclosure)
             preempt_cooldown = ready_different_model_head and min_hold_disclosure is None
-            if self._clock() < state.cooldown_until and not preempt_cooldown and not retention_ended:
+            cooldown_waived = preempt_cooldown or retention_ended or never_converges
+            if self._clock() < state.cooldown_until and not cooldown_waived:
                 # Drained, but hold the residency through the cooldown so an imminent heavy job reuses it.
                 continue
             # The restore's own churn (respawning siblings, cycling safety back on-GPU) briefly makes the queue
@@ -3761,7 +3768,35 @@ class InferenceScheduler:
                 f"{post_process_note}{vae_lane_note}{component_lane_note}.</>",
                 model,
             )
+        self._release_exclusive_admits_without_residency()
         self._pop_claim_tracker.disclose_edge(self.whole_card_pop_claim(), now=self._clock())
+
+    def _release_exclusive_admits_without_residency(self) -> None:
+        """Release the pending exclusive admits whose card does not hold a residency for the admit's model.
+
+        While the mark stands, every other job's preload onto the card is refused as ``EXCLUSIVE_IN_PROGRESS``. A
+        residency can end without clearing the mark, and a soft reset rebuilds the lanes without touching the marks
+        or the ledger. A released job is marked again when a demand path grants it a residency.
+
+        An over-budget admit is left marked, since that mark isolates the job for the job's whole life whether or
+        not a residency is held.
+        """
+        for job in self._job_tracker.jobs_pending_inference:
+            tracked = self._job_tracker.get_tracked_job(job.id_) if job.id_ is not None else None
+            if tracked is None or not tracked.admitted_exclusive or tracked.admitted_over_budget or job.model is None:
+                continue
+            device_index = tracked.admitted_exclusive_device_index
+            if self._whole_card_ledger.holds_model_on_card(job.model, device_index):
+                continue
+            if device_index is None and self._whole_card_ledger.holder_for_model(job.model)[0]:
+                # An admit without a card is worker-wide, so a residency for the model on any card keeps it.
+                continue
+            self._job_tracker.release_pending_exclusive_admits(job.model, device_index=device_index)
+            # Log contract: analysis/log_signatures.py (exclusive_admit_released_without_residency).
+            logger.info(
+                f"Released the pending exclusive admits for {job.model} on card {device_index}, since the card "
+                "does not hold a residency for that model.",
+            )
 
     def set_max_inference_processes(self, max_inference_processes: int) -> None:
         """Mutate the cached worker-wide inference ceiling after the per-card targets change at runtime.
@@ -10020,7 +10055,9 @@ class InferenceScheduler:
         stops only that card: the walk goes on over jobs whose load would land elsewhere, and any later job
         aimed at a stopped card is refused for the reason already recorded against it. A stop about the host
         or the queue head stops everything, and one preload per cycle is still the ceiling. A single card has
-        nowhere else to continue to, so the pass exits at the first stop exactly as it always has.
+        nowhere else to continue to, so the pass exits at the first stop. An ``EXCLUSIVE_IN_PROGRESS`` refusal is
+        the exception on any number of cards. The pass goes on over the held card and skips every job there except
+        the card's exclusive admit (:func:`is_exclusive_beneficiary`).
 
         Returns:
             True if a model was preloaded, False otherwise.
@@ -10069,6 +10106,7 @@ class InferenceScheduler:
 
         residency_lanes = self._residency_promoted_lanes()
         stopped_cards: set[int] = cards_yielded_to_head
+        cards_held_for_exclusive_admit: set[int | None] = set()
         for job_id in snapshot.queue.pending_in_placement_order:
             if job_id not in snapshot.queue.jobs:
                 continue
@@ -10080,18 +10118,29 @@ class InferenceScheduler:
                 # The promoted job is waiting for its slot (another lane's work, or its isolation), not for a
                 # load. Loading a foreign model here would unload the very weights the promotion kept it for.
                 continue
-            if self._preload_plan_card(snapshot, plan) in stopped_cards:
+            plan_card = self._preload_plan_card(snapshot, plan)
+            if plan_card in stopped_cards:
                 # An earlier job already stopped this card for a reason that still stands, so this job's load
                 # onto it is refused for the same reason. Deciding it again would only restate that.
+                continue
+            if plan_card in cards_held_for_exclusive_admit and not is_exclusive_beneficiary(
+                snapshot.queue.jobs[job_id],
+                plan_card,
+            ):
+                # The card is held for an exclusive admit. That job is the only one the pass preloads there.
                 continue
             step = self._run_preload_plan(plan, snapshot)
             if step.control is PreloadPassControl.PRELOAD_SENT:
                 return True
-            if step.control is PreloadPassControl.STOP_PASS and (
+            if step.decision is AdmissionDecision.EXCLUSIVE_IN_PROGRESS:
+                # A job refused for the hold can be queued ahead of the card's exclusive admit. Stopping here
+                # would leave the admit without a preload and the card idle until the residency is released.
+                cards_held_for_exclusive_admit.add(step.device_index)
+            elif step.control is PreloadPassControl.STOP_PASS and (
                 not self._multi_gpu_routing_active or step.stops_every_card
             ):
                 return False
-            if step.control is PreloadPassControl.STOP_PASS and step.device_index is not None:
+            elif step.control is PreloadPassControl.STOP_PASS and step.device_index is not None:
                 stopped_cards.add(step.device_index)
             if plan.commands:
                 snapshot = self.snapshot()

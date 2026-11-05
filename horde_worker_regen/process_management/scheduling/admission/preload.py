@@ -127,6 +127,9 @@ def stop_is_card_scoped(decision: AdmissionDecision, *, is_head_blocker: bool) -
     A card-scoped stop for the head is still card-scoped: the head is waiting for that one card, and a load
     onto a card it is not waiting for takes nothing from it.
 
+    ``EXCLUSIVE_IN_PROGRESS`` does not stop the target card. The pass goes on over that card for the card's
+    exclusive admit (:func:`is_exclusive_beneficiary`), on one card as well as on several.
+
     Args:
         decision: The recorded decision for the job whose plan stopped the pass.
         is_head_blocker: Whether that job is the queue head, whose escalations outrank later jobs' loads.
@@ -134,6 +137,17 @@ def stop_is_card_scoped(decision: AdmissionDecision, *, is_head_blocker: bool) -
     if is_head_blocker and decision in _HEAD_ESCALATION_STOPS:
         return False
     return decision not in _WORKER_WIDE_STOPS
+
+
+def is_exclusive_beneficiary(job: JobSnapshot, device_index: int | None) -> bool:
+    """Return whether ``job`` is the exclusive admit holding ``device_index``.
+
+    After an ``EXCLUSIVE_IN_PROGRESS`` refusal the pass goes on over the held card for this job alone. A job
+    refused for the hold can be queued ahead of the card's exclusive admit. A pass that stopped at the refusal
+    would never preload the admit. The admit must be planned for this card, so an exclusive admit for another
+    card does not pass.
+    """
+    return job.admitted_exclusive and job.admitted_exclusive_device_index == device_index
 
 
 @dataclass(frozen=True)

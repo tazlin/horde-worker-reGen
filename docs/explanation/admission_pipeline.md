@@ -272,7 +272,7 @@ already recorded against it. One preload per cycle is still the ceiling
 | `NO_TARGET` for the head | worker-wide | the head-room fallback is spent, so every remaining slot is one the head still needs |
 | `DEFER_BUDGET` for the head | worker-wide | the head's reclaim ladder is evicting on its behalf, and a later load would spend what it frees |
 | `DEFER_VRAM_GROWTH_HOLD` | card | the target card sits near its paging cliff |
-| `EXCLUSIVE_IN_PROGRESS` | card | an exclusive job holds the target card to itself |
+| `EXCLUSIVE_IN_PROGRESS` | card, held for the exclusive admit | an exclusive job holds the target card to itself, and the pass goes on over that card for that job alone |
 | `DEFER_POST_PROCESSING` | card | the post-processing lane's card is owed a drain window |
 | `DEFER_CONCURRENCY` | card | loads are serialized per device, not worker-wide |
 | `REPLACE_PROCESS` | card | one slot on one card is being cycled for its model change |
@@ -280,7 +280,15 @@ already recorded against it. One preload per cycle is still the ceiling
 
 A card-scoped stop for the head is still card-scoped: the head is waiting for that one card, and a load onto a
 card it is not waiting for takes nothing from it. A single-GPU worker has nowhere to continue to, so the pass
-exits at its first stop exactly as it always has.
+exits at the first stop.
+
+`EXCLUSIVE_IN_PROGRESS` is the exception, on one card or on several. Preload and dispatch both step past a job
+whose auxiliary files have not landed, so a card can be granted to a whole-card head queued behind such jobs. When
+those files land before the head is preloaded, those jobs come first in the pass and are refused for the head's
+claim. The pass then marks the card as held and goes on. Every later job aimed at that card is skipped except
+the one whose exclusive admit was planned for it
+([`is_exclusive_beneficiary`][horde_worker_regen.process_management.scheduling.admission.preload.is_exclusive_beneficiary]).
+An exclusive admit for another card does not pass, and every other stop keeps the scope in the table.
 
 ## One job through the preload pass
 
@@ -289,7 +297,8 @@ flowchart LR
     job[pending job] --> gates{decide_preload_gates}
     gates -->|"NEXT_JOB: aux-gated, already resident"| next[next job]
     gates -->|"UNSERVICEABLE / QUARANTINED: FaultJob"| fault[executor faults the job] --> resnap["snapshot() again"] --> next
-    gates -->|"DEFER_*, NO_TARGET, EXCLUSIVE_IN_PROGRESS"| stop[pass stops this cycle]
+    gates -->|"DEFER_*, NO_TARGET"| stop[pass stops this cycle]
+    gates -->|EXCLUSIVE_IN_PROGRESS| held[card held for the exclusive admit] --> next
     gates -->|"REPLACE_PROCESS: ReplaceProcess"| cycle[executor cycles the child] --> stop
     gates -->|ADMIT| wc{whole-card demand}
     wc -->|PRESTAGE| ram

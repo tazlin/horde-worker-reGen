@@ -187,6 +187,20 @@ class TestSchedulingSnapshot:
         assert snapshot.now == 1_000.0
         assert snapshot.services.model_metadata is scheduler._model_metadata  # type: ignore[attr-defined]
 
+    async def test_an_exclusive_admit_carries_its_planned_card(self) -> None:
+        """The job's exclusive mark and the admit's planned card are frozen together."""
+        initial, scheduler = await self._scheduler()
+        head_id = initial.queue.head()
+        assert head_id is not None
+        assert initial.queue.jobs[head_id].admitted_exclusive is False
+        assert initial.queue.jobs[head_id].admitted_exclusive_device_index is None
+        scheduler._job_tracker.mark_admitted_exclusive(initial.queue.payloads[head_id], device_index=1)  # type: ignore[attr-defined]
+
+        marked = scheduler.snapshot().queue.jobs[head_id]  # type: ignore[attr-defined]
+
+        assert marked.admitted_exclusive is True
+        assert marked.admitted_exclusive_device_index == 1
+
     async def test_ram_load_charge_and_outstanding_ram_are_frozen(self) -> None:
         """A RAM decision reads the captured charge and outstanding RAM even when live providers later change."""
         _initial, scheduler = await self._scheduler()

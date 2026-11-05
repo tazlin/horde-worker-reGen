@@ -425,9 +425,11 @@ uv run pytest -m chaos_sweep        # generated wedge-liveness sweep (pre-releas
   so a grant never precedes the job start and a clear never precedes the encode, and a run's per-job encoder
   reload does not page the kept weights out. A clearance-transport or run-duty claim needs a row that drives that
   order, or a live measurement.
-- **On one card the preload pass ends at its first stop of any kind.** `stop_is_card_scoped` in
-  `admission/preload.py` matters only with multi-GPU routing active; on a single card, whatever decision a parked
-  head records decides whether anything behind it preloads. `DEFER_RESIDENCY_GOVERNOR` is not a stop, since a head
+- **On one card the preload pass ends at its first stop of any kind, except `EXCLUSIVE_IN_PROGRESS`.**
+  `stop_is_card_scoped` in `admission/preload.py` matters only with multi-GPU routing active; on a single card,
+  whatever decision a parked head records decides whether anything behind it preloads. After an
+  `EXCLUSIVE_IN_PROGRESS` refusal the pass goes on over the held card for that card's exclusive admit alone
+  (`is_exclusive_beneficiary`), on one card as on several. `DEFER_RESIDENCY_GOVERNOR` is not a stop, since a head
   standing down for the establish-rate limiter lets the pass go on.
 
 ## Changing scheduling, memory, or recovery behaviour

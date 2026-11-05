@@ -205,6 +205,9 @@ class JobSnapshot:
     cold_overhead_seconds: float | None = None
     """The learned dispatch-to-first-step seconds for the job's signature on a lane not holding its model in VRAM,
     or None until the performance model has enough observations (or none is wired)."""
+    admitted_exclusive_device_index: int | None = None
+    """The planned card of the job's exclusive admit, or None when the job is not admitted exclusively or the
+    admit has no card."""
 
 
 @dataclass(frozen=True)
@@ -693,6 +696,7 @@ def build_scheduling_snapshot(
             cold_overhead_seconds=dispatch_overhead_seconds(job, False)
             if dispatch_overhead_seconds is not None
             else None,
+            admitted_exclusive_device_index=tracked.admitted_exclusive_device_index if tracked is not None else None,
         )
         (in_progress_ids if is_in_progress else pending_ids).append(key)
 

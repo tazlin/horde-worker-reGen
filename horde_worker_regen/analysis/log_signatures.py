@@ -1232,6 +1232,17 @@ _SIGNATURE_LIST: list[LogSignature] = [
         sample="Whole-card governor deferral of Krea2-Turbo_fp8 on card None cleared after 2448s held.",
         dry_run_reason=_WHOLE_CARD_NOT_EXERCISED,
     ),
+    _signature(
+        "exclusive_admit_released_without_residency",
+        r"Released the pending exclusive admits for (?P<model>.+) on card (?P<device>\d+|None), since the card "
+        r"does not hold a residency for that model\.",
+        emitter="process_management.scheduling.inference_scheduler:_release_exclusive_admits_without_residency",
+        sample=(
+            "Released the pending exclusive admits for Z-Image-Turbo on card 0, since the card does not hold a "
+            "residency for that model."
+        ),
+        dry_run_reason=_WHOLE_CARD_NOT_EXERCISED,
+    ),
     # --- Blank/malformed model-name pop cascade ---
     _signature(
         "empty_model_pop",

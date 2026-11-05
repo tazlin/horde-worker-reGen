@@ -484,7 +484,12 @@ nothing loading it and no exclusive job of its own in flight, while the undispat
 model, can neither converge nor drain: the preload pass serves the head, and the head is barred by this very
 residency. Such a residency releases through the normal restore path instead of being retained by its queued
 work, and the pending exclusive admits for its model lose their mark with it, since the claim they held on the
-card was for that residency. The no-holder reading is only trusted past the establish grace, since a residency
+card was for that residency. The release does not wait for the cooldown or the minimum hold. Each pass while the
+model was pending refreshed the cooldown, and any job that could use the teardown has lost the route to the card.
+The same pass also releases a pending exclusive admit when the admit's card does not hold a residency for the
+admit's model, as after a soft reset that rebuilt the lanes. The job is marked again when a demand path grants it
+a residency.
+The no-holder reading is only trusted past the establish grace, since a residency
 legitimately has no holder for as long as its pre-stage preload takes to land.
 
 The dispatch gate also ends a residency inside its establish grace. The gate prices the head only once the
