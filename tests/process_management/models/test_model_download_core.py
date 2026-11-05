@@ -84,6 +84,47 @@ def test_chunk_pacer_aborts_when_signalled() -> None:
         pacer.step(0, 100, is_paused=lambda: False, rate_limit_kbps=lambda: None, should_abort=lambda: True)
 
 
+def test_chunk_pacer_serializes_segment_throttle_waits() -> None:
+    """Two segments cannot pace their cumulative progress concurrently against one shared baseline."""
+    pacer = ChunkPacer()
+    entered = threading.Event()
+    release = threading.Event()
+    overlapped = threading.Event()
+    clock = _use_fake_clock(pacer)
+    sleeping = 0
+    lock = threading.Lock()
+
+    def sleep(seconds: float) -> None:
+        nonlocal sleeping
+        with lock:
+            sleeping += 1
+            if sleeping > 1:
+                overlapped.set()
+        entered.set()
+        assert release.wait(2)
+        clock.sleep(seconds)
+        with lock:
+            sleeping -= 1
+
+    pacer._sleep = sleep
+    kwargs = {"is_paused": lambda: False, "rate_limit_kbps": lambda: 10, "should_abort": lambda: False}
+    pacer.step(0, 4096, **kwargs)
+    first = threading.Thread(target=lambda: pacer.step(1024, 4096, **kwargs))
+    second = threading.Thread(target=lambda: pacer.step(2048, 4096, **kwargs))
+    first.start()
+    assert entered.wait(2)
+    second.start()
+    try:
+        assert not overlapped.wait(0.1)
+    finally:
+        release.set()
+        first.join(2)
+        second.join(2)
+    assert not first.is_alive() and not second.is_alive()
+    assert pacer._last_bytes == 2048
+    assert pacer.wait_seconds == pytest.approx(0.2)
+
+
 def test_chunk_pacer_rate_limit_paces_a_chunk() -> None:
     """A capped rate sleeps long enough to honour the cap for the chunk's byte delta."""
     pacer = ChunkPacer()

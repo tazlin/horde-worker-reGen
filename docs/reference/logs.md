@@ -17,6 +17,15 @@ log line it reads, and the dashboard are kept from drifting apart.
 | `bridge_tui.log` / `bridge_host.log` | The supervisor (parent) process's own log: TUI dashboard or `--host` wrapper. Captures worker launch, crash-loop, and TUI-process crash diagnostics that never reach `bridge.log`. |
 | `text_backend.log` | A managed text backend's own stdout and stderr, appended across launches. Written by the backend, not the worker. |
 
+## Download timing
+
+The download child records `Download task timing`, including total task time, measured pause/throttle
+wait and the bandwidth share at completion. Its engine records `Download transfer` separately from
+`Download verification`, so an extra checksum pass is visible independently of the HTTP transfer.
+Debug-level range-probe and response lines include the final hostname, without URL queries or credentials.
+See [Diagnosing slow downloads](../explanation/model_downloads.md#diagnosing-slow-downloads) for how
+to compare one and four connections on the same file while idle and during inference.
+
 ## Repeating telemetry is time-boxed
 
 Some lines describe a condition that is re-evaluated on every control-loop tick: a child's memory report,

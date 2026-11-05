@@ -585,13 +585,13 @@ the scheduler admits work under two live limits:
   download; raise it to also parallelize within a host (useful when many aux models
   share one host, such as the R2 mirror below).
 
-Job-driven ad-hoc LoRA/TI prefetches are exempt from the per-host limit (they
-neither wait for nor consume a host slot; the global ceiling still applies). A
-pending job's dispatch gate is waiting on exactly that fetch, so it must not queue
-behind an unrelated slow transfer to the same host, and the exemption cannot
-stampede a host: the fetches are single-stream (the host limit exists to be polite
-about multi-connection segmented downloads) and the ad-hoc engine's own worker pool
-bounds them again downstream.
+Job-driven ad-hoc LoRA/TI prefetches remain exempt from the per-host task limit;
+the global ceiling still applies. A pending job must not wait behind an unrelated
+background transfer to the same host. These files may themselves use segmented
+downloads, so the task limits apply to tasks and do not bound sockets. Four concurrent
+prefetches with four connections each can issue sixteen range requests. The
+ad-hoc manager keeps the internal pool, including for default seeding.
+File admission, queue order and inference scheduling are unchanged.
 
 Both limits are honoured at startup and retuned live on config reload (raising the
 global limit grows the executor-thread pool so the new ceiling is actually used; it
@@ -603,8 +603,8 @@ required safety and aux work is never aborted by an image-model removal. The
 Downloads tab lists every concurrent download, grouped by host.
 
 Two correctness invariants underpin the threading. First, ordinary file downloads
-are serialized **per manager/model destination**: duplicate requests for the same
-file cannot write it concurrently, while independent model records on the same
+are serialized **per manager/model destination**. Duplicate requests for the same
+file cannot write it concurrently, and independent model records on the same
 manager can use the scheduler's host-level parallelism. Manager-wide maintenance
 operations retain their broader manager lock. The annotator **verify**
 (`ANNOTATOR_VERIFY`), which needs a full ComfyUI init, runs **exclusively** (no other
@@ -625,6 +625,11 @@ large file over several concurrent **ranged** connections at once and reassemble
   connection count, honoured at startup and retuned live on config reload, and also
   surfaced in the Config tab. It is independent of the host limits above: it
   parallelizes the bytes *within* one file, while they parallelize *across* files.
+
+The same setting is passed to the LoRA/TI managers, including on config reload,
+when their engine supports `configure_downloads`. It then takes precedence over
+`AIWORKER_LORA_DOWNLOAD_CONNECTIONS`, the default for standalone
+hordelib consumers. An active transfer keeps the starting connection count.
 
 The engine ([`download_engine.download_file`][] in `horde_model_reference`) treats
 segmentation as a fast path with a guaranteed fallback. It first sends a one-byte
@@ -683,6 +688,34 @@ configuration resolves to.
 `download_models.py` is a standalone entry point to pre-fetch the configured
 models without starting the worker, useful for provisioning a machine or a
 container image ahead of time.
+
+Checkpoint and ordinary auxiliary downloads use the configured
+`download_connections_per_file` and `download_rate_limit_kbps`, matching the
+runtime transport controls. Preload uses the configured connection count.
+LoRA/TI managers receive the same per-file connection
+setting when supported. Safety-library downloads, annotator verification and the
+default-LoRA seed keep their coarse progress APIs. The preload rate cap does
+not control those third-party transfers. The startup pause flag is not applied to
+the standalone command, which has no live resume control.
+
+### Diagnosing slow downloads
+
+The engine emits separate `Download transfer` and `Download verification` timing
+summaries. Transfer time includes HTTP, disk writes, inline hashing and callbacks.
+Verification time exposes the extra full-file hash needed by segmented/resumed
+downloads. Debug logs record range-probe latency and final hostnames, without URL
+queries or credentials. The worker adds `Download task timing` with total task
+time, measured pause/throttle wait and the rate share at completion (0 = unlimited).
+Hordelib's ad-hoc success event also separates reference commit/save time.
+
+Before changing defaults, compare the same checkpoint and LoRA version with one
+and four connections, one active file, identical credentials and fresh temporary
+destinations on the same volume. Repeat idle and during a stable inference
+workload. Compare NIC traffic to displayed speed and transfer time to verification
+time. Then restore normal concurrency to expose contention between files. A cap,
+an expensive checksum read and a remote host serving ranges slowly require
+different fixes. The connection default is four until those measurements
+justify changing it.
 
 ## The gated R2 mirror for auxiliary models
 

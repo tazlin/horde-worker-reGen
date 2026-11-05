@@ -30,6 +30,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     AuxPrefetchOutcome,
     HordeAuxPrefetchControlMessage,
     HordeAuxPrefetchResultMessage,
+    HordeDownloadControlMessage,
 )
 from horde_worker_regen.process_management.models.download_scheduler import DownloadKind, DownloadTask
 
@@ -197,6 +198,23 @@ def _current_fake_manager() -> SimpleNamespace:
     import hordelib.api
 
     return hordelib.api.SharedModelManager.manager  # type: ignore[attr-defined,no-any-return]
+
+
+def test_live_connection_setting_reaches_adhoc_manager(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The per-file connection count reaches the ad-hoc manager on load and reload. Admission is unchanged."""
+
+    class ConfigurableLora(_FakeLoraManager):
+        def configure_downloads(self, *, connections: int) -> None:
+            self.connections = connections
+
+    lora = ConfigurableLora(present=set())
+    process = _make_process(monkeypatch, lora=lora, ti=None)
+    process._managers_ready = True
+    process._configure_adhoc_limits()
+    assert lora.connections == 4
+    process._handle_control_message(HordeDownloadControlMessage(set_connections_per_file=1))
+    assert lora.connections == 1
+    assert not process._scheduler.has_work()
 
 
 def _drain_scheduler(process: HordeDownloadProcess, *, max_tasks: int = 20) -> None:

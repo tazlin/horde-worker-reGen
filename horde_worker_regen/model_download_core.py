@@ -23,7 +23,7 @@ import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 from urllib.parse import urlsplit
 
 from loguru import logger
@@ -39,6 +39,7 @@ __all__ = [
     "ModelProgress",
     "UNKNOWN_DOWNLOAD_HOST",
     "download_host_for_url",
+    "configure_adhoc_downloads",
     "download_one_model",
     "ensure_aux_model_present",
     "ensure_models_present",
@@ -163,6 +164,24 @@ class DownloadControls:
             return self._rate_limit_kbps
 
 
+@runtime_checkable
+class ConfigurableAdhocDownloads(Protocol):
+    """Optional download controls, provided when the horde-engine supports them."""
+
+    def configure_downloads(self, *, connections: int) -> None:
+        """Apply the connection setting to subsequent transfers."""
+        ...
+
+
+def configure_adhoc_downloads(manager: object, *, connections: int) -> bool:
+    """Configure an ad-hoc manager, reporting engines that cannot enforce these controls."""
+    if not isinstance(manager, ConfigurableAdhocDownloads):
+        logger.warning("Ad-hoc download controls unavailable; update horde-engine to apply the connection setting")
+        return False
+    manager.configure_downloads(connections=connections)
+    return True
+
+
 class ChunkPacer:
     """Holds the per-download state needed to enforce rate-limit and compute a smoothed speed/ETA.
 
@@ -184,7 +203,9 @@ class ChunkPacer:
         self._last_bytes = 0
         self._last_time = 0.0
         self._speed_bps: float | None = None
-        self._clock: Callable[[], float] = time.time
+        self._lock = threading.Lock()
+        self.wait_seconds = 0.0
+        self._clock: Callable[[], float] = time.monotonic
         self._sleep: Callable[[float], None] = time.sleep
 
     def step(
@@ -197,6 +218,29 @@ class ChunkPacer:
         should_abort: Callable[[], bool],
         on_wait: Callable[[ModelProgress], None] | None = None,
         poll_seconds: float = 0.2,
+    ) -> ModelProgress:
+        """Serialize pacing across segment threads. Callbacks for a transfer must arrive in byte order."""
+        with self._lock:
+            return self._step(
+                downloaded,
+                total,
+                is_paused=is_paused,
+                rate_limit_kbps=rate_limit_kbps,
+                should_abort=should_abort,
+                on_wait=on_wait,
+                poll_seconds=poll_seconds,
+            )
+
+    def _step(
+        self,
+        downloaded: int,
+        total: int,
+        *,
+        is_paused: Callable[[], bool],
+        rate_limit_kbps: Callable[[], int | None],
+        should_abort: Callable[[], bool],
+        on_wait: Callable[[ModelProgress], None] | None,
+        poll_seconds: float,
     ) -> ModelProgress:
         """Pace one chunk: honour the rate cap, smooth the speed, then block while paused.
 
@@ -289,7 +333,7 @@ class ChunkPacer:
             if on_wait is not None:
                 on_wait(make_progress())
             nap = min(poll_seconds, remaining)
-            self._sleep(nap)
+            self._wait(nap)
             remaining -= nap
         if should_abort():
             raise DownloadAborted
@@ -307,9 +351,15 @@ class ChunkPacer:
         while is_paused() and not should_abort():
             if on_wait is not None:
                 on_wait(progress)
-            self._sleep(poll_seconds)
+            self._wait(poll_seconds)
         if should_abort():
             raise DownloadAborted
+
+    def _wait(self, seconds: float) -> None:
+        """Account for actual pause/throttle time separately from network transfer time."""
+        started = self._clock()
+        self._sleep(seconds)
+        self.wait_seconds += max(0.0, self._clock() - started)
 
 
 def download_one_model(
@@ -385,19 +435,28 @@ def ensure_models_present(
     on_progress: Callable[[str, int, int, ModelProgress], None] | None = None,
     on_model_finish: Callable[[str, int, int, bool], None] | None = None,
     connections: int = 1,
+    validate_existing: bool = False,
 ) -> DownloadOutcome:
     """Ensure every name in *model_names* is on disk, downloading the missing ones with live pause/rate-limit.
 
-    Already-present models are skipped (and reported in :attr:`DownloadOutcome.present`); the remainder are
-    downloaded one at a time, each with its own :class:`ChunkPacer`. The ``on_*`` callbacks let a caller
-    surface progress (the benchmark emits structured events; the worker logs); ``index``/``total`` count the
+    Already-present models are skipped and reported in :attr:`DownloadOutcome.present`. The remainder are
+    downloaded one at a time, each with a :class:`ChunkPacer`. The ``on_*`` callbacks let a caller
+    surface progress (the benchmark emits structured events, the worker logs). ``index``/``total`` count the
     models being downloaded (present ones excluded), so a UI can render "k of n". ``connections`` is forwarded
     to the engine to segment each large file across that many ranged connections.
+    ``validate_existing`` applies preload's auxiliary-file integrity check. A present file failing
+    validation is tainted and fetched again instead of being skipped on existence alone.
     """
     controls = controls or DownloadControls()
     should_abort = should_abort or (lambda: False)
 
-    pending = [name for name in model_names if not compvis.is_model_available(name)]
+    pending = []
+    for name in model_names:
+        if not compvis.is_model_available(name):
+            pending.append(name)
+        elif validate_existing and validate_present_file(compvis, name) is False:
+            compvis.taint_models([name])
+            pending.append(name)
     present = [name for name in model_names if name not in pending]
     outcome = DownloadOutcome(present=present)
     total = len(pending)

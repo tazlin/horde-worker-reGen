@@ -90,10 +90,10 @@ class DownloadKind(enum.Enum):
 HOST_LIMIT_EXEMPT_KINDS = frozenset({DownloadKind.LORA, DownloadKind.TI})
 """Kinds admitted regardless of the per-host concurrency limit (the global limit still applies).
 
-The per-host limit exists to be polite to hosts served multi-connection segmented fetches (an image model
-already opens several sockets). Job-driven ad-hoc prefetches are single-stream, must not queue behind an
-unrelated slow transfer to the same host (a pending job's dispatch gate is waiting on them), and are
-additionally bounded by the ad-hoc engine's own worker pool, so exempting them cannot stampede a host."""
+Job-driven prefetches must not queue behind an unrelated slow transfer to the same host, because a pending
+job's dispatch gate waits on them. The global task ceiling and the ad-hoc engine's pool still apply.
+Ad-hoc files may be segmented, so these limits apply to tasks and do not bound sockets. Several
+concurrent prefetches can each use the configured per-file connection count."""
 
 
 class DownloadPriority(enum.IntEnum):

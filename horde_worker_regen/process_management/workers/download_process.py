@@ -58,6 +58,7 @@ from horde_worker_regen.model_download_core import (
     ChunkPacer,
     DownloadAborted,
     ModelProgress,
+    configure_adhoc_downloads,
     download_host_for_url,
     download_one_model,
     ensure_aux_model_present,
@@ -327,6 +328,7 @@ class HordeDownloadProcess(HordeProcess):
         # Max concurrent connections per single large file (forwarded to the engine, which segments a big
         # file across that many ranged connections to raise its rate). Retuned live via the control message.
         self._connections_per_file = max(1, connections_per_file)
+        self._managers_ready = False
         self._active: dict[tuple[DownloadKind, str, str], _TaskRuntime] = {}
         # The pending jobs waiting on each in-flight ad-hoc prefetch task (keyed by the scheduler dedup key),
         # so one deduplicated download reports its outcome back to every job that requested the same file.
@@ -592,10 +594,13 @@ class HordeDownloadProcess(HordeProcess):
                 self._ensure_executor_threads(message.set_max_parallel_downloads)
             changed = True
 
+        with self._lock:
+            if message.set_connections_per_file is not None:
+                # Active segmented downloads retain their existing connections.
+                self._connections_per_file = max(1, message.set_connections_per_file)
+                changed = True
         if message.set_connections_per_file is not None:
-            # Applies to the next file fetched; in-flight segmented downloads keep their existing connections.
-            self._connections_per_file = max(1, message.set_connections_per_file)
-            changed = True
+            self._configure_adhoc_limits()
 
         if desired is not None:
             removed = self._scheduler.prune(
@@ -1196,6 +1201,8 @@ class HordeDownloadProcess(HordeProcess):
                 SharedModelManager.load_model_managers(multiprocessing_lock=self.disk_lock)
                 if SharedModelManager.manager.compvis is None:
                     raise RuntimeError("compvis model manager failed to load")
+                self._managers_ready = True
+                self._configure_adhoc_limits()
                 self._error_message = None
                 return True
             except Exception as e:  # noqa: BLE001 - report and retry rather than crash the worker
@@ -1206,6 +1213,27 @@ class HordeDownloadProcess(HordeProcess):
                 self._send_status(DownloadPhase.ERROR, scan_complete=False, force=True)
                 time.sleep(_LOAD_RETRY_BACKOFF_SECONDS[attempt])
         return False
+
+    def _configure_adhoc_limits(self) -> None:
+        """Apply the shared per-file connection setting without changing task admission or pool size."""
+        if not self._managers_ready:
+            return
+        from hordelib.api import SharedModelManager
+
+        # Manager loading and the control thread both apply controls under the policy lock, so a
+        # startup snapshot cannot overwrite a later live setting.
+        with self._lock:
+            for manager in (SharedModelManager.manager.lora, SharedModelManager.manager.ti):
+                if manager is not None:
+                    configure_adhoc_downloads(
+                        manager,
+                        connections=self._connections_per_file,
+                    )
+        logger.info(
+            "Download controls: connections_per_file={} rate_limit_kib_s={} (0=unlimited)",
+            min(8, self._connections_per_file),
+            self._rate_limit_kbps or 0,
+        )
 
     def _refresh_present(self) -> None:
         from hordelib.api import SharedModelManager
@@ -1915,6 +1943,7 @@ class HordeDownloadProcess(HordeProcess):
 
     def _run_task(self, task: DownloadTask) -> None:
         """Execute one task: register its runtime, fetch it (by kind), retry/record, tear the runtime down."""
+        started = time.monotonic()
         runtime = _TaskRuntime(
             status=CurrentDownloadStatus(
                 model_name=task.model_name,
@@ -1938,6 +1967,18 @@ class HordeDownloadProcess(HordeProcess):
         except Exception as e:  # noqa: BLE001 - any download error is a recorded failure, not a crash
             reason = f"{type(e).__name__}: {e}"
         finally:
+            logger.info(
+                "Download task timing: model={} kind={} host={} success={} aborted={} elapsed_seconds={:.3f} "
+                "pacing_wait_seconds={:.3f} rate_share_kib_s={} (0=unlimited)",
+                task.model_name,
+                task.kind.name,
+                task.host,
+                success,
+                aborted,
+                time.monotonic() - started,
+                runtime.pacer.wait_seconds,
+                self._rate_share() or 0,
+            )
             self._end_task(task)
             self._refresh_present()
             # A completed aux download may have made a gated feature ready; recompute so the next report

@@ -63,6 +63,26 @@ def download_all_models(
 
     SharedModelManager.load_model_managers()
 
+    from horde_worker_regen.model_download_core import (
+        DownloadControls,
+        configure_adhoc_downloads,
+        ensure_models_present,
+    )
+
+    controls = DownloadControls(rate_limit_kbps=bridge_data.download_rate_limit_kbps)
+    connections = bridge_data.download_connections_per_file
+    for adhoc_manager in (SharedModelManager.manager.lora, SharedModelManager.manager.ti):
+        if adhoc_manager is not None:
+            configure_adhoc_downloads(
+                adhoc_manager,
+                connections=connections,
+            )
+    logger.info(
+        "Preload download controls: connections_per_file={} rate_limit_kib_s={} (0=unlimited)",
+        min(8, connections),
+        bridge_data.download_rate_limit_kbps or 0,
+    )
+
     if bridge_data.allow_lora:
         if SharedModelManager.manager.lora is None:
             logger.error("Failed to load LORA model manager")
@@ -93,8 +113,15 @@ def download_all_models(
                 logger.warning(f"Skipping download of {cn_model} because `allow_sdxl_controlnet` is false.")
                 continue
 
-            SharedModelManager.manager.controlnet.download_model(cn_model)
-            SharedModelManager.manager.controlnet.download_model(cn_model)
+            outcome = ensure_models_present(
+                SharedModelManager.manager.controlnet,
+                [cn_model],
+                controls=controls,
+                connections=connections,
+                validate_existing=True,
+            )
+            if outcome.failed:
+                raise SystemExit(f"Failed to download controlnet model {cn_model}")
         if not SharedModelManager.preload_annotators():
             logger.error("Failed to download the controlnet annotators")
             exit(1)
@@ -103,16 +130,16 @@ def download_all_models(
         if SharedModelManager.manager.miscellaneous is None:
             logger.error("Failed to load miscellaneous model manager")
             exit(1)
-        SharedModelManager.manager.miscellaneous.download_all_models()
-        SharedModelManager.manager.miscellaneous.download_all_models()
-        for model in SharedModelManager.manager.miscellaneous.model_reference:
-            if not SharedModelManager.manager.miscellaneous.validate_model(
-                model,
-            ) and not SharedModelManager.manager.miscellaneous.download_model(model):
-                logger.error(f"Failed to download model {model}")
-                exit(1)
-        else:
-            logger.success("Downloaded all Miscellaneous models")
+        outcome = ensure_models_present(
+            SharedModelManager.manager.miscellaneous,
+            list(SharedModelManager.manager.miscellaneous.model_reference),
+            controls=controls,
+            connections=connections,
+            validate_existing=True,
+        )
+        if outcome.failed:
+            raise SystemExit(f"Failed to download miscellaneous models: {outcome.failures}")
+        logger.success("Downloaded all Miscellaneous models")
 
     if bridge_data.allow_post_processing:
         if SharedModelManager.manager.gfpgan is None:
@@ -125,46 +152,30 @@ def download_all_models(
             logger.error("Failed to load codeformer model manager")
             exit(1)
 
-        SharedModelManager.manager.gfpgan.download_all_models()
-        SharedModelManager.manager.gfpgan.download_all_models()
-        for model in SharedModelManager.manager.gfpgan.model_reference:
-            if not SharedModelManager.manager.gfpgan.validate_model(
-                model,
-            ) and not SharedModelManager.manager.gfpgan.download_model(model):
-                logger.error(f"Failed to download model {model}")
-                exit(1)
-        else:
-            logger.success("Downloaded all GFPGAN models")
-
-        SharedModelManager.manager.esrgan.download_all_models()
-        SharedModelManager.manager.esrgan.download_all_models()
-        for model in SharedModelManager.manager.esrgan.model_reference:
-            if not SharedModelManager.manager.esrgan.validate_model(
-                model,
-            ) and not SharedModelManager.manager.esrgan.download_model(model):
-                logger.error(f"Failed to download model {model}")
-                exit(1)
-        else:
-            logger.success("Downloaded all ESRGAN models")
-
-        SharedModelManager.manager.codeformer.download_all_models()
-        SharedModelManager.manager.codeformer.download_all_models()
-        for model in SharedModelManager.manager.codeformer.model_reference:
-            if not SharedModelManager.manager.codeformer.validate_model(
-                model,
-            ) and not SharedModelManager.manager.codeformer.download_model(model):
-                logger.error(f"Failed to download model {model}")
-                exit(1)
+        for manager in (
+            SharedModelManager.manager.gfpgan,
+            SharedModelManager.manager.esrgan,
+            SharedModelManager.manager.codeformer,
+        ):
+            outcome = ensure_models_present(
+                manager,
+                list(manager.model_reference),
+                controls=controls,
+                connections=connections,
+                validate_existing=True,
+            )
+            if outcome.failed:
+                raise SystemExit(f"Failed to download post-processing models: {outcome.failures}")
 
     if SharedModelManager.manager.compvis is None:
         logger.error("Failed to load compvis model manager")
         exit(1)
 
-    from horde_worker_regen.model_download_core import ensure_models_present
-
     outcome = ensure_models_present(
         SharedModelManager.manager.compvis,
         list(bridge_data.image_models_to_load),
+        controls=controls,
+        connections=connections,
         on_model_finish=lambda name, _index, _total, ok: (
             None if ok else logger.error(f"Failed to download model {name}")
         ),
