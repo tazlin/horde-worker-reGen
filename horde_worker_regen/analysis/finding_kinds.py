@@ -861,7 +861,7 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
         kind=FindingKind.UTILITIES_LANE_BRINGUP_TIMEOUT,
         title="Image utilities did not come up",
         action=(
-            "Read the image utilities log, `bridge_utilities_<slot>.log`, for what stopped it. Turn off "
+            "Read the image utilities log, \"bridge_utilities_<slot>.log\", for what stopped it, or turn off "
             "`enable_image_utilities` to stop offering the jobs it serves."
         ),
         detail=(
