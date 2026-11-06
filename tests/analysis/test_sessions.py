@@ -116,6 +116,21 @@ class TestEndReason:
         """A session that abandoned ship is GAVE_UP_ABORTED even though it also logged a clean exit."""
         assert _sessions()[0].end_reason is SessionEndReason.GAVE_UP_ABORTED
 
+    def test_a_runaway_recovery_abort_is_gave_up_aborted(self) -> None:
+        """The runaway-recovery abort writes "Abandoning ship" with a capital and classifies the same way."""
+        lines: list[str] = []
+        for line in _LOG.splitlines():
+            if "cannot restore a working process pool" in line:
+                prefix = line.split(" - ", 1)[0]
+                line = (
+                    f"{prefix} - Save-our-ship: 20 process recoveries within 300s (ceiling 20); the worker is "
+                    "flapping and cannot stabilise. Abandoning ship (the last resort) rather than recovering forever."
+                )
+            lines.append(line)
+        assert "abandoning ship" not in "\n".join(lines)
+        sessions = segment_sessions(parse_lines(lines, Path("bridge.log")))
+        assert sessions[0].end_reason is SessionEndReason.GAVE_UP_ABORTED
+
     def test_supervisor_shutdown(self) -> None:
         """An operator-stopped session is SUPERVISOR_SHUTDOWN."""
         assert _sessions()[1].end_reason is SessionEndReason.SUPERVISOR_SHUTDOWN

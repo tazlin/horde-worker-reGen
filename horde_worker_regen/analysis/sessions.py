@@ -44,7 +44,7 @@ _HORDELIB_IDENTITY_RE = pattern_for("hordelib_identity")
 _MAIN_STARTUP_RE = re.compile(r"Setting up logger for main process")
 
 # End-of-life markers, most-specific first; the first match wins when classifying a session.
-_ABANDON_SHIP_RE = re.compile(r"cannot restore a working process pool|abandoning ship")
+_ABANDON_SHIP_RE = re.compile(r"cannot restore a working process pool|abandoning ship", re.IGNORECASE)
 _ABORT_FILE_RE = pattern_for("abort_sentinel_found")
 _SUPERVISOR_SHUTDOWN_RE = re.compile(r"Supervisor requested shutdown")
 # The control loop's last word before an unexpected exception. The graceful shutdown that follows also logs
