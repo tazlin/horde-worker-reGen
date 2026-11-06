@@ -3449,6 +3449,47 @@ class TestUtilitiesLaneBringupTimeout:
         )
         assert "never came up" in findings["utilities_lane_bringup_timeout"].headline
 
+    @staticmethod
+    def _exited_early(ts: str) -> str:
+        return (
+            f"2026-06-25 {ts} | ERROR    | horde_worker_regen.process_management.lifecycle.utilities_adapter:"
+            "_bringup_loop:328 - Image utilities service failed to become healthy: RuntimeError Capability "
+            "service exited early with code 1."
+        )
+
+    def test_a_service_that_exits_while_starting_is_not_called_slow(self, tmp_path: Path) -> None:
+        """An exit before the health wait expires is a broken environment, and the remedy says to rebuild it."""
+        findings = _diagnose(
+            tmp_path,
+            self._bridge(
+                self._started("07:50:16.000"),
+                self._exited_early("07:50:16.100"),
+                self._started("07:50:19.000"),
+                self._exited_early("07:50:19.100"),
+                "2026-06-25 07:52:30.000 | INFO | x:y:1 - still working",
+            ),
+        )
+        finding = findings["utilities_lane_bringup_timeout"]
+        assert "exited while starting 2 times and never came up" in finding.headline
+        assert "ran out of time" not in finding.headline
+        assert any("Exited while starting: 2" in line for line in finding.evidence)
+        assert "update-runtime" in (finding.action_addendum or "")
+
+    def test_timeouts_keep_the_retry_advice(self, tmp_path: Path) -> None:
+        """A wait that expired is the slow-load case, so the remedy stays the warm-cache retry."""
+        findings = _diagnose(
+            tmp_path,
+            self._bridge(
+                self._started("07:50:16.000"),
+                self._timed_out("07:51:17.000"),
+                "2026-06-25 07:52:30.000 | INFO | x:y:1 - still working",
+            ),
+        )
+        finding = findings["utilities_lane_bringup_timeout"]
+        assert "ran out of time starting once" in finding.headline
+        assert "cached" in (finding.action_addendum or "")
+        assert "update-runtime" not in (finding.action_addendum or "")
+
 
 class TestHostRamStarvation:
     """A host-RAM finding relates repeated holds and loads to one threshold model."""

@@ -5298,16 +5298,17 @@ def detect_lane_placement(context: SessionContext) -> list[Finding]:
 
 
 def detect_utilities_lane_bringup_timeout(context: SessionContext) -> list[Finding]:
-    """The image-utilities lane's health wait expiring before its capability service could answer.
+    """The image-utilities lane's capability service failing to come up, by timeout or by an early exit.
 
     The service must import its whole image stack before uvicorn binds a port, so a start against a cold
     file cache can outlast the launcher's fixed startup budget while it is still making progress. The
     launcher then kills it, throwing that loading away, and the lane restarts from nothing. The kills warm
-    the file cache, so a later attempt usually wins the same race; the cost is the lane's features being
-    unavailable throughout, and each replacement counting against the session's process recoveries.
+    the file cache, so a later attempt usually wins the same race. A service that exits before the health
+    wait expires is a different failure: its own environment could not run it, and no retry warms anything.
+    Both leave the lane's features unavailable throughout.
 
-    Reported from the parent log alone: the timeout line names neither what the service was loading nor how
-    far it got, which live in the lane's own console file, so the evidence points the reader at it.
+    Reported from the parent log alone: the failure line names neither what the service was loading nor why
+    it exited, which live in the lane's own console file, so the evidence points the reader at it.
     """
     records = context.session.records
     timeouts = _matching(records, _UTILITIES_BRINGUP_FAILED_RE)
@@ -5316,6 +5317,14 @@ def detect_utilities_lane_bringup_timeout(context: SessionContext) -> list[Findi
 
     healthy = _matching(records, _UTILITIES_BRINGUP_HEALTHY_RE)
     starts = _matching(records, _UTILITIES_LANE_STARTED_RE)
+    # The launcher raises TimeoutError when the health wait expires and RuntimeError when the service process
+    # exits first. The two have different remedies, so the error type decides the copy below.
+    early_exits = [
+        record
+        for record in timeouts
+        if (match := _UTILITIES_BRINGUP_FAILED_RE.search(record.message)) is not None
+        and match.group("error") != "TimeoutError"
+    ]
     last_timeout = timeouts[-1].timestamp
     # The recovery is the first healthy report *after* the last expiry, not merely any healthy report: a
     # program that came up, was restarted later and then timed out has not recovered from that timeout.
@@ -5337,26 +5346,42 @@ def detect_utilities_lane_bringup_timeout(context: SessionContext) -> list[Findi
     lost_clause = f", over {lost_seconds / 60:.0f} minutes" if lost_seconds >= 90 else ""
 
     attempts = "once" if len(timeouts) == 1 else f"{len(timeouts)} times"
+    failure = "exited while starting" if early_exits else "ran out of time starting"
     if recovered:
-        headline = f"Image utilities ran out of time starting {attempts} before it came up{lost_clause}."
+        headline = f"Image utilities {failure} {attempts} before it came up{lost_clause}."
     else:
-        headline = f"Image utilities ran out of time starting {attempts} and never came up{lost_clause}."
+        headline = f"Image utilities {failure} {attempts} and never came up{lost_clause}."
 
-    narrative = [f"Starts: {len(starts)}. Timed out: {len(timeouts)}. Reported healthy: {len(healthy)}."]
+    narrative = [
+        f"Starts: {len(starts)}. Timed out: {len(timeouts) - len(early_exits)}. Exited while starting: "
+        f"{len(early_exits)}. Reported healthy: {len(healthy)}.",
+    ]
     if not recovered:
         narrative.append(
-            "Nothing reported healthy after the last time it ran out, so the features it serves were "
-            "unavailable for the rest of the session.",
+            "Nothing reported healthy after the last failure, so the features it serves were unavailable for "
+            "the rest of the session.",
         )
     narrative.append('The program\'s output is in the log file "bridge_utilities_<slot>.log".')
+    if early_exits:
+        addendum = (
+            "An exit moments after the start is not a slow load. A `uv trampoline failed to spawn Python` "
+            "error in that log means the lane's own environment cannot run; re-run `update-runtime.cmd` "
+            "(Windows) or `./update-runtime.sh` to rebuild it."
+        )
+    else:
+        addendum = (
+            "The worker starts it again by itself, and a later attempt usually succeeds once the files it "
+            "reads are cached. If every attempt ran out of time, that log says what it was loading."
+        )
 
-    evidence = timeouts[:2] + ([recovery] if recovery is not None else [])
+    evidence = (early_exits or timeouts)[:2] + ([recovery] if recovery is not None else [])
     return [
         Finding(
             kind=FindingKind.UTILITIES_LANE_BRINGUP_TIMEOUT,
             severity=Severity.WARNING,
             headline=headline,
             evidence=narrative + [_evidence(record) for record in evidence],
+            action_addendum=addendum,
             see_also=FindingKind.SESSION_SUMMARY,
         ),
     ]

@@ -859,18 +859,18 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
     ),
     FindingSpec(
         kind=FindingKind.UTILITIES_LANE_BRINGUP_TIMEOUT,
-        title="Image utilities ran out of time starting up",
+        title="Image utilities did not come up",
         action=(
-            "The worker starts it again by itself and a later attempt usually succeeds, once the files it "
-            "reads are cached. If every attempt ran out of time, read the image utilities log for what it "
-            "was loading. Turn off `enable_image_utilities` to stop offering the jobs it serves."
+            "Read the image utilities log, `bridge_utilities_<slot>.log`, for what stopped it. Turn off "
+            "`enable_image_utilities` to stop offering the jobs it serves."
         ),
         detail=(
             "Image utilities runs as a separate program and the worker waits for it to answer a health "
             "check. It loads its whole image stack before it can answer. That is slow the first time after "
             "a reboot and quick once those files are cached. When the wait runs out the worker stops it and "
-            "starts a new one, losing the loading already done. Control map and background removal jobs "
-            "cannot run until it answers."
+            "starts a new one, losing the loading already done. A program that exits moments after it starts "
+            "never got that far: its own environment could not run it. Control map and background removal "
+            "jobs cannot run until it answers."
         ),
     ),
     FindingSpec(
