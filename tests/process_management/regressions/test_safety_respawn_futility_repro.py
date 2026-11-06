@@ -60,9 +60,11 @@ from horde_worker_regen.process_management.lifecycle.process_lifecycle import (
     CRASH_LOOP_WINDOW_SECONDS,
     SAFETY_CRASH_LOOP_MAX,
     SAFETY_PROCESS_ID,
-    SAFETY_RESPAWN_BACKOFF_MAX_SECONDS,
     PauseOwner,
     ProcessLifecycleManager,
+)
+from horde_worker_regen.process_management.lifecycle.service_lane_start_gate import (
+    SERVICE_LANE_START_BACKOFF_MAX_SECONDS,
 )
 from horde_worker_regen.process_management.models.model_availability import (
     DOWNLOAD_PROGRESS_STALL_SECONDS,
@@ -86,7 +88,7 @@ coincide, which is the condition a rate-independent futility signal has to cover
 _FUTILE_RESPAWN_COUNT = SAFETY_CRASH_LOOP_MAX * 3
 """Rebuild attempts driven per futility scenario: well past any plausible bound on respawning."""
 
-_BACKOFF_CLEARING_RESPAWN_SECONDS = SAFETY_RESPAWN_BACKOFF_MAX_SECONDS * 2
+_BACKOFF_CLEARING_RESPAWN_SECONDS = SERVICE_LANE_START_BACKOFF_MAX_SECONDS * 2
 """Spacing between rebuilds that clears the respawn backoff while staying dense inside the crash-loop window.
 
 Consecutive failed rebuilds are deliberately spaced out by a growing backoff, so a scenario driving rebuild

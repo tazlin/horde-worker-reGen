@@ -99,6 +99,7 @@ class StatusReporter:
         num_jobs_faulted: int,
         num_job_slowdowns: int,
         num_process_recoveries: int,
+        num_lane_start_failures: int,
         time_spent_no_jobs_available: float,
         user_info: UserDetailsResponse | None,
         max_concurrent_inference_processes: int,
@@ -135,6 +136,7 @@ class StatusReporter:
             num_jobs_faulted: Number of faulted jobs.
             num_job_slowdowns: Number of slow jobs.
             num_process_recoveries: Number of process recoveries.
+            num_lane_start_failures: Number of service-lane children that died before reporting ready.
             time_spent_no_jobs_available: Time spent without jobs available.
             user_info: User information from the API.
             max_concurrent_inference_processes: Maximum concurrent inference processes.
@@ -198,6 +200,7 @@ class StatusReporter:
             num_jobs_faulted,
             num_job_slowdowns,
             num_process_recoveries,
+            num_lane_start_failures,
             time_spent_no_jobs_available,
         )
 
@@ -374,6 +377,7 @@ class StatusReporter:
         num_jobs_faulted: int,
         num_job_slowdowns: int,
         num_process_recoveries: int,
+        num_lane_start_failures: int,
         time_spent_no_jobs_available: float,
     ) -> None:
         """Print job information."""
@@ -398,6 +402,7 @@ class StatusReporter:
                 f"faulted: {num_jobs_faulted}",
                 f"slow_jobs: {num_job_slowdowns}",
                 f"process_recoveries: {num_process_recoveries}",
+                f"lane_start_failures: {num_lane_start_failures}",
                 f"{time_spent_no_jobs_available:.2f} seconds without jobs",
             ],
         )

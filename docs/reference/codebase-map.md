@@ -32,7 +32,7 @@ these files, read [Architecture](../explanation/architecture.md) first.
 | Parsing child-to-parent messages       | `process_management/ipc/message_dispatcher.py` (`MessageDispatcher`) |
 | IPC message and enum definitions       | `process_management/ipc/messages.py`                               |
 | Shared resizable inference permits | `process_management/ipc/inference_gate.py` (bounded recovery releases, resize only when drained) |
-| Starting / replacing child processes, and pinning each auxiliary lane to its card | `process_management/lifecycle/process_lifecycle.py` (`ProcessLifecycleManager`) |
+| Starting / replacing child processes, and pinning each auxiliary lane to its card | `process_management/lifecycle/process_lifecycle.py` (`ProcessLifecycleManager`). The start-failure streak and respawn backoff shared by the service lanes are in `service_lane_start_gate.py` (`ServiceLaneStartGate`) |
 | Live process state and per-card queries (running job, busy load, reservations, bare-context residual) | `process_management/lifecycle/process_map.py` (`ProcessMap`), `process_info.py` |
 | Result upload & submission             | `process_management/jobs/job_submitter.py` (`JobSubmitter`)        |
 | Config fields & hot-reload             | `bridge_data/`, `process_management/config/runtime_config.py`, `process_management/config/bridge_data_reloader.py` |

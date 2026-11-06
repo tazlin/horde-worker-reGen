@@ -6940,6 +6940,7 @@ class HordeWorkerProcessManager:
             num_jobs_faulted=self._job_tracker.num_jobs_faulted,
             num_job_slowdowns=self._job_submitter.num_job_slowdowns,
             num_process_recoveries=self._process_lifecycle._num_process_recoveries,
+            num_lane_start_failures=self._process_lifecycle._num_lane_start_failures,
             time_spent_no_jobs_available=self._job_popper.time_spent_no_jobs_available,
             user_info=self.user_info,
             max_concurrent_inference_processes=self.max_concurrent_inference_processes,
@@ -8997,6 +8998,7 @@ class HordeWorkerProcessManager:
                 if (last_recovery_lane := self._process_lifecycle._last_process_recovery_lane) is not None
                 else None
             ),
+            num_lane_start_failures=self._process_lifecycle._num_lane_start_failures,
             pending_megapixelsteps=self._job_tracker.get_pending_megapixelsteps(),
             jobs_pending_inference=len(self._job_tracker.jobs_pending_inference),
             jobs_in_progress=len(self._job_tracker.jobs_in_progress) + jobs_in_hand_other_flows,

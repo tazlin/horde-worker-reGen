@@ -61,6 +61,7 @@ from horde_worker_regen.process_management.lifecycle.horde_process import HordeP
 from horde_worker_regen.process_management.lifecycle.owned_process_registry import OwnedProcessRegistry
 from horde_worker_regen.process_management.lifecycle.process_info import ChildProcessHandle, HordeProcessInfo
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
+from horde_worker_regen.process_management.lifecycle.service_lane_start_gate import ServiceLaneStartGate
 from horde_worker_regen.process_management.models.component_residency_map import ComponentResidencyMap
 from horde_worker_regen.process_management.models.download_scheduler import DownloadPriorityPolicy
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
@@ -117,6 +118,21 @@ class UtilitiesDemandReconcile:
     """The demand behind a lane start this pass, None when the pass started nothing."""
     held_down: bool = False
     """The lane is enabled and down because no job needs it."""
+
+
+def _service_lane_name(process_type: HordeProcessType) -> str:
+    """Return a lane's operator-facing name ending in "lane", such as "image utilities lane" or "VAE lane"."""
+    name = process_type.display_name
+    return name if name.endswith("lane") else f"{name} lane"
+
+
+def _service_lane_reported_ready(process_info: HordeProcessInfo) -> bool:
+    """Return whether a service-lane child has reported a state past startup other than its own ending."""
+    return process_info.last_process_state not in (
+        HordeProcessState.PROCESS_STARTING,
+        HordeProcessState.PROCESS_ENDING,
+        HordeProcessState.PROCESS_ENDED,
+    )
 
 
 def _pause_owner_phrase(owner: PauseOwner) -> str:
@@ -258,22 +274,6 @@ covers is a fixed, small number of rebuilds regardless of how long each cold sta
 bound would have to be sized against the slowest legitimate start and would then be outrun by exactly the
 slow deterministic failure this exists to catch. Three covers the pause, the restore, and one retry of
 either; past that the window is no longer describing a placement change."""
-
-SAFETY_RESPAWN_BACKOFF_BASE_SECONDS: float = 2.0
-"""First non-zero delay before respawning a safety process that has failed to reach readiness.
-
-The delay doubles per consecutive failure up to ``SAFETY_RESPAWN_BACKOFF_MAX_SECONDS``. The first respawn
-after a lone crash is immediate: that is the ordinary recovery path and delaying it would leave the worker
-without safety capacity for no reason. Only a repeat failure earns a wait, so a pool that cannot start stops
-consuming a spawn, a full cold start, and a reap several times a second while the escalation above decides
-what to do about it."""
-
-SAFETY_RESPAWN_BACKOFF_MAX_SECONDS: float = 30.0
-"""Ceiling on the safety respawn backoff.
-
-Bounded well under the crash-loop window so a genuinely broken pool still accumulates rebuilds fast enough
-for both breakers to see it, and low enough that a pool whose external cause has cleared (a card a co-tenant
-released) comes back promptly rather than sitting out a long sleep."""
 
 SAFETY_READINESS_LATENCY_FLOOR_SECONDS: float = 30.0
 """Floor (seconds) on the priced cost of one safety placement flip, used before any flip has been measured.
@@ -648,6 +648,8 @@ class ProcessLifecycleManager:
     _num_process_recoveries: int
     _last_process_recovery_time: float | None
     _last_process_recovery_lane: HordeProcessType | None
+    _num_lane_start_failures: int
+    _service_lane_start_gates: dict[HordeProcessType, ServiceLaneStartGate]
     _safety_processes_should_be_replaced: bool
     _safety_processes_ending: bool
     _safety_end_deferred_work: frozenset[str]
@@ -667,9 +669,8 @@ class ProcessLifecycleManager:
     _retired_slot_room_since_by_device: dict[int, float]
     _max_inference_processes_listener: Callable[[int], None] | None
     _safety_recovery_history: list[float]
-    _safety_consecutive_start_failures: int
+    _safety_start_gate: ServiceLaneStartGate
     _safety_intentional_window_rebuilds: int
-    _safety_next_start_allowed_at: float
     _safety_start_initiated_at: float | None
     _safety_readiness_latency_seconds: float | None
     _last_safety_child_ever_reported: bool | None
@@ -836,6 +837,18 @@ class ProcessLifecycleManager:
         self._num_process_recoveries = 0
         self._last_process_recovery_time = None
         self._last_process_recovery_lane = None
+        # Service-lane children that died before reporting ready, counted apart from recoveries because the
+        # recovery count feeds the runaway-recovery ceiling (see :meth:`_record_lane_start_failure`).
+        self._num_lane_start_failures = 0
+        self._service_lane_start_gates = {
+            process_type: ServiceLaneStartGate()
+            for process_type in (
+                HordeProcessType.UTILITIES,
+                HordeProcessType.POST_PROCESS,
+                HordeProcessType.COMPONENT,
+                HordeProcessType.VAE_LANE,
+            )
+        }
         self._num_slowdown_events = 0
         # Count of inference slots replaced as the reclaim ladder's last rung (a crawling sampler on a card
         # that has been SATURATED past the kill horizon with every softer reclaim rung exhausted). Surfaced on
@@ -983,11 +996,11 @@ class ProcessLifecycleManager:
         # Told the new worker-wide ceiling whenever the per-card targets change at runtime.
         self._max_inference_processes_listener = None
         self._safety_recovery_history = []
-        # Rebuilds of the safety pool since one last reached readiness, the rebuilds an open intentional
-        # window has absorbed so far, and the earliest time the next safety start may be attempted.
-        self._safety_consecutive_start_failures = 0
+        # The safety pool's start gate counts rebuilds since one last reached readiness and holds the next
+        # start back by the respawn backoff. The window count is how many rebuilds an open intentional window
+        # has absorbed so far.
+        self._safety_start_gate = ServiceLaneStartGate()
         self._safety_intentional_window_rebuilds = 0
-        self._safety_next_start_allowed_at = 0.0
         # When the most recent safety start was launched (cleared once a pool reaches readiness), and the
         # running average of how long a start takes to reach readiness. Placement policy reads the latter to
         # price what one off-GPU/on-GPU flip costs in safety unavailability.
@@ -1112,6 +1125,68 @@ class ProcessLifecycleManager:
             device_index=device_index,
             detail=reason,
         )
+
+    def _record_lane_start_failure(self, process_info: HordeProcessInfo, exit_code: int | None) -> None:
+        """Count a service-lane child that died before reporting ready, and hold its lane's next start back.
+
+        Counted apart from :meth:`_count_process_recovery`, whose count feeds the runaway-recovery ceiling. The
+        worker runs without these lanes. Counted as recoveries, the futile starts of one lane with a broken
+        environment would exit the whole worker.
+
+        Args:
+            process_info: The dead child, still in the map.
+            exit_code: The child's exit code, or None when the handle does not report one.
+        """
+        lane_name = _service_lane_name(process_info.process_type)
+        gate = self._service_lane_start_gates[process_info.process_type]
+        gate.record_start_failure(time.time())
+        self._num_lane_start_failures += 1
+        if self._event_sink is not None:
+            self._event_sink(
+                WorkerEventKind.LANE_START_FAILED,
+                process_id=process_info.process_id,
+                device_index=process_info.device_index,
+                count=gate.consecutive_start_failures,
+                detail=lane_name,
+            )
+        delay = gate.backoff_seconds()
+        if delay <= 0:
+            return
+        logger.warning(
+            f"{lane_name[0].upper()}{lane_name[1:]} failed to start {gate.consecutive_start_failures} times in a "
+            f"row (exit code {exit_code}, see {self._lane_log_name(process_info)}). Next start in {delay:.0f} s.",
+        )
+
+    def _lane_log_name(self, process_info: HordeProcessInfo) -> str:
+        """Return the file name of a service-lane child's log, which records why the child died."""
+        if process_info.process_type is HordeProcessType.UTILITIES:
+            return os.path.basename(self._utilities_lane_log_path(process_info.process_id))
+        return f"bridge_{process_info.process_id}.log"
+
+    def _service_lane_start_held(self, lane: HordeProcessType) -> bool:
+        """Return whether the lane's start gate holds its next start back after repeated start failures."""
+        return not self._service_lane_start_gates[lane].start_allowed(time.time())
+
+    def _count_service_lane_replacement(self, lane: HordeProcessType) -> None:
+        """Count a completed crash replacement of a service lane as a recovery, unless a start failure caused it.
+
+        A lane that has not reported ready since its last start failure was counted by
+        :meth:`_record_lane_start_failure`, so its replacement stays out of the recovery count.
+        """
+        if self._service_lane_start_gates[lane].consecutive_start_failures > 0:
+            return
+        self._count_process_recovery(lane=lane, reason=None)
+
+    def _observe_service_lane_readiness(self) -> None:
+        """Clear the start gate of every service lane whose child has reported ready.
+
+        A child's first state past startup proves the lane can initialise, so the start failures before it are
+        over and a later crash is an ordinary recovery.
+        """
+        for process_info in self._process_map.values():
+            gate = self._service_lane_start_gates.get(process_info.process_type)
+            if gate is not None and _service_lane_reported_ready(process_info):
+                gate.observe_ready()
 
     def _notify_process_recovery(self, process_info: HordeProcessInfo, reason: str) -> None:
         if self._on_process_recovery is None:
@@ -2055,6 +2130,10 @@ class ProcessLifecycleManager:
         if self._process_map.num_post_process_processes() > 0:
             return True
 
+        # A lane that keeps dying before it reports ready waits out its start backoff, from any call site.
+        if self._service_lane_start_held(HordeProcessType.POST_PROCESS):
+            return False
+
         bridge_data = self._runtime_config.bridge_data
         lane_card = self._post_process_card()
         key = self._pending_gpu_start_key(HordeProcessType.POST_PROCESS, None)
@@ -2221,6 +2300,8 @@ class ProcessLifecycleManager:
             and self._process_map.num_loaded_post_process_processes() == 0
             and self._process_map.num_post_process_processes() == 0
         ):
+            if self._service_lane_start_held(HordeProcessType.POST_PROCESS):
+                return
             self.start_post_process_processes()
             self._post_process_processes_ending = False
             self._post_process_processes_should_be_replaced = False
@@ -2229,7 +2310,7 @@ class ProcessLifecycleManager:
                 # recovery count so a burst of whole-card jobs cycling the lane is not read as a crash loop.
                 self._post_process_replacement_intentional = False
             else:
-                self._count_process_recovery(lane=HordeProcessType.POST_PROCESS, reason=None)
+                self._count_service_lane_replacement(HordeProcessType.POST_PROCESS)
 
     @property
     def post_process_processes_should_be_replaced(self) -> bool:
@@ -2400,11 +2481,14 @@ class ProcessLifecycleManager:
         A job that needs the lane may wait for it in any of these states, since the demand driver starts a lane
         that is down by policy on the tick after the job arrives. Down by policy means enabled, provisioned, not
         paused by a reclaim or residency owner, no start deferred for VRAM, no crash replacement under way and no
-        demand start that failed outright. A crashed lane or one whose start was refused is not waited for.
+        demand start that failed outright. A crashed lane or one whose start was refused is not waited for, and
+        neither is one whose next start waits out the start backoff after repeated start failures.
         """
         if not self.utilities_process_enabled() or not self.process_type_wanted(HordeProcessType.UTILITIES):
             return False
         if self._state.shutting_down or self._utilities_gpu_paused:
+            return False
+        if self._service_lane_start_held(HordeProcessType.UTILITIES):
             return False
         if self._utilities_processes_should_be_replaced:
             # An operator recycle ends in a fresh start through the demand gate. A crash replacement is not waited for.
@@ -2449,6 +2533,10 @@ class ProcessLifecycleManager:
 
         if self._process_map.num_utilities_processes() > 0:
             return True
+
+        # A lane that keeps dying before it reports ready waits out its start backoff, from any call site.
+        if self._service_lane_start_held(HordeProcessType.UTILITIES):
+            return False
 
         if not self._utilities_interpreter_available():
             logger.error(
@@ -2581,6 +2669,8 @@ class ProcessLifecycleManager:
             and self._process_map.num_loaded_utilities_processes() == 0
             and self._process_map.num_utilities_processes() == 0
         ):
+            if self._service_lane_start_held(HordeProcessType.UTILITIES):
+                return
             self.start_utilities_processes()
             self._utilities_processes_ending = False
             self._utilities_processes_should_be_replaced = False
@@ -2589,7 +2679,7 @@ class ProcessLifecycleManager:
                 # commit-charge reset is not read as a crash loop.
                 self._utilities_replacement_intentional = False
             else:
-                self._count_process_recovery(lane=HordeProcessType.UTILITIES, reason=None)
+                self._count_service_lane_replacement(HordeProcessType.UTILITIES)
 
     @property
     def utilities_processes_should_be_replaced(self) -> bool:
@@ -2642,6 +2732,9 @@ class ProcessLifecycleManager:
         if self._utilities_processes_should_be_replaced:
             return UtilitiesDemandReconcile()
         if self._pending_gpu_start_key(HordeProcessType.UTILITIES, None) in self._pending_gpu_starts:
+            return UtilitiesDemandReconcile()
+        if self._service_lane_start_held(HordeProcessType.UTILITIES):
+            # The backoff is not a failed start, so the attempt flag stays clear and the start runs once it is over.
             return UtilitiesDemandReconcile()
         if self._utilities_demand_start_attempted:
             return UtilitiesDemandReconcile()
@@ -2709,6 +2802,10 @@ class ProcessLifecycleManager:
 
         if self._process_map.num_component_processes() > 0:
             return True
+
+        # A lane that keeps dying before it reports ready waits out its start backoff, from any call site.
+        if self._service_lane_start_held(HordeProcessType.COMPONENT):
+            return False
 
         bridge_data = self._runtime_config.bridge_data
         lane_card = self._post_process_card()
@@ -2808,6 +2905,8 @@ class ProcessLifecycleManager:
             and self._process_map.num_loaded_component_processes() == 0
             and self._process_map.num_component_processes() == 0
         ):
+            if self._service_lane_start_held(HordeProcessType.COMPONENT):
+                return
             self.start_component_processes()
             self._component_processes_ending = False
             self._component_processes_should_be_replaced = False
@@ -2816,7 +2915,7 @@ class ProcessLifecycleManager:
                 # recovery count so a burst of whole-card jobs cycling the lane is not read as a crash loop.
                 self._component_lane_replacement_intentional = False
             else:
-                self._count_process_recovery(lane=HordeProcessType.COMPONENT, reason=None)
+                self._count_service_lane_replacement(HordeProcessType.COMPONENT)
 
     def component_lane_enabled(self) -> bool:
         """Whether the dedicated component (text-encode) lane should run (public view of the config gate)."""
@@ -2931,6 +3030,10 @@ class ProcessLifecycleManager:
         if self._process_map.num_vae_lane_processes() > 0:
             return True
 
+        # A lane that keeps dying before it reports ready waits out its start backoff, from any call site.
+        if self._service_lane_start_held(HordeProcessType.VAE_LANE):
+            return False
+
         bridge_data = self._runtime_config.bridge_data
         lane_card = self._post_process_card()
         key = self._pending_gpu_start_key(HordeProcessType.VAE_LANE, None)
@@ -3032,6 +3135,8 @@ class ProcessLifecycleManager:
             and self._process_map.num_loaded_vae_lane_processes() == 0
             and self._process_map.num_vae_lane_processes() == 0
         ):
+            if self._service_lane_start_held(HordeProcessType.VAE_LANE):
+                return
             self.start_vae_lane_processes()
             self._vae_lane_processes_ending = False
             self._vae_lane_processes_should_be_replaced = False
@@ -3040,7 +3145,7 @@ class ProcessLifecycleManager:
                 # recovery count so a burst of whole-card jobs cycling the lane is not read as a crash loop.
                 self._vae_lane_replacement_intentional = False
             else:
-                self._count_process_recovery(lane=HordeProcessType.VAE_LANE, reason=None)
+                self._count_service_lane_replacement(HordeProcessType.VAE_LANE)
 
     @property
     def vae_lane_processes_should_be_replaced(self) -> bool:
@@ -4708,6 +4813,13 @@ class ProcessLifecycleManager:
                 f"{process_info} exited unexpectedly (exitcode={exit_code}) while "
                 f"{process_info.last_process_state.name}; recovering",
             )
+        if process_info.process_type in self._service_lane_start_gates:
+            if process_info.last_process_state is HordeProcessState.PROCESS_STARTING:
+                self._record_lane_start_failure(process_info, exit_code)
+            elif _service_lane_reported_ready(process_info):
+                # The per-tick readiness check misses a child that reported ready and died between two ticks.
+                # Clearing the gate here keeps its replacement counted as a recovery.
+                self._service_lane_start_gates[process_info.process_type].observe_ready()
         if process_info.process_type == HordeProcessType.SAFETY:
             self._last_safety_child_ever_reported = process_info.has_ever_reported
             self._safety_child_failure_in_streak = True
@@ -4762,7 +4874,7 @@ class ProcessLifecycleManager:
             and self._process_map.num_loaded_safety_processes() == 0
             and self._process_map.num_safety_processes() == 0
         ):
-            if time.time() < self._safety_next_start_allowed_at:
+            if not self._safety_start_gate.start_allowed(time.time()):
                 return
             if self._safety_rebuild_places_afresh:
                 self._place_rebuilt_safety_afresh()
@@ -4808,9 +4920,8 @@ class ProcessLifecycleManager:
         armed from the same streak so a pool failing repeatedly stops respawning at reap speed, while the
         first respawn after a lone crash stays immediate.
         """
-        self._safety_consecutive_start_failures += 1
-        self._safety_next_start_allowed_at = time.time() + self._safety_respawn_backoff_seconds()
-        if self._safety_consecutive_start_failures == SAFETY_CRASH_LOOP_MAX_START_FAILURES:
+        self._safety_start_gate.record_start_failure(time.time())
+        if self._safety_start_gate.consecutive_start_failures == SAFETY_CRASH_LOOP_MAX_START_FAILURES:
             if self._last_safety_child_ever_reported is None:
                 ipc_evidence = "no safety child has been reaped, so the failure is not in a reaped child"
             elif self._last_safety_child_ever_reported:
@@ -4828,20 +4939,10 @@ class ProcessLifecycleManager:
                     "these rebuilds, so they are parent-initiated placement churn rather than a failing pool."
                 )
             logger.critical(
-                f"The safety pool has been rebuilt {self._safety_consecutive_start_failures} consecutive times "
+                f"The safety pool has been rebuilt {self._safety_start_gate.consecutive_start_failures} "
+                "consecutive times "
                 f"without one reaching readiness; {ipc_evidence}. {verdict}",
             )
-
-    def _safety_respawn_backoff_seconds(self) -> float:
-        """Return how long the next safety start waits, given the consecutive-failure streak.
-
-        Zero for the first failure (the ordinary recovery path, which must not be delayed), then doubling
-        from ``SAFETY_RESPAWN_BACKOFF_BASE_SECONDS`` up to ``SAFETY_RESPAWN_BACKOFF_MAX_SECONDS``.
-        """
-        if self._safety_consecutive_start_failures <= 1:
-            return 0.0
-        delay = SAFETY_RESPAWN_BACKOFF_BASE_SECONDS * (2 ** (self._safety_consecutive_start_failures - 2))
-        return min(delay, SAFETY_RESPAWN_BACKOFF_MAX_SECONDS)
 
     def _observe_safety_pool_readiness(self) -> None:
         """Observe safety-pool readiness and clear what an unready pool accumulates.
@@ -4859,8 +4960,7 @@ class ProcessLifecycleManager:
             self._record_safety_readiness_latency(time.time() - initiated_at)
         self._safety_replacement_intentional_until_ready = False
         self._safety_intentional_window_rebuilds = 0
-        self._safety_consecutive_start_failures = 0
-        self._safety_next_start_allowed_at = 0.0
+        self._safety_start_gate.observe_ready()
         self._safety_child_failure_in_streak = False
 
     def _record_safety_readiness_latency(self, seconds: float) -> None:
@@ -4920,7 +5020,7 @@ class ProcessLifecycleManager:
         can arrive spaced wider than that window and age out before they accumulate; the streak is evidence
         the pool cannot initialise at all, whatever its spacing.
         """
-        return self._safety_consecutive_start_failures >= SAFETY_CRASH_LOOP_MAX_START_FAILURES
+        return self._safety_start_gate.consecutive_start_failures >= SAFETY_CRASH_LOOP_MAX_START_FAILURES
 
     @property
     def safety_pool_failure_evidence_seen(self) -> bool:
@@ -5194,6 +5294,7 @@ class ProcessLifecycleManager:
         spanning levels is still caught.
         """
         self._num_process_recoveries = 0
+        self._num_lane_start_failures = 0
         self._last_process_recovery_time = None
         self._last_process_recovery_lane = None
         self._num_slowdown_events = 0
@@ -5310,9 +5411,8 @@ class ProcessLifecycleManager:
         logger.error(f"Soft reset: rebuilding safety pool ({reason}).")
         self._safety_rebuild_places_afresh = True
         self._safety_recovery_history.clear()
-        self._safety_consecutive_start_failures = 0
+        self._safety_start_gate.reset()
         self._safety_intentional_window_rebuilds = 0
-        self._safety_next_start_allowed_at = 0.0
         self._safety_child_failure_in_streak = False
         self._safety_replacement_intentional = True
         self._initiate_safety_replacement()
@@ -6069,6 +6169,7 @@ class ProcessLifecycleManager:
 
         now = time.time()
         self._observe_safety_pool_readiness()
+        self._observe_service_lane_readiness()
         any_started_pending = self.drain_pending_gpu_starts() > 0
         self.restore_retired_inference_slots()
 

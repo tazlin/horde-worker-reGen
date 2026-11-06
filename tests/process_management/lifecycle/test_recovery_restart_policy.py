@@ -18,13 +18,21 @@ import pytest
 from horde_worker_regen.process_management import main_entry_point
 from horde_worker_regen.process_management.config.worker_state import RecoveryParkReason
 from horde_worker_regen.process_management.ipc.action_ledger import LedgerEventType
+from horde_worker_regen.process_management.ipc.messages import HordeProcessState
 from horde_worker_regen.process_management.lifecycle import worker_recovery_coordinator
+from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
+from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
+from horde_worker_regen.process_management.lifecycle.service_lane_start_gate import (
+    SERVICE_LANE_START_BACKOFF_MAX_SECONDS,
+)
 from horde_worker_regen.process_management.lifecycle.worker_recovery_coordinator import (
     RecoveryDisposition,
     WorkerRecoveryCoordinator,
 )
+from horde_worker_regen.process_management.process_manager import HordeWorkerProcessManager
 from horde_worker_regen.process_management.resources.reclaim_ladder import ReclaimRung, ReclaimRungKind
 from tests.process_management.conftest import make_testable_process_manager
+from tests.process_management.lifecycle.test_utilities_lifecycle import _FrozenTime
 
 
 class TestRecoveryAbortRequiresSomethingToRelaunch:
@@ -269,6 +277,111 @@ class TestRefusedAbortIsReportedHonestly:
         assert coordinator.maybe_abort_on_runaway_recoveries() is True
         assert coordinator._state.shutting_down is False
         process_manager._shutdown_manager.abort.assert_called_once()
+
+
+class _SettableClock:
+    """A wall clock the test sets by hand, for the recovery coordinator's rolling window."""
+
+    def __init__(self) -> None:
+        self.now = 1_000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+class TestLaneStartFailuresStayBelowTheRunawayCeiling:
+    """A service lane that never comes up does not count toward the runaway-recovery ceiling.
+
+    The worker runs without the image-utilities lane, so a lane that dies on every start is a degraded worker. Fed
+    into the ceiling, it exits the whole worker every few minutes instead.
+    """
+
+    def _drive_utilities_deaths(
+        self,
+        process_manager: HordeWorkerProcessManager,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        reported_ready: bool,
+    ) -> list[bool]:
+        """Kill one utilities child per pass, as often as the ceiling, all inside one rolling window.
+
+        Each child dies at once with exit code 1, either still starting or after reporting ready. The lifecycle's
+        clock moves past the longest start backoff between deaths, so every restart runs and the gate does not
+        thin the deaths out. The coordinator's clock puts all of them inside one ceiling window.
+
+        Returns:
+            Whether each pass's runaway check aborted the worker.
+        """
+        lifecycle = process_manager._process_lifecycle
+        coordinator = process_manager._recovery_coordinator
+        lifecycle_time = _FrozenTime()
+        monkeypatch.setattr(
+            "horde_worker_regen.process_management.lifecycle.process_lifecycle.time",
+            lifecycle_time,
+        )
+        coordinator_clock = _SettableClock()
+        coordinator._clock = coordinator_clock
+        # The replacement's own restart is not under test here, only which deaths are counted.
+        lifecycle.start_utilities_processes = Mock(return_value=True)  # type: ignore[method-assign]
+
+        ceiling = coordinator.RUNAWAY_RECOVERY_CEILING
+        spacing = coordinator.RUNAWAY_RECOVERY_WINDOW_SECONDS / (ceiling + 1)
+        aborted: list[bool] = []
+        for index in range(ceiling):
+            dead_handle = Mock()
+            dead_handle.is_alive.return_value = False
+            dead_handle.exitcode = 1
+            dead_handle.pid = 200_000 + index
+            lane = HordeProcessInfo(
+                mp_process=dead_handle,
+                pipe_connection=Mock(),
+                process_id=100 + index,
+                process_type=HordeProcessType.UTILITIES,
+                last_process_state=(
+                    HordeProcessState.WAITING_FOR_JOB if reported_ready else HordeProcessState.PROCESS_STARTING
+                ),
+                process_launch_identifier=index,
+                device_index=0,
+            )
+            lifecycle._process_map[lane.process_id] = lane
+
+            assert lifecycle._reap_if_crashed(lane) is True
+            lifecycle_time.advance(SERVICE_LANE_START_BACKOFF_MAX_SECONDS)
+            lifecycle._replace_all_utilities_process()
+            assert lifecycle._process_map.num_utilities_processes() == 0
+            assert lifecycle.utilities_processes_should_be_replaced is False, "the replacement completed"
+
+            aborted.append(coordinator.maybe_abort_on_runaway_recoveries())
+            coordinator_clock.now += spacing
+        return aborted
+
+    def test_twenty_start_failures_inside_the_window_do_not_trip_the_ceiling(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """As many start failures as the ceiling, inside one window, leave the worker running."""
+        process_manager = make_testable_process_manager(exit_on_unhandled_faults=False)
+        process_manager._supervisor = Mock()
+        process_manager._shutdown_manager = Mock()
+
+        aborted = self._drive_utilities_deaths(process_manager, monkeypatch, reported_ready=False)
+
+        assert aborted == [False] * len(aborted)
+        process_manager._shutdown_manager.abort.assert_not_called()
+        assert process_manager._process_lifecycle._num_process_recoveries == 0
+        assert process_manager._process_lifecycle._num_lane_start_failures == len(aborted)
+
+    def test_the_same_deaths_after_readiness_still_trip_the_ceiling(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A lane that came up and keeps dying is still a flapping worker, so the ceiling still applies to it."""
+        process_manager = make_testable_process_manager(exit_on_unhandled_faults=False)
+        process_manager._supervisor = Mock()
+        process_manager._shutdown_manager = Mock()
+
+        aborted = self._drive_utilities_deaths(process_manager, monkeypatch, reported_ready=True)
+
+        assert aborted[-1] is True
+        process_manager._shutdown_manager.abort.assert_called_once()
+        assert process_manager._process_lifecycle._num_lane_start_failures == 0
 
 
 class TestRecoveryParkReprobeState:

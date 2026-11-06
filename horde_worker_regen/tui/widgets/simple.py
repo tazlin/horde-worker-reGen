@@ -271,6 +271,10 @@ def event_sentence(event: WorkerEvent) -> str | None:
                 # A whole service lane was rebuilt rather than one card's slot, so there is no card to name.
                 return "Recovered a worker process"
             return f"Recovered the inference process on GPU {event.payload.device_index}"
+        case WorkerEventKind.LANE_START_FAILED:
+            if event.payload.detail is None:
+                return "A service lane failed to start"
+            return f"The {event.payload.detail} failed to start"
         case WorkerEventKind.DOWNLOAD_FINISHED:
             return f"Finished downloading {shorten(event.model, 24)}" if event.model else "Finished a download"
         case WorkerEventKind.MAINTENANCE_ON:

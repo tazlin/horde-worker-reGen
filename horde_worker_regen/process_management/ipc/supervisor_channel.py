@@ -34,7 +34,7 @@ if TYPE_CHECKING:
     from horde_worker_regen.process_management.resources.run_metrics import JobMetricsRecord
     from horde_worker_regen.process_management.resources.system_memory import SystemMemorySummary
 
-SUPERVISOR_PROTOCOL_VERSION = 35
+SUPERVISOR_PROTOCOL_VERSION = 36
 """Bumped when the snapshot/command schema changes incompatibly; the TUI checks it on connect.
 
 v2 added per-process ``num_jobs_completed`` and the snapshot's worker-details maintenance/paused and
@@ -152,6 +152,9 @@ The two aggregate flags stay as "any" over the map, so a reader of the whole-wor
 v34 adds ``post_processing_offered`` and ``post_processing_offer_withheld_reason``, the ``allow_post_processing``
 value the last image pop carried and why it was withheld, which can differ from the configured flag.
 v35 adds drained ``RESIZE_CAPACITY`` requests, correlated outcomes with retryability, and ``config_revision``.
+v36 adds ``num_lane_start_failures`` and the ``lane_start_failed`` event kind. A service-lane child that dies
+before reporting ready is counted there instead of in ``num_process_recoveries``, which feeds the runaway-recovery
+ceiling. A frontend reads the two counts side by side to show a lane that cannot start.
 """
 
 RECENT_JOBS_IN_SNAPSHOT = 25
@@ -845,6 +848,7 @@ class WorkerEventKind(enum.StrEnum):
     BACKEND_READY = "backend_ready"
     BACKEND_RELAUNCHED = "backend_relaunched"
     PROCESS_RECOVERED = "process_recovered"
+    LANE_START_FAILED = "lane_start_failed"
     DOWNLOAD_FINISHED = "download_finished"
     MAINTENANCE_ON = "maintenance_on"
     MAINTENANCE_OFF = "maintenance_off"
@@ -1767,6 +1771,11 @@ class WorkerStateSnapshot(BaseModel):
     against its own clock, which a remote frontend does not share."""
     last_process_recovery_lane: str | None = None
     """Which lane that recovery replaced, in operator words ("image utilities", "inference slot")."""
+    num_lane_start_failures: int = 0
+    """Service-lane children that died before reporting ready this session, counted apart from recoveries.
+
+    A lane that cannot start leaves the worker running without it, so these are not part of the recovery count
+    that judges whether the worker is flapping."""
     pending_megapixelsteps: int = 0
     jobs_in_hand: int = 0
     """Work units the worker holds right now across every workload: every image job from pop to submit, whatever

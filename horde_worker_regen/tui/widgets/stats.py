@@ -183,6 +183,7 @@ class StatsView(Vertical):
             ("Kudos/hr", "-" if snapshot.kudos_per_hour is None else f"{snapshot.kudos_per_hour:,.0f}"),
             ("GPU duty", gpu_duty),
             ("Recoveries", f"{snapshot.num_process_recoveries:,}"),
+            ("Lane start failures", f"{snapshot.num_lane_start_failures:,}"),
             ("Slowdowns", f"{snapshot.num_job_slowdowns:,}"),
             ("No-work time", human_duration(snapshot.time_spent_no_jobs_available)),
             ("Pipeline", f"{snapshot.jobs_pending_inference} queued / {snapshot.jobs_in_progress} in progress"),

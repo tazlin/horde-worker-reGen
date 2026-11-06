@@ -184,13 +184,15 @@ Three of them apply, and they cover different shapes of the same failure:
   later dies is an ordinary crash the rebuild path is for. This is the safety-side
   companion of `CRASH_LOOP_MAX_START_FAILURES` on inference slots, and either
   signal makes the pool *unrecoverable* to the wedge assessment.
-- **The respawn backoff** (`SAFETY_RESPAWN_BACKOFF_BASE_SECONDS` doubling to
-  `SAFETY_RESPAWN_BACKOFF_MAX_SECONDS`): consecutive failed rebuilds wait longer
+- **The respawn backoff** (`SERVICE_LANE_START_BACKOFF_BASE_SECONDS` doubling to
+  `SERVICE_LANE_START_BACKOFF_MAX_SECONDS`, held by the pool's
+  `ServiceLaneStartGate`): consecutive failed rebuilds wait longer
   before the next start attempt. The first respawn after a lone crash is
   immediate, since that is the ordinary recovery path; only a repeat failure
   earns a wait, so a pool that cannot start stops consuming a spawn, a cold
   start, and a reap several times a second while the escalation decides. Only the
-  respawn waits: a hung child is still ended and reaped promptly.
+  respawn waits: a hung child is still ended and reaped promptly. The other
+  service lanes use the same gate (see below).
 
 Deliberate safety-pool churn is kept out of the record: a whole-card
 pause/restore cycle and a supervised soft-reset rebuild both mark the replacement
@@ -207,6 +209,33 @@ Reading these incidents, a child that died before it ever reported to the parent
 (`HordeProcessInfo.has_ever_reported`) failed in its own startup, before its
 message loop; one that had reported got past that and died later. The futility
 disclosure names which it was.
+
+### Service lanes that cannot start
+
+The image-utilities, post-processing, component and VAE lanes each have their own
+`ServiceLaneStartGate` (`process_management/lifecycle/service_lane_start_gate.py`),
+the same streak-and-backoff arithmetic as the safety pool's respawn backoff. A
+lane child that dies while still `PROCESS_STARTING` is a *start failure*: the
+reaper records it on the lane's gate, the first restart runs at once, and each
+further failure doubles the wait up to `SERVICE_LANE_START_BACKOFF_MAX_SECONDS`.
+The lane's `start_*` function does not start the lane while the gate holds, from
+any call site, and the lane's replacement state machine checks again on later
+ticks.
+Every deferred restart logs one WARNING with the lane, the failure count, the
+exit code, the lane's log file and the delay. The lane's first state past startup
+clears the gate.
+
+Start failures are counted in `num_lane_start_failures` (the status block, the
+dashboard's stats panel and the `lane_start_failed` event), not in
+`num_process_recoveries`. The recovery count feeds save-our-ship's
+runaway-recovery ceiling (`RUNAWAY_RECOVERY_CEILING` recoveries within
+`RUNAWAY_RECOVERY_WINDOW_SECONDS`), which exits the worker. The worker runs
+without these lanes, so a lane with a broken environment leaves the worker
+degraded, and its futile restarts must not exit it. A lane that came
+up and later crashes is still replaced as a recovery and still counts toward the
+ceiling. While the gate holds the image-utilities lane back, `utilities_lane_will_serve`
+is false, so the extended ControlNet offer is withdrawn instead of popping jobs
+the lane cannot serve.
 
 ### A safety check that runs out of device memory
 

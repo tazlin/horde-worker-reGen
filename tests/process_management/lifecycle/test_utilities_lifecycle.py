@@ -13,8 +13,10 @@ import multiprocessing
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from typing import Any
 from unittest.mock import Mock
 
+import pytest
 from horde_sdk.generation_parameters.alchemy.consts import KNOWN_MISC_POST_PROCESSORS
 from loguru import logger
 
@@ -25,6 +27,10 @@ from horde_worker_regen.process_management.lifecycle.horde_process import HordeP
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.lifecycle.process_lifecycle import PauseOwner, ProcessLifecycleManager
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
+from horde_worker_regen.process_management.lifecycle.service_lane_start_gate import (
+    SERVICE_LANE_START_BACKOFF_BASE_SECONDS,
+    SERVICE_LANE_START_BACKOFF_MAX_SECONDS,
+)
 from horde_worker_regen.process_management.scheduling.workload_flow import (
     AlchemyFormDemand,
     UtilitiesLaneDemandReason,
@@ -44,6 +50,7 @@ class _FakeHandle:
     def __init__(self) -> None:
         self.alive = True
         self.terminated = False
+        self.exit_code: int | None = None
 
     @property
     def pid(self) -> int | None:
@@ -51,7 +58,7 @@ class _FakeHandle:
 
     @property
     def exitcode(self) -> int | None:
-        return None
+        return self.exit_code
 
     def is_alive(self) -> bool:
         return self.alive
@@ -166,6 +173,51 @@ def _captured_error_messages() -> Iterator[list[str]]:
         yield messages
     finally:
         logger.remove(sink_id)
+
+
+@contextmanager
+def _captured_warning_messages() -> Iterator[list[str]]:
+    """Capture loguru WARNING messages emitted inside the block."""
+    messages: list[str] = []
+    sink_id = logger.add(
+        lambda message: messages.append(message.record["message"]),
+        level="WARNING",
+        filter=lambda record: record["level"].name == "WARNING",
+    )
+    try:
+        yield messages
+    finally:
+        logger.remove(sink_id)
+
+
+class _FrozenTime:
+    """Stand-in for the lifecycle module's ``time`` whose wall clock moves only when the test advances it.
+
+    Every other attribute is forwarded to the real module, so ``monotonic`` and ``sleep`` keep working.
+    """
+
+    def __init__(self) -> None:
+        self._now = time.time()
+
+    def __getattr__(self, name: str) -> Any:  # noqa: ANN401 - forwards the real module's arbitrary members
+        """Return the real ``time`` module's attribute of that name."""
+        return getattr(time, name)
+
+    def time(self) -> float:
+        """Return the frozen wall clock."""
+        return self._now
+
+    def advance(self, seconds: float) -> None:
+        """Move the wall clock forward."""
+        self._now += seconds
+
+
+@pytest.fixture
+def frozen_time(monkeypatch: pytest.MonkeyPatch) -> _FrozenTime:
+    """Freeze the lifecycle module's wall clock, where start failures and the start backoff are timed."""
+    clock = _FrozenTime()
+    monkeypatch.setattr("horde_worker_regen.process_management.lifecycle.process_lifecycle.time", clock)
+    return clock
 
 
 def _set_lane_form_waiting(plm: ProcessLifecycleManager, *, waiting: bool) -> None:
@@ -462,11 +514,12 @@ def test_a_lane_reporting_idle_after_its_end_is_replaced_once() -> None:
 
 
 def test_crash_replacement_without_demand_leaves_the_lane_down_and_counts_the_recovery() -> None:
-    """The replacement's final start obeys the demand check, and the crash is still a recovery."""
+    """The replacement's final start obeys the demand check, and the crash of a lane that came up is a recovery."""
     constructed: list[_FakeAdapter] = []
     plm = _make_utilities_plm(constructed=constructed)
     assert plm.start_utilities_processes() is True
     utilities = plm._process_map.get_capable_processes(WorkerCapability.IMAGE_UTILITIES)[0]
+    plm._process_map.on_process_state_change(utilities.process_id, HordeProcessState.WAITING_FOR_JOB)
     recoveries_before = plm._num_process_recoveries
 
     _set_lane_form_waiting(plm, waiting=False)
@@ -536,6 +589,108 @@ def test_a_crashed_paused_or_refused_lane_will_not_serve() -> None:
     assert plm.start_utilities_processes() is False
     assert plm.has_pending_gpu_starts() is True
     assert plm.utilities_lane_will_serve() is False, "start refused for VRAM"
+
+
+def test_a_lane_held_back_by_the_start_backoff_will_not_serve(frozen_time: _FrozenTime) -> None:
+    """A lane whose next start waits out the backoff will not serve, so the extended-ControlNet offer is withdrawn."""
+    plm = _make_utilities_plm(constructed=[], demand=False)
+    assert plm.utilities_lane_will_serve() is True, "down by policy, startable on demand"
+
+    gate = plm._service_lane_start_gates[HordeProcessType.UTILITIES]
+    gate.record_start_failure(frozen_time.time())
+    gate.record_start_failure(frozen_time.time())
+    assert plm.utilities_lane_will_serve() is False, "start held back after repeated start failures"
+
+    frozen_time.advance(gate.backoff_seconds())
+    assert plm.utilities_lane_will_serve() is True, "the backoff has run out"
+
+
+_TICK_SECONDS = 0.5
+"""Control-loop period the start-failure rows step the frozen clock by. It divides every backoff exactly."""
+
+_START_FAILURE_RUN_SECONDS = 240.0
+"""How long the start-failure row keeps the lane failing: long enough to reach the backoff ceiling twice."""
+
+
+def _expected_start_delays(count: int) -> list[float]:
+    """Return the first ``count`` delays between a start failure and the restart that follows it."""
+    delays = [0.0]
+    delay = SERVICE_LANE_START_BACKOFF_BASE_SECONDS
+    while len(delays) < count:
+        delays.append(min(delay, SERVICE_LANE_START_BACKOFF_MAX_SECONDS))
+        delay *= 2
+    return delays
+
+
+def test_a_lane_failing_every_start_backs_off_and_is_not_counted_as_a_recovery(frozen_time: _FrozenTime) -> None:
+    """A lane that dies before reporting ready restarts after a doubling delay and stays out of the recovery count.
+
+    The first restart is immediate, then each failure doubles the wait up to the ceiling. A lane that has never come
+    up is not evidence of a flapping worker, so its restarts are counted as lane start failures. Counted as
+    recoveries, a lane with a broken environment trips the runaway-recovery ceiling and exits the whole worker.
+    Once the lane comes up the backoff clears, and a crash after that is an ordinary recovery again.
+    """
+    constructed: list[_FakeAdapter] = []
+    plm = _make_utilities_plm(constructed=constructed)
+    assert plm.start_utilities_processes() is True
+    recoveries_before = plm._num_process_recoveries
+
+    delays: list[float] = []
+    failures = 0
+    failed_at = frozen_time.time()
+    starts_seen = len(constructed)
+    with _captured_warning_messages() as warnings:
+        for _ in range(int(_START_FAILURE_RUN_SECONDS / _TICK_SECONDS)):
+            frozen_time.advance(_TICK_SECONDS)
+            for adapter in constructed:
+                adapter.handle.alive = False
+                adapter.handle.exit_code = 1
+            for process_info in list(plm._process_map.values()):
+                if plm._reap_if_crashed(process_info):
+                    failures += 1
+                    failed_at = frozen_time.time()
+            # The control loop's own replacement pass, after the reap.
+            plm._replace_all_utilities_process()
+            if len(constructed) > starts_seen:
+                starts_seen = len(constructed)
+                delays.append(frozen_time.time() - failed_at)
+            elif plm._process_map.num_utilities_processes() == 0:
+                assert plm.utilities_lane_will_serve() is False, "a lane waiting out its backoff is not waited for"
+
+    assert len(delays) >= 8, "the run reaches the backoff ceiling more than once"
+    assert delays == _expected_start_delays(len(delays))
+    assert plm._num_process_recoveries == recoveries_before
+    assert plm._num_lane_start_failures == failures
+
+    # The first failure restarts at once and says nothing. Every later one defers its restart and says so once.
+    start_failure_warnings = [message for message in warnings if "failed to start" in message]
+    assert len(start_failure_warnings) == failures - 1
+    third = start_failure_warnings[1]
+    assert third.startswith(
+        "Image utilities lane failed to start 3 times in a row (exit code 1, see bridge_utilities_"
+    )
+    assert third.endswith(f".log). Next start in {SERVICE_LANE_START_BACKOFF_BASE_SECONDS * 2:.0f} s.")
+
+    # The deferred start runs, and this time the lane comes up.
+    while plm._process_map.num_utilities_processes() == 0:
+        frozen_time.advance(_TICK_SECONDS)
+        plm._replace_all_utilities_process()
+    lane = plm._process_map.get_capable_processes(WorkerCapability.IMAGE_UTILITIES)[0]
+    plm._process_map.on_process_state_change(lane.process_id, HordeProcessState.WAITING_FOR_JOB)
+    plm._observe_service_lane_readiness()
+    gate = plm._service_lane_start_gates[HordeProcessType.UTILITIES]
+    assert gate.consecutive_start_failures == 0
+    assert gate.start_allowed(frozen_time.time())
+
+    start_failures_before = plm._num_lane_start_failures
+    starts_before = len(constructed)
+    constructed[-1].handle.alive = False
+    assert plm._reap_if_crashed(lane) is True
+    plm._replace_all_utilities_process()
+
+    assert len(constructed) == starts_before + 1, "a crash after readiness restarts at once"
+    assert plm._num_process_recoveries == recoveries_before + 1
+    assert plm._num_lane_start_failures == start_failures_before
 
 
 def test_a_start_deferred_for_vram_is_reported_as_deferred_only_while_pending() -> None:

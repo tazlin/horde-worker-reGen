@@ -55,6 +55,12 @@ from tests.process_management.conftest import (
     make_testable_process_manager,
     track_popped_job_async,
 )
+from tests.process_management.lifecycle.test_utilities_lifecycle import (
+    _START_FAILURE_RUN_SECONDS,
+    _TICK_SECONDS,
+    _expected_start_delays,
+    _FrozenTime,
+)
 from tests.process_management.regressions.test_inference_start_retirement_repro import (
     _CARD_TOTAL_MB as _RETIREMENT_CARD_TOTAL_MB,
 )
@@ -1432,12 +1438,12 @@ def test_slow_healthy_safety_placement_respawn_cannot_advance_start_failure_brea
     assert plm.pause_safety_on_gpu(owner=PauseOwner.RUNTIME_SAFETY_PLACEMENT) is True
     plm._replace_all_safety_process()
     plm._replace_all_safety_process()
-    assert plm._safety_consecutive_start_failures == 1
+    assert plm._safety_start_gate.consecutive_start_failures == 1
 
     for _ in range(10):
         assert plm.restore_safety_on_gpu(owner=PauseOwner.RUNTIME_SAFETY_PLACEMENT) is False
 
-    assert plm._safety_consecutive_start_failures == 1
+    assert plm._safety_start_gate.consecutive_start_failures == 1
     assert plm.safety_pool_start_failing is False
 
     plm._process_map[0] = make_mock_process_info(
@@ -1447,7 +1453,56 @@ def test_slow_healthy_safety_placement_respawn_cannot_advance_start_failure_brea
         process_type=HordeProcessType.SAFETY,
     )
     plm._observe_safety_pool_readiness()
-    assert plm._safety_consecutive_start_failures == 0
+    assert plm._safety_start_gate.consecutive_start_failures == 0
+
+
+def test_post_process_lane_failing_every_start_shares_the_service_lane_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The post-processing lane spaces out failed starts with the same backoff as the image-utilities lane.
+
+    Every child the lane starts is already dead while still starting. The restarts follow the shared doubling
+    delay, and each death is counted as a lane start failure. The lane's start function does not start it while the
+    backoff holds, so no other call site can bypass the backoff.
+    """
+    frozen_time = _FrozenTime()
+    monkeypatch.setattr(process_lifecycle_module, "time", frozen_time)
+    fake_ctx = Mock()
+    fake_ctx.get_start_method.return_value = "spawn"
+    fake_ctx.Pipe.return_value = (Mock(), Mock())
+    fake_ctx.Process.return_value.pid = 12345
+    fake_ctx.Process.return_value.exitcode = 1
+    fake_ctx.Process.return_value.is_alive.return_value = False
+    # The mocked bridge data reports the post-processing lane as available.
+    plm = _make_plm(ctx=fake_ctx)
+    plm._runtime_config.bridge_data.dry_run_skip_post_processing = False
+    assert plm.start_post_process_processes() is True
+    recoveries_before = plm._num_process_recoveries
+
+    delays: list[float] = []
+    failures = 0
+    refused_while_held = 0
+    failed_at = frozen_time.time()
+    launches_seen = fake_ctx.Process.call_count
+    for _ in range(int(_START_FAILURE_RUN_SECONDS / _TICK_SECONDS)):
+        frozen_time.advance(_TICK_SECONDS)
+        for process_info in list(plm._process_map.values()):
+            if plm._reap_if_crashed(process_info):
+                failures += 1
+                failed_at = frozen_time.time()
+        plm._replace_all_post_process_process()
+        if fake_ctx.Process.call_count > launches_seen:
+            launches_seen = fake_ctx.Process.call_count
+            delays.append(frozen_time.time() - failed_at)
+        elif plm._process_map.num_post_process_processes() == 0:
+            assert plm.start_post_process_processes() is False
+            refused_while_held += 1
+
+    assert len(delays) >= 8, "the run reaches the backoff ceiling more than once"
+    assert delays == _expected_start_delays(len(delays))
+    assert refused_while_held > 0
+    assert plm._num_process_recoveries == recoveries_before
+    assert plm._num_lane_start_failures == failures
 
 
 def test_pause_and_restore_post_process_lane_stops_and_restarts_it_for_whole_card() -> None:
@@ -2057,7 +2112,8 @@ def test_a_start_failure_streak_is_not_a_deliberate_rebuild() -> None:
     plm._runtime_config.bridge_data.safety_on_gpu = True
     plm.start_safety_processes = Mock()  # type: ignore[method-assign]
     assert plm.pause_safety_on_gpu(owner=PauseOwner.RECLAIM_LADDER) is True
-    plm._safety_consecutive_start_failures = SAFETY_CRASH_LOOP_MAX_START_FAILURES
+    for _ in range(SAFETY_CRASH_LOOP_MAX_START_FAILURES):
+        plm._safety_start_gate.record_start_failure(time.time())
 
     assert plm.safety_pool_start_failing is True
     assert plm.safety_rebuild_is_deliberate is False
