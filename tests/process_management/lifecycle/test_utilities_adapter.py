@@ -695,6 +695,40 @@ def test_a_self_stopped_adapter_reports_both_terminal_states(http_service: tuple
         parent_conn.close()
 
 
+class _StartFailingServer(_FakeServer):
+    """A launcher whose service exits before it answers a health check."""
+
+    def start(self) -> None:
+        self.start_called = True
+        self.running = False
+        self.exit = 1
+        raise RuntimeError("Capability service exited early with code 1.")
+
+
+def test_a_failed_bringup_stops_the_adapter_threads(http_service: tuple[_ServiceState, str]) -> None:
+    """A service that exits during bring-up leaves no thread behind to poll its dead port.
+
+    The parent retires a launch whose handle reads dead without calling terminate on it, so the adapter has
+    to stop itself, or every failed launch keeps a cadence thread sending memory reports for the session.
+    """
+    _state, base_url = http_service
+    q: queue.Queue[object] = queue.Queue()
+    parent_conn, child_conn = multiprocessing.Pipe(duplex=True)
+    adapter, fake_server = _build_adapter(base_url, q, child_conn, server=_StartFailingServer(base_url))
+
+    adapter.start()
+    try:
+        assert _wait_for(lambda: adapter.handle.is_alive() is False)
+        assert _wait_for(lambda: not any(thread.is_alive() for thread in adapter._threads))
+        assert fake_server.stop_called
+        _drain(q)
+        time.sleep(0.2)
+        assert _drain(q) == []
+    finally:
+        adapter.stop()
+        parent_conn.close()
+
+
 def test_servable_excludes_cold_detectors_and_trusts_payloads_without_the_flag() -> None:
     """A detector the service reports cold (``warmed: false``) is withheld from the servable set.
 

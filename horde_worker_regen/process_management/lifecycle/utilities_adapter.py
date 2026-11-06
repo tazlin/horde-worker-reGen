@@ -327,6 +327,9 @@ class UtilitiesProcessAdapter:
         except Exception as e:
             logger.error(f"Image utilities service failed to become healthy: {type(e).__name__} {e}")
             self._handle.bringup_failed = True
+            # The handle now reads dead, so the parent retires this launch without ever calling terminate on
+            # it. Without this stop the cadence thread would outlive the launch and poll the dead port forever.
+            self.stop()
             return
         if self._stop.is_set():
             return
