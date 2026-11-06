@@ -18,9 +18,9 @@ even though the pure-torch upscalers/face-fixers would still run on the post-pro
 forms are enumerated per-form, so there ``strip_background`` alone is dropped (see
 :func:`strip_background_available`) and the pure-torch forms stay on offer.
 
-The utilities-lane probe reads the venv interpreter path from ``worker_bootstrap.paths`` (stdlib-only),
-so importing this module (and the process manager) stays cheap, requires no torch, and preserves the
-no-GPU/no-network dry-run test path.
+The utilities-lane probe asks ``worker_bootstrap.utilities_env`` (stdlib-only) whether the venv
+interpreter can run, so importing this module (and the process manager) stays cheap, requires no torch,
+and preserves the no-GPU/no-network dry-run test path.
 """
 
 from __future__ import annotations
@@ -35,6 +35,7 @@ from horde_worker_regen.process_management.scheduling.workload_kind import Workl
 if TYPE_CHECKING:
     from horde_worker_regen.bridge_data.data_model import reGenBridgeData
     from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
+    from worker_bootstrap.utilities_env import UtilitiesVenvState
 
 # The one worker-local fact about feature extras: how a horde-engine feature extra is re-exported under
 # the worker's own ``[project.optional-dependencies]`` name. horde-engine's ``rembg`` extra is surfaced
@@ -65,13 +66,43 @@ def _worker_extra_for_feature() -> dict[str, str]:
     }
 
 
+_UTILITIES_VENV_REMEDY = (
+    "Re-run update-runtime.cmd (Windows) or ./update-runtime.sh to rebuild the image-utilities environment."
+)
+
+# Each reason is logged once per process. The probe runs on every scheduler tick and pop.
+_logged_utilities_venv_states: set[UtilitiesVenvState] = set()
+
+
+def utilities_venv_usable() -> bool:
+    """Return whether the image-utilities venv's interpreter can run, logging the reason the first time it cannot.
+
+    The verdict comes from :func:`worker_bootstrap.utilities_env.utilities_venv_health`. The bootstrap re-syncs
+    the venv on the same verdict, so the next update rebuilds any venv that the worker does not start. A venv
+    whose base interpreter was deleted still has its own ``python`` file, and a launch through it exits at once.
+    """
+    from worker_bootstrap.utilities_env import utilities_venv_health
+
+    health = utilities_venv_health()
+    if health.usable:
+        return True
+    if health.state not in _logged_utilities_venv_states:
+        _logged_utilities_venv_states.add(health.state)
+        logger.warning(
+            "The image-utilities lane is unavailable. {} {}",
+            health.describe(),
+            _UTILITIES_VENV_REMEDY,
+        )
+    return False
+
+
 def utilities_available(bridge_data: reGenBridgeData | None = None) -> bool:
     """Return whether the image-utilities lane can serve ControlNet annotation and background removal.
 
     The lane is the execution home for both features, so their availability collapses to two facts:
 
-    - the utilities venv interpreter exists on disk (it is provisioned), read the same way the process
-      lifecycle reaches it (``worker_bootstrap.paths.utilities_python``); and
+    - the utilities venv interpreter can run (:func:`utilities_venv_usable`, the same check the process
+      lifecycle makes before it starts the lane); and
     - when a config is supplied, the operator has not explicitly disabled the lane
       (``enable_image_utilities is not False``; a mock bridge-data object whose attributes all read
       truthy is treated as enabled, matching the coercion call sites).
@@ -80,9 +111,7 @@ def utilities_available(bridge_data: reGenBridgeData | None = None) -> bool:
     flag is enforced where a config is in hand (the coercion pass) and, at runtime, by the pop gate that
     withholds offers while no healthy utilities process exists.
     """
-    from worker_bootstrap import paths
-
-    if not paths.utilities_python().is_file():
+    if not utilities_venv_usable():
         return False
     return bridge_data is None or bridge_data.enable_image_utilities is not False
 

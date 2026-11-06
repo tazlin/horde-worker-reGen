@@ -15,6 +15,8 @@ owns the pure, side-effect-light pieces of keeping that venv in step:
   of the bootstrap uses).
 - :func:`utilities_provision_wanted` decides, from the same feature resolution the main sync uses, whether
   the utilities venv is wanted at all.
+- :func:`utilities_venv_health` reports whether the venv's interpreter can run. It is the one check every
+  caller uses to decide whether the image-utilities lane can start.
 - :func:`needs_provision` compares the recorded stamp against the current utilities lock so an up-to-date
   venv is left untouched.
 - :func:`torch_hold` reports a worker environment that is limping along on an older torch than the
@@ -28,10 +30,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sys
 import tomllib
 import warnings
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 
 from worker_bootstrap import backend, paths, sync_plan
@@ -41,12 +45,15 @@ __all__ = [
     "TorchHold",
     "UtilitiesProvisionError",
     "UtilitiesStamp",
+    "UtilitiesVenvHealth",
+    "UtilitiesVenvState",
     "locked_torch_version",
     "needs_provision",
     "plan_utilities_provision",
     "read_utilities_stamp",
     "torch_hold",
     "utilities_provision_wanted",
+    "utilities_venv_health",
     "write_utilities_stamp",
 ]
 
@@ -57,6 +64,12 @@ UTILITIES_PYTHON_VERSION = "3.12"
 
 _STAMP_BACKEND_TOKEN_KEY = "backend_token"
 _STAMP_LOCK_SHA256_KEY = "lock_sha256"
+
+_PYVENV_CFG_NAME = "pyvenv.cfg"
+_PYVENV_CFG_HOME_KEY = "home"
+# A venv's home is the directory of the base interpreter it was created from. A POSIX build may install only
+# the versioned ``python3`` name there.
+_BASE_INTERPRETER_NAMES: tuple[str, ...] = ("python.exe",) if os.name == "nt" else ("python", "python3")
 
 
 class UtilitiesProvisionError(RuntimeError):
@@ -282,18 +295,121 @@ def torch_hold(*, backend_token: str, root: Path | None = None) -> TorchHold | N
     return TorchHold(installed_version=installed_torch_version, locked_version=locked_torch_build)
 
 
+class UtilitiesVenvState(StrEnum):
+    """Whether the utilities venv's interpreter can run, and if not, which piece of it is missing."""
+
+    USABLE = "usable"
+    MISSING_PYTHON = "missing_python"
+    MISSING_PYVENV_CFG = "missing_pyvenv_cfg"
+    HOME_GONE = "home_gone"
+
+
+@dataclass(frozen=True)
+class UtilitiesVenvHealth:
+    """What was found on disk when checking whether the utilities venv's interpreter can run.
+
+    Attributes:
+        state: The verdict, :attr:`UtilitiesVenvState.USABLE` or the first missing piece.
+        venv_dir: The utilities venv directory that was checked.
+        python_path: The venv's own interpreter file.
+        python_exists: Whether that file exists.
+        home: The base interpreter directory named by the venv's ``pyvenv.cfg``, or None when the file is
+            missing, unreadable or has no ``home`` entry.
+        home_exists: Whether that directory exists. It can exist without an interpreter in it.
+    """
+
+    state: UtilitiesVenvState
+    venv_dir: Path
+    python_path: Path
+    python_exists: bool
+    home: Path | None
+    home_exists: bool
+
+    @property
+    def usable(self) -> bool:
+        """Whether the venv's interpreter can start."""
+        return self.state is UtilitiesVenvState.USABLE
+
+    def describe(self) -> str:
+        """Return a one-sentence reason for the verdict, for a log line or a support bundle."""
+        if self.state is UtilitiesVenvState.MISSING_PYTHON:
+            return f"The image-utilities environment has no Python interpreter at {self.python_path}."
+        if self.state is UtilitiesVenvState.MISSING_PYVENV_CFG:
+            return (
+                f"The image-utilities environment's {_PYVENV_CFG_NAME} in {self.venv_dir} is missing, unreadable "
+                f"or does not name a base Python installation, so its interpreter cannot start."
+            )
+        if self.state is UtilitiesVenvState.HOME_GONE:
+            return (
+                f"The Python installation that the image-utilities environment was built from ({self.home}) "
+                f"is gone, so its interpreter cannot start."
+            )
+        return f"The image-utilities environment in {self.venv_dir} can run."
+
+
+def _read_pyvenv_home(cfg_path: Path) -> Path | None:
+    """Return the ``home`` directory named in a venv's ``pyvenv.cfg``, or None when it cannot be read."""
+    try:
+        cfg_text = cfg_path.read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return None
+    for cfg_line in cfg_text.splitlines():
+        key, separator, value = cfg_line.partition("=")
+        if separator and key.strip().lower() == _PYVENV_CFG_HOME_KEY and value.strip():
+            return Path(value.strip())
+    return None
+
+
+def utilities_venv_health(root: Path | None = None) -> UtilitiesVenvHealth:
+    """Return whether the utilities venv's interpreter can run, with the reason when it cannot.
+
+    The venv's ``python`` is a launcher for the base interpreter in the directory named by the ``home`` key
+    of ``pyvenv.cfg``. The managed CPython lives in a data folder that is replaced when an install moves, so
+    the venv's own ``python`` file can outlive the base interpreter, and then every start of it fails. A
+    missing file does not raise. It becomes the reported reason.
+
+    Args:
+        root: The install root (defaults to :func:`worker_bootstrap.paths.install_root`).
+
+    Returns:
+        The verdict with the paths that were checked.
+    """
+    venv_dir = paths.utilities_venv_dir(root)
+    python_path = paths.utilities_python(root)
+    python_exists = python_path.is_file()
+    home = _read_pyvenv_home(venv_dir / _PYVENV_CFG_NAME)
+    home_exists = home is not None and home.is_dir()
+    if not python_exists:
+        state = UtilitiesVenvState.MISSING_PYTHON
+    elif home is None:
+        state = UtilitiesVenvState.MISSING_PYVENV_CFG
+    elif not any((home / interpreter_name).is_file() for interpreter_name in _BASE_INTERPRETER_NAMES):
+        state = UtilitiesVenvState.HOME_GONE
+    else:
+        state = UtilitiesVenvState.USABLE
+    return UtilitiesVenvHealth(
+        state=state,
+        venv_dir=venv_dir,
+        python_path=python_path,
+        python_exists=python_exists,
+        home=home,
+        home_exists=home_exists,
+    )
+
+
 def needs_provision(*, backend_token: str, root: Path | None = None) -> bool:
     """Return whether the utilities venv must be (re)provisioned for *backend_token*.
 
     False when there is no committed utilities lock (nothing to sync from), so the caller can stay a no-op
-    until the utilities project ships. Otherwise True when the venv interpreter is missing, when no stamp is
-    recorded, or when the recorded token or lock digest no longer match the committed lock; False when a
-    matching stamp proves the venv is already up to date.
+    until the utilities project ships. Otherwise True when the venv interpreter cannot run (see
+    :func:`utilities_venv_health`), when no stamp is recorded, or when the recorded token or lock digest no
+    longer match the committed lock; False when a matching stamp proves the venv is already up to date. A
+    venv whose base interpreter is gone keeps a matching stamp, and a sync recreates it.
     """
     lock = paths.utilities_lock_file(root)
     if not lock.is_file():
         return False
-    if not paths.utilities_python(root).is_file():
+    if not utilities_venv_health(root).usable:
         return True
     stamp = read_utilities_stamp(root)
     if stamp is None:

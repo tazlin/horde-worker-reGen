@@ -2420,9 +2420,9 @@ class ProcessLifecycleManager:
 
         if self._entry_points.utilities_adapter_factory is not create_utilities_adapter:
             return True
-        from worker_bootstrap import paths
+        from horde_worker_regen.capabilities import utilities_venv_usable
 
-        return paths.utilities_python().is_file()
+        return utilities_venv_usable()
 
     def set_utilities_alchemy_form_demand_provider(self, provider: Callable[[], AlchemyFormDemand]) -> None:
         """Register the alchemy flow's part of the image-utilities lane's demand.
@@ -2539,10 +2539,8 @@ class ProcessLifecycleManager:
             return False
 
         if not self._utilities_interpreter_available():
-            logger.error(
-                "The image-utilities lane is enabled but its virtual environment interpreter is missing; "
-                "not starting the lane. Provision the utilities venv to enable it.",
-            )
+            # The probe logs the reason and the remedy once per process. This line only records the refusal.
+            logger.debug("Not starting the image-utilities lane: its environment cannot run.")
             return False
 
         # An idle lane holds a CUDA context and spends tens of seconds of CPU priming its

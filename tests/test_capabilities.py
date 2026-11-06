@@ -7,6 +7,8 @@ tests need no provisioned venv and assert the coercion behaviour directly: a wor
 feature the utilities lane cannot serve.
 """
 
+import os
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -110,25 +112,56 @@ def test_dependency_helpers_track_utilities_probe(monkeypatch: pytest.MonkeyPatc
     assert capabilities.controlnet_available() is True
 
 
-def test_utilities_available_requires_provisioned_venv(monkeypatch: pytest.MonkeyPatch, tmp_path: object) -> None:
-    """utilities_available is False when the venv interpreter is missing, True once it exists."""
+def _make_utilities_venv(monkeypatch: pytest.MonkeyPatch, data_dir: Path, *, home_exists: bool) -> Path:
+    """Lay out a utilities venv under *data_dir* whose ``pyvenv.cfg`` home holds an interpreter or is gone.
+
+    ``HORDE_WORKER_DATA_DIR`` points the bootstrap's paths at *data_dir*, so the probe reads this layout.
+    """
     from worker_bootstrap import paths
 
-    missing = SimpleNamespace(is_file=lambda: False)
-    monkeypatch.setattr(paths, "utilities_python", lambda *_a, **_k: missing)
+    monkeypatch.setenv("HORDE_WORKER_DATA_DIR", str(data_dir))
+    monkeypatch.setattr(capabilities, "_logged_utilities_venv_states", set())
+    home = data_dir / "python" / "cpython-3.12"
+    if home_exists:
+        home.mkdir(parents=True)
+        (home / ("python.exe" if os.name == "nt" else "python3")).write_text("", encoding="utf-8")
+    venv_python = paths.utilities_python()
+    venv_python.parent.mkdir(parents=True)
+    venv_python.write_text("", encoding="utf-8")
+    (paths.utilities_venv_dir() / "pyvenv.cfg").write_text(f"home = {home}\n", encoding="utf-8")
+    return home
+
+
+def test_utilities_available_requires_provisioned_venv(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """utilities_available is False when the venv interpreter is missing, True once a runnable venv exists."""
+    monkeypatch.setenv("HORDE_WORKER_DATA_DIR", str(tmp_path / "unprovisioned"))
+    monkeypatch.setattr(capabilities, "_logged_utilities_venv_states", set())
     assert capabilities.utilities_available() is False
 
-    present = SimpleNamespace(is_file=lambda: True)
-    monkeypatch.setattr(paths, "utilities_python", lambda *_a, **_k: present)
+    _make_utilities_venv(monkeypatch, tmp_path / "provisioned", home_exists=True)
     assert capabilities.utilities_available() is True
+
+
+def test_utilities_unavailable_when_venv_home_is_gone(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A venv python whose base interpreter was deleted is unavailable, and the reason is logged once."""
+    home = _make_utilities_venv(monkeypatch, tmp_path, home_exists=False)
+    logged: list[str] = []
+    sink_id = logger.add(lambda message: logged.append(message.record["message"]), level="WARNING")
+    try:
+        assert capabilities.utilities_available() is False
+        assert capabilities.utilities_venv_usable() is False
+    finally:
+        logger.remove(sink_id)
+
+    assert len(logged) == 1
+    assert str(home) in logged[0]
+    assert "update-runtime.cmd" in logged[0]
+    assert "./update-runtime.sh" in logged[0]
 
 
 def test_utilities_available_honours_enable_flag(monkeypatch: pytest.MonkeyPatch) -> None:
     """With the venv present, an explicit enable_image_utilities: false makes the lane unavailable."""
-    from worker_bootstrap import paths
-
-    present = SimpleNamespace(is_file=lambda: True)
-    monkeypatch.setattr(paths, "utilities_python", lambda *_a, **_k: present)
+    monkeypatch.setattr(capabilities, "utilities_venv_usable", lambda: True)
 
     assert capabilities.utilities_available(_bridge_data(enable_image_utilities=False)) is False  # type: ignore[arg-type]
     assert capabilities.utilities_available(_bridge_data(enable_image_utilities=True)) is True  # type: ignore[arg-type]
@@ -140,10 +173,7 @@ def test_utilities_available_treats_mock_bridge_data_as_enabled(monkeypatch: pyt
     Guards the Mock-truthiness gotcha: ``enable_image_utilities is not False`` must not trip for a Mock
     whose ``enable_image_utilities`` is itself a truthy Mock.
     """
-    from worker_bootstrap import paths
-
-    present = SimpleNamespace(is_file=lambda: True)
-    monkeypatch.setattr(paths, "utilities_python", lambda *_a, **_k: present)
+    monkeypatch.setattr(capabilities, "utilities_venv_usable", lambda: True)
 
     assert capabilities.utilities_available(Mock()) is True  # type: ignore[arg-type]
 

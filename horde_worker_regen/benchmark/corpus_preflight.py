@@ -384,11 +384,11 @@ def _missing_models(models: list[str]) -> list[str] | None:
 
 
 def _utilities_interpreter_available() -> bool:
-    """Whether the image-utilities service's own interpreter is provisioned, so the strip cells can run."""
+    """Whether the image-utilities service's own interpreter can start, so the strip cells can run."""
     try:
-        from worker_bootstrap import paths
+        from horde_worker_regen.capabilities import utilities_venv_usable
 
-        return paths.utilities_python().is_file()
+        return utilities_venv_usable()
     except Exception:  # noqa: BLE001 - an unprovisioned bootstrap reads as no interpreter, never as a crash
         return False
 

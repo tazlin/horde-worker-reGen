@@ -7,6 +7,8 @@ and requires explicit opt-in, so generating a bundle does not load torch into th
 ``rotational_storage`` reports whether a path is on spinning or solid-state media, for advice that depends on
 how expensive a model reload from disk is.
 
+``utilities_venv_summary`` records whether the image-utilities venv's interpreter can run, and why not.
+
 Read ``bridgeData.yaml`` directly when available to avoid importing the config module and its Textual
 dependency. This module can be used without the TUI.
 """
@@ -237,6 +239,33 @@ def nvidia_smi_summary() -> dict[str, Any] | None:
     return summary or None
 
 
+def utilities_venv_summary(root: Path | None = None) -> dict[str, Any]:
+    """Return what is on disk for the image-utilities venv and whether its interpreter can run.
+
+    The venv lives in the data folder beside the install, so it can outlive a moved or replaced install while
+    the base interpreter it was built from does not. The service then exits at every start. Every missing file
+    reads as False or None.
+
+    Args:
+        root: The install root (defaults to :func:`worker_bootstrap.paths.install_root`).
+    """
+    from worker_bootstrap.utilities_env import read_utilities_stamp, utilities_venv_health
+
+    health = utilities_venv_health(root)
+    stamp = read_utilities_stamp(root)
+    return {
+        "venv_dir": str(health.venv_dir),
+        "python_path": str(health.python_path),
+        "python_exists": health.python_exists,
+        "pyvenv_home": str(health.home) if health.home is not None else None,
+        "pyvenv_home_exists": health.home_exists,
+        "usable": health.usable,
+        "state": health.state.value,
+        "reason": health.describe(),
+        "stamp": stamp.to_dict() if stamp is not None else None,
+    }
+
+
 def collect_system_info(*, cache_home: str | None = None, probe_gpu: bool = False) -> dict[str, Any]:
     """Gather worker version, OS/python, CPU/RAM, disk, and (optionally) a GPU inventory.
 
@@ -264,6 +293,7 @@ def collect_system_info(*, cache_home: str | None = None, probe_gpu: bool = Fals
             "cache_home": _disk_free(Path(cache_home)) if cache_home else None,
         },
         "cache_home": cache_home,
+        "utilities_venv": utilities_venv_summary(),
     }
     driver = nvidia_smi_summary()
     if driver is not None:

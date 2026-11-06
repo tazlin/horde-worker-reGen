@@ -65,7 +65,9 @@ alongside the old files; you do not need to delete the old environment before up
 2. Download the [latest source zip](https://github.com/Haidra-Org/horde-worker-reGen/archive/refs/heads/main.zip).
    Continue when the browser reports that the download completed.
 3. Extract it over the existing worker folder and allow matching files to be replaced. Keep
-   `bridgeData.yaml` and the sibling `<worker>-data` folder. Confirm that
+   `bridgeData.yaml` and the sibling `<worker>-data` folder. Keep the worker folder's name. If you extract
+   to a new folder instead, step 4 rebuilds the image-utilities environment in `<worker>-data`, since that
+   environment points at its Python installation by full path. Confirm that
    `horde_worker_regen/__init__.py` contains the version from the downloaded archive.
 4. Run `update-runtime.cmd` on Windows or `./update-runtime.sh` on Linux/macOS. Continue when dependency
    synchronization completes without an error.

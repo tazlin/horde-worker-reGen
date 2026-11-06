@@ -36,6 +36,84 @@ class TestSystemInfo:
         assert info["disk"]["cache_home"]["total_bytes"] > 0
 
 
+class TestUtilitiesVenvSummary:
+    """The image-utilities venv block, read from venv layouts under tmp_path."""
+
+    @pytest.fixture
+    def install_root(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+        """Return an install root whose data folder is its ``-data`` sibling under tmp_path."""
+        monkeypatch.delenv("HORDE_WORKER_DATA_DIR", raising=False)
+        return tmp_path / "HordeWorker"
+
+    @staticmethod
+    def _make_venv(install_root: Path, *, home: Path | None) -> None:
+        """Create the venv python file, with a ``pyvenv.cfg`` naming *home* unless it is None."""
+        from worker_bootstrap import paths
+
+        venv_python = paths.utilities_python(install_root)
+        venv_python.parent.mkdir(parents=True)
+        venv_python.write_text("", encoding="utf-8")
+        if home is not None:
+            (paths.utilities_venv_dir(install_root) / "pyvenv.cfg").write_text(f"home = {home}\n", encoding="utf-8")
+
+    def test_records_a_deleted_home_as_not_usable(self, install_root: Path, tmp_path: Path) -> None:
+        """A venv whose ``pyvenv.cfg`` home was deleted is recorded with the home, the verdict and the stamp."""
+        from worker_bootstrap import utilities_env
+
+        deleted_home = tmp_path / "old-install-data" / "python" / "cpython-3.12"
+        self._make_venv(install_root, home=deleted_home)
+        utilities_env.write_utilities_stamp(backend_token="cu132", root=install_root)
+
+        summary = system_info.utilities_venv_summary(install_root)
+
+        assert summary["python_exists"] is True
+        assert summary["pyvenv_home"] == str(deleted_home)
+        assert summary["pyvenv_home_exists"] is False
+        assert summary["usable"] is False
+        assert summary["state"] == "home_gone"
+        assert str(deleted_home) in summary["reason"]
+        assert summary["stamp"]["backend_token"] == "cu132"
+
+    def test_records_a_runnable_venv_as_usable(self, install_root: Path, tmp_path: Path) -> None:
+        """A venv whose home holds the base interpreter is usable, and a missing stamp reads as None."""
+        home = tmp_path / "data" / "python" / "cpython-3.12"
+        home.mkdir(parents=True)
+        (home / ("python.exe" if sys.platform == "win32" else "python3")).write_text("", encoding="utf-8")
+        self._make_venv(install_root, home=home)
+
+        summary = system_info.utilities_venv_summary(install_root)
+
+        assert summary["usable"] is True
+        assert summary["state"] == "usable"
+        assert summary["pyvenv_home_exists"] is True
+        assert summary["stamp"] is None
+
+    def test_records_a_missing_pyvenv_cfg(self, install_root: Path) -> None:
+        """A venv python without ``pyvenv.cfg`` is recorded as not usable with no home."""
+        self._make_venv(install_root, home=None)
+
+        summary = system_info.utilities_venv_summary(install_root)
+
+        assert summary["usable"] is False
+        assert summary["state"] == "missing_pyvenv_cfg"
+        assert summary["pyvenv_home"] is None
+        assert summary["pyvenv_home_exists"] is False
+
+    def test_tolerates_a_missing_venv(self, install_root: Path) -> None:
+        """With nothing on disk, every field is filled and the reads do not raise."""
+        summary = system_info.utilities_venv_summary(install_root)
+
+        assert summary["python_exists"] is False
+        assert summary["usable"] is False
+        assert summary["state"] == "missing_python"
+        assert summary["stamp"] is None
+
+    def test_collect_system_info_includes_the_block(self) -> None:
+        """The bundle's system report has the utilities venv block."""
+        info = collect_system_info(probe_gpu=False)
+        assert set(info["utilities_venv"]) >= {"venv_dir", "python_exists", "pyvenv_home", "usable", "reason"}
+
+
 class TestNvidiaSmiSummary:
     """The driver block of the system report, read from a stubbed nvidia-smi."""
 

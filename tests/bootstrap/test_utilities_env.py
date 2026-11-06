@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
 
@@ -21,11 +22,37 @@ def _write_lock(root: Path, *, body: str = "utilities-lock-contents\n") -> Path:
     return lock
 
 
-def _make_interpreter(root: Path) -> None:
-    """Create a stand-in utilities venv interpreter file so the interpreter-present branch is exercised."""
+def _base_interpreter_name() -> str:
+    """Return the file name of the interpreter that a venv's ``pyvenv.cfg`` home holds on this platform."""
+    return "python.exe" if os.name == "nt" else "python3"
+
+
+def _make_venv_layout(root: Path, *, home: Path | None) -> None:
+    """Create a stand-in utilities venv interpreter file, with a ``pyvenv.cfg`` naming *home* unless it is None."""
     interpreter = paths.utilities_python(root)
     interpreter.parent.mkdir(parents=True, exist_ok=True)
     interpreter.write_text("", encoding="utf-8")
+    if home is not None:
+        (paths.utilities_venv_dir(root) / "pyvenv.cfg").write_text(
+            f"home = {home}\nimplementation = CPython\nversion_info = 3.12.9\n",
+            encoding="utf-8",
+        )
+
+
+def _make_base_interpreter(home: Path) -> Path:
+    """Create a stand-in base interpreter under *home*, the directory a venv's ``pyvenv.cfg`` names."""
+    home.mkdir(parents=True, exist_ok=True)
+    (home / _base_interpreter_name()).write_text("", encoding="utf-8")
+    return home
+
+
+def _make_interpreter(root: Path) -> None:
+    """Create a stand-in utilities venv whose interpreter can run, so the interpreter-present branch is exercised.
+
+    A runnable venv needs its base interpreter as well as its own ``python`` file, since a uv venv's
+    ``python`` only starts the interpreter in the ``pyvenv.cfg`` home.
+    """
+    _make_venv_layout(root, home=_make_base_interpreter(root / "managed-python"))
 
 
 # --- the committed utilities project ----------------------------------------------------------------
@@ -203,6 +230,103 @@ def test_needs_provision_true_when_backend_token_changed(tmp_path: Path) -> None
     _make_interpreter(tmp_path)
     utilities_env.write_utilities_stamp(backend_token="cu126", root=tmp_path)
     assert utilities_env.needs_provision(backend_token="cu132", root=tmp_path) is True
+
+
+def test_needs_provision_true_when_home_gone_despite_matching_stamp(tmp_path: Path) -> None:
+    """A venv whose base interpreter was deleted is re-synced even though its stamp still matches the lock."""
+    _write_lock(tmp_path)
+    _make_venv_layout(tmp_path, home=tmp_path / "deleted-python")
+    utilities_env.write_utilities_stamp(backend_token="cu126", root=tmp_path)
+    assert utilities_env.needs_provision(backend_token="cu126", root=tmp_path) is True
+
+
+# --- utilities_venv_health (can the venv interpreter run) -------------------------------------------
+
+
+def test_venv_health_usable_when_home_holds_an_interpreter(tmp_path: Path) -> None:
+    """A venv python with a ``pyvenv.cfg`` home that holds the base interpreter is usable."""
+    home = _make_base_interpreter(tmp_path / "managed-python")
+    _make_venv_layout(tmp_path, home=home)
+
+    health = utilities_env.utilities_venv_health(tmp_path)
+
+    assert health.usable is True
+    assert health.state is utilities_env.UtilitiesVenvState.USABLE
+    assert health.python_exists is True
+    assert health.home == home
+    assert health.home_exists is True
+
+
+def test_venv_health_reports_home_gone_when_home_was_deleted(tmp_path: Path) -> None:
+    """A ``pyvenv.cfg`` home that no longer exists leaves the venv python unable to start."""
+    deleted_home = tmp_path / "deleted-python"
+    _make_venv_layout(tmp_path, home=deleted_home)
+
+    health = utilities_env.utilities_venv_health(tmp_path)
+
+    assert health.usable is False
+    assert health.state is utilities_env.UtilitiesVenvState.HOME_GONE
+    assert health.python_exists is True
+    assert health.home == deleted_home
+    assert health.home_exists is False
+    assert str(deleted_home) in health.describe()
+
+
+def test_venv_health_reports_home_gone_when_home_holds_no_interpreter(tmp_path: Path) -> None:
+    """A home directory that exists without a base interpreter in it counts as gone."""
+    empty_home = tmp_path / "empty-python"
+    empty_home.mkdir()
+    _make_venv_layout(tmp_path, home=empty_home)
+
+    health = utilities_env.utilities_venv_health(tmp_path)
+
+    assert health.usable is False
+    assert health.state is utilities_env.UtilitiesVenvState.HOME_GONE
+    assert health.home_exists is True
+
+
+def test_venv_health_not_usable_without_pyvenv_cfg(tmp_path: Path) -> None:
+    """A venv python with no ``pyvenv.cfg`` beside it is not usable."""
+    _make_venv_layout(tmp_path, home=None)
+
+    health = utilities_env.utilities_venv_health(tmp_path)
+
+    assert health.usable is False
+    assert health.state is utilities_env.UtilitiesVenvState.MISSING_PYVENV_CFG
+    assert health.home is None
+    assert health.home_exists is False
+
+
+def test_venv_health_not_usable_when_pyvenv_cfg_unreadable(tmp_path: Path) -> None:
+    """A ``pyvenv.cfg`` that cannot be read as a file is treated as missing."""
+    _make_venv_layout(tmp_path, home=None)
+    (paths.utilities_venv_dir(tmp_path) / "pyvenv.cfg").mkdir()
+
+    health = utilities_env.utilities_venv_health(tmp_path)
+
+    assert health.usable is False
+    assert health.state is utilities_env.UtilitiesVenvState.MISSING_PYVENV_CFG
+
+
+def test_venv_health_not_usable_when_pyvenv_cfg_has_no_home(tmp_path: Path) -> None:
+    """A ``pyvenv.cfg`` without a ``home`` key is not usable."""
+    _make_venv_layout(tmp_path, home=None)
+    (paths.utilities_venv_dir(tmp_path) / "pyvenv.cfg").write_text("implementation = CPython\n", encoding="utf-8")
+
+    health = utilities_env.utilities_venv_health(tmp_path)
+
+    assert health.usable is False
+    assert health.state is utilities_env.UtilitiesVenvState.MISSING_PYVENV_CFG
+
+
+def test_venv_health_not_usable_without_venv_python(tmp_path: Path) -> None:
+    """With no venv python file at all, the reason is the missing python, whatever else is on disk."""
+    health = utilities_env.utilities_venv_health(tmp_path)
+
+    assert health.usable is False
+    assert health.state is utilities_env.UtilitiesVenvState.MISSING_PYTHON
+    assert health.python_exists is False
+    assert health.venv_dir == paths.utilities_venv_dir(tmp_path)
 
 
 # --- stamp round-trip -------------------------------------------------------------------------------
