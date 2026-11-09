@@ -5,6 +5,7 @@ from __future__ import annotations
 import enum
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 
 from horde_sdk.ai_horde_api import GENERATION_STATE
 from horde_sdk.ai_horde_api.fields import GenerationID
@@ -69,6 +70,19 @@ reservation, a lane's context charge plus reservations), so one that promises es
 to return, and issuing it waits out a settling window against an unchanged resource condition. Lane rungs
 always carry at least their stopped process's CUDA-context charge, so in practice this skips unmeasured or
 empty tenants, never a lane with a context to give back."""
+
+
+@dataclass(frozen=True)
+class RemedyLanePause:
+    """The receipt for a lane pause a save-our-ship remedy acquired."""
+
+    rung: ReclaimRung
+    """The lane-pause rung that acted."""
+    issued_for_job: GenerationID | None
+    """The queue head when the rung acted, or None when no accepted job was unresolved.
+
+    The pause holds against the stranded-lane backstop only while this job is tracked. Once the job has submitted
+    or been finalized as faulted, the lane is no longer kept down for it, although the episode may stay open."""
 
 
 class WorkerRecoveryCoordinator:
@@ -338,7 +352,7 @@ class WorkerRecoveryCoordinator:
         # Lane pauses this episode's rungs actually acquired, in issue order, so the episode close restores
         # exactly those and in reverse. A pause that was a no-op (another owner already held it) is not recorded,
         # so this coordinator never lifts a hold it does not own.
-        self.reclaim_paused_lanes: list[ReclaimRung] = []
+        self.reclaim_paused_lanes: list[RemedyLanePause] = []
         # When head-of-queue model materialisation (a preload/load for the head over an otherwise idle pool)
         # was first observed in the current continuity; None when the head is not materialising. Bounds the
         # give-up deferral so a stuck load still escalates. Cleared when materialisation stops or the episode
@@ -1559,7 +1573,7 @@ class WorkerRecoveryCoordinator:
                 self.reclaim_remedy_started_at = now
             self.reclaim_effect_baseline = (head_blocker, starts_before_rung) if head_blocker is not None else None
             if rung.kind in LANE_PAUSE_RUNG_KINDS:
-                self.reclaim_paused_lanes.append(rung)
+                self.reclaim_paused_lanes.append(RemedyLanePause(rung=rung, issued_for_job=self._remedy_target_job()))
             logger.warning(
                 f"Save-our-ship: issued the constructive remedy {rung.kind.value} on {rung.tenant_label} "
                 f"(~{rung.promised_freed_mb:.0f}MB promised) and yielding up to "
@@ -1595,20 +1609,54 @@ class WorkerRecoveryCoordinator:
         owner. Without this the ladder's stranded-pause backstop reads a live recovery remedy as an orphan and
         restores it, which both defeats the remedy inside its yield window and restarts the lane process each
         time the remedy is re-issued. :meth:`restore_reclaimed_lanes` remains the responsible restore.
+
+        A receipt issued for a job holds only while that job is tracked. An episode can stay open long after the
+        job submits or is faulted, and the lane would stay down, with the post-processing offer withheld, for all
+        of it. A receipt issued with no job outstanding holds until the episode closes.
         """
-        return any(rung.kind is kind for rung in self.reclaim_paused_lanes)
+        return any(receipt.rung.kind is kind and self._receipt_holds(receipt) for receipt in self.reclaim_paused_lanes)
+
+    def _remedy_target_job(self) -> GenerationID | None:
+        """Return the job a lane-pause remedy frees room for, or None when no accepted job is unresolved.
+
+        The remedy acts for the queue head, which is the oldest job still waiting for or running inference. An
+        older job in a later stage is not the one held up, and it can finish while the head still needs the room.
+        With no such job, the episode's frontier job is used.
+        """
+        for job in self._job_tracker.jobs_pending_inference:
+            if job.id_ is not None:
+                return job.id_
+        frontier = self._current_recovery_frontier()
+        return frontier[0] if frontier is not None else None
+
+    def _receipt_holds(self, receipt: RemedyLanePause) -> bool:
+        """Whether a remedy's lane pause is still kept down for the job it was issued for."""
+        if receipt.issued_for_job is None:
+            return True
+        return self._job_tracker.get_tracked_job(receipt.issued_for_job) is not None
+
+    def release_lane_pause(self, kind: ReclaimRungKind) -> None:
+        """Drop the receipts for a ``kind`` lane pause that the stranded-lane backstop has restored.
+
+        The backstop calls this only after its restore acted, which it attempts only once :meth:`holds_lane_pause`
+        reports False. Keeping the receipt would let the episode close restore a later pause of the same lane that
+        belongs to the reclaim ladder, which records its pauses under the same owner.
+        """
+        self.reclaim_paused_lanes = [receipt for receipt in self.reclaim_paused_lanes if receipt.rung.kind is not kind]
 
     def restore_reclaimed_lanes(self) -> None:
         """Restart every lane this episode's rungs paused, in reverse issue order.
 
         The recovery episode owns this restore because the pauses are its own: it holds the receipt of exactly
-        which lanes its rungs acquired, so it restores those and no others. No external backstop is relied on,
-        because the conditions those backstops require (a card debounced healthy for a sustained window, a
-        matching device index) are not reached on a chronically pressured card, and a stranded reclaim-owned
-        post-processing pause additionally stops suppressing the lane's admission-patience clock, aging out
-        queued work.
+        which lanes its rungs acquired, so it restores those and no others. The episode close does not rely on
+        the stranded-lane backstop, because the conditions it requires (a card debounced healthy for a sustained
+        window, a matching device index) are not reached on a chronically pressured card, and a stranded
+        reclaim-owned post-processing pause additionally stops suppressing the lane's admission-patience clock,
+        aging out queued work. The backstop restores a pause earlier only once the job it was issued for has left
+        the tracker (see :meth:`holds_lane_pause`), and then releases its receipt.
         """
-        for rung in reversed(self.reclaim_paused_lanes):
+        for receipt in reversed(self.reclaim_paused_lanes):
+            rung = receipt.rung
             if not restore_reclaim_rung(rung, self._inference_scheduler):
                 continue
             self._action_ledger.record(

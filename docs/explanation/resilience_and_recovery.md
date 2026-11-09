@@ -793,9 +793,15 @@ The escalation, in order:
    from doing nothing while the wedge stands. Lane rungs are priced as their stopped process's CUDA-context
    charge plus its allocator reservation, since stopping the process is what returns the context, so a lane
    with a context on the card never prices as zero and remains available as a remedy. The lane pauses the
-   remedy does take are stamped with the reclaim ladder's owner (it acts through
-   that actuator), so the ladder's stranded-pause backstop consults the coordinator's own receipt before
-   treating one as an orphan; the coordinator's unwind remains the responsible restore. The ladder also
+   remedy does take are stamped with the reclaim ladder's owner, because it acts through that actuator. The
+   coordinator therefore keeps a receipt for each pause, with the queue head at the moment the
+   rung acted (none when no accepted job was unresolved). The stranded-pause backstop does not restore a pause
+   while its receipt holds. The coordinator restores its pauses when the episode closes or the park lifts.
+   An episode can stay open long after the job the remedy was issued for has submitted or been faulted, with
+   the lane down and the post-processing offer withheld for all of it. A receipt therefore holds only while
+   its job is tracked. Once the job leaves the tracker, the backstop restores the lane on its usual gates and
+   releases the receipt, so the episode close does not lift a later ladder pause of the same lane. A receipt
+   without a job holds until the episode closes. The ladder also
    judges its own relevance: every rung on it frees card memory, which addresses the head only when a
    shortfall is what holds it. When the scheduler publishes the constraint blocking the head, each issued
    rung is judged once, after its full settling window, on whether the named constraint or the

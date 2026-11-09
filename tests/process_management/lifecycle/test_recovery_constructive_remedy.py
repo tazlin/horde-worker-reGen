@@ -252,7 +252,7 @@ class TestSafetyStarvedWedgeReachesAConstructiveRung:
             if ReclaimRungKind.PAUSE_VAE_LANE.value in transcript:
                 break
 
-        assert [rung.kind for rung in coordinator.reclaim_paused_lanes] == [
+        assert [receipt.rung.kind for receipt in coordinator.reclaim_paused_lanes] == [
             ReclaimRungKind.PAUSE_PP_LANE,
             ReclaimRungKind.PAUSE_VAE_LANE,
         ]

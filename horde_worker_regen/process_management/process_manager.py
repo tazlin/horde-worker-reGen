@@ -4037,6 +4037,11 @@ class HordeWorkerProcessManager:
         the worker-wide scope, where the per-cycle admission path books its pauses on a single-GPU host. The
         post-processing lane must also have been paused for the debounce, so a pause taken on a card that has
         long been HEALTHY is left to its owner instead of being reversed on the next tick.
+
+        A save-our-ship remedy's pause is held by the recovery coordinator's receipt only while the job it was
+        issued for is tracked (:meth:`WorkerRecoveryCoordinator.holds_lane_pause`). A restore that acts on a pause
+        the receipt no longer holds releases that receipt, so the episode close does not restore a later pause of
+        the same lane.
         """
         if device_index != self._process_lifecycle.vae_lane_card_index():
             return
@@ -4066,7 +4071,8 @@ class HordeWorkerProcessManager:
                 "saturation episode or post-processing borrow still claims it and the card has been healthy. "
                 "Disaggregation was disabled for as long as it stayed paused.",
             )
-            scheduler.restore_vae_lane(device_index)
+            if scheduler.restore_vae_lane(device_index):
+                recovery.release_lane_pause(ReclaimRungKind.PAUSE_VAE_LANE)
 
         if (
             lifecycle.is_component_gpu_paused
@@ -4079,7 +4085,8 @@ class HordeWorkerProcessManager:
                 "but no saturation episode or post-processing borrow still claims it and the card has been "
                 "healthy. Disaggregation was disabled for as long as it stayed paused.",
             )
-            scheduler.restore_component_lane(device_index)
+            if scheduler.restore_component_lane(device_index):
+                recovery.release_lane_pause(ReclaimRungKind.PAUSE_COMPONENT_LANE)
 
         post_process_paused_at = lifecycle.post_process_paused_at
         post_process_pause_outlived_debounce = (
@@ -4090,12 +4097,16 @@ class HordeWorkerProcessManager:
             post_process_pause_outlived_debounce
             and lifecycle.post_process_pause_owner is PauseOwner.RECLAIM_LADDER
             and not recovery.holds_lane_pause(ReclaimRungKind.PAUSE_PP_LANE)
+            # The restore stands down while a whole-card teardown is held and nothing waits for post-processing.
+            # The receipt is then kept and the gates above still hold, so a later tick retries. The line below is
+            # logged only when the restore acts, since a refused restore repeats on every tick.
+            and scheduler.restore_post_process_lane(device_index)
         ):
             logger.warning(
-                f"Restoring a stranded post-processing lane on device {device_index}: the reclaim ladder paused "
+                f"Restored a stranded post-processing lane on device {device_index}: the reclaim ladder paused "
                 "it, but no saturation episode still claims it and the card has been healthy.",
             )
-            scheduler.restore_post_process_lane(device_index)
+            recovery.release_lane_pause(ReclaimRungKind.PAUSE_PP_LANE)
 
     def _utilities_pause_stranded(self) -> bool:
         """Whether a reclaim-ladder pause on the image-utilities lane has outlived every owner that could restore it.
@@ -4130,7 +4141,10 @@ class HordeWorkerProcessManager:
         self._kept_servable_set()
         if not self._download_coordinator.inference_processes_started:
             return
-        outcome = self._process_lifecycle.reconcile_utilities_demand(pause_stranded=self._utilities_pause_stranded())
+        pause_stranded = self._utilities_pause_stranded()
+        outcome = self._process_lifecycle.reconcile_utilities_demand(pause_stranded=pause_stranded)
+        if pause_stranded and self._process_lifecycle.utilities_pause_owner is None:
+            self._recovery_coordinator.release_lane_pause(ReclaimRungKind.PAUSE_UTILITIES_LANE)
         if outcome.started_for is not None:
             self._run_metrics.record_decision(
                 decision_kind=DecisionKind.IMAGE_UTILITIES_ROUTING,

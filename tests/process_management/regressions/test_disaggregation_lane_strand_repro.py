@@ -24,14 +24,23 @@ import time
 from dataclasses import replace
 
 import pytest
+from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 from loguru import logger
 
+from horde_worker_regen.process_management.jobs.job_popper import POST_PROCESSING_OFFER_REASON_LANE_PAUSED
+from horde_worker_regen.process_management.jobs.job_tracker import JobFaultOrigin, JobStage
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_lifecycle import PauseOwner
+from horde_worker_regen.process_management.lifecycle.worker_recovery_coordinator import RemedyLanePause
 from horde_worker_regen.process_management.process_manager import HordeWorkerProcessManager
 from horde_worker_regen.process_management.resources.reclaim_ladder import ReclaimRung, ReclaimRungKind
 from horde_worker_regen.process_management.resources.vram_arbiter import ActuatorCommandKind
 from horde_worker_regen.process_management.workers import post_process_orchestrator as pp_orchestrator_module
+from tests.process_management.conftest import (
+    make_job_pop_response,
+    queue_job_for_safety_async,
+    track_popped_job_async,
+)
 from tests.process_management.regressions.test_post_process_drain_context_reclaim_repro import (
     _live_process,
     _live_shaped_manager,
@@ -165,11 +174,14 @@ async def test_backstop_leaves_a_recovery_remedys_own_lane_pause_alone(monkeypat
 
     assert manager._process_lifecycle.pause_post_process_off_gpu(owner=PauseOwner.RECLAIM_LADDER) is True
     coordinator.reclaim_paused_lanes.append(
-        ReclaimRung(
-            kind=ReclaimRungKind.PAUSE_PP_LANE,
-            tenant_label="post-processing lane",
-            promised_freed_mb=512.0,
-            device_index=0,
+        RemedyLanePause(
+            rung=ReclaimRung(
+                kind=ReclaimRungKind.PAUSE_PP_LANE,
+                tenant_label="post-processing lane",
+                promised_freed_mb=512.0,
+                device_index=0,
+            ),
+            issued_for_job=None,
         ),
     )
     manager._healthy_since_by_device[0] = time.monotonic() - (manager._STRANDED_LANE_RESTORE_DEBOUNCE_SECONDS + 5.0)
@@ -192,6 +204,162 @@ def _age_post_process_pause_past_debounce(manager: HordeWorkerProcessManager) ->
     lifecycle = manager._process_lifecycle
     assert lifecycle._post_process_gpu_paused_at is not None
     lifecycle._post_process_gpu_paused_at -= manager._STRANDED_LANE_RESTORE_DEBOUNCE_SECONDS + 5.0
+
+
+_REMEDY_PP_LANE_RUNG = ReclaimRung(
+    kind=ReclaimRungKind.PAUSE_PP_LANE,
+    device_index=0,
+    promised_freed_mb=1_288.0,
+    tenant_label="post-processing lane",
+)
+"""The save-our-ship remedy that stops the post-processing lane, as the coordinator's frozen ladder holds it."""
+
+
+def _remedy_pauses_the_post_process_lane(manager: HordeWorkerProcessManager) -> None:
+    """Issue the post-processing lane pause through the coordinator's constructive-remedy path."""
+    coordinator = manager._recovery_coordinator
+    coordinator.reclaim_rungs = (_REMEDY_PP_LANE_RUNG,)
+    assert coordinator.issue_next_constructive_remedy() == _REMEDY_PP_LANE_RUNG
+    assert manager._process_lifecycle.post_process_pause_owner is PauseOwner.RECLAIM_LADDER
+
+
+def _run_backstop_on_a_healthy_card(manager: HordeWorkerProcessManager) -> None:
+    """Run the backstop once the pause and the card's health have both outlived the debounce."""
+    _age_post_process_pause_past_debounce(manager)
+    manager._healthy_since_by_device[0] = time.monotonic() - (manager._STRANDED_LANE_RESTORE_DEBOUNCE_SECONDS + 5.0)
+    manager._reclaim_stranded_service_lane_pauses(0)
+
+
+def _offer_withheld_for_the_paused_lane(manager: HordeWorkerProcessManager) -> bool:
+    """Whether the next pop withholds post-processing because the lane is held off the GPU."""
+    return manager._job_popper._post_processing_offer_withheld_reason() == POST_PROCESSING_OFFER_REASON_LANE_PAUSED
+
+
+async def _finalize(manager: HordeWorkerProcessManager, job: ImageGenerateJobPopResponse) -> None:
+    """Queue ``job`` for submit and finalize it with the state its job info holds."""
+    job_tracker = manager._job_tracker
+    job_info = await job_tracker.get_job_info(job)
+    assert job_info is not None
+    assert job.id_ is not None
+    if job_tracker.get_stage(job.id_) is not JobStage.PENDING_SUBMIT:
+        await job_tracker.queue_for_submit(job_info)
+    await job_tracker.finalize_submitted(job_info)
+
+
+async def test_a_remedy_pause_is_restored_once_its_job_has_submitted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The backstop restores a remedy's lane once the job it was paused for has left the tracker.
+
+    The recovery episode can stay open long after that job submits, and the episode close is the coordinator's
+    only restore. The supervisor is not ticked here, so a restore can only come from the backstop.
+    """
+    manager, _vae, _component, _safety = _live_shaped_manager(monkeypatch)
+    job = await track_popped_job_async(manager._job_tracker, make_job_pop_response())
+    _remedy_pauses_the_post_process_lane(manager)
+
+    await _finalize(manager, job)
+    assert manager._job_tracker.num_jobs_total == 0
+    _run_backstop_on_a_healthy_card(manager)
+
+    assert manager._process_lifecycle.is_post_process_gpu_paused is False, (
+        "the remedy's lane stayed down after its job submitted, for as long as the episode stays open"
+    )
+    assert not _offer_withheld_for_the_paused_lane(manager)
+
+    # The reclaim ladder later pauses the lane for its own episode. The recovery episode's close must not lift
+    # that pause on the strength of the receipt the backstop already discharged.
+    assert manager._process_lifecycle.pause_post_process_off_gpu(owner=PauseOwner.RECLAIM_LADDER) is True
+    manager._recovery_coordinator.restore_reclaimed_lanes()
+    assert manager._process_lifecycle.is_post_process_gpu_paused is True
+
+
+async def test_a_remedy_pause_is_restored_once_the_give_up_faults_its_job(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A job faulted by the give-up leaves the tracker at finalize, and the emptied queue holds nothing back."""
+    manager, _vae, _component, _safety = _live_shaped_manager(monkeypatch)
+    job = await track_popped_job_async(manager._job_tracker, make_job_pop_response())
+    _remedy_pauses_the_post_process_lane(manager)
+
+    manager._job_tracker.handle_job_fault_now(job, retryable=False, fault_origin=JobFaultOrigin.SCHEDULING_RECOVERY)
+    await _finalize(manager, job)
+    assert manager._job_tracker.num_jobs_total == 0
+    _run_backstop_on_a_healthy_card(manager)
+
+    assert manager._process_lifecycle.is_post_process_gpu_paused is False
+    assert not _offer_withheld_for_the_paused_lane(manager)
+
+
+async def test_a_remedy_pause_holds_for_the_queue_head_when_an_older_job_finishes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The receipt is for the job waiting on inference, so an older job leaving a later stage does not end it.
+
+    The remedy frees room for the queue head. An older job already past inference can submit while the head
+    still needs that room, and restoring the lane then would undo the remedy.
+    """
+    manager, _vae, _component, _safety = _live_shaped_manager(monkeypatch)
+    job_tracker = manager._job_tracker
+    older_job = await track_popped_job_async(job_tracker, make_job_pop_response())
+    older_job_info = await job_tracker.get_job_info(older_job)
+    assert older_job_info is not None
+    await queue_job_for_safety_async(job_tracker, older_job_info)
+    queue_head = await track_popped_job_async(job_tracker, make_job_pop_response())
+    _remedy_pauses_the_post_process_lane(manager)
+
+    await _finalize(manager, older_job)
+    assert queue_head.id_ is not None
+    assert job_tracker.get_tracked_job(queue_head.id_) is not None
+    _run_backstop_on_a_healthy_card(manager)
+
+    assert manager._process_lifecycle.is_post_process_gpu_paused is True
+
+
+async def test_a_refused_remedy_restore_is_retried_on_a_later_tick(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The post-processing restore stands down under a held teardown, and the backstop tries again afterwards."""
+    manager, _vae, _component, _safety = _live_shaped_manager(monkeypatch)
+    job = await track_popped_job_async(manager._job_tracker, make_job_pop_response())
+    _remedy_pauses_the_post_process_lane(manager)
+    await _finalize(manager, job)
+
+    teardown_held = {"held": True}
+    monkeypatch.setattr(
+        manager._inference_scheduler._whole_card_ledger,
+        "teardown_held",
+        lambda: teardown_held["held"],
+    )
+    _run_backstop_on_a_healthy_card(manager)
+    assert manager._process_lifecycle.is_post_process_gpu_paused is True
+
+    teardown_held["held"] = False
+    manager._reclaim_stranded_service_lane_pauses(0)
+    assert manager._process_lifecycle.is_post_process_gpu_paused is False
+    assert not _offer_withheld_for_the_paused_lane(manager)
+
+
+async def test_a_remedy_pause_holds_while_its_job_is_tracked(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The remedy keeps its lane down while the job it was paused for is still unresolved."""
+    manager, _vae, _component, _safety = _live_shaped_manager(monkeypatch)
+    await track_popped_job_async(manager._job_tracker, make_job_pop_response())
+    _remedy_pauses_the_post_process_lane(manager)
+
+    _run_backstop_on_a_healthy_card(manager)
+
+    assert manager._process_lifecycle.is_post_process_gpu_paused is True
+    assert manager._process_lifecycle.post_process_pause_owner is PauseOwner.RECLAIM_LADDER
+    assert _offer_withheld_for_the_paused_lane(manager)
+
+
+async def test_a_remedy_pause_without_a_job_holds_until_the_episode_closes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A pause issued with no accepted job outstanding is restored by the episode close alone."""
+    manager, _vae, _component, _safety = _live_shaped_manager(monkeypatch)
+    assert manager._job_tracker.num_jobs_total == 0
+    _remedy_pauses_the_post_process_lane(manager)
+
+    _run_backstop_on_a_healthy_card(manager)
+    assert manager._process_lifecycle.is_post_process_gpu_paused is True
+    assert _offer_withheld_for_the_paused_lane(manager)
+
+    manager._recovery_coordinator.restore_reclaimed_lanes()
+    assert manager._process_lifecycle.is_post_process_gpu_paused is False
+    assert not _offer_withheld_for_the_paused_lane(manager)
 
 
 async def test_backstop_leaves_a_worker_wide_ladder_pp_pause_alone(monkeypatch: pytest.MonkeyPatch) -> None:
