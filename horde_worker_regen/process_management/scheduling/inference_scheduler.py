@@ -4065,6 +4065,59 @@ class InferenceScheduler:
             for key in (device_index, None)
         )
 
+    def _head_takes_exclusive_claim(self, job: ImageGenerateJobPopResponse, device_index: int | None) -> bool:
+        """Whether an unmarked dispatch head takes the pending exclusive claim on ``device_index`` for its model.
+
+        Both demand paths step past a job waiting for auxiliary files, so the card can be granted to a job queued
+        behind such a head. Once the files land the head is the dispatch head again, and the pending claim of the
+        job behind it suppresses the head. The dispatch walk does not reach past an idle resident head to a job of
+        the same model, so neither job runs. The claim was made for the card's residency, and a head of that
+        model serves the same residency, so the head takes the claim and the job behind it is marked again when
+        it next claims the card.
+
+        The head does not take the claim while an exclusive job is sampling in scope, while the card holds no
+        residency for the head's model, or while any pending claim in scope is for another model, is
+        unattributed, or is an over-budget admit, whose mark isolates that one job for its whole life.
+
+        Args:
+            job: The dispatch head, before the suppression check.
+            device_index: The dispatch's routing scope, the same scope the claims were marked with.
+        """
+        if job.model is None or self._job_tracker.is_admitted_exclusive(job):
+            return False
+        if self._job_tracker.has_exclusive_job_running(device_index):
+            return False
+        if not self._whole_card_ledger.holds_model_on_card(job.model, device_index):
+            return False
+        claim_found = False
+        for pending in self._job_tracker.jobs_pending_inference:
+            tracked = self._job_tracker.get_tracked_job(pending.id_) if pending.id_ is not None else None
+            if tracked is None or not tracked.admitted_exclusive:
+                continue
+            claim_device_index = tracked.admitted_exclusive_device_index
+            if device_index is not None and claim_device_index is not None and claim_device_index != device_index:
+                # Another card's claim does not suppress this card.
+                continue
+            if claim_device_index != device_index or pending.model != job.model or tracked.admitted_over_budget:
+                return False
+            claim_found = True
+        return claim_found
+
+    def _transfer_exclusive_claim_to_head(self, job: ImageGenerateJobPopResponse, device_index: int | None) -> None:
+        """Move the pending exclusive claim on ``device_index`` to the dispatch head.
+
+        The job behind the head loses its mark, so one job holds the card's claim at a time. See
+        :meth:`_head_takes_exclusive_claim` for when the head takes it.
+        """
+        if job.model is None:
+            raise ValueError(f"job.model is None ({job})")
+        self._job_tracker.release_pending_exclusive_admits(job.model, device_index=device_index)
+        self._job_tracker.mark_admitted_exclusive(job, device_index=device_index)
+        logger.info(
+            f"Moved the pending exclusive claim for {job.model} on card {device_index} to the dispatch head "
+            f"{str(job.id_)[:8]}, which serves the same residency.",
+        )
+
     def _note_exclusive_dispatch_suppression(
         self,
         job: ImageGenerateJobPopResponse,
@@ -4896,9 +4949,12 @@ class InferenceScheduler:
             )
         # Below the cap the same admit still holds dispatch whenever it holds a live claim on the card (a
         # running over-budget job, or a staged one whose whole-card residency is up). Attribute that slot to the
-        # admit here too, so the wait is named rather than falling through to the gate-less stall report.
-        if not self._job_tracker.is_admitted_exclusive(head) and self._exclusive_dispatch_suppression_active(
-            process.device_index,
+        # admit here too, so the wait is named rather than falling through to the gate-less stall report. A head
+        # that dispatch lets take the claim is not held by it.
+        if (
+            not self._job_tracker.is_admitted_exclusive(head)
+            and self._exclusive_dispatch_suppression_active(process.device_index)
+            and not self._head_takes_exclusive_claim(head, self._routing_device_index(process))
         ):
             return SlotDutyBucket.EXCLUSIVE_ISOLATION, (
                 f"its model is resident and idle on process {process.process_id}, but an exclusively-admitted "
@@ -12254,8 +12310,11 @@ class InferenceScheduler:
         if not self._job_tracker.is_admitted_exclusive(next_job) and self._exclusive_dispatch_suppression_active(
             dispatch_scope,
         ):
-            self._note_exclusive_dispatch_suppression(next_job, dispatch_scope)
-            return None
+            if line_skip is not None or not self._head_takes_exclusive_claim(next_job, dispatch_scope):
+                self._note_exclusive_dispatch_suppression(next_job, dispatch_scope)
+                return None
+            if not information_only:
+                self._transfer_exclusive_claim_to_head(next_job, dispatch_scope)
 
         self._head_admission.clear_missing_model()
 

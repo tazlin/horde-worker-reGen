@@ -22,6 +22,10 @@ A card can be granted to a whole-card head queued behind jobs waiting for auxili
 dispatch both step past such jobs. When the files land during the teardown, those jobs come first in the preload
 pass and are refused for the head's exclusive claim. The pass goes on over the held card for the head alone, so
 the head is preloaded and samples, and the jobs ahead of it run once the residency drains.
+
+When the job waiting for files is of the same model as the granted job behind it, it becomes the dispatch head once
+the files land and takes the pending claim, since it serves the same residency. A job of another model, and an
+over-budget admit's claim, are left as they were.
 """
 
 from __future__ import annotations
@@ -651,3 +655,149 @@ async def test_an_exclusive_mark_left_without_a_residency_is_released_and_the_jo
         f"the queue-deadlock detector reported a wedge on tick(s) {world.structural_queue_wedges}. "
         f"{world.state_dump()}"
     )
+
+
+_SAME_MODEL_ROW_TICKS = 150
+"""Ticks the same-model rows run after the head's file lands: the head's load and sample, then the follower's."""
+
+
+async def _mark_follower_behind_aux_held_head(
+    world: _DispatchWorld,
+) -> tuple[ImageGenerateJobPopResponse, ImageGenerateJobPopResponse]:
+    """Queue a Qwen head held on a LoRA file and a Qwen follower, and step until the follower holds the claim.
+
+    Returns the head and the follower. On return the card holds a residency for Qwen granted to the follower, the
+    follower has not sampled, and the head's file has not landed.
+    """
+    head = make_job_pop_response(
+        _QWEN.name,
+        width=1024,
+        height=1024,
+        ddim_steps=8,
+        loras=[LorasPayloadEntry(name="a_lora_still_downloading", model=1.0, clip=1.0)],
+    )
+    await _pop_aux_held(world, head)
+    follower = make_job_pop_response(_QWEN.name, width=1024, height=1024, ddim_steps=8)
+    await world.pop(follower)
+    tracker = world._job_tracker
+    for _ in range(_SETUP_TICKS):
+        await world.step()
+        if tracker.is_admitted_exclusive(follower):
+            break
+    assert tracker.is_admitted_exclusive(follower), (
+        f"precondition: the follower was never admitted to the card exclusively. {world.state_dump()}"
+    )
+    assert not tracker.is_admitted_exclusive(head), (
+        f"precondition: the held head must be unmarked. {world.state_dump()}"
+    )
+    assert world.dispatch_tick(follower) is None, (
+        f"precondition: the follower must not sample before the head's file lands. {world.state_dump()}"
+    )
+    assert world.scheduler._whole_card_ledger.holder_for_model(_QWEN.name)[0], (
+        f"precondition: the card must hold a residency for the follower's model. {world.state_dump()}"
+    )
+    return head, follower
+
+
+def _exclusive_jobs_running(world: _DispatchWorld) -> int:
+    """Return how many exclusively admitted jobs are sampling."""
+    tracker = world._job_tracker
+    return sum(1 for job in tracker.jobs_in_progress if tracker.is_admitted_exclusive(job))
+
+
+async def test_a_same_model_head_whose_file_lands_takes_the_claim_from_the_marked_follower() -> None:
+    """A Qwen head whose LoRA lands after a Qwen follower was granted the card dispatches with the card to itself.
+
+    Both demand paths step past a job waiting for auxiliary files, so the follower is granted the residency and
+    marked while the head waits. Once the file lands the head is the dispatch head again. It is unmarked, and the
+    follower's pending claim with the residency held suppresses every unmarked job on the card. The dispatch walk
+    returns nothing for the head and never reaches the follower, and the release pass keeps the follower's mark
+    while the card holds a residency for its model. Taking the claim lets the head sample, and the follower runs
+    after it. At most one exclusive job samples at a time.
+    """
+    world = _beneficiary_world()
+    head, follower = await _mark_follower_behind_aux_held_head(world)
+    _land_aux(world, head)
+    landed_at = world.now
+    most_exclusive_running = 0
+    for _ in range(_SAME_MODEL_ROW_TICKS):
+        await world.step()
+        most_exclusive_running = max(most_exclusive_running, _exclusive_jobs_running(world))
+        if world.submitted_jobs == 2:
+            break
+
+    head_sampled_at = _tick_time(world, world.dispatch_tick(head))
+    assert head_sampled_at is not None and head_sampled_at - landed_at < _ESCAPE_BOUND_SECONDS, (
+        f"the head did not sample within {_ESCAPE_BOUND_SECONDS:.0f}s of its file landing (sampled at tick "
+        f"{world.dispatch_tick(head)}). {world.state_dump()}"
+    )
+    assert world.submitted_jobs == 2, f"{world.submitted_jobs} of 2 jobs were finalized. {world.state_dump()}"
+    assert most_exclusive_running <= 1, (
+        f"{most_exclusive_running} exclusive jobs sampled on the card at once. {world.state_dump()}"
+    )
+    assert world._job_tracker.num_jobs_faulted == 0, f"a job faulted. {world.state_dump()}"
+    assert not world.structural_queue_wedges, (
+        f"the queue-deadlock detector reported a wedge on tick(s) {world.structural_queue_wedges}. "
+        f"{world.state_dump()}"
+    )
+    assert not world._job_tracker.has_exclusive_job_in_progress(), (
+        f"an exclusive admit outlived the job. {world.state_dump()}"
+    )
+
+
+_HELD_CLAIM_TICKS = 30
+"""Ticks the over-budget row watches the claim after the head's file lands."""
+
+
+async def test_a_job_of_another_model_does_not_take_the_claim_from_the_marked_follower() -> None:
+    """A dispatch head of a model other than the residency's stays suppressed by the follower's pending claim.
+
+    The claim is the card's residency for Qwen, which an SDXL job does not serve. The row reads the rule on the
+    card's live state, since a second inference lane resident with SDXL does not survive the teardown.
+    """
+    world = _beneficiary_world()
+    head, follower = await _mark_follower_behind_aux_held_head(world)
+    other = make_job_pop_response(_SDXL.name, width=1024, height=1024, ddim_steps=20)
+    await world.pop(other)
+    scheduler = world.scheduler
+
+    assert scheduler._exclusive_dispatch_suppression_active(None), (
+        f"precondition: the follower's claim must suppress unmarked jobs on the card. {world.state_dump()}"
+    )
+    assert scheduler._head_takes_exclusive_claim(head, None), (
+        f"precondition: a Qwen head must be able to take the claim on the same state. {world.state_dump()}"
+    )
+    assert not scheduler._head_takes_exclusive_claim(other, None), (
+        f"an SDXL head took the claim from a Qwen admit while the Qwen residency is held. {world.state_dump()}"
+    )
+    assert world._job_tracker.is_admitted_exclusive(follower), f"the follower lost its claim. {world.state_dump()}"
+    assert not world._job_tracker.is_admitted_exclusive(other), f"the SDXL job was marked. {world.state_dump()}"
+
+
+async def test_an_over_budget_admit_keeps_its_claim_when_a_same_model_head_is_ready() -> None:
+    """A same-model head does not take the claim of an over-budget admit, whose mark isolates that job for its life.
+
+    The row marks the follower over budget before the head's file lands, then watches the claim. On every tick while
+    the follower is pending it keeps its mark and the head stays unmarked.
+    """
+    world = _beneficiary_world()
+    head, follower = await _mark_follower_behind_aux_held_head(world)
+    tracker = world._job_tracker
+    assert world.scheduler._head_takes_exclusive_claim(head, None), (
+        f"precondition: the head must be able to take a whole-card admit's claim. {world.state_dump()}"
+    )
+    tracker.mark_admitted_over_budget(follower)
+    _land_aux(world, head)
+    assert not world.scheduler._head_takes_exclusive_claim(head, None), (
+        f"the head may take an over-budget admit's claim. {world.state_dump()}"
+    )
+    for _ in range(_HELD_CLAIM_TICKS):
+        await world.step()
+        if follower not in tracker.jobs_pending_inference:
+            break
+        assert tracker.is_admitted_exclusive(follower), (
+            f"the over-budget follower lost its claim while pending. {world.state_dump()}"
+        )
+        assert not tracker.is_admitted_exclusive(head), (
+            f"the head took the over-budget follower's claim. {world.state_dump()}"
+        )
