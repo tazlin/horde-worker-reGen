@@ -60,6 +60,28 @@ record totals the session's holds: `dispatch_holds`, `dispatch_hold_seconds`, an
 (`dispatch_holds_released_by_reclaim`, `_by_natural_free`, `_by_measured_attempt`). Records written before
 these fields existed simply omit them.
 
+### Slot-duty fields on `stats_sample`
+
+| Field | Meaning |
+| ----- | ------- |
+| `slot_duty_totals` | Cumulative slot-seconds per `SlotDutyBucket` value at sample time: `sampling`, and the bucket each empty inference slot was attributed to. The totals only grow, so a window's breakdown is the difference of two samples. The buckets are defined in [GPU duty cycle](../explanation/duty-cycle.md#slot-duty-attribution-what-the-configured-capacity-was-doing). |
+| `slot_duty_capacity` | The configured concurrent-inference slot count the totals are spread over. |
+| `dispatch_hold_bucket` | The bucket the latest tick gave the empty slots, or `null` when no slot was empty with work waiting. |
+| `process_state_summary` | One `label#process_id=STATE` entry per lane (`inference#1=INFERENCE_PRIMED post_process#2=WAITING_FOR_JOB`), with an optional lower-case segment before the state. The offline duty report reads each lane's state from it. |
+
+Under the clearance lease an empty slot beside a primed lane books `clearance_hold` while the clearance gate
+holds its job, and `child_preparing` while the child loads, encodes or uploads its weights. Sessions recorded
+before `child_preparing` existed book both to `clearance_hold`. The keys have no fixed list, and the duty report
+prints each key it finds, so an old file and a new file both read without a version check.
+
+### Sampling window on `job_completed`
+
+A record for a job that reached its denoise loop has `sampling_window`, stamped by the child on the host's
+monotonic clock. `first_step` and `last_step` bound the steps the child reported, and exclude loading and
+decode. `lease_wait_seconds` is how long the child blocked on its stage and clearance permits, timed by the
+child, so a slow load before the first acquire does not count. It is the job's measure of the clearance gate.
+`lease_timed_out` is true when an acquire returned without a permit and the job loaded or sampled unpriced.
+
 ### Worker-condition fields on `job_completed`
 
 Two jobs of identical shape can cost very different amounts depending on what the worker was doing around

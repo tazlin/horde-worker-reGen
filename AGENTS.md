@@ -98,7 +98,9 @@ line is registered, update the pattern, the sample, and any detector in the same
 (a pending submit outranks a pending safety check, which outranks every lane state), not costs; the costs are the
 per-job phase medians and the `job_completed` rows' `phase_metrics` (sampling seconds and per-step rates, encode,
 decode, `ram_to_vram`, the post-processing chain, safety, and the job's measured device peaks). The
-`clearance_hold` slot bucket carries the cleared child's load as well as the arbiter's hold. The stats rows are
+`clearance_hold` slot bucket is the arbiter holding a child that waits on its grant, and `child_preparing` is the
+child's own load, encode and upload before its first step. Sessions recorded before `child_preparing` existed book
+both to `clearance_hold`. The stats rows are
 `{"event": "stats_sample", "sample": {...}}` plus `decision`, `resource_state`, `job_completed` and one
 `session_start`; their epochs are UTC while the logs are the host's zone. A recorded session's `job_completed`
 rows are also the source of a replay fixture for the dispatch-world simulator (`tests/process_management/liveness/replay/`),
@@ -153,10 +155,10 @@ owned_pids.json, action_ledger.jsonl, perf_model.json, vram_footprints.json), al
 Start from the mechanism, not the file. Each line states the owner of one question; read outward from it.
 
 - **What an empty sampling slot was waiting on:** `InferenceScheduler.record_slot_duty` and `slot_duty.py`.
-  The `clearance_hold` bucket is keyed on the lane state and a cleared child stays `INFERENCE_PRIMED` until its
-  first step, so the bucket carries the child's weight upload and prompt encode as well as the arbiter's hold.
-  Split it with the `Clearance held` and `cleared process` lines: dispatch to clearance is the gate, clearance to
-  first step is the child.
+  A primed lane books `clearance_hold` only from its child's clearance wait entry to its sample grant
+  (`_clearance_gate_holds_lane`). The rest of the primed span, before the wait entry and after the grant, books
+  `child_preparing`, because the child reports `INFERENCE_PRIMED` at dispatch and loads, encodes and uploads
+  before its first step.
 - **Whether a staged child may load and sample:** `scheduling/clearance_lease.py` (`ClearanceController.step`,
   `decide_clearances`, `_clear`, `_clear_stage`; the child's `ClearanceLeaseProxy` serves the grant's device-free
   and activation-reserve figures once each) and the scheduler's `clearance_admit_process` and

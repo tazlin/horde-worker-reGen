@@ -360,11 +360,14 @@ class TestSlotDutyObservedEveryTick:
         assert totals == {SlotDutyBucket.SAMPLING: 20.0}
         assert hold is None, "the hold published to the stats stream is the current tick's, not a stale stall"
 
-    async def test_a_primed_lane_accrues_clearance_hold_while_no_cycle_runs(
+    async def test_a_primed_lane_accrues_child_preparing_while_no_cycle_runs(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Under the clearance lease a staged lane's empty sampling slot is the clearance gate's on every tick."""
+        """Under the clearance lease a primed lane's empty sampling slot is priced on every tick.
+
+        The child has not entered its clearance wait, so it is still loading and encoding and the slot is its own.
+        """
         process_manager = await self._one_busy_lane_with_a_queued_head(
             HordeProcessState.INFERENCE_PRIMED,
             clearance_lease=True,
@@ -374,8 +377,8 @@ class TestSlotDutyObservedEveryTick:
 
         cycle.assert_not_called()
         totals, _capacity, hold = process_manager._inference_scheduler.slot_duty_snapshot()
-        assert totals == {SlotDutyBucket.CLEARANCE_HOLD: 20.0}
-        assert hold == str(SlotDutyBucket.CLEARANCE_HOLD)
+        assert totals == {SlotDutyBucket.CHILD_PREPARING: 20.0}
+        assert hold == str(SlotDutyBucket.CHILD_PREPARING)
 
     async def test_a_tick_that_runs_the_cycle_observes_after_its_dispatch_pass(self) -> None:
         """A head the cycle is about to dispatch is priced at what the pass did, not as a gate-less stall."""

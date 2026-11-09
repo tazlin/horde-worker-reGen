@@ -64,10 +64,15 @@ class SlotDutyBucket(StrEnum):
     head dispatches once the chain finishes; a real, nameable head-park, distinct from the gate-less
     ``UNEXPLAINED`` scheduler stall."""
     CLEARANCE_HOLD = "clearance_hold"
-    """The GPU denoise clearance lease held a staged waiter at the VRAM moment because its full
-    materialisation did not yet fit measured device truth. The waiter is cleared once eviction makes room (or
-    it degrades into unpriced sampling via the lease-acquire timeout); a real, nameable slot-park attributed to
-    the clearance gate rather than the gate-less ``UNEXPLAINED`` scheduler stall."""
+    """Under the GPU denoise clearance lease, a primed child had entered its clearance wait and the clearance gate
+    had not granted its sample permit. The gate holds a waiter whose full materialisation does not yet fit
+    measured device truth, or one waiting its turn for a slot. The waiter is cleared once eviction makes room, or
+    it samples unpriced at the lease-acquire timeout."""
+    CHILD_PREPARING = "child_preparing"
+    """Under the GPU denoise clearance lease, a primed child had not taken its first denoise step and the
+    clearance gate was not holding it. The child was loading its checkpoint and encoding its prompt before its
+    clearance wait, or uploading its weights after its grant. The child reports ``INFERENCE_PRIMED`` at dispatch,
+    so these seconds follow the dispatch and are not the arbiter's."""
     HEAD_PRIORITY_BARRIER = "head_priority_barrier"
     """The head-priority barrier withheld the dispatch so the card the starved head's load is aimed at drains
     to the no-live-consumer admit. The withheld job keeps its queue position and runs once the barrier

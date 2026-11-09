@@ -5156,11 +5156,12 @@ class InferenceScheduler:
         park); with no waiting work they accrue ``NO_LOCAL_WORK``. The classification is a read-only
         diagnostic: any failure inside it degrades to ``UNEXPLAINED`` rather than touching scheduling.
 
-        Under the clearance lease a slot is productive only while its child is *actively sampling*: a staged
-        child holds an in-progress job but its sampling slot is empty until the parent clears it. So busy is
-        counted from processes in their denoise loop, and a staged-but-uncleared child (the clearance gate
-        holding it, or waiting its turn for a slot) attributes the empty sampling slot to ``CLEARANCE_HOLD``.
-        Without the lease dispatch is the sampling moment, so busy is the in-progress count exactly as before.
+        Under the clearance lease a slot is productive only while its child is *actively sampling*, so busy is
+        counted from processes in their denoise loop. A primed lane's empty slot goes to ``CLEARANCE_HOLD`` while
+        the clearance gate holds its job (:meth:`_clearance_gate_holds_lane`) and to ``CHILD_PREPARING`` while the
+        child loads, encodes or uploads before its first step. When one of several primed lanes is held the tick
+        books ``CLEARANCE_HOLD``, since the accumulator takes one bucket for all empty slots. Without the lease
+        dispatch is the sampling moment, so busy is the in-progress count.
         """
         # The slots priced here are every sampling slot the worker owns, and the in-progress count compared
         # against them is worker-wide, so the capacity is the sum over driven cards (one card's figure on a
@@ -5170,24 +5171,26 @@ class InferenceScheduler:
 
         if self._clearance_lease_active():
             sampling_count = 0
-            primed_count = 0
+            primed_lanes: list[HordeProcessInfo] = []
             for process_info in self._process_map.values():
                 if process_info.process_type != HordeProcessType.INFERENCE:
                     continue
                 if process_info.last_process_state == HordeProcessState.INFERENCE_STARTING:
                     sampling_count += 1
                 elif process_info.last_process_state == HordeProcessState.INFERENCE_PRIMED:
-                    primed_count += 1
+                    primed_lanes.append(process_info)
             # Prune clearance-hold records for jobs that have left the in-progress set (self-healing).
             self._dispatch_holds.forget_clearance(str(job.id_) for job in in_progress if job.id_ is not None)
 
             busy = min(sampling_count, capacity)
             hold: SlotDutyBucket | None = None
-            if busy < capacity and primed_count > 0:
-                # A staged child not yet sampling is waiting on the clearance gate (held for VRAM fit, or its
-                # turn for a slot): the empty sampling slot is the clearance gate's, not the gate-less stall.
-                hold = SlotDutyBucket.CLEARANCE_HOLD
-                waiting = primed_count
+            if busy < capacity and primed_lanes:
+                hold = (
+                    SlotDutyBucket.CLEARANCE_HOLD
+                    if any(self._clearance_gate_holds_lane(process_info) for process_info in primed_lanes)
+                    else SlotDutyBucket.CHILD_PREPARING
+                )
+                waiting = len(primed_lanes)
             else:
                 head = self._job_tracker.undispatched_head()
                 waiting = len(self._job_tracker.jobs_pending_inference) - len(in_progress)
@@ -5225,6 +5228,21 @@ class InferenceScheduler:
             waiting_jobs=max(waiting, 0),
             hold=hold,
         )
+
+    def _clearance_gate_holds_lane(self, process_info: HordeProcessInfo) -> bool:
+        """Whether the clearance gate is holding the job of a lane whose child has entered its clearance wait.
+
+        The child reports ``INFERENCE_PRIMED`` at dispatch, before its checkpoint load and prompt encode, and its
+        wait entry is the first point at which the parent can tell that the child stopped working and waits. From
+        there the gate holds the job until it grants the sample permit. A stage grant lets the child upload its
+        weights, so a staged job counts as held again only once the sample admission has withheld it.
+        """
+        job = process_info.current_inference_job()
+        if job is None or job.id_ is None or not process_info.is_waiting_on_clearance():
+            return False
+        job_id = str(job.id_)
+        granted = job_id in self._dispatch_holds.clearance_granted_ids
+        return not granted or job_id in self._dispatch_holds.clearance_hold_ids
 
     def slot_duty_snapshot(self) -> tuple[dict[str, float], int, str | None]:
         """The cumulative slot-second totals, the current capacity, and the currently-named hold bucket.

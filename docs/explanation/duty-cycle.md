@@ -249,23 +249,33 @@ the measured free, net of the reserve and the sampling peak (and a pending chain
 clears a fixed margin, so a `post_processing_defer` slot now reflects a hold both the static *and* the
 measured tests refused to admit.
 
-A `clearance_hold` slot appears only when the GPU denoise clearance lease is enabled. Under the lease a
-dispatch stages the next job (checkpoint disk load, prompt encode) while another samples, and the diffusion
-weights load at **clearance**, the moment the parent admits the child into its sample window against measured
-device truth. A busy slot is therefore an *actively sampling* child, not merely an in-progress one: a staged
-child whose clearance the parent is holding (its full materialisation does not yet fit, so the single reclaim
-owner evicts idle residents first) is an empty sampling slot attributed to `clearance_hold`. A job landing on
-a slot that retains its model's weights is priced at its activation delta alone, so a same-model streak is
-not held for weights the card is already carrying. It clears once
-eviction frees room, or the child samples anyway through its bounded lease-acquire timeout (liveness over
-pricing), so like the other gate buckets it is a named, real head-park rather than the gate-less stall.
-The bucket is keyed on the lane state, and a cleared child stays `INFERENCE_PRIMED` until its first denoise
-step, so `clearance_hold` also carries the weight upload and prompt encode that run *after* the grant. On a
-card where the next model cannot stage beside the running one, that post-clearance load is most of the bucket
-and none of it is the arbiter holding. Read the bucket beside the `Clearance held` and `cleared process`
-lines. The seconds between a job's dispatch and its clearance are the gate, and the seconds between its
-clearance and its first step are the child's load. Only the first is a pricing question. The offline `horde-log
-duty` report carries the same bucket, so its `clearance_hold` share over-reads the gate by the same amount.
+The `clearance_hold` and `child_preparing` slots appear only when the GPU denoise clearance lease is enabled.
+Under the lease a dispatch stages the next job (checkpoint disk load, prompt encode) while another samples, and
+the diffusion weights load at **clearance**, the moment the parent admits the child into its sample window
+against measured device truth. A busy slot is therefore an *actively sampling* child, not merely an in-progress
+one. The child reports `INFERENCE_PRIMED` when it receives the job, before its checkpoint load and prompt
+encode, and stays primed until its first denoise step. When a sampling slot is empty and a lane is primed, the
+empty slot goes to one of two buckets, chosen from the parent's records for that lane's job:
+
+- `clearance_hold`: the child has entered its clearance wait (its encode boundary report has arrived) and the
+  clearance gate has not granted its sample permit. The gate holds a waiter whose full materialisation does
+  not yet fit, so the single reclaim owner evicts idle residents first, or a waiter whose turn for a slot has
+  not come. A job whose weights stay on its slot is priced at its activation delta alone, so a same-model streak
+  is not held for weights the card already has. The hold ends when eviction frees room, or when the child
+  samples anyway at its bounded lease-acquire timeout (liveness over pricing).
+- `child_preparing`: the clearance gate is not holding the job. The child is loading its checkpoint and
+  encoding its prompt before its clearance wait, or uploading its weights after its grant. A stage grant
+  starts the upload too, so a staged job counts as held again only once the sample admission withholds it.
+
+When several lanes are primed and one of them is held, the tick books `clearance_hold`, since every empty slot
+in a tick takes one bucket. The rule reads the dispatch-hold ledger's clearance entries (`clearance_hold_ids`,
+`clearance_granted_ids`) and the lane's clearance wait entry, so it adds no clock of its own. Only
+`clearance_hold` is a pricing question. `child_preparing` is the child's load path, and it is large on a card
+where the next model cannot stage beside the running one. The gate does not start at the dispatch. A grant can
+reach the child before its wait entry, and the seconds from dispatch to wait entry are the child working. The
+child's own measure of the gate is `sampling_window.lease_wait_seconds` in its `job_completed` row (see
+[Stats stream](../reference/stats.md)). Sessions recorded before `child_preparing` existed book both spans to
+`clearance_hold`, so their `clearance_hold` share over-reads the gate.
 Under two-phase clearance (`gpu_sampling_lease_two_phase`) the dispatch-time overlap headway is not applied to
 leased jobs, because the stage and sample grants price the weight load and the denoise onset. `overlap_headway`
 therefore reads zero there, and the scheduler logs once per overlap episode on a card that the headway is not
@@ -350,8 +360,12 @@ disaggregated VAE lane report the `POST_PROCESSING` process state, so the lane l
 reuses `INFERENCE_STARTING` for its text-encode window, where on an inference lane that state means the
 denoise loop is running, so the same rule separates them: `component` lanes fill `text_encode` and an
 inference lane in `INFERENCE_STARTING` is productive sampling and books no loss at all. An inference lane
-in `INFERENCE_PRIMED` is the RAM-to-VRAM staging and prompt-encode window and fills `vram_transfer`;
-`PRELOADING_MODEL`/`PRELOADED_MODEL` fill `model_load`.
+in `INFERENCE_PRIMED` fills `vram_transfer`, and `PRELOADING_MODEL`/`PRELOADED_MODEL` fill `model_load`. The
+primed state runs from dispatch to the first denoise step, so `vram_transfer` covers the child's checkpoint
+load, prompt encode and weight upload as well as any clearance hold. The slot-duty buckets split the same
+state into `child_preparing` and `clearance_hold` (see
+[Slot-duty attribution](#slot-duty-attribution-what-the-configured-capacity-was-doing)). This loss label does
+not split it, so read the arbiter's share from `clearance_hold`.
 
 The disaggregated stage buckets measure *loss*, not occupancy: a lane can be busy through a window that
 carried no shortfall, because the sampler was at or above the duty target the whole time. A session can

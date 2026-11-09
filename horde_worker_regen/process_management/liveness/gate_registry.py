@@ -980,8 +980,9 @@ GATE_REGISTRY: tuple[GateEntry, ...] = (
         kind=GateKind.HOLD,
         subsystem="process_management.scheduling.clearance_lease",
         engaged_by=(
-            "a staged waiter's full materialisation does not fit measured device truth at the moment it would "
-            "take the GPU"
+            "a primed child has entered its clearance wait and the clearance gate has not granted its sample "
+            "permit, because its full materialisation does not fit measured device truth or it waits its turn "
+            "for a slot"
         ),
         released_by="eviction making room, which grants the lease",
         bound_seconds=None,
@@ -990,6 +991,21 @@ GATE_REGISTRY: tuple[GateEntry, ...] = (
             "the lease-acquire timeout, past which the waiter degrades into unpriced sampling rather than "
             "holding the slot"
         ),
+        observable_at=_DISPATCH_STALL_OBSERVABLE,
+    ),
+    GateEntry(
+        key="child_preparing",
+        surface=GateSurface.DISPATCH_STALL,
+        kind=GateKind.OUTCOME,
+        subsystem="process_management.scheduling.inference_scheduler",
+        engaged_by=(
+            "a primed child is loading its checkpoint, encoding its prompt or uploading its weights before its "
+            "first denoise step, and the clearance gate is not holding it"
+        ),
+        released_by="not a hold: the child is running its own job, which reaches its first step or faults",
+        bound_seconds=None,
+        bound_source="",
+        backstop="",
         observable_at=_DISPATCH_STALL_OBSERVABLE,
     ),
     GateEntry(

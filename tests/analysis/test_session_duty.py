@@ -481,6 +481,62 @@ class TestSlotDutyAndOccupancy:
         assert "preload_deferred" in output
         assert "jobs in progress at once (limit 2):" in output
 
+    def test_clearance_hold_and_child_preparing_report_apart(self, tmp_path: Path) -> None:
+        """The arbiter's hold and the child's own pre-step work are separate rows in both report sections."""
+        from horde_worker_regen.analysis.session_duty import NotSamplingLaneState, render_session_duty_report
+
+        stats_dir = tmp_path / "stats"
+        stats_dir.mkdir()
+        primed = "inference#1=INFERENCE_PRIMED inference#2=WAITING_FOR_JOB"
+        _write_jsonl(
+            stats_dir / "stats-v1.0.0-20260101-000000-000.jsonl",
+            [
+                _job(stage_timestamps={"INFERENCE_STARTED": 90.0, "PENDING_SUBMIT": 99.0, "FINALIZED": 100.0}),
+                _sample(
+                    100.0,
+                    jobs_in_progress=1,
+                    jobs_pending_inference=1,
+                    process_state_summary=primed,
+                    slot_duty_totals={"sampling": 10.0},
+                    slot_duty_capacity=1,
+                    dispatch_hold_bucket="child_preparing",
+                ),
+                _sample(
+                    106.0,
+                    jobs_in_progress=1,
+                    jobs_pending_inference=1,
+                    process_state_summary=primed,
+                    slot_duty_totals={"sampling": 10.0, "child_preparing": 6.0},
+                    slot_duty_capacity=1,
+                    dispatch_hold_bucket="clearance_hold",
+                ),
+                _sample(
+                    108.0,
+                    jobs_in_progress=1,
+                    jobs_pending_inference=1,
+                    process_state_summary=primed,
+                    slot_duty_totals={"sampling": 10.0, "child_preparing": 6.0, "clearance_hold": 2.0},
+                    slot_duty_capacity=1,
+                    dispatch_hold_bucket="clearance_hold",
+                ),
+            ],
+        )
+
+        report = analyze_stats_sessions(stats_dir)[0]
+
+        assert report.slot_duty_seconds == {"sampling": 0.0, "child_preparing": 6.0, "clearance_hold": 2.0}
+        assert report.sampling_concurrency is not None
+        primed_row = next(
+            row for row in report.sampling_concurrency.rows if row.lane_state is NotSamplingLaneState.PRIMED
+        )
+        assert {(hold.dispatch_hold_bucket, hold.samples) for hold in primed_row.holds} == {
+            ("child_preparing", 1),
+            ("clearance_hold", 2),
+        }
+        output = render_session_duty_report([report])
+        assert "child_preparing 75% (6s)" in output
+        assert "clearance_hold 25% (2s)" in output
+
     def test_pre_field_stats_files_degrade_gracefully(self, tmp_path: Path) -> None:
         """Sessions recorded before the slot-duty fields existed report empty slot-duty, not errors."""
         stats_dir = tmp_path / "stats"

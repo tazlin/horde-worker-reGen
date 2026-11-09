@@ -23,6 +23,7 @@ from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse, LorasP
 from horde_worker_regen.analysis.log_signatures import SIGNATURES
 from horde_worker_regen.process_management.ipc.messages import HordeProcessState
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
+from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap, ModelLoadState
 from horde_worker_regen.process_management.scheduling import inference_scheduler as inference_scheduler_module
@@ -581,3 +582,99 @@ class TestRecordSlotDutyIntegration:
         # The head's model is not resident and nothing is loading it: the empty slot is a deferred preload.
         assert totals[SlotDutyBucket.PRELOAD_DEFERRED] == 10.0
         assert hold == str(SlotDutyBucket.PRELOAD_DEFERRED)
+
+
+class TestPrimedLaneSplitsClearanceHoldFromChildPreparing:
+    """A primed lane's empty sampling slot is the clearance gate's only while the gate holds its job.
+
+    The child reports ``INFERENCE_PRIMED`` at dispatch, before it loads its checkpoint and encodes its prompt, and
+    stays primed after its grant while it uploads its weights. Those seconds are the child's own work. Only the
+    span from its clearance wait entry to its sample grant is the arbiter's.
+    """
+
+    @staticmethod
+    async def _scheduler_with_primed_lane(
+        *,
+        sampling_beside: bool = False,
+    ) -> tuple[InferenceScheduler, ImageGenerateJobPopResponse, HordeProcessInfo]:
+        job_tracker = JobTracker()
+        processes: dict[int, HordeProcessInfo] = {}
+        if sampling_beside:
+            running = make_job_pop_response("stable_diffusion")
+            await job_tracker.record_popped_job(running)
+            await job_tracker.mark_inference_started(running)
+            sampler = make_mock_process_info(0, state=HordeProcessState.INFERENCE_STARTING)
+            sampler.last_job_referenced = running
+            processes[0] = sampler
+        job = make_job_pop_response("stable_diffusion")
+        await job_tracker.record_popped_job(job)
+        await job_tracker.mark_inference_started(job)
+        primed = make_mock_process_info(1, state=HordeProcessState.INFERENCE_PRIMED)
+        primed.last_job_referenced = job
+        processes[1] = primed
+        scheduler = _make_inference_scheduler(
+            process_map=ProcessMap(processes),
+            job_tracker=job_tracker,
+            bridge_data=make_mock_bridge_data(gpu_sampling_lease_enabled=True, max_threads=2),
+            max_concurrent=2,
+        )
+        return scheduler, job, primed
+
+    @staticmethod
+    def _observed_hold(scheduler: InferenceScheduler) -> str | None:
+        scheduler.record_slot_duty({})
+        _totals, _capacity, hold = scheduler.slot_duty_snapshot()
+        return hold
+
+    async def test_a_waiter_the_gate_is_holding_books_clearance_hold(self) -> None:
+        """A child that entered its clearance wait and was withheld its grant is the arbiter's empty slot."""
+        scheduler, job, primed = await self._scheduler_with_primed_lane()
+        primed.note_clearance_wait_entered(time.time())
+        scheduler._dispatch_holds.note_clearance_hold(str(job.id_))
+
+        assert self._observed_hold(scheduler) == str(SlotDutyBucket.CLEARANCE_HOLD)
+
+    async def test_a_waiter_not_yet_asked_about_books_clearance_hold(self) -> None:
+        """A child waiting on a grant the gate has not issued is held, whether or not the admission ran yet."""
+        scheduler, _job, primed = await self._scheduler_with_primed_lane()
+        primed.note_clearance_wait_entered(time.time())
+
+        assert self._observed_hold(scheduler) == str(SlotDutyBucket.CLEARANCE_HOLD)
+
+    async def test_a_child_that_has_not_asked_for_its_grant_books_child_preparing(self) -> None:
+        """Before its wait entry the child is loading and encoding, even when the admission already withheld it."""
+        scheduler, job, _primed = await self._scheduler_with_primed_lane()
+        scheduler._dispatch_holds.note_clearance_hold(str(job.id_))
+
+        assert self._observed_hold(scheduler) == str(SlotDutyBucket.CHILD_PREPARING)
+
+    async def test_a_granted_child_before_its_first_step_books_child_preparing(self) -> None:
+        """After its sample grant the child uploads its weights, which is its own work."""
+        scheduler, job, primed = await self._scheduler_with_primed_lane()
+        primed.note_clearance_wait_entered(time.time())
+        scheduler._dispatch_holds.note_clearance_granted(str(job.id_))
+
+        assert self._observed_hold(scheduler) == str(SlotDutyBucket.CHILD_PREPARING)
+
+    async def test_a_staged_child_whose_sample_grant_is_withheld_books_clearance_hold(self) -> None:
+        """A stage grant lets the weights land, and a withheld sample grant still holds the child afterwards."""
+        scheduler, job, primed = await self._scheduler_with_primed_lane()
+        primed.note_clearance_wait_entered(time.time())
+        scheduler._dispatch_holds.note_clearance_granted(str(job.id_))
+        scheduler._dispatch_holds.note_clearance_hold(str(job.id_))
+
+        assert self._observed_hold(scheduler) == str(SlotDutyBucket.CLEARANCE_HOLD)
+
+    async def test_a_lane_sampling_beside_a_primed_lane_still_books_sampling(self, monkeypatch) -> None:  # noqa: ANN001
+        """The sampler's slot is productive, and only the empty slot takes the primed lane's bucket."""
+        scheduler, _job, _primed = await self._scheduler_with_primed_lane(sampling_beside=True)
+        clock = iter([1000.0, 1010.0])
+        monkeypatch.setattr(scheduler, "_clock", lambda: next(clock))
+
+        scheduler.record_slot_duty({})
+        scheduler.record_slot_duty({})
+
+        totals, capacity, hold = scheduler.slot_duty_snapshot()
+        assert capacity == 2
+        assert totals == {SlotDutyBucket.SAMPLING: 10.0, SlotDutyBucket.CHILD_PREPARING: 10.0}
+        assert hold == str(SlotDutyBucket.CHILD_PREPARING)

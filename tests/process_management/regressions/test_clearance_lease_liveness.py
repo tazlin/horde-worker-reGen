@@ -272,10 +272,10 @@ class TestClearanceAdmission:
 
 
 class TestSlotDutyClearanceAttribution:
-    """A staged-but-uncleared child's empty sampling slot is attributed to CLEARANCE_HOLD under the lease."""
+    """A child waiting on a clearance grant leaves its empty sampling slot to CLEARANCE_HOLD under the lease."""
 
     def test_primed_uncleared_slot_reads_as_clearance_hold(self) -> None:
-        """With the lease on and a primed child not yet sampling, the spare sampling slot names CLEARANCE_HOLD."""
+        """With the lease on and a primed child waiting on its grant, the spare sampling slot books CLEARANCE_HOLD."""
         scheduler = _make_inference_scheduler(
             bridge_data=make_mock_bridge_data(gpu_sampling_lease_enabled=True),
             max_concurrent=2,
@@ -283,6 +283,7 @@ class TestSlotDutyClearanceAttribution:
         proc = make_mock_process_info(0, model_name="stable_diffusion", state=HordeProcessState.INFERENCE_PRIMED)
         job = make_job_pop_response("stable_diffusion")
         proc.last_job_referenced = job
+        proc.note_clearance_wait_entered(time.time())
         scheduler._process_map = ProcessMap({0: proc})
 
         scheduler.record_slot_duty({})

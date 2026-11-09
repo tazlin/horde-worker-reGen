@@ -179,7 +179,10 @@ class NotSamplingLaneState(StrEnum):
     """What the inference lanes were doing in a stats sample where none of them sampled."""
 
     PRIMED = "primed"
-    """A job is in progress and an inference lane sits ``INFERENCE_PRIMED``, staged and waiting for clearance."""
+    """A job is in progress and an inference lane sits ``INFERENCE_PRIMED``, dispatched and short of its first step.
+
+    The row's ``clearance_hold`` share is the clearance gate holding the job, and ``child_preparing`` is the child
+    loading, encoding or uploading its weights."""
     LOADING = "loading"
     """A job is in progress and an inference lane is downloading or preloading a model."""
     OTHER = "other"
@@ -728,9 +731,9 @@ def _lane_loss_kind(lanes: list[tuple[str, str]]) -> DutyLossKind | None:
         return DutyLossKind.TEXT_ENCODE
     if any(state in _MODEL_LOAD_LANE_STATES for _, state in lanes):
         return DutyLossKind.MODEL_LOAD
-    # The one-time RAM->VRAM staging/prompt-encode window is INFERENCE_PRIMED (INFERENCE_STARTING means
-    # the denoise loop is actually running, which is not a duty loss). Attribute the transfer gap to the
-    # primed window.
+    # INFERENCE_PRIMED runs from dispatch to the first denoise step (INFERENCE_STARTING means the denoise loop is
+    # running, which is not a duty loss). It covers the child's load, encode and weight upload and any clearance
+    # hold, which the slot-duty buckets split as child_preparing and clearance_hold.
     if any(state in _STAGING_LANE_STATES for _, state in lanes):
         return DutyLossKind.VRAM_TRANSFER
     if any(state in _MODEL_UNLOAD_LANE_STATES for _, state in lanes):
