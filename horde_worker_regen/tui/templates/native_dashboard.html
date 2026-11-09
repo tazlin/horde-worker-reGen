@@ -509,7 +509,7 @@
           summary = `New work is held by ${holds.join(" and ")}.`;
           attention = true;
         } else if (state.effective_maintenance) {
-          summary = "The horde answered the last job request with maintenance mode, so no new work arrives.";
+          summary = "The horde returned maintenance mode for the last job request. New jobs are paused.";
           attention = true;
         } else if (offline) {
           summary = `${offline} worker process${offline === 1 ? " is" : "es are"} offline.`;

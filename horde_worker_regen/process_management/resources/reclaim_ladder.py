@@ -954,8 +954,9 @@ class VerifiedReclaimLadder:
                 return False
             logger.debug(
                 f"Reclaim rung {pending.rung.kind.value} on {pending.rung.tenant_label} "
-                f"(device {pending.rung.device_index}) carried no promised free, so its realized "
-                f"~{max(0.0, realized_mb):.0f}MB cannot be graded; escalating without crediting it.",
+                f"(device {pending.rung.device_index}) did not specify how much memory would be freed. "
+                f"The measured ~{max(0.0, realized_mb):.0f}MB cannot be compared with a target. "
+                "Escalating without crediting it.",
             )
             episode.pending = None
             return True

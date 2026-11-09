@@ -2342,7 +2342,7 @@ class InferenceScheduler:
                 return
             if requested_owner is not None or residency_veto:
                 self._note_safety_restore_hold(
-                    "another owner asks for the card" if requested_owner is not None else "a residency veto",
+                    "another active request requires the card" if requested_owner is not None else "a residency veto",
                     inputs,
                 )
                 return

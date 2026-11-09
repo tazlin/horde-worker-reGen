@@ -236,7 +236,7 @@ def resolve_effective_models(
                     EffectiveStatus.EXCLUDED_LARGE,
                     model.size_on_disk_bytes,
                     model.on_disk,
-                    "large model; enable “Include large models”",
+                    "large model. Enable “Include large models”",
                 ),
             )
             continue
@@ -248,7 +248,7 @@ def resolve_effective_models(
                     EffectiveStatus.EXCLUDED_OFFLINE,
                     model.size_on_disk_bytes,
                     model.on_disk,
-                    "not on disk; dropped by “Only models on disk”",
+                    "not on disk. Excluded by “Only models on disk”",
                 ),
             )
             continue

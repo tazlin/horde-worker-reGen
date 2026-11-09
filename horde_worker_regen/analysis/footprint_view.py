@@ -169,7 +169,7 @@ def render_learned_sampling_footprints(
     """
     dropped = card_blind_entries_dropped(path, card_gb=card_gb)
     dropped_line = (
-        f"   older figures left out: {dropped}. They were recorded before figures carried their card, and the card "
+        f"   older figures left out: {dropped}. These figures do not include the card size, and the card "
         "that measured them is not known. Pass the card size to read them."
         if dropped > 0
         else None
@@ -184,7 +184,7 @@ def render_learned_sampling_footprints(
         "A job is budgeted at this figure when it is the lower of the two.",
         "   activation watermark: the highest VRAM use recorded beyond the model weights.",
         "   resident: the VRAM a loaded model holds while idle, without the per-process CUDA context.",
-        "   Every figure belongs to the card size it was measured on.",
+        "   Every figure belongs to the card size used for the measurement.",
         *([dropped_line] if dropped_line is not None else []),
     ]
     for row in rows:

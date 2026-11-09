@@ -53,8 +53,8 @@ def detect_text_backend_accelerator() -> TextBackendAccelerator:
         from worker_bootstrap.koboldcpp_bin import detected_accelerator
     except ImportError:
         logger.warning(
-            "This install declares no compute backend and does not carry worker_bootstrap, so the text "
-            "backend's hardware cannot be probed; assuming CUDA. Set `text_backend_accelerator` to choose.",
+            "This install does not specify a compute backend or include worker_bootstrap, so the text "
+            "backend's hardware cannot be probed. Assuming CUDA. Set `text_backend_accelerator` to choose.",
         )
         return TextBackendAccelerator.CUDA
     return TextBackendAccelerator(detected_accelerator())
@@ -95,8 +95,8 @@ def _provision_koboldcpp(accelerator: TextBackendAccelerator) -> Path:
         )
     except ImportError as error:
         raise TextBackendProvisionError(
-            "koboldcpp provisioning needs the worker_bootstrap package, which this install does not carry; "
-            "set text_backend_executable to a koboldcpp binary instead.",
+            "koboldcpp provisioning needs the worker_bootstrap package, which is not installed. "
+            "Set text_backend_executable to a koboldcpp binary instead.",
         ) from error
     try:
         return ensure_koboldcpp(variant=variant_for_accelerator(accelerator))

@@ -999,7 +999,7 @@ class LearnedFootprintStore:
         if miskeyed_entries_dropped > 0:
             logger.info(
                 f"Learned VRAM footprints at {self._path}: dropped {miskeyed_entries_dropped} sampling entries "
-                f"written under schema {schema_version}, since they may carry another model's readings.",
+                f"written under schema {schema_version}, since they may include another model's readings.",
             )
 
     def _card_of_card_blind_file(self) -> int | None:
@@ -1022,7 +1022,7 @@ class LearnedFootprintStore:
             reason = "the cards that wrote them are unknown"
         logger.info(
             f"Learned VRAM footprints at {self._path}: dropped {self.card_blind_entries_dropped} entries written "
-            f"under schema {schema_version}, which carry no card identity, since {reason} and a figure only "
+            f"under schema {schema_version}, which do not include a card size, since {reason} and a figure only "
             f"describes the card it was measured on.",
         )
 

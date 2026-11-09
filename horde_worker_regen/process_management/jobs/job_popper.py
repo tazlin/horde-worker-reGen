@@ -1990,8 +1990,9 @@ class JobPopper:
         # with pop/fault round-trips. The next well-formed pop resets the cadence.
         self._pop_throttler.on_pop_error()
         logger.error(
-            f"Popped job {job_pop_response.id_} carries no model name (got {model!r}); returning it to the horde "
-            "for reissue without queueing it. This is a malformed pop response, not a model failure.",
+            f"Popped job {job_pop_response.id_} does not include a model name (got {model!r}). "
+            "Returning it to the horde for reissue without queueing it. The pop response is malformed. "
+            "This does not count as a model failure.",
         )
         return True
 
@@ -2207,8 +2208,8 @@ class JobPopper:
                     nsfw=advertised.nsfw,
                 )
                 logger.debug(
-                    f"Card-scoped pop: selecting card {target_card} due to {target_reason}; the request carries "
-                    "only combinations that card can serve.",
+                    f"Card-scoped pop: selecting card {target_card} due to {target_reason}. The request includes "
+                    "only combinations supported by that card.",
                 )
 
         models = _select_models_for_pop(

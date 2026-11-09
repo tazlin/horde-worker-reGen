@@ -360,7 +360,7 @@ def _main() -> int:
         "--window-seconds",
         type=float,
         default=None,
-        help="Explicit kudos/hr window; defaults to first-pop..last-finalize across the records",
+        help="Explicit kudos/hr window. Defaults to first-pop..last-finalize across the records",
     )
     args = parser.parse_args()
 

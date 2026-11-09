@@ -239,18 +239,18 @@ two ticks is time it could not see and must not charge to the worker; it moves t
 instead. That forgiveness is bounded (three re-graces, or five minutes of already-forgiven time, per
 rolling hour), because an unbounded one silently disables the wedge backstop.
 
-- `INFO` `Supervisor tick gap of Ns (it was likely descheduled or the host slept); resetting the worker
-  wedge baseline …` -- one gap was forgiven. The line carries a running counter (`Re-grace 2/3 in the last
+- `INFO` `Supervisor tick gap of Ns (it was likely descheduled or the host slept). Resetting the worker
+  wedge baseline …` records one forgiven gap. The line includes a running counter (`Re-grace 2/3 in the last
   60 minutes`, plus session totals), so a repeating pattern reads as one condition rather than as unrelated
-  events. A single line after a laptop resume is expected and needs no action; a rising counter means the
+  events. A single line after a laptop resume is expected and does not need action. A rising counter means the
   host is starving the dashboard/host process.
-- `WARNING` `Supervisor tick gap of Ns, but its stall-forgiveness budget is spent …` -- further gaps are
+- `WARNING` `Supervisor tick gap of Ns, but its stall-forgiveness budget is spent …` means further gaps are
   now charged to the worker so wedge detection can proceed. Emitted once when the budget runs out, not per
   gap, so its absence on later gaps does not mean the condition cleared. A worker that is still advancing
   is unaffected by this; a silent one will be force-killed and relaunched.
-- `WARNING` `Worker (pid=…) survived the prior wedge tree-kill attempt; retrying …` -- the same frozen PID
+- `WARNING` `Worker (pid=…) survived the prior wedge tree-kill attempt. Retrying …` means the same frozen PID
   remained alive after the orphan-proof kill. The supervisor retries every ten seconds until process death
-  reaches the ordinary bounded relaunch path; real loop progress or a replacement clears the retry state.
+  reaches the ordinary bounded relaunch path. Real loop progress or a replacement clears the retry state.
 
 The same counters are on the dashboard status bar as a `stalls n/3` segment (yellow while forgiving, red
 once the budget is spent), which appears only when there is something to report. See

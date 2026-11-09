@@ -261,7 +261,7 @@ def test_forgiveness_is_reported_once_per_event_with_running_counters(monkeypatc
     finally:
         logger.remove(sink_id)
 
-    forgiven = [line for line in lines if "resetting the worker wedge baseline" in line[1]]
+    forgiven = [line for line in lines if "Resetting the worker wedge baseline" in line[1]]
     refused = [line for line in lines if "stall-forgiveness budget is spent" in line[1]]
 
     assert len(forgiven) == _MAX_FORGIVEN_RESETS

@@ -390,7 +390,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     duty_parser = subparsers.add_parser(
         "duty",
-        help="Report how much of the time the GPU was generating and what it waited on the rest of the time.",
+        help="Report the time spent generating on the GPU and the causes of idle time.",
         description="The same report as horde-duty-report, with the same options.",
     )
     add_duty_report_arguments(duty_parser)

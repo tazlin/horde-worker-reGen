@@ -540,8 +540,8 @@ class GettingStartedScreen(Screen[bool]):
                 yield Static("", id="gs-api-key-error", classes="gs-error")
                 with Vertical(id="gs-civitai"):
                     yield Static(
-                        "Civitai token (optional). LoRA files download from Civitai as jobs ask for "
-                        "them. Some refuse anonymous downloads, and a token from a free Civitai "
+                        "Civitai token (optional). LoRA files download from Civitai as needed for "
+                        "jobs. Some files require authentication, and a token from a free Civitai "
                         "account allows them.",
                     )
                     yield Input(placeholder="Civitai API token", password=True, id="gs-civitai-token")

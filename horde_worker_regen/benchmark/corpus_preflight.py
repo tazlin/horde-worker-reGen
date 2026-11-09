@@ -478,7 +478,7 @@ def _check_machine_id(machine_id: str | None) -> PreflightCheck:
         return PreflightCheck(
             name="machine id",
             severity="ok",
-            detail="none given; this run's rows carry no machine facts and cannot be pooled with others",
+            detail="not supplied. This run's rows do not include machine details and cannot be pooled with others",
         )
     if not MACHINE_ID_PATTERN.match(machine_id):
         return PreflightCheck(

@@ -57,7 +57,7 @@ class SourceImageDownloader:
             return job_pop_response
 
         if job_pop_response.id_ is None:
-            logger.error("Received ImageGenerateJobPopResponse with id_ is None. Please let the devs know!")
+            logger.error("Received an image-generation job without an ID. Report this error to the developers.")
             return job_pop_response
 
         (
@@ -161,7 +161,7 @@ class SourceImageDownloader:
             return
 
         if job_pop_response.id_ is None:
-            logger.error("Received ImageGenerateJobPopResponse with id_ is None. Please let the devs know!")
+            logger.error("Received an image-generation job without an ID. Report this error to the developers.")
             return
 
         source_image_is_url, source_mask_is_url, any_extra_source_images_are_urls = self._url_backed_media(

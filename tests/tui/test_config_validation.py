@@ -133,7 +133,7 @@ def test_enabled_pins_only_pool_without_pins_warns() -> None:
         ConfigValidationSeverity.WARNING,
     )
 
-    assert any("nothing to seat" in message for message in warnings)
+    assert any("cannot select models without a demand ranker or pinned models" in message for message in warnings)
 
 
 def _role_errors(config: dict[str, object]) -> list[tuple[str, str]]:

@@ -93,7 +93,7 @@ class WorkerJobObject:
         with contextlib.suppress(Exception):
             self._handle = self._create_kill_on_close_job()
         if self._handle is None:
-            logger.debug("No worker Job Object; relying on the owned-pid registry to reap orphans instead.")
+            logger.debug("Worker Job Object is unavailable. Using the owned-pid registry to end orphaned processes.")
 
     @property
     def active(self) -> bool:

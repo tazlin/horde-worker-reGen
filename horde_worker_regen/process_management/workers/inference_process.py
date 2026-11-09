@@ -546,7 +546,8 @@ class HordeInferenceProcess(HordeProcess):
         cap_tag = f"sm_{capability[0]}{capability[1]}"
         build_tag = f"CUDA {torch_build}" if torch_build else "an unknown CUDA"
         logger.critical(
-            f"The installed PyTorch ({torch_version}, {build_tag} build) does not carry CUDA kernels for this GPU."
+            f"The installed PyTorch ({torch_version}, {build_tag} build) "
+            "does not include CUDA kernels for this GPU. "
             f"{device_name} is compute capability {capability[0]}.{capability[1]} ({cap_tag}), but this "
             f"torch build only supports {' '.join(arch_list)}. Every job would fail at the first kernel "
             f"launch with 'no kernel image is available for execution on the device'. Reinstall the worker "
@@ -558,7 +559,7 @@ class HordeInferenceProcess(HordeProcess):
         self.send_process_state_change_message(
             process_state=HordeProcessState.TORCH_GPU_INCOMPATIBLE,
             info=(
-                f"The installed PyTorch ({build_tag} build) does not carry CUDA kernels for {device_name}"
+                f"The installed PyTorch ({build_tag} build) does not include CUDA kernels for {device_name} "
                 f"(compute capability {cap_tag}). Reinstall the worker to get the matching CUDA backend, "
                 f"and update your NVIDIA driver if asked. The worker will not pop jobs until this is fixed."
             ),
@@ -1522,8 +1523,8 @@ class HordeInferenceProcess(HordeProcess):
             premade_control_map_bytes,
         ):
             logger.warning(
-                f"Job {job_info.id_} carried a pre-annotated control map but has no controlnet parameters; "
-                "falling back to in-graph preprocessing.",
+                f"Job {job_info.id_} included a pre-annotated control map but does not have controlnet parameters. "
+                "Falling back to in-graph preprocessing.",
             )
 
         from hordelib.api import AUTO_PIPELINE

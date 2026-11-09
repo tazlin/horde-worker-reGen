@@ -80,7 +80,7 @@ def find_session_parts(stats_dir: Path, definition: PricingCorpusDefinition) -> 
     after ``created_at`` within the search window. A session that started earlier belongs to another run.
     """
     if definition.created_at is None:
-        raise BundleError("the definition carries no created_at, so its stats session cannot be located")
+        raise BundleError("the definition does not include created_at, so its stats session cannot be located")
     candidates: list[tuple[float, str]] = []
     for path in stats_dir.iterdir():
         match = _STATS_PART_RE.match(path.name)

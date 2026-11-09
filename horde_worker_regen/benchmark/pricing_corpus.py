@@ -251,8 +251,8 @@ on the steps sweep's own grid and span the range requests mostly fall in."""
 
 _CENSUS_EXCLUDED_SAMPLERS: dict[str, str] = {
     "k_dpm_adaptive": (
-        "chooses its own step count, so its records would carry a step count the work never obeyed and "
-        "would corrupt the steps marginal"
+        "uses an adaptive step count, so the recorded step count would not match the work done and "
+        "would invalidate the estimated cost per step"
     ),
 }
 """Sampler vocabulary values the census refuses to run, each with the reason it is absent."""
@@ -1094,8 +1094,8 @@ def _manifest_vocabularies() -> tuple[str, dict[str, tuple[str, ...]]]:
     missing = sorted(set(CENSUS_AXES) - set(vocabularies))
     if missing:
         raise PricingCorpusError(
-            f"the kudos feature manifest ({manifest.manifest_version}) carries no vocabulary for "
-            f"{', '.join(missing)}, so the census cannot claim to cover it",
+            f"the kudos feature manifest ({manifest.manifest_version}) does not include a vocabulary for "
+            f"{', '.join(missing)}, so the census cannot cover it",
         )
     return manifest.manifest_version, vocabularies
 
@@ -1169,7 +1169,7 @@ def _census_validity() -> tuple[str, dict[str, tuple[str, ...]], dict[str, tuple
                     kind="value",
                     axis="baseline",
                     value=value,
-                    reason=("no model of this baseline is in the corpus's pinned model set, so no job can carry it"),
+                    reason=("the corpus does not include a pinned model for this baseline, so jobs cannot use it"),
                 ),
             )
 

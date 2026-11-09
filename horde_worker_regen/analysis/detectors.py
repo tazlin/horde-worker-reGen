@@ -663,7 +663,7 @@ def detect_stuck_inference_step(context: SessionContext) -> list[Finding]:
             severity=Severity.WARNING,
             headline=(
                 "An image process repeated one sampling step without finishing and was restarted "
-                f"{_times_text(len(stuck))}, losing the job it was running{' each time' if len(stuck) > 1 else ''}."
+                f"{_times_text(len(stuck))}, losing the running job{' each time' if len(stuck) > 1 else ''}."
             ),
             evidence=[_evidence(r) for r in stuck[:4]],
         ),
@@ -1261,7 +1261,7 @@ def detect_service_lane_restart_churn(context: SessionContext) -> list[Finding]:
 _DOUBLE_DISPATCH_SIGNATURES = ("inference_result_lost", "inference_result_job_missing")
 _DOUBLE_DISPATCH_EVIDENCE_LABELS: dict[str, str] = {
     "inference_result_lost": 'results lost while their job was still in progress ("its inference result was lost")',
-    "inference_result_job_missing": 'results for a job the worker no longer tracked ("not found in jobs_in_progress")',
+    "inference_result_job_missing": 'results for a job that was no longer tracked ("not found in jobs_in_progress")',
 }
 """What each signature counts, in a reader's words, with the log phrase to search for."""
 _OWNERSHIP_RELEASED_RE = pattern_for("ended_job_ownership_released")
@@ -3783,7 +3783,7 @@ def _churn_remediation(
             else ""
         )
         return (
-            "Report it. The reservation could not free anything, since the process count it asked for was "
+            "Report it. The reservation could not free anything, since the requested process count was "
             f"already met.{unreclaimable}"
         )
     if unmeasured_marginal:
@@ -4432,8 +4432,8 @@ def detect_pop_liveness_full_queue(context: SessionContext) -> list[Finding]:
                 "The card was reserved for one model while the next job needed another. Report it with the "
                 "log around the freeze."
                 if residency_held
-                else "Something the card carries between jobs held it. The usual holders are an idle helper "
-                "process, a process parked on an unused load, or weights a process said it freed and did not. "
+                else "Memory held on the card between jobs prevented progress. Possible causes include an idle helper "
+                "process, an unused loaded model, or weights that remained allocated after an unload. "
                 "Report it with the log around the freeze."
             ),
             evidence=(
@@ -4588,7 +4588,7 @@ def detect_empty_model_pop_cascade(context: SessionContext) -> list[Finding]:
             f"{_count_text(len(rejected), 'job offer')} arrived with no model name and the worker handed "
             f"{'it' if len(rejected) == 1 else 'each one'} back without loading anything or losing a process."
         )
-        remediation = "Each refused offer is a job this worker could not serve, so watch the rate."
+        remediation = "Each refused offer is a job that could not run on this worker, so watch the rate."
         severity = Severity.WARNING
         evidence_lines = [_evidence(r) for r in (rejected[:2] + refused_preloads[:1] + refused_incidents[:1])]
 
@@ -5182,7 +5182,7 @@ def detect_model_churn(context: SessionContext) -> list[Finding]:
             severity=severity,
             action_addendum="System RAM pressure also held jobs or model loads during these swaps." if ram else None,
             headline=(
-                f"Over {dispatches} jobs the worker loaded {_count_text(movement.preloads, 'model')} and unloaded "
+                f"Across {dispatches} jobs, the worker loaded {_count_text(movement.preloads, 'model')} and unloaded "
                 f"{movement.unloads}, and {movement.cleared_preloads} of those loads "
                 f"{'was thrown away before it' if movement.cleared_preloads == 1 else 'were thrown away before they'}"
                 " ran."
@@ -5190,7 +5190,7 @@ def detect_model_churn(context: SessionContext) -> list[Finding]:
             evidence=[
                 f"loads {movement.preloads} ({preload_ratio:.2f} per job), unloads {movement.unloads} "
                 f"({unload_ratio:.2f} per job), loads cleared before use {movement.cleared_preloads} "
-                f"({cleared_ratio:.2f} per job), records dropped for a model another model had replaced "
+                f"({cleared_ratio:.2f} per job), records dropped after model replacement "
                 f'{movement.displaced_expiries} ("Expiring displaced entry"), models moved from VRAM to system RAM '
                 f"{movement.moved_to_system_ram}, against {dispatches} jobs",
             ],
@@ -5282,7 +5282,7 @@ def detect_lane_placement(context: SessionContext) -> list[Finding]:
             f"{_LANE_ROLE_NAMES[placement.role]} (process {placement.process_id})" for placement in stacked
         )
         verdict_parts.append(
-            f"Card {_SAFETY_GPU_DEVICE_INDEX} carries "
+            f"Card {_SAFETY_GPU_DEVICE_INDEX} runs "
             f"{_count_text(len(stacked), 'helper process', 'helper processes')} beside the safety check on "
             f"a host driving {card_count} cards."
         )
@@ -5365,7 +5365,7 @@ def detect_utilities_lane_bringup_timeout(context: SessionContext) -> list[Findi
     if early_exits:
         addendum = (
             "An exit moments after the start is not a slow load. A `uv trampoline failed to spawn Python` "
-            "error in that log means the lane's own environment cannot run; re-run `update-runtime.cmd` "
+            "error in that log means the lane's own environment cannot run. Re-run `update-runtime.cmd` "
             "(Windows) or `./update-runtime.sh` to rebuild it."
         )
     else:

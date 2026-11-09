@@ -66,8 +66,8 @@ def incompatibility_message(
     build_desc = f"{torch_version}, CUDA {torch_build} build" if torch_build else torch_version
     backend = recommended_backend(capability)
     return (
-        f"FATAL: this image's PyTorch ({build_desc}) does not carry CUDA kernels for {device_name}"
-        f"(compute capability {capability[0]}.{capability[1]}, {cap_tag}); the wheel was built for "
+        f"FATAL: this image's PyTorch ({build_desc}) does not include CUDA kernels for {device_name} "
+        f"(compute capability {capability[0]}.{capability[1]}, {cap_tag}). The wheel was built for "
         f"{' '.join(arch_list)}. A Docker image is immutable and cannot switch torch builds at runtime, so "
         f"every GPU model load would crash (typically deep inside the first CLIP/checkpoint load). Rebuild "
         f"the image for this GPU, for example:\n"

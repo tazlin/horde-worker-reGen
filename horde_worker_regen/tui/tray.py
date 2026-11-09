@@ -132,7 +132,7 @@ class WorkerTray:
             self._thread.start()
             logger.debug("Worker tray icon started.")
         except Exception:
-            logger.opt(exception=True).warning("Failed to start the worker tray icon; continuing without it.")
+            logger.opt(exception=True).warning("Failed to start the worker tray icon. Continuing without it.")
             self._icon = None
 
     def _handle_open(self, icon: object = None, item: object = None) -> None:

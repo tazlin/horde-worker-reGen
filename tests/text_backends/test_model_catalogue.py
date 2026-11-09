@@ -291,7 +291,7 @@ class TestResolution:
         with pytest.raises(TextModelResolutionError) as raised:
             resolve_text_model("author/NameOnly", records, tmp_path)
 
-        assert "declares no file" in str(raised.value)
+        assert "without a file to download" in str(raised.value)
 
     def test_an_unknown_value_names_both_things_it_could_have_been(self, tmp_path: Path) -> None:
         """Neither a file nor a name, so the error has to say which two things the key accepts."""

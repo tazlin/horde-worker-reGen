@@ -236,7 +236,7 @@ class WorkerHost:
                 self._supervisor.tick()
                 self._broadcast()
             except Exception:
-                logger.exception("Worker host control tick failed; the host keeps supervising.")
+                logger.exception("Worker host control tick failed. The host keeps supervising.")
             time.sleep(self._control_interval)
 
     def _drain_requests(self) -> None:
@@ -368,7 +368,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         "--process-mode",
         choices=[mode.value for mode in WorkerProcessMode],
         default=WorkerProcessMode.REAL.value,
-        help="'real' runs the GPU worker; 'fake' runs a synthetic worker.",
+        help="'real' runs the GPU worker. 'fake' runs a synthetic worker.",
     )
     parser.add_argument("-e", "--load-config-from-env-vars", action="store_true", help="Load config from env vars.")
     parser.add_argument("--amd", "--amd-gpu", action="store_true", help="Enable AMD GPU optimisations.")

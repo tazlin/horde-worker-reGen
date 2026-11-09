@@ -545,19 +545,19 @@ class KoboldApiTextBackend:
             raw = await self._request(method=hdrs.METH_GET, route=route, timeout_seconds=timeout_seconds)
         except (aiohttp.ClientError, TimeoutError) as request_error:
             raise TextBackendUnavailable(
-                f"Text backend at {self._base_url} did not answer {route}: {request_error}",
+                f"Text backend at {self._base_url} did not respond to {route}: {request_error}",
             ) from request_error
 
         self._raise_for_refused_credential(raw, detail=f"reading {route}")
 
         if raw.status == HTTPStatus.NOT_FOUND:
             raise _RouteNotImplemented(
-                f"Text backend at {self._base_url} has no {route} route",
+                f"Text backend at {self._base_url} does not support the {route} route",
             )
 
         if raw.status != HTTPStatus.OK:
             raise TextBackendUnavailable(
-                f"Text backend at {self._base_url} answered {route} with status {raw.status}: "
+                f"Text backend at {self._base_url} returned status {raw.status} for {route}: "
                 f"{_summarise_body(raw.body_text)}",
             )
 
@@ -565,7 +565,7 @@ class KoboldApiTextBackend:
             return response_model.model_validate_json(raw.body_text)
         except ValidationError as parse_error:
             raise TextBackendUnavailable(
-                f"Text backend at {self._base_url} answered {route} with an unreadable body: "
+                f"Text backend at {self._base_url} returned an unreadable response for {route}: "
                 f"{_summarise_body(raw.body_text)}",
             ) from parse_error
 
@@ -722,7 +722,7 @@ class KoboldApiTextBackend:
             )
         except (aiohttp.ClientError, TimeoutError) as probe_error:
             logger.debug(
-                f"Text backend at {self._base_url} did not answer the statistics probe, so token counts "
+                f"Text backend at {self._base_url} did not respond to the statistics probe, so token counts "
                 f"will be unknown for this backend: {probe_error}",
             )
             return False
@@ -731,12 +731,12 @@ class KoboldApiTextBackend:
 
         if raw.status != HTTPStatus.OK:
             logger.debug(
-                f"Text backend at {self._base_url} answered the statistics probe with status "
-                f"{raw.status}; it has no {KoboldApiRoutes.GENERATION_STATS} route",
+                f"Text backend at {self._base_url} returned status {raw.status} for the statistics probe. "
+                f"The {KoboldApiRoutes.GENERATION_STATS} route is unavailable.",
             )
             return False
 
-        logger.debug(f"Text backend at {self._base_url} answers per-request generation statistics")
+        logger.debug(f"Text backend at {self._base_url} supports per-request generation statistics")
         return True
 
     # endregion
@@ -858,8 +858,8 @@ class KoboldApiTextBackend:
             generate_response = _KoboldGenerateResponse.model_validate_json(raw.body_text)
         except ValidationError as parse_error:
             raise TextBackendUnavailable(
-                f"Text backend at {self._base_url} answered generation {generation_key} with no usable "
-                f"'{KoboldApiJsonKeys.RESULTS}' entry: {_summarise_body(raw.body_text)}",
+                f"Text backend at {self._base_url} returned a response for generation {generation_key} "
+                f"without a usable '{KoboldApiJsonKeys.RESULTS}' entry: {_summarise_body(raw.body_text)}",
             ) from parse_error
 
         # The blocking answer carries its own counts, so this path needs no second request to learn
@@ -1036,7 +1036,7 @@ class KoboldApiTextBackend:
             )
         except (aiohttp.ClientError, TimeoutError) as request_error:
             logger.debug(
-                f"Text backend at {self._base_url} did not answer statistics for generation "
+                f"Text backend at {self._base_url} did not respond to the statistics request for generation "
                 f"{generation_key}: {request_error}",
             )
             return None
@@ -1044,15 +1044,15 @@ class KoboldApiTextBackend:
         if raw.status == HTTPStatus.NOT_FOUND:
             self._generation_stats_present = False
             logger.debug(
-                f"Text backend at {self._base_url} has no {KoboldApiRoutes.GENERATION_STATS} route; "
-                f"token counts will be unknown for this backend",
+                f"Text backend at {self._base_url} does not support {KoboldApiRoutes.GENERATION_STATS}. "
+                "Token counts will be unknown for this backend.",
             )
             return None
 
         if raw.status != HTTPStatus.OK:
             logger.debug(
-                f"Text backend at {self._base_url} answered statistics for generation {generation_key} "
-                f"with status {raw.status}: {_summarise_body(raw.body_text)}",
+                f"Statistics request for generation {generation_key} at {self._base_url} "
+                f"returned status {raw.status}: {_summarise_body(raw.body_text)}",
             )
             return None
 
@@ -1060,8 +1060,8 @@ class KoboldApiTextBackend:
             return _KoboldGenerationStats.model_validate_json(raw.body_text)
         except ValidationError as parse_error:
             logger.debug(
-                f"Text backend at {self._base_url} answered statistics for generation {generation_key} "
-                f"unreadably: {_summarise_body(raw.body_text)} ({parse_error})",
+                f"Statistics request for generation {generation_key} at {self._base_url} "
+                f"returned an unreadable response: {_summarise_body(raw.body_text)} ({parse_error})",
             )
             return None
 
@@ -1154,7 +1154,7 @@ class KoboldApiTextBackend:
             )
         except (aiohttp.ClientError, TimeoutError) as request_error:
             logger.debug(
-                f"Text backend at {self._base_url} did not answer an abort for generation "
+                f"Text backend at {self._base_url} did not respond to the abort request for generation "
                 f"{generation_key}: {request_error}",
             )
             return
@@ -1163,15 +1163,15 @@ class KoboldApiTextBackend:
             if not self._abort_route_missing_logged:
                 self._abort_route_missing_logged = True
                 logger.debug(
-                    f"Text backend at {self._base_url} has no {KoboldApiRoutes.ABORT} route; "
-                    f"generations cannot be abandoned on this backend",
+                    f"Text backend at {self._base_url} does not support {KoboldApiRoutes.ABORT}. "
+                    "Generations cannot be abandoned on this backend.",
                 )
             return
 
         if raw.status != HTTPStatus.OK:
             logger.debug(
-                f"Text backend at {self._base_url} answered an abort for generation {generation_key} "
-                f"with status {raw.status}: {_summarise_body(raw.body_text)}",
+                f"Abort request for generation {generation_key} at {self._base_url} "
+                f"returned status {raw.status}: {_summarise_body(raw.body_text)}",
             )
             return
 
@@ -1179,8 +1179,8 @@ class KoboldApiTextBackend:
             abort_response = _KoboldAbortResponse.model_validate_json(raw.body_text)
         except ValidationError as parse_error:
             logger.debug(
-                f"Text backend at {self._base_url} answered an abort for generation {generation_key} "
-                f"unreadably: {_summarise_body(raw.body_text)} ({parse_error})",
+                f"Abort request for generation {generation_key} at {self._base_url} "
+                f"returned an unreadable response: {_summarise_body(raw.body_text)} ({parse_error})",
             )
             return
 

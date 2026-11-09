@@ -117,12 +117,15 @@ def validate_config_interlocks(config: dict[str, Any]) -> list[ConfigValidationI
         if _uses_meta_command(models_to_load):
             warning(
                 "models_to_load",
-                "TOP/BOTTOM/ALL model load rules can pick Civitai-hosted models; those that require a login "
+                "TOP/BOTTOM/ALL model load rules can pick Civitai-hosted models. Those that require a login "
                 "will not download without a CivitAI API token.",
             )
 
     if not _bool(config, "dreamer") and not _bool(config, "alchemist") and not _bool(config, "scribe"):
-        error("dreamer", "Enable Dreamer image generation, Alchemist or Scribe; all off serves nothing.")
+        error(
+            "dreamer",
+            "Enable Dreamer image generation, Alchemist or Scribe. The worker cannot serve jobs with all roles off.",
+        )
 
     # The horde routes a text request only to a worker whose advertised context holds it, and a request
     # that fits no worker is accepted and left waiting rather than refused. The bridge default is small
@@ -184,13 +187,13 @@ def validate_config_interlocks(config: dict[str, Any]) -> list[ConfigValidationI
     if pool_enabled and not _bool(config, "model_pool_ranker_enabled") and not pinned:
         warning(
             "model_pool_ranker_enabled",
-            "The model pool has neither a demand ranker nor pinned models, so it has nothing to seat.",
+            "The model pool cannot select models without a demand ranker or pinned models.",
         )
     seats = _int(config, "model_pool_seats")
     if seats > 0 and len(pinned) > seats:
         warning(
             "model_pool_pinned",
-            f"There are {len(pinned)} pinned models for {seats} seat(s); affinity decides which pins seat first.",
+            f"There are {len(pinned)} pinned models for {seats} seat(s). Models with higher affinity get seats first.",
         )
 
     if _bool(config, "gpu_sampling_lease_enabled") and _bool(config, "unload_models_from_vram_often"):

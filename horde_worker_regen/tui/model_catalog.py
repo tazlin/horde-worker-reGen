@@ -327,7 +327,8 @@ META_OPTIONS: list[MetaOption] = [
         MetaKind.ALL,
         "All models",
         False,
-        "Loads every model in the reference (over 1 TB of downloads). Almost never what you want.",
+        "Loads every model in the reference (over 1 TB of downloads). "
+        "Select a smaller set unless you need the full catalogue.",
     ),
     MetaOption(MetaKind.ALL_SDXL, "All SDXL models", False, "All Stable Diffusion XL models (~7 GB each)."),
     MetaOption(MetaKind.ALL_SD15, "All SD 1.5 models", False, "All Stable Diffusion 1.5 models (~1–2 GB each)."),
@@ -346,8 +347,8 @@ META_OPTIONS_BY_KIND = {option.kind: option for option in META_OPTIONS}
 
 GENERAL_META_GUIDANCE = (
     "Meta commands expand to real models when the worker starts. Large models (Flux, Cascade) are "
-    "excluded from ALL/TOP unless load_large_models is on. Note: models_to_skip only removes models; "
-    "it never adds them back, so 'top 10' minus a skip yields 9 models."
+    "excluded from ALL/TOP unless load_large_models is on. Note: models_to_skip only removes models. "
+    "It does not add them back, so 'top 10' minus one excluded model yields 9 models."
 )
 
 # Mirrors horde_sdk.worker.dispatch.ai_horde.bridge_data.MetaInstruction (kept local to stay import-light).

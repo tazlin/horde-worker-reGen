@@ -500,7 +500,7 @@ class ClearanceLeaseProxy:
         :attr:`stage_lease` first.
         """
         if self._stage is None:
-            raise ValueError("this proxy carries no stage permit")
+            raise ValueError("this proxy does not have a stage permit")
         _write_shared_figure(self._staged_device_free, device_free_mb)
         _write_shared_figure(self._staged_device_free_at, _figure_time(device_free_mb, device_free_measured_at))
         _write_shared_figure(self._staged_sampling_reserve, sampling_reserve_mb)

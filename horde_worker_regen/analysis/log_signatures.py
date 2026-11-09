@@ -1288,11 +1288,13 @@ _SIGNATURE_LIST: list[LogSignature] = [
     ),
     _signature(
         "malformed_pop_rejected",
-        r"Popped job (?P<job>\S+) carries no model name \(got .*?\); returning it to the horde",
+        r"Popped job (?P<job>\S+) (?:carries no|does not include a) model name \(got .*?\)"
+        r"(?:; returning|\. Returning) it to the horde",
         emitter="process_management.jobs.job_popper:_reject_malformed_pop",
         sample=(
-            "Popped job 019546e7-4a4a-4eea-afd6-d41078e14ac7 carries no model name (got ''); returning it to "
-            "the horde for reissue."
+            "Popped job 019546e7-4a4a-4eea-afd6-d41078e14ac7 does not include a model name (got ''). Returning it to "
+            "the horde for reissue without queueing it. The pop response is malformed. "
+            "This does not count as a model failure."
         ),
         dry_run_reason=_MALFORMED_POP_NOT_EXERCISED,
     ),
@@ -1611,8 +1613,9 @@ _SIGNATURE_LIST: list[LogSignature] = [
     # --- Text generation flow: jobs a backend refuses as busy ---
     _signature(
         "text_backend_wedged",
-        r"The text backend at (?P<address>\S+) has answered busy for (?P<seconds>\d+)s "
-        r"\((?P<answers>\d+) busy answers\) with no job receiving text"
+        r"The text backend at (?P<address>\S+) has (?:answered busy|returned busy responses) for (?P<seconds>\d+)s "
+        r"\((?P<answers>\d+) (?:busy answers|responses)\) "
+        r"(?:with no job receiving text|without sending text to any job)"
         r"(?: \[(?:backend counters: (?P<generations_at_start>\d+) generations completed at spell start, "
         r"(?P<generations_now>\d+) now, idle (?P<idle>yes|no|unknown), queue (?P<queue>\d+|unknown)"
         r"|(?P<no_counters>backend reports no counters))\])?",
@@ -1621,10 +1624,11 @@ _SIGNATURE_LIST: list[LogSignature] = [
         # the decision; a worker from before the counters wrote no bracket, so the group is optional.
         emitter="process_management.jobs.text_generation_coordinator:_enter_wedge_hold",
         sample=(
-            "The text backend at http://127.0.0.1:5001 has answered busy for 64s (5 busy answers) with no job "
-            "receiving text [backend counters: 41 generations completed at spell start, 41 now, idle no, queue 2]; "
-            "it looks wedged. Relaunching it (relaunch 1 of 3 without a successful generation). No text jobs are "
-            "popped until it answers again."
+            "The text backend at http://127.0.0.1:5001 has returned busy responses for 64s (5 responses) without "
+            "sending text to any job [backend counters: 41 generations completed at spell start, "
+            "41 now, idle no, queue 2]. "
+            "It appears stuck. Relaunching it (relaunch 1 of 3 without a successful generation). Text jobs are not "
+            "popped until it responds again."
         ),
         dry_run_reason=_TEXT_FLOW_NOT_EXERCISED,
     ),
@@ -1634,13 +1638,13 @@ _SIGNATURE_LIST: list[LogSignature] = [
         r"It is not relaunched again",
         emitter="process_management.jobs.text_generation_coordinator:_enter_wedge_hold",
         sample=(
-            "The text backend at http://127.0.0.1:5001 has answered busy for 64s (5 busy answers) with no job "
-            "receiving text [backend reports no counters], after 3 relaunches with no successful generation "
+            "The text backend at http://127.0.0.1:5001 has returned busy responses for 64s (5 responses) without "
+            "sending text to any job [backend reports no counters], after 3 relaunches with no successful generation "
             "between them. It is not relaunched again, and no text jobs are popped until it generates or restarts. "
             "Look in logs/text_backend.log for "
             "`find_slot` or `failed to find a memory slot`: parallel requests share one context pool of "
             "`text_threads` x `max_context_length` tokens, which the worker opens at launch, so those lines mean "
-            "the pool still ran out. `text_threads: 1` only confirms that cause; it is not the fix."
+            "the pool still ran out. `text_threads: 1` only confirms that cause. It does not fix the context size."
         ),
         dry_run_reason=_TEXT_FLOW_NOT_EXERCISED,
     ),

@@ -69,8 +69,8 @@ def main(
             )
             if len(bridge_data.api_key) == 10:
                 logger.error(
-                    "API key is the default. This is almost certainly not what you want. "
-                    "Please check your environment variables are being set correctly and try again.",
+                    "The API key is still the default. Check your environment variables and set your API key "
+                    "before trying again.",
                 )
 
                 logger.error("Exiting...")

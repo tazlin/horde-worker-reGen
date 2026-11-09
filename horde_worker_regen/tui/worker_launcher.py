@@ -430,7 +430,7 @@ class WorkerSupervisor:
         if self._start_already_running_logged:
             return
         self._start_already_running_logged = True
-        logger.info("Start requested but the worker is already running; leaving the running worker as it is.")
+        logger.info("Start requested but the worker is already running. Leaving the running worker as it is.")
 
     def _is_cooperative_stop_draining(self) -> bool:
         """Whether a stop or restart intent is recorded and the worker it targets is still alive."""
@@ -447,7 +447,7 @@ class WorkerSupervisor:
         if not self._restart_after_stop:
             self._restart_after_stop = True
             logger.info(
-                "Start requested while the worker is still draining; it will be relaunched once the "
+                "Start requested while the worker is still draining. It will be relaunched once the "
                 "running worker exits rather than started alongside it.",
             )
         self._set_status(SupervisorStatus.RESTARTING)
@@ -672,7 +672,7 @@ class WorkerSupervisor:
                     f"Supervisor tick gap of {gap:.0f}s, but its stall-forgiveness budget is spent "
                     f"({len(self._stall_forgiveness_events)} re-graces / {forgiven_in_window:.0f}s in the "
                     f"last {_SUPERVISOR_STALL_FORGIVENESS_WINDOW_SECONDS / 60:.0f} minutes). Charging this "
-                    "gap to the worker so wedge detection can proceed; a worker that is still advancing is "
+                    "gap to the worker so wedge detection can proceed. A worker that is still advancing is "
                     "unaffected, a silent one will be restarted.",
                 )
             return False
@@ -681,7 +681,7 @@ class WorkerSupervisor:
         self._stall_forgiven_seconds += gap
         self._stall_budget_spent_logged = False
         logger.info(
-            f"Supervisor tick gap of {gap:.0f}s (it was likely descheduled or the host slept); resetting "
+            f"Supervisor tick gap of {gap:.0f}s (it was likely descheduled or the host slept). Resetting "
             f"the worker wedge baseline rather than charging the gap to the worker. Re-grace "
             f"{len(self._stall_forgiveness_events)}/{_SUPERVISOR_STALL_MAX_FORGIVEN_RESETS} in the last "
             f"{_SUPERVISOR_STALL_FORGIVENESS_WINDOW_SECONDS / 60:.0f} minutes "
@@ -736,12 +736,12 @@ class WorkerSupervisor:
         if last_attempt is None:
             logger.error(
                 f"Worker (pid={process.pid}) control loop has not advanced for {staleness:.0f}s "
-                f"(> {WEDGE_LIVENESS_TIMEOUT_SECONDS:.0f}s): alive but wedged. Force-killing its process tree; "
-                "it will be relaunched once the kill is observed.",
+                f"(> {WEDGE_LIVENESS_TIMEOUT_SECONDS:.0f}s): alive but wedged. Force-killing its process tree. "
+                "It will be relaunched once the process has exited.",
             )
         else:
             logger.warning(
-                f"Worker (pid={process.pid}) survived the prior wedge tree-kill attempt; retrying after "
+                f"Worker (pid={process.pid}) survived the prior wedge tree-kill attempt. Retrying after "
                 f"{now - last_attempt:.0f}s.",
             )
         self._last_wedge_kill_attempt_wall = now
@@ -753,7 +753,7 @@ class WorkerSupervisor:
             return
         if time.time() < self._graceful_stop_deadline:
             return
-        logger.warning("Worker did not exit within the graceful-stop window; terminating its process tree.")
+        logger.warning("Worker did not exit within the graceful-stop window. Terminating its process tree.")
         self._force_kill_tree(process)
         self._graceful_stop_deadline = 0.0  # the kill is forceful; the next tick will finalize.
 
@@ -796,7 +796,7 @@ class WorkerSupervisor:
         """
         if self.latest_snapshot is not None or (time.time() - self._last_spawn_time) >= _HEALTHY_UPTIME_SECONDS:
             return ""
-        return " It never reported, so it likely crashed during startup; see logs/bridge_main_startup.log"
+        return " It never reported, so it likely crashed during startup. See logs/bridge_main_startup.log"
 
     def _handle_unexpected_exit(self, process: BaseProcess) -> None:
         """React to a worker that exited on its own: relaunch within budget, else mark crashed."""
@@ -819,11 +819,11 @@ class WorkerSupervisor:
             self._set_status(SupervisorStatus.CRASHED)
             if not self._auto_restart:
                 logger.warning(
-                    f"Worker process exited unexpectedly (exitcode={process.exitcode}); not restarting.{startup_hint}",
+                    f"Worker process exited unexpectedly (exitcode={process.exitcode}). Not restarting.{startup_hint}",
                 )
             else:
                 logger.error(
-                    f"Worker exceeded the restart budget ({self._max_restart_attempts}); leaving it "
+                    f"Worker exceeded the restart budget ({self._max_restart_attempts}). Leaving it "
                     f"stopped.{startup_hint}",
                 )
             return
@@ -834,7 +834,7 @@ class WorkerSupervisor:
         if self._last_crash_time == 0.0:
             self._last_crash_time = now
             logger.warning(
-                f"Worker process exited unexpectedly (exitcode={process.exitcode}); relaunching.{startup_hint}",
+                f"Worker process exited unexpectedly (exitcode={process.exitcode}). Relaunching.{startup_hint}",
             )
         if now - self._last_crash_time < self._restart_backoff:
             return  # Honour the backoff; a later tick performs the relaunch.
@@ -1001,7 +1001,7 @@ class WorkerSupervisor:
         self.send_command(SupervisorControlMessage(command=SupervisorCommand.SHUTDOWN))
         if not already_stopping:
             logger.info(
-                f"Asked the worker (pid={process.pid}) to shut down; it has {timeout:.0f}s to drain before "
+                f"Sent a shutdown request to the worker (pid={process.pid}). It has {timeout:.0f}s to drain before "
                 "its process tree is terminated.",
             )
         if self._graceful_stop_deadline == 0.0:
@@ -1043,15 +1043,15 @@ class WorkerSupervisor:
         if process is not None and process.is_alive():
             if not self.send_command(SupervisorControlMessage(command=SupervisorCommand.SHUTDOWN)):
                 logger.warning(
-                    "Could not send the shutdown request because the worker pipe is unusable; "
-                    "terminating its process tree.",
+                    "Could not send the shutdown request because the worker pipe is unusable. "
+                    "Terminating its process tree.",
                 )
                 self._force_kill_tree(process)
                 process.join(5.0)
             else:
                 self._join_while_draining(process, timeout=timeout)
                 if process.is_alive():
-                    logger.warning("Worker did not exit after shutdown request; terminating its process tree.")
+                    logger.warning("Worker did not exit after shutdown request. Terminating its process tree.")
                     self._force_kill_tree(process)
                     process.join(5.0)
         self._cleanup_process()

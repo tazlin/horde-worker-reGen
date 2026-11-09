@@ -207,7 +207,7 @@ class TestJobRows:
 
     def test_session_without_start_is_refused(self) -> None:
         """Stats with no session_start row cannot be offset."""
-        with pytest.raises(ReplayFixtureError, match="no session_start"):
+        with pytest.raises(ReplayFixtureError, match="do not include a session_start"):
             build_replay_job_rows([_stats_sample()])
 
     def test_unpopped_record_is_counted_and_left_out(self) -> None:

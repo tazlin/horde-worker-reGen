@@ -1421,7 +1421,7 @@ class HordeWorkerProcessManager:
         if any_offered_model_wants_whole_card(self.bridge_data.image_models_to_load):
             if self.total_ram_bytes < (24 * 1024 * 1024 * 1024):
                 raise ValueError(
-                    "A configured model wants the whole GPU (e.g. Flux, Stable Cascade), but total system RAM "
+                    "A configured model requires the whole GPU (e.g. Flux, Stable Cascade), but total system RAM "
                     "is less than 24GB, which is not enough to run the worker with it. Remove it from your "
                     "`models_to_load` or add it to your `models_to_skip`.",
                 )

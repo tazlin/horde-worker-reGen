@@ -555,7 +555,7 @@ def run_mock_worker(connection: object, options: WorkerLaunchOptions) -> None:
             seconds_since_last_pop=(time.time() - last_pop) if last_pop else None,
             last_pop_no_jobs_available=no_work,
             last_pop_skipped_reasons=dict(_MOCK_SKIP_REASONS) if no_work else {},
-            api_messages=["Simulated network issue; the worker is retrying."] if blip else [],
+            api_messages=["Simulated network issue. The worker is retrying."] if blip else [],
             pending_megapixelsteps=random.randint(0, 12),
             jobs_pending_inference=len(pending_jobs),
             jobs_in_progress=sampling_count,

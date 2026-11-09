@@ -257,12 +257,12 @@ SECTION_GUIDANCE: dict[str, str] = {
     "each shortens the job timeout (high = 1/3, moderate = 1/2 of the default). extra_slow_worker overrides "
     "both, disables them, and clamps concurrency (max_threads 1, queue_size 0, preload_timeout >= 150).",
     "Features": "Some features depend on others: inpainting is forced off unless img2img is allowed, and "
-    "SDXL ControlNet requires ControlNet (which in turn wants img2img). Enabling a dependent feature without "
+    "SDXL ControlNet requires ControlNet, which also requires img2img. Enabling a dependent feature without "
     "its prerequisite has no effect.",
     "Models": "Edit the load/skip rules below. The panel previews which models will load and "
     "their disk cost. Press Resolve to expand 'top N' / 'bottom N' commands (needs usage stats).",
     "Workload policy": "These switches shape the model set produced by the load/skip rules. Presets may replace "
-    "the model list; review the preset diff before saving.",
+    "the model list. Review the preset diff before saving.",
     "Model pool": "The fixed model pool biases work toward a small set of logical seats. A seat is an advertising "
     "commitment, and the runtime panels separately show whether its model is resident. This can reduce model "
     "swaps when the horde has demand for resident seats. Leave it off (the default) to advertise "
@@ -277,10 +277,9 @@ SECTION_GUIDANCE: dict[str, str] = {
     "the editor blocks saving LoRA on because many LoRAs and popular checkpoints cannot be fetched.",
     "Alchemist": "Alchemy is a separate worker role (interrogation / post-processing), distinct from LoRA. "
     "Enabling it serves alchemy jobs alongside (or instead of) image generation.",
-    "Scribe": "A scribe is a separate worker role serving text-generation jobs, which run in a backend "
-    "program rather than in this worker's inference processes, so a scribe can run on its own or "
-    "beside the other roles. The worker obtains, starts and supervises that backend for you; turn "
-    "'Worker runs the backend' off to attach to one you run yourself instead.",
+    "Scribe": "A scribe serves text-generation jobs through a separate backend program. It can run on its own "
+    "or alongside the other worker roles. The worker runs and supervises the backend for you, downloading it "
+    "if needed. Turn 'Worker runs the backend' off to connect to a backend you run yourself.",
     "Timeouts": "ADVANCED. Most users should leave every field on this tab at its default. "
     "The defaults are tuned for the common case. Wrong values here make the watchdog kill healthy jobs or "
     "leave hung jobs running too long. Only adjust if you understand the specific symptom "
@@ -289,7 +288,7 @@ SECTION_GUIDANCE: dict[str, str] = {
     "VRAM budget": "ADVANCED. Most users should leave every field on this tab at its default. "
     "These settings control how the scheduler prevents multi-process GPU over-commit (the cause of "
     "out-of-memory crashes). Wrong values can cause repeated out-of-memory faults or permanently "
-    "hold back jobs the card could run. Only adjust if you have diagnosed a specific "
+    "hold back jobs that could run on the card. Only adjust if you have diagnosed a specific "
     "budget-related problem in the logs.",
     "Post-processing budget": "ADVANCED. Leave these at their defaults unless you have diagnosed a "
     "post-processing (upscale/face-fix) VRAM problem. They guard the VRAM peak that lands after sampling, "
@@ -299,7 +298,7 @@ SECTION_GUIDANCE: dict[str, str] = {
     "Changes to these fields require a worker restart.",
     "Logs": "Automatic log cleanup runs at startup only. Set both values to 0 to keep logs indefinitely.",
     "Stats": "Structured stats export (.horde_worker_regen/stats) plus its startup retention and autozip. "
-    "Enable export to write a machine-readable per-session stream for offline analysis; cleanup and "
+    "Enable export to write a machine-readable per-session stream for offline analysis. Cleanup and "
     "compression run at startup only. Set both retention values to 0 to keep stats indefinitely.",
     "Dry-run": "Testing flags that skip real GPU work. All fields here require a worker restart. "
     "Do not enable these on a production worker.",
@@ -313,8 +312,8 @@ CONFIG_FIELDS: list[ConfigField] = [
         "Web dashboard address",
         FieldKind.STR,
         "Dashboard",
-        "Address the browser dashboard binds when launched without --host. 127.0.0.1 keeps it on this "
-        "machine; 0.0.0.0 serves it to your whole network, unauthenticated. Applies the next time the "
+        "Address used by the browser dashboard when launched without --host. 127.0.0.1 keeps it on this "
+        "machine. 0.0.0.0 serves it to your whole network without authentication. Applies the next time the "
         "dashboard is launched.",
         explicit_default="127.0.0.1",
         risk_level="advanced",
@@ -394,7 +393,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         "Max batch size",
         FieldKind.INT,
         "Throughput",
-        "The most images one job may ask for. A batch is sampled in one pass, so a larger one takes longer "
+        "The maximum number of images per job. A batch is sampled in one pass, so a larger one takes longer "
         "and needs more VRAM. Ensure you can generate max_batch images at half your max_power.",
         minimum=1,
         maximum=20,
@@ -446,7 +445,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         "Very fast disk mode",
         FieldKind.BOOL,
         "Memory & performance",
-        "Load multiple models off disk at once. Needs a very fast disk; high disk usage.",
+        "Load multiple models from disk at once. Requires a very fast disk and causes high disk usage.",
     ),
     ConfigField(
         "cycle_process_on_model_change",
@@ -565,14 +564,14 @@ CONFIG_FIELDS: list[ConfigField] = [
         "Allow ControlNet",
         FieldKind.BOOL,
         "Features",
-        "Accept ControlNet jobs (extra RAM/VRAM; needs img2img).",
+        "Accept ControlNet jobs. Uses extra RAM/VRAM and requires img2img.",
     ),
     ConfigField(
         "allow_sdxl_controlnet",
         "Allow SDXL ControlNet",
         FieldKind.BOOL,
         "Features",
-        "Accept SDXL ControlNet/transparency jobs (heavy; requires allow_controlnet).",
+        "Accept SDXL ControlNet/transparency jobs. Uses extra RAM/VRAM and requires allow_controlnet.",
     ),
     ConfigField(
         "aesthetic_scoring_enabled",
@@ -589,7 +588,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         "Offer LoRA jobs",
         FieldKind.BOOL,
         "LoRA",
-        "Accept LoRA jobs. Downloads on demand; set a civitai_api_token. Needs fast internet.",
+        "Accept LoRA jobs. Downloads files as needed. Set civitai_api_token. Requires fast internet.",
     ),
     ConfigField(
         "civitai_api_token",
@@ -642,7 +641,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         "Models to skip",
         FieldKind.MODEL_LIST,
         "Models",
-        "Models to exclude from a meta selection (only removes; never adds).",
+        "Models to exclude from a meta selection. This setting only removes models.",
     ),
     ConfigField(
         "load_large_models",
@@ -656,7 +655,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         "Only offer downloaded models",
         FieldKind.BOOL,
         "Models",
-        "Only offer models already downloaded; any resolved model not on disk is dropped, never fetched.",
+        "Only offer models already downloaded. Models missing from disk are excluded and are not downloaded.",
     ),
     ConfigField(
         "custom_models",
@@ -709,8 +708,8 @@ CONFIG_FIELDS: list[ConfigField] = [
         "Enable demand ranker",
         FieldKind.BOOL,
         "Model pool",
-        "Let the demand ranker fill the seats your pins do not claim, choosing the highest live-demand models this "
-        "card runs quickly. On by default; turn it off to run a pins-only pool.",
+        "Fill unpinned seats using a score based on demand and expected earnings on this card. "
+        "Enabled by default. Turn it off to use only pinned models.",
         yaml_parent="model_pool",
         explicit_default=True,
     ),
@@ -719,9 +718,9 @@ CONFIG_FIELDS: list[ConfigField] = [
         "Rotation window",
         FieldKind.FLOAT,
         "Model pool",
-        "Minutes a seat serves before it becomes eligible for a timed re-contest against a stronger candidate. A "
-        "pin's affinity extends its window on top of this. Lower rotates the seat set faster (more variety, "
-        "more swaps); higher holds a committed set longer.",
+        "Minutes before a seated model can be replaced by a model with a higher score for demand and expected "
+        "earnings. A pin's affinity extends this window. Lower values change models more often. "
+        "Higher values keep the same models longer.",
         minimum=0.0,
         exclusive_minimum=True,
         unit="min",
@@ -792,9 +791,9 @@ CONFIG_FIELDS: list[ConfigField] = [
         "Auto-download admission budget",
         FieldKind.FLOAT,
         "Model pool",
-        "Declared-size GB the pool may admit for automatic downloads during this session. Each request is charged "
-        "its reference-declared full size when it starts; the charge is neither live disk occupancy nor measured "
-        "bandwidth and is not refunded after failure. 0 prevents ranker-selected automatic downloads. Models "
+        "Maximum total size in GB for automatic downloads during this session. Each request counts against "
+        "this limit at the full size listed in the model reference. The count does not measure disk usage or "
+        "bandwidth and is not reduced after failure. 0 prevents ranker-selected automatic downloads. Models "
         "already configured or pinned remain governed by their normal download rules.",
         minimum=0.0,
         unit="GB",
@@ -847,7 +846,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         FieldKind.INT,
         "Model downloads",
         "Connections used to fetch a single large file (1 = single stream). A big checkpoint is split "
-        "across this many ranged connections to raise its download rate; small files use one stream. "
+        "across this many ranged connections to raise its download rate. Small files use one stream. "
         "WARNING: a multi-connection download CANNOT resume. If interrupted, the whole file restarts "
         "from scratch. Set this to 1 on a slow/unreliable connection to keep resumable downloads.",
         minimum=1,
@@ -871,7 +870,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         FieldKind.SELECT,
         "Model downloads",
         "serve_first fetches the safety models and one image model before the rest, so the worker can start "
-        "serving sooner; parallel is first come, first served. Switchable live from the Downloads tab.",
+        "serving sooner. The parallel policy uses request order. Change this while running from the Downloads tab.",
         choices=DOWNLOAD_PRIORITY_POLICY_CHOICES,
         explicit_default=DownloadPriorityPolicy.SERVE_FIRST.value,
     ),
@@ -935,7 +934,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         "Enable captioning",
         FieldKind.BOOL,
         "Alchemist",
-        "Allow BLIP captioning (loads BLIP; extra RAM/VRAM).",
+        "Allow BLIP captioning. Loads BLIP and uses extra RAM/VRAM.",
     ),
     ConfigField(
         "alchemy_allow_concurrent",
@@ -1002,10 +1001,10 @@ CONFIG_FIELDS: list[ConfigField] = [
         "Text model",
         FieldKind.STR,
         "Scribe",
-        "Which model the backend loads: a catalogued model's name, or the path to a model file of your "
-        "own. Choose browses the catalogue. A catalogued name is fetched into the text models folder once "
-        "and verified against its digest; a path is read where it sits. Applies when the worker runs the "
-        "backend.",
+        "Model to load in the backend: a catalogue name or a local file path. Click Choose to browse the catalogue. "
+        "A catalogued model is downloaded to the text models folder once and checked against its digest. "
+        "A file path is used directly. "
+        "Applies when the worker runs the backend.",
         requires_restart=True,
         picker=FieldPicker.TEXT_MODEL,
     ),
@@ -1036,7 +1035,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         "Max tokens per generation",
         FieldKind.INT,
         "Scribe",
-        "The most tokens this worker offers to generate per job. The worker advertises the smaller of this "
+        "The maximum number of tokens to generate per job. The worker advertises the smaller of this "
         "and the backend's limit. The derived generation timeout is computed from this value.",
         requires_restart=True,
         minimum=1,
@@ -1048,9 +1047,9 @@ CONFIG_FIELDS: list[ConfigField] = [
         "Max context length",
         FieldKind.INT,
         "Scribe",
-        "The largest prompt plus answer, in tokens, this worker offers to hold. The worker advertises the "
+        "The maximum combined length of a prompt and generated text, in tokens. The worker advertises the "
         "smaller of this and the backend's limit. The horde never sends a request that needs more than this, "
-        "so the default of 1024 reaches very little work. A backend the worker runs is launched with this much "
+        "so the default of 1024 reaches very little work. A managed backend is launched with this much "
         "context per text thread, and that context costs VRAM.",
         requires_restart=True,
         minimum=1,
@@ -1062,9 +1061,9 @@ CONFIG_FIELDS: list[ConfigField] = [
         "Advertised model name",
         FieldKind.STR,
         "Scribe",
-        "Advertise the model under this name instead of the resolved one, spelled as the text model "
-        "reference spells it (author/Model). Use it for a file of your own whose name is not the one the horde "
-        "knows, or for an attached backend that reports a name the horde does not recognise. Leave the "
+        "Advertise the model under this name instead of the resolved one. Use the name from the text model "
+        "reference (author/Model). Use it for a local file with a different name from the model reference "
+        "or for an attached backend that reports an unrecognised model name. Leave the "
         "backend prefix off. The worker adds it.",
         requires_restart=True,
         risk_level="advanced",
@@ -1074,8 +1073,8 @@ CONFIG_FIELDS: list[ConfigField] = [
         "Text models folder",
         FieldKind.STR,
         "Scribe",
-        "Where model files the worker fetches are kept. Blank puts them beside the image weights under "
-        "the model cache. A text model naming a path is read where it sits and never copied here. "
+        "Folder for downloaded text models. Leave blank to put them beside the image weights in "
+        "the model cache. A local model file is read directly and is not copied here. "
         "Applies when the worker runs the backend.",
         requires_restart=True,
         risk_level="advanced",
@@ -1133,8 +1132,8 @@ CONFIG_FIELDS: list[ConfigField] = [
         "Backend GPU layers",
         FieldKind.INT,
         "Scribe",
-        "How much of the model the managed backend places on the card, in the backend's unit (layers, "
-        "for llama.cpp-based backends). A large value means the whole model; 0 keeps it on the CPU. "
+        "Amount of the model to load on the card, in the backend's unit (layers, "
+        "for llama.cpp-based backends). A large value means the whole model. 0 keeps it on the CPU. "
         "Applies when the worker runs the backend.",
         requires_restart=True,
         minimum=0,
@@ -1146,7 +1145,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         "Backend GPU device index",
         FieldKind.INT,
         "Scribe",
-        "The stable device index of the card the managed backend uses. Blank picks the driven card with the "
+        "The stable device index of the card used by the managed backend. Blank picks the driven card with the "
         "most free VRAM at launch and shares it with image generation. Naming a card on a multi-GPU host "
         "dedicates it to text, and image generation stops using that card. On a single-card host the card "
         "stays shared whatever is set here. Applies when the worker runs the backend.",
@@ -1161,8 +1160,8 @@ CONFIG_FIELDS: list[ConfigField] = [
         "Backend compute path",
         FieldKind.SELECT,
         "Scribe",
-        "Which compute path the managed backend runs on. 'auto' follows the backend this install was set "
-        "up for: an NVIDIA build runs text on CUDA, an AMD build on Vulkan, a CPU build on the CPU. Set "
+        "Compute backend for managed text generation. 'auto' uses the backend selected "
+        "during installation: an NVIDIA build runs text on CUDA, an AMD build on Vulkan, a CPU build on the CPU. Set "
         "it explicitly when text should differ from the install, as on a text-only worker installed with "
         "the CPU build whose card should still serve text. Applies when the worker runs the backend.",
         requires_restart=True,
@@ -1206,7 +1205,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         FieldKind.FLOAT,
         "Scribe",
         "Seconds without a single token arriving before a generation is abandoned and the job faulted. "
-        "The backend streams its answer, so a gap this long is a backend that stopped rather than one "
+        "The backend streams generated text, so a gap this long is a backend that stopped rather than one "
         "that is slow. The generation timeout stays the outer limit. The first token after the backend "
         "starts is exempt, because a cold backend spends seconds warming up.",
         minimum=0,
@@ -1221,7 +1220,8 @@ CONFIG_FIELDS: list[ConfigField] = [
         "Job timeout",
         FieldKind.INT,
         "Timeouts",
-        "Max seconds a job may run before being killed. High-performance mode divides by 3; moderate by 2.",
+        "Max seconds a job may run before being killed. High-performance mode divides this by 3. "
+        "Moderate mode divides it by 2.",
         minimum=15,
         maximum=3600,
         unit="s",
@@ -1334,8 +1334,8 @@ CONFIG_FIELDS: list[ConfigField] = [
         "Idle warning after",
         FieldKind.INT,
         "Retry & scheduling",
-        "Log a low-demand advisory once idle this many minutes in a session. The worker never exits when "
-        "idle; this only controls the reminder. 0 (default) disables the reminder.",
+        "Log a low-demand advisory once idle this many minutes in a session. The worker does not exit when "
+        "idle. This only controls the reminder. 0 (default) disables the reminder.",
         minimum=0,
         maximum=3600,
         unit="min",
@@ -1422,9 +1422,9 @@ CONFIG_FIELDS: list[ConfigField] = [
         "Per-process RAM ceiling",
         FieldKind.INT,
         "VRAM budget",
-        "Resident RAM (MB) one inference process may hold before it is recycled while the host is under the "
-        "RAM danger floor (idle recycled at once; busy drained then recycled). Bounds a single process's "
-        "balloon so several processes plus co-tenants cannot drive an OS OOM kill. Consulted only under the "
+        "Maximum resident RAM (MB) per inference process before it is recycled while the host is under the "
+        "RAM danger floor. Idle processes are recycled at once. Busy processes finish their jobs first. Limits "
+        "RAM held by one process to reduce the risk of an OS out-of-memory kill. Applies only under the "
         "floor. 0 disables.",
         minimum=0,
         maximum=1048576,
@@ -1437,8 +1437,8 @@ CONFIG_FIELDS: list[ConfigField] = [
         "Per-process VRAM overhead",
         FieldKind.INT,
         "VRAM budget",
-        "VRAM (MB) one inference process uses for its CUDA context with no model loaded. 0 (default) "
-        "auto-detects via the startup probe; set a positive value only to override a bad measurement.",
+        "VRAM (MB) used by one inference process for its CUDA context with no model loaded. 0 (default) "
+        "auto-detects via the startup probe. Set a positive value only to override a bad measurement.",
         minimum=0,
         maximum=49152,
         unit="MB",
@@ -1560,7 +1560,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         "Exclusive residency",
         "Minimum seconds between offering different very-large models (Flux/Cascade/Qwen/Z-Image), so a "
         "queue does not force a fresh whole-card teardown + multi-GB reload on every switch. 0 disables. "
-        "Jobs for the model already loaded are unaffected; an idle worker offers large models regardless.",
+        "Jobs for the model already loaded are unaffected. An idle worker offers large models regardless.",
         minimum=0,
         maximum=600,
         unit="s",
@@ -1574,7 +1574,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         "Exclusive residency",
         "Seconds to avoid any very-large model after the last one drains, so the worker does ordinary work "
         "in between instead of reloading large models back to back. -1 (default) inherits the whole-card "
-        "cooldown; 0 disables.",
+        "cooldown. 0 disables.",
         minimum=-1,
         maximum=600,
         unit="s",
@@ -1660,7 +1660,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         "GPU sampling lease",
         "How many processes may run the denoising loop at once when gpu_sampling_lease_enabled is true. "
         "Leave blank to track Max threads. Set 1 to serialize (efficient on Windows WDDM, where concurrent "
-        "loops only time-slice); higher values permit that many concurrent loops, up to Max threads.",
+        "loops only time-slice). Higher values permit that many concurrent loops, up to Max threads.",
         requires_restart=True,
         minimum=None,
         maximum=16,
@@ -1674,7 +1674,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         "Clear maintenance on start",
         FieldKind.BOOL,
         "Other",
-        "Clear maintenance mode at startup. Maintenance is a safety feature; investigate if frequent.",
+        "Clear maintenance mode at startup. Maintenance is a safety feature. Investigate if it occurs frequently.",
     ),
     ConfigField(
         "auto_clear_server_maintenance",
@@ -1747,8 +1747,8 @@ CONFIG_FIELDS: list[ConfigField] = [
         "Export stats JSONL",
         FieldKind.BOOL,
         "Stats",
-        "Write a structured per-session stats stream on every start (off by default; the dashboard toggle "
-        "still overrides per session).",
+        "Write a structured per-session stats stream on every start (off by default). The dashboard toggle "
+        "still overrides per session.",
     ),
     ConfigField(
         "stats_purge_max_age_days",
@@ -1816,7 +1816,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         "Skip API calls",
         FieldKind.BOOL,
         "Dry-run",
-        "Skip job pop and submit; use canned scenarios instead.",
+        "Skip job pop and submit. Use canned scenarios instead.",
         requires_restart=True,
     ),
     ConfigField(
@@ -1871,7 +1871,7 @@ GPU_GLOBAL_FIELDS: list[ConfigField] = [
         "Multi-GPU",
         "Local-queue imbalance fraction that prioritizes the next job pop for one under-fed card. "
         "Heterogeneous cards otherwise rotate complete card-scoped offers. 0 prioritizes any observed "
-        "imbalance; 1 disables imbalance prioritization. No effect on a single-GPU worker.",
+        "imbalance. 1 disables imbalance prioritization. No effect on a single-GPU worker.",
         minimum=0.0,
         maximum=1.0,
         explicit_default=GPU_POP_BALANCE_THRESHOLD_DEFAULT,
@@ -1935,7 +1935,7 @@ GPU_OVERRIDE_FIELDS: list[ConfigField] = [
         "Models to load",
         FieldKind.STR_LIST,
         "Models",
-        "Models this card offers (one per line; concrete names and/or meta commands like 'top 5'). "
+        "Models offered by this card. Enter one name or meta command (such as 'top 5') per line. "
         "Overrides the global list entirely for this card.",
     ),
     ConfigField(
@@ -1967,7 +1967,7 @@ GPU_OVERRIDE_FIELDS: list[ConfigField] = [
         "Offer SDXL ControlNet jobs",
         FieldKind.BOOL,
         "Features",
-        "Accept SDXL ControlNet jobs on this card (heavy; requires allow_controlnet).",
+        "Accept SDXL ControlNet jobs on this card. Uses extra RAM/VRAM and requires allow_controlnet.",
     ),
     ConfigField(
         "allow_post_processing",
@@ -2001,7 +2001,7 @@ GPU_OVERRIDE_FIELDS: list[ConfigField] = [
         "Max batch size",
         FieldKind.INT,
         "Features",
-        "Largest batched request this card accepts. Jobs asking for more images are refused here.",
+        "Maximum images per job on this card. Jobs with more images are refused.",
         minimum=1,
         maximum=20,
     ),
@@ -2061,7 +2061,7 @@ GPU_OVERRIDE_FIELDS: list[ConfigField] = [
         FieldKind.INT,
         "VRAM budget",
         "MB subtracted from measured free VRAM before a load is judged to fit. Lower it (or set 0) to admit a "
-        "model you have seen run with the card to itself; raise it for headroom against spikes.",
+        "model you have seen run with the card to itself. Raise it for headroom against spikes.",
         minimum=0,
         unit="MB",
     ),
@@ -2324,7 +2324,7 @@ def validate_identity_names(
         errors.append(
             (
                 "dreamer_name",
-                "Dreamer name is still the default placeholder; set a unique one (worker names are unique "
+                "Dreamer name is still the default placeholder. Set a unique one (worker names are unique "
                 "horde-wide and the default is rejected)",
             ),
         )
@@ -2335,7 +2335,7 @@ def validate_identity_names(
             errors.append(("alchemist_name", "Alchemist name is required when alchemy is enabled"))
         elif alchemist == ALCHEMIST_NAME_RESERVED_DEFAULT:
             errors.append(
-                ("alchemist_name", "Alchemist name is still the default placeholder; set a unique one"),
+                ("alchemist_name", "Alchemist name is still the default placeholder. Set a unique one"),
             )
         elif dreamer and alchemist.lower() == dreamer.lower():
             errors.append(
@@ -2352,7 +2352,7 @@ def validate_identity_names(
             errors.append(("scribe_name", "Scribe name is required when text generation is enabled"))
         elif scribe == SCRIBE_NAME_RESERVED_DEFAULT:
             errors.append(
-                ("scribe_name", "Scribe name is still the default placeholder; set a unique one"),
+                ("scribe_name", "Scribe name is still the default placeholder. Set a unique one"),
             )
         else:
             # Only a name a role registers under can collide, so the alchemist counts as an occupant of
@@ -2556,6 +2556,6 @@ def describe_process_plan(
         return base + note_text
     total = per_card * n_cards
     return (
-        f"About {per_card} inference process(es) per card + 1 safety process; across {n_cards} cards up to "
+        f"About {per_card} inference process(es) per card + 1 safety process. Across {n_cards} cards up to "
         f"{total} inference processes, reduced at runtime to fit shared RAM and each card's VRAM." + note_text
     )

@@ -956,7 +956,7 @@ def _decide_preload_gate_ladder(
         # which considers strictly more lanes, so this can only ever add a target for a follower.
         target = select_follower_room_target(snapshot, job_id, head_job_id=head_job_id)
         if target is not None:
-            admit_reason = "gates passed (displacing a less wanted idle copy)"
+            admit_reason = "gates passed (displacing a lower-demand idle copy)"
     if target is None:
         return plan(
             AdmissionDecision.NO_TARGET,

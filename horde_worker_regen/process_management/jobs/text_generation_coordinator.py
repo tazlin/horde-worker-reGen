@@ -1076,11 +1076,11 @@ class TextGenerationCoordinator:
         """
         self._backend_capabilities = await backend.capabilities()
         if self._backend_capabilities.generation_stats:
-            logger.info("Text backend reports per-request statistics; text jobs will carry token counts and a rate.")
+            logger.info("Text backend reports per-request statistics. Text jobs will include token counts and a rate.")
             return
         logger.info(
-            "Text backend has no per-request statistics route, so text jobs report how much text has "
-            "arrived but no token counts and no token rate. A stock backend build is expected to answer this way.",
+            "Text backend does not support per-request statistics, so text jobs report how much text has "
+            "arrived without token counts or a token rate. This is normal for a stock backend build.",
         )
 
     async def _warm_up_backend(self) -> None:
@@ -1277,18 +1277,18 @@ class TextGenerationCoordinator:
             generations_at_start=counters.latest.generations_completed if counters is not None else None,
         )
         busy_for = (
-            f"has answered busy for {busy_seconds:.0f}s ({self._busy_answers_in_spell} busy answers) with no "
-            f"job receiving text {self._spell_counters_note()}"
+            f"has returned busy responses for {busy_seconds:.0f}s ({self._busy_answers_in_spell} responses) without "
+            f"sending text to any job {self._spell_counters_note()}"
         )
 
         if self._relaunch_backend is None:
             logger.error(
-                f"The text backend at {self.backend_address} {busy_for}; it looks wedged. No text jobs are "
-                "popped until it answers again. Restart the backend; the worker resumes on its own. In the "
+                f"The text backend at {self.backend_address} {busy_for}. It appears stuck. Text jobs are not "
+                "popped until it responds again. Restart the backend. The worker resumes on its own. In the "
                 "backend's own output, `find_slot` or `failed to find a memory slot` means its context ran "
                 "out: parallel requests share one context pool, which must hold `text_threads` x "
                 "`max_context_length` tokens, so start it with `--contextsize` sized that way. "
-                "`text_threads: 1` only confirms that cause; it is not the fix.",
+                "`text_threads: 1` only confirms that cause. It does not fix the context size.",
             )
             return
 
@@ -1302,22 +1302,23 @@ class TextGenerationCoordinator:
                     "generates or restarts. Look in logs/text_backend.log for `find_slot` or `failed to "
                     "find a memory slot`: parallel requests share one context pool of `text_threads` x "
                     "`max_context_length` tokens, which the worker opens at launch, so those lines mean the "
-                    "pool still ran out. `text_threads: 1` only confirms that cause; it is not the fix.",
+                    "pool still ran out. `text_threads: 1` only confirms that cause. "
+                    "It does not fix the context size.",
                 )
             return
 
         reason = f"wedged: {busy_for}"
         if not self._relaunch_backend(reason):
             logger.warning(
-                f"The text backend at {self.backend_address} {busy_for}; it looks wedged, but it is not "
-                "serving, so it is already being relaunched. No text jobs are popped until it answers again.",
+                f"The text backend at {self.backend_address} {busy_for}. It appears stuck, but it is not "
+                "serving, so it is already being relaunched. Text jobs are not popped until it responds again.",
             )
             return
         self._wedge_relaunches_without_success += 1
         logger.warning(
-            f"The text backend at {self.backend_address} {busy_for}; it looks wedged. Relaunching it "
+            f"The text backend at {self.backend_address} {busy_for}. It appears stuck. Relaunching it "
             f"(relaunch {self._wedge_relaunches_without_success} of {TEXT_BACKEND_WEDGE_MAX_RELAUNCHES} "
-            "without a successful generation). No text jobs are popped until it answers again.",
+            "without a successful generation). Text jobs are not popped until it responds again.",
         )
 
     def _end_wedge_hold(self, reason: str) -> None:
@@ -1357,7 +1358,7 @@ class TextGenerationCoordinator:
             wedge.launch_count_at_start
         )
         if relaunched or wedge.saw_unready:
-            self._end_wedge_hold("the backend answered again after restarting")
+            self._end_wedge_hold("the backend responded again after restarting")
             return
         progress = await self.require_backend().generation_progress()
         if progress is None or progress.generations_completed is None:
@@ -1533,7 +1534,7 @@ class TextGenerationCoordinator:
                 self._run_metrics.record_event(
                     WorkerEventKind.MAINTENANCE_OFF,
                     workload=WorkloadKind.TEXT_GENERATION,
-                    detail="the horde answered a pop again",
+                    detail="the horde responded to a job request again",
                 )
         self._start_popped_jobs(pop_response, advertisement=advertisement)
 
@@ -1655,9 +1656,8 @@ class TextGenerationCoordinator:
         while True:
             if _ttl_is_spent(job):
                 logger.warning(
-                    f"Text job {job.job_id[:8]} reached the ttl the horde popped it with before the "
-                    "backend took it; faulting it rather than generating an answer the server has "
-                    "already given up on",
+                    f"Text job {job.job_id[:8]} reached the horde deadline before the backend accepted it. "
+                    "Marking it as faulted because the server is no longer waiting for the result.",
                 )
                 return None
             # Re-stamped per attempt, so a job the backend turned away as busy measures its wait to the
@@ -1677,9 +1677,9 @@ class TextGenerationCoordinator:
                 self._note_busy_answer()
                 if _busy_bound_without_ttl_is_spent(job, deadline_seconds=deadline_seconds):
                     logger.warning(
-                        f"Text backend answered busy to job {job.job_id[:8]} {job.busy_attempts} times over "
-                        f"its {deadline_seconds:.0f}s generation deadline, and the pop carried no ttl; "
-                        f"faulting it: {busy}",
+                        f"Text backend returned busy responses for job {job.job_id[:8]} {job.busy_attempts} times "
+                        f"over its {deadline_seconds:.0f}s generation deadline. The pop did not include a ttl. "
+                        f"Marking the job as faulted: {busy}",
                     )
                     return None
                 # Re-offered every couple of seconds for as long as the ttl allows, so only the first

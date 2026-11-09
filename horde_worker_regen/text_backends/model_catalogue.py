@@ -403,9 +403,9 @@ def resolve_text_model(
     declared_file = record.config.download[0] if record.config.download else None
     if declared_file is None:
         raise TextModelResolutionError(
-            f"`text_model` is set to {text_model!r}, which the text model reference knows as a model but "
-            "declares no file for, so the worker cannot tell which artefact to load. Give the path to a "
-            "model file you have, or a reference name that carries one.",
+            f"`text_model` is set to {text_model!r}. This model is listed in the text model reference "
+            "without a file to download, so the model cannot be loaded. Give the path to a local "
+            "model file, or a reference name with a file to download.",
         )
 
     directory = default_text_models_dir() if text_models_dir is None else text_models_dir

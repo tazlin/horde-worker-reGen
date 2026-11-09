@@ -738,7 +738,7 @@ class HordeWorkerTUI(App[None]):
                 yield OverviewView()
             with TabPane("Stats", id="tab-stats"):
                 yield TabPrimer(
-                    "Totals and averages for the work this computer has done. Nothing here needs "
+                    "Totals and averages for work done by this computer. Nothing here needs "
                     "changing. It is a record of what happened.",
                     PRIMERS.get("Stats", ()),
                 )
@@ -752,7 +752,7 @@ class HordeWorkerTUI(App[None]):
                 yield ControlView()
             with TabPane("GPUs", id="tab-gpus"):
                 yield TabPrimer(
-                    "What your graphics card is doing, and how much of its memory the worker is using.",
+                    "What your graphics card is doing, and how much memory is used by the worker.",
                 )
                 yield GpusView()
             with TabPane("Live", id="tab-live"):
@@ -2759,7 +2759,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         "--process-mode",
         choices=[mode.value for mode in WorkerProcessMode],
         default=WorkerProcessMode.REAL.value,
-        help="'real' runs the GPU worker; 'fake' runs a synthetic worker for UI demos/tests.",
+        help="'real' runs the GPU worker. 'fake' runs a synthetic worker for UI demos/tests.",
     )
     parser.add_argument(
         "-e",
@@ -2774,7 +2774,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         "--config",
         type=Path,
         default=DEFAULT_CONFIG_PATH,
-        help="Path to the bridgeData.yaml the config editor reads/writes.",
+        help="Path to bridgeData.yaml for the config editor.",
     )
     parser.add_argument("--no-auto-restart", action="store_true", help="Do not relaunch the worker if it crashes.")
     parser.add_argument(
@@ -2785,7 +2785,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         const=f"{sp.DEFAULT_HOST_ADDRESS}:{sp.DEFAULT_HOST_PORT}",
         help="Attach to a running worker host instead of owning the worker (used by the web launcher, and "
         f"to reattach a terminal dashboard). With no value, attaches to {sp.DEFAULT_HOST_ADDRESS}:"
-        f"{sp.DEFAULT_HOST_PORT}; pass host:port to target another. The worker survives this session "
+        f"{sp.DEFAULT_HOST_PORT}. Pass host:port to target another. The worker survives this session "
         "closing.",
     )
     parser.add_argument(

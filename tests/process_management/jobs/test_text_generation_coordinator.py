@@ -1760,7 +1760,7 @@ async def test_a_wedged_managed_backend_holds_pops_and_is_relaunched_once(monkey
     relaunch_lines = [message for level, message in logged if level == "WARNING" and "Relaunching it" in message]
     assert len(relaunch_lines) == 1
     assert coordinator.backend_address in relaunch_lines[0]
-    assert "answered busy for" in relaunch_lines[0]
+    assert "returned busy responses for" in relaunch_lines[0]
 
     await coordinator.api_text_pop()
     assert session.pop_requests == [], "the flow popped into a wedged backend"
@@ -1781,14 +1781,14 @@ async def test_a_wedged_backend_the_operator_runs_is_held_and_reported_once(monk
     finally:
         logger.remove(sink_id)
 
-    wedge_errors = [message for level, message in logged if level == "ERROR" and "wedged" in message]
+    wedge_errors = [message for level, message in logged if level == "ERROR" and "appears stuck" in message]
     assert len(wedge_errors) == 1, "the standing wedge was reported more than once"
     assert coordinator.backend_address in wedge_errors[0]
     assert "Restart the backend" in wedge_errors[0]
     assert "failed to find a memory slot" in wedge_errors[0], "the copy does not name the line that shows the cause"
     assert "`text_threads` x `max_context_length`" in wedge_errors[0]
     assert "`--contextsize`" in wedge_errors[0], "an attached backend's context is the operator's to size"
-    assert "it is not the fix" in wedge_errors[0], "one generation at a time was offered as the fix"
+    assert "It does not fix the context size" in wedge_errors[0], "one generation at a time was offered as the fix"
     assert coordinator.backend_wedged is True, "a readiness answer alone ended the hold on a wedged backend"
 
     await coordinator.api_text_pop()
@@ -1906,7 +1906,7 @@ async def test_relaunches_stop_at_the_bound_until_a_generation_completes(monkeyp
     assert "logs/text_backend.log" in bound_lines[0]
     assert "`find_slot`" in bound_lines[0]
     assert "`text_threads` x `max_context_length`" in bound_lines[0]
-    assert "it is not the fix" in bound_lines[0], "one generation at a time was offered as the fix"
+    assert "It does not fix the context size" in bound_lines[0], "one generation at a time was offered as the fix"
 
     backend.locked = False
     await _hold_one_job_against_the_backend(coordinator)

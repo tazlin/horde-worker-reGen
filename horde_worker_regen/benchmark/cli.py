@@ -1285,8 +1285,8 @@ def _run_pricing_corpus(args: argparse.Namespace) -> int:
         ensure_model_reference_manager_initialized()
     except Exception as reference_error:  # noqa: BLE001 - a reference miss degrades records, not the run
         logger.warning(
-            f"Could not initialize the model reference ({type(reference_error).__name__}); corpus records "
-            "will carry stubbed baselines.",
+            f"Could not initialize the model reference ({type(reference_error).__name__}). Corpus records "
+            "will use placeholder baselines.",
         )
     logger.info(
         f"Running the {definition.tier} pricing corpus: {len(definition.jobs)} jobs over "
@@ -1408,7 +1408,7 @@ def _run_soak(args: argparse.Namespace) -> int:
 
     if args.process_mode == "real" and not args.no_loras and not (args.shared_lora and args.unique_lora):
         logger.warning(
-            f"The {args.mix} mix carries LoRA references and none were supplied, so its LoRA-bearing "
+            f"The {args.mix} mix includes LoRA references, but they were not supplied, so its LoRA-bearing "
             "templates use synthetic names that cannot resolve: those jobs would measure the prefetch "
             "failure path. Pass --shared-lora/--unique-lora with resolvable references, or --no-loras.",
         )
@@ -1422,8 +1422,8 @@ def _run_soak(args: argparse.Namespace) -> int:
             ensure_model_reference_manager_initialized()
         except Exception as reference_error:  # noqa: BLE001 - a reference miss degrades records, not the run
             logger.warning(
-                f"Could not initialize the model reference ({type(reference_error).__name__}); soak records "
-                "will carry stubbed baselines.",
+                f"Could not initialize the model reference ({type(reference_error).__name__}). Soak records "
+                "will use placeholder baselines.",
             )
 
     stats_dir = default_stats_dir()

@@ -509,7 +509,7 @@ def verify_suggestion_consistency(report: CapabilityReport) -> list[str]:
             continue
         decision = by_setting.get(setting)
         if decision is None:
-            problems.append(f"{setting} is set but carries no provenance decision.")
+            problems.append(f"{setting} is set but does not have a recorded reason.")
         elif decision.basis != SuggestionBasis.PROVEN:
             problems.append(f"{setting} is enabled on a '{decision.basis}' basis, not a proven pass.")
     return problems

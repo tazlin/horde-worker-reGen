@@ -289,7 +289,7 @@ def build_replay_job_rows(payloads: Iterable[Mapping[str, Any]]) -> ReplayJobStr
             continue
         rows.append(_replay_job_row(record, popped=record.time_popped, session_start=session_start))
     if session_start is None:
-        raise ReplayFixtureError("the stats files carry no session_start row")
+        raise ReplayFixtureError("the stats files do not include a session_start row")
     rows.sort(key=lambda row: row.offset_s)
     return ReplayJobStream(session_start_epoch=session_start, rows=rows, unpopped_count=unpopped_count)
 

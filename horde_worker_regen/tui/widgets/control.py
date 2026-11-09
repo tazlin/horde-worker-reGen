@@ -127,7 +127,7 @@ class ControlView(VerticalScroll):
 
         help_text = Text(
             "Pause stops new pops and lets in-flight jobs finish. "
-            "Horde maintenance asks the horde to stop sending work.",
+            "Horde maintenance pauses jobs being sent to the worker.",
             style="grey62",
         )
         return Panel(Group(table, help_text), title="Control state", title_align="left", border_style="grey37")
