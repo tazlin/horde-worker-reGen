@@ -768,7 +768,29 @@
     {
       "decisions": [
         {
-          "inputs": {},
+          "inputs": {
+            "admit_reason": "measured load attempt: candidate does not fit the instantaneous reading but the card is empty and the demand is under the achievable ceiling; admitting one real load to let measured reality decide",
+            "available_mb": 13826.8,
+            "candidate_delta_mb": 14573.0,
+            "device_free_mb": 14646.0,
+            "device_index": null,
+            "hold_seconds": 10.0,
+            "is_head_of_queue": true,
+            "measured_attempt": true,
+            "model": "Flux.1-Schnell fp8 (Compact)",
+            "noise_buffer_mb": 819.2,
+            "outstanding_reservations_mb": 0.0,
+            "probe_state": "in_progress",
+            "reclaim_applied": false,
+            "reclaim_applied_kinds": "",
+            "reclaim_requested": false,
+            "reclaim_requested_kinds": "",
+            "starved_seconds": 10.0,
+            "whole_card_measured_mb": null,
+            "whole_card_observations": 0,
+            "whole_card_retired_by_measurement": false,
+            "whole_card_wants": true
+          },
           "kind": "inference_dispatch",
           "reason": "dispatch_admitted",
           "subject": "job-2",

@@ -14360,11 +14360,33 @@ class InferenceScheduler:
         verdict = outcome.verdict
         device_index = outcome.device_index
 
+        room = verdict.room
         if verdict.admits:
-            self._resolve_dispatch_hold(next_job, measured_attempt=verdict.measured_attempt)
+            admit_inputs: FlatScalarMap | None = None
+            if next_job.id_ is not None and str(next_job.id_) in self._dispatch_holds.hold_since:
+                # Only a held job gets a resolving record, so the admitting figures are built only for one. The
+                # hold's own records show why the job waited, and this one shows what the arbiter measured when
+                # it let the job through.
+                admit_room_inputs: FlatScalarMap = dict(
+                    self._dispatch_hold_context_inputs(next_job, device_index=device_index),
+                )
+                if room is not None:
+                    admit_room_inputs.update(room.as_inputs())
+                admit_inputs = self._dispatch_decision_inputs(
+                    next_job,
+                    outcome,
+                    is_head_of_queue=is_head_of_queue,
+                    room_inputs=admit_room_inputs,
+                )
+                admit_inputs["admit_reason"] = verdict.reason
+                admit_inputs["measured_attempt"] = verdict.measured_attempt
+            self._resolve_dispatch_hold(
+                next_job,
+                measured_attempt=verdict.measured_attempt,
+                decision_inputs=admit_inputs,
+            )
             return False
 
-        room = verdict.room
         hold_context = self._dispatch_hold_context_inputs(next_job, device_index=device_index)
         room_inputs: FlatScalarMap = dict(hold_context)
         if room is not None:
@@ -14471,7 +14493,7 @@ class InferenceScheduler:
         is_head_of_queue: bool,
         room_inputs: FlatScalarMap,
     ) -> FlatScalarMap:
-        """Return the terms a dispatch-gate decision record reports for a verdict that does not admit."""
+        """Return the terms a dispatch-gate decision record reports for a verdict."""
         measured = outcome.verdict.measured
         candidate_delta_mb = outcome.candidate_delta_mb
         inputs: FlatScalarMap = {

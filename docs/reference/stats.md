@@ -157,6 +157,11 @@ judged against: `room_candidate_mb`, `room_available_mb`, `room_deficit_mb`, `ro
 `whole_card_wants`, `whole_card_retired_by_measurement`, `whole_card_measured_mb`,
 `whole_card_observations`. The hold WARNING in the log renders the same figures on one line.
 
+The record that resolves a dispatch hold as `dispatch_admitted` has the figures of the admitting pass:
+`candidate_delta_mb`, `device_free_mb`, `available_mb`, `outstanding_reservations_mb` and `noise_buffer_mb`,
+the standing fields above, `admit_reason` (the arbiter's reason for the admitting verdict) and
+`measured_attempt`. A dispatch that was never held writes no decision record.
+
 For a safety process with fixed multi-GPU residency, `tenancy_safety_mb` is never lower than the learned-or-seed
 safety footprint and `safety_off_gpu` is omitted from the room's rung fields entirely: it is capacity the card
 cannot offer, not a currently forbidden action an operator setting could unlock. A job held because the safety

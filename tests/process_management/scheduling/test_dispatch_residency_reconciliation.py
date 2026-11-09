@@ -189,6 +189,46 @@ class TestGatePredicate:
         assert scheduler.dispatch_holds.released_by_reclaim == 0
         assert scheduler.dispatch_holds.released_by_natural_free == 1
 
+    async def test_the_record_that_releases_a_hold_reports_the_admitting_verdict(self) -> None:
+        """A held dispatch that is then admitted records the figures the admission was decided on.
+
+        The hold's own records show why the job waited. Only the admitting pass shows what room the arbiter
+        measured when it let the job through, which is the figure needed to judge an admission afterwards.
+        """
+        scheduler, job, target = await _scheduler_without_sibling()
+        decision_sink = Mock(return_value=None)
+        scheduler._decision_sink = decision_sink
+
+        _install_cycle(scheduler, _over_committed_state())
+        assert scheduler._dispatch_residency_reconciliation_holds(job, target) is True
+        _install_cycle(scheduler, _fitting_state())
+        assert scheduler._dispatch_residency_reconciliation_holds(job, target) is False
+
+        admitted = [
+            call.kwargs for call in decision_sink.call_args_list if call.kwargs["reason"] == "dispatch_admitted"
+        ]
+        assert len(admitted) == 1
+        inputs = admitted[0]["inputs"]
+        assert inputs is not None
+        assert inputs["model"] == "model_a"
+        assert inputs["device_free_mb"] == round(_fitting_state().device_free_mb, 1)
+        assert inputs["candidate_delta_mb"] is not None
+        assert inputs["available_mb"] is not None
+        assert "admit_reason" in inputs
+        assert inputs["measured_attempt"] is False
+
+    async def test_a_dispatch_that_was_never_held_records_no_admission(self) -> None:
+        """A first-pass admit writes no decision record, so the admitting figures are not computed for it."""
+        scheduler, job, target = await _scheduler_without_sibling()
+        decision_sink = Mock(return_value=None)
+        scheduler._decision_sink = decision_sink
+        scheduler._dispatch_decision_inputs = Mock(wraps=scheduler._dispatch_decision_inputs)  # type: ignore[method-assign]
+
+        _install_cycle(scheduler, _fitting_state())
+        assert scheduler._dispatch_residency_reconciliation_holds(job, target) is False
+
+        scheduler._dispatch_decision_inputs.assert_not_called()
+
 
 _SMALL_CARD_INDEX = 1
 """The card holding the head's copy in the reroute tests."""

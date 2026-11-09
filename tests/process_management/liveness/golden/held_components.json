@@ -411,7 +411,29 @@
     {
       "decisions": [
         {
-          "inputs": {},
+          "inputs": {
+            "admit_reason": "the candidate fits the measured available room",
+            "available_mb": 13442.8,
+            "candidate_delta_mb": 8258.0,
+            "device_free_mb": 14262.0,
+            "device_index": null,
+            "hold_seconds": 14.0,
+            "is_head_of_queue": true,
+            "measured_attempt": false,
+            "model": "sdxl-checkpoint",
+            "noise_buffer_mb": 819.2,
+            "outstanding_reservations_mb": 0.0,
+            "probe_state": "eligible",
+            "reclaim_applied": false,
+            "reclaim_applied_kinds": "",
+            "reclaim_requested": false,
+            "reclaim_requested_kinds": "",
+            "starved_seconds": 14.0,
+            "whole_card_measured_mb": null,
+            "whole_card_observations": 0,
+            "whole_card_retired_by_measurement": false,
+            "whole_card_wants": false
+          },
           "kind": "inference_dispatch",
           "reason": "dispatch_admitted",
           "subject": "job-1",
