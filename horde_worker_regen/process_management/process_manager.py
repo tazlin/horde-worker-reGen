@@ -6514,10 +6514,13 @@ class HordeWorkerProcessManager:
         """Fan a finalized job out to the run metrics (stage latencies) and the performance model (calibration).
 
         Also releases the job's dispatch VRAM reservation explicitly, tightening the latency between completion
-        and the reservation clearing; reconcile-by-omission is still the correctness guarantee.
+        and the reservation clearing; reconcile-by-omission is still the correctness guarantee. The recovery
+        coordinator receives the outcome too, because the tracker deletes the job here and a recovery baseline
+        job that submitted is progress.
         """
         self._run_metrics.on_job_finalized(tracked, completed_job_info)
         self._performance_model.on_job_finalized(tracked, completed_job_info)
+        self._recovery_coordinator.on_job_finalized(tracked, completed_job_info)
         self._inference_scheduler.release_dispatch_reservation(tracked.sdk_api_job_info)
         # Finalization is the end of the line: a job that arrives here faulted has exhausted its retries
         # (or was never retryable), so its id is recorded for the canned sources to skip.

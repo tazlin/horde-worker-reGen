@@ -20,11 +20,13 @@ from horde_worker_regen.process_management.config.worker_state import (
 )
 from horde_worker_regen.process_management.ipc.action_ledger import ActionLedger, LedgerEventType
 from horde_worker_regen.process_management.ipc.message_dispatcher import MessageDispatcher
+from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
 from horde_worker_regen.process_management.jobs.job_tracker import (
     JobFaultOrigin,
     JobStage,
     JobTracker,
     PostProcessingFaultCause,
+    TrackedJob,
 )
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_lifecycle import ProcessLifecycleManager
@@ -290,6 +292,9 @@ class WorkerRecoveryCoordinator:
         self.episode_inference_start_baseline: int | None = None
         self.episode_post_processing_progress_baseline: int | None = None
         self.episode_frontier_baseline: tuple[GenerationID, JobStage] | None = None
+        # Finalize stops tracking a job whether it submitted or faulted, so the frontier check cannot read the
+        # baseline job's outcome from the tracker afterwards. Only the current baseline job's outcome is kept.
+        self.episode_frontier_baseline_submitted = False
         self.unrelated_progress_deferral_spent = False
         self.recovery_event_times: list[float] = []
         self.last_seen_recovery_count = 0
@@ -943,13 +948,15 @@ class WorkerRecoveryCoordinator:
     def _capture_progress_baseline(self) -> None:
         """Snapshot the progress counters as the reference for :meth:`made_progress_since_episode`.
 
-        Taken when a wedge episode opens and re-taken on every soft reset, so ``made_progress`` measures
-        forward motion since the most recent recovery attempt rather than since the episode began.
+        Taken when a wedge episode opens and re-taken on every soft reset and after every give-up, so
+        ``made_progress`` measures forward motion since the most recent recovery attempt rather than since the
+        episode began.
         """
         self.episode_progress_baseline = self._job_tracker.total_num_successful_submits
         self.episode_inference_start_baseline = self._job_tracker.total_num_inference_starts
         self.episode_post_processing_progress_baseline = self._job_tracker.total_num_post_processing_progress
         self.episode_frontier_baseline = self._current_recovery_frontier()
+        self.episode_frontier_baseline_submitted = False
 
     def _current_recovery_frontier(self) -> tuple[GenerationID, JobStage] | None:
         """Return the oldest nonterminal accepted job and its current stage.
@@ -970,8 +977,8 @@ class WorkerRecoveryCoordinator:
     def made_progress_since_episode(self) -> bool:
         """Return whether accepted work moved forward since the most recent recovery baseline.
 
-        The baseline is captured when the episode opens and re-captured on each soft reset, so this reports
-        progress since the latest soft reset once one has been attempted.
+        The baseline is captured when the episode opens and re-captured on each soft reset and after each
+        give-up, so this reports progress since the latest of those recovery actions.
 
         When accepted work has a frontier, only movement of that same oldest unresolved job counts. Aggregate
         counters remain a fallback for pool-level episodes with no accepted frontier. They are also observed
@@ -984,10 +991,15 @@ class WorkerRecoveryCoordinator:
         return self._worker_progress_since_episode()
 
     def _frontier_made_progress(self) -> bool:
-        """Return whether the baseline head advanced rather than faulting or retrying."""
+        """Return whether the baseline head advanced rather than faulting or retrying.
+
+        A baseline job finalized as submitted counts. One finalized as faulted does not.
+        """
         baseline = self.episode_frontier_baseline
         if baseline is None:
             return False
+        if self.episode_frontier_baseline_submitted:
+            return True
         baseline_job_id, baseline_stage = baseline
         current = self._current_recovery_frontier()
         if current == baseline:
@@ -1001,6 +1013,22 @@ class WorkerRecoveryCoordinator:
         if current is None or current[0] != baseline_job_id:
             return tracked.stage is JobStage.PENDING_SUBMIT
         return current[1].value > baseline_stage.value
+
+    def on_job_finalized(self, tracked: TrackedJob, completed_job_info: HordeJobInfo) -> None:
+        """Record whether the current baseline job was finalized as submitted.
+
+        A faulted finalize is not recorded, because a fault is never proof that the worker can serve work.
+
+        Args:
+            tracked: The job's final tracked state, read before the tracker deletes it.
+            completed_job_info: The finalized job info. Its state tells a submitted job from a faulted one.
+        """
+        baseline = self.episode_frontier_baseline
+        if baseline is None or tracked.job_id != baseline[0]:
+            return
+        if completed_job_info.state == GENERATION_STATE.faulted:
+            return
+        self.episode_frontier_baseline_submitted = True
 
     def _worker_progress_since_episode(self) -> bool:
         """Return whether aggregate completion or stage counters advanced since the episode baseline."""
@@ -1109,6 +1137,7 @@ class WorkerRecoveryCoordinator:
         self.episode_inference_start_baseline = None
         self.episode_post_processing_progress_baseline = None
         self.episode_frontier_baseline = None
+        self.episode_frontier_baseline_submitted = False
         self.unrelated_progress_deferral_spent = False
         self.episode_saw_unrecoverable_pool = False
         self.pp_reclaim_remedy_issued_at = None
@@ -1288,6 +1317,11 @@ class WorkerRecoveryCoordinator:
                     self.give_up_yields_spent += 1
             else:
                 self.give_up_on_wedged_jobs(terminal=self.recovery_supervisor.give_up_is_terminal)
+                # The give-up may have faulted the baseline job, and a faulted baseline never reads as progress,
+                # so without a fresh baseline the episode could not close for the rest of the session. The
+                # faulted jobs wait in PENDING_SUBMIT, which the frontier excludes, and they do not move the
+                # aggregate counters. The give-up and its faults therefore cannot read as progress.
+                self._capture_progress_baseline()
         elif self.limp_by_active and not self.recovery_supervisor.is_in_episode:
             self.limp_by_active = False
             logger.info("Save-our-ship: pools recovered (soft-reset episode cleared).")

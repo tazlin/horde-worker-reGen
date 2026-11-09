@@ -754,7 +754,10 @@ manager-side **actions**:
 
   When accepted work exists, the progress signal is movement of the episode's
   recovery frontier: the oldest unresolved accepted job must advance to a later stage
-  or complete successfully. Faulting or requeueing that head is not progress the
+  or be finalized as submitted. Finalize stops tracking a job whether it submitted
+  or faulted, so the coordinator receives the baseline job's outcome from the
+  tracker's finalize observer (fanned out by `HordeWorkerProcessManager._on_job_finalized`)
+  and keeps only that one outcome. Faulting or requeueing that head is not progress the
   recovery path may use to prove itself. A follower starting or completing cannot prove that an unchanged
   blocked head recovered. Aggregate submit and stage counters remain the
   fallback for pool-level episodes with no accepted frontier. Their end-to-end
@@ -765,8 +768,15 @@ manager-side **actions**:
   advances while the frontier does not, it may earn one observation interval for
   that throughput to reach the head; this delay neither closes the episode nor
   consumes a reset/give-up rung, and it cannot repeat within the episode. The
-  baseline is captured when the episode opens and re-captured after a soft reset,
-  so recovery credit always describes motion since the latest recovery attempt.
+  baseline is captured when the episode opens and re-captured after a soft reset
+  and after a give-up, so recovery credit always describes motion since the latest
+  recovery attempt. The give-up's re-capture matters because the give-up often
+  faults the baseline job itself, and a faulted baseline never reads as progress:
+  without a fresh baseline the episode could not close for the rest of the session.
+  The give-up's own faults cannot prove recovery either. They wait in
+  `PENDING_SUBMIT`, which the frontier excludes, and they do not move the
+  aggregate counters. Escalation state is otherwise kept, so the episode closes
+  through the ordinary clean streak once new work advances.
 
 The escalation, in order:
 
