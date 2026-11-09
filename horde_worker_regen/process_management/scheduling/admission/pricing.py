@@ -450,15 +450,17 @@ def candidate_delta_mb(
     *,
     process_id: int | None,
     disaggregated: bool,
+    co_tenant_discount: bool = True,
 ) -> float | None:
     """The job's marginal predicted VRAM (MB) for the measured overlay, net of resident-weight credit.
 
     Sampler-only for a disaggregation-class job, and for a job sharing its card with an extra-large co-tenant
-    (:func:`prices_sampler_only_on_card`); the whole-job sampling peak otherwise.
+    (:func:`prices_sampler_only_on_card`); the whole-job sampling peak otherwise. ``co_tenant_discount`` False
+    drops the co-tenant case, which prices the job as it stands once the card's running jobs have ended.
     """
     slot = snapshot.slots.get(process_id) if process_id is not None else None
     device_index = snapshot.routing_device_index(slot) if slot is not None else None
-    sampler_only = disaggregated or prices_sampler_only_on_card(snapshot, job, device_index)
+    sampler_only = disaggregated or (co_tenant_discount and prices_sampler_only_on_card(snapshot, job, device_index))
     static_gross_mb = (
         predict_job_sampler_only_vram_mb(job, baseline)
         if sampler_only

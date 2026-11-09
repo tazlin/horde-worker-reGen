@@ -265,6 +265,66 @@ class TestSchedulingSnapshot:
         assert snapshot.card(1) is snapshot.cards[1]
         assert snapshot.slots_of_type(HordeProcessType.INFERENCE) == (snapshot.slots[0],)
 
+    async def test_a_pending_job_holds_the_slots_whose_card_cannot_seat_it(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """On a two-card host each pending job freezes the slots the seat predicate refuses, now and once free.
+
+        The predicate is read at build, so a later change to it does not reach a built snapshot. The once-free set
+        is filled only for a job with a slot refused now.
+        """
+        small = make_mock_process_info(0, model_name="sd", state=HordeProcessState.WAITING_FOR_JOB)
+        small.device_index = 1
+        large = make_mock_process_info(1, model_name="xl", state=HordeProcessState.WAITING_FOR_JOB)
+        large.device_index = 0
+        job_tracker = JobTracker()
+        scheduler = _make_inference_scheduler(
+            process_map=ProcessMap({0: small, 1: large}),
+            job_tracker=job_tracker,
+            card_runtimes=make_test_card_runtimes(device_indices=(0, 1)),
+            device_free_mb=6000.0,
+        )
+        head = make_job_pop_response(model="sd")
+        await track_popped_job_async(job_tracker, head)
+        monkeypatch.setattr(scheduler, "_eligible_card_indices", lambda _job: {0, 1})
+        refused: set[int] = {0}
+        refused_when_free: set[int] = {0, 1}
+
+        def can_seat(_snapshot: SchedulingSnapshot, _job_id: str, process_id: int, *, when_free: bool = False) -> bool:
+            return process_id not in (refused_when_free if when_free else refused)
+
+        monkeypatch.setattr(_sched_mod, "preload_slot_can_seat", can_seat)
+
+        snapshot = scheduler.snapshot()
+        refused.clear()
+        refused_when_free.clear()
+
+        head_id = snapshot.queue.head()
+        assert head_id is not None
+        head_job = snapshot.queue.jobs[head_id]
+        assert head_job.eligible_cards == frozenset({0, 1})
+        assert head_job.unseatable_process_ids == frozenset({0})
+        assert head_job.unseatable_when_free_process_ids == frozenset({0, 1})
+        rebuilt = scheduler.snapshot().queue.jobs[head_id]
+        assert rebuilt.unseatable_process_ids == frozenset()
+        assert rebuilt.unseatable_when_free_process_ids == frozenset(), "not filled without a slot refused now"
+
+    async def test_a_single_card_host_reads_every_slot_as_seatable(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A single card has no other card to skip to, so the seat predicate is not read and every slot can seat."""
+        snapshot, scheduler = await self._scheduler()
+
+        def refuse(_snapshot: SchedulingSnapshot, _job_id: str, _process_id: int, *, when_free: bool = False) -> bool:
+            raise AssertionError("the seat predicate was read on a single-card host")
+
+        monkeypatch.setattr(_sched_mod, "preload_slot_can_seat", refuse)
+
+        rebuilt = scheduler.snapshot()  # type: ignore[attr-defined]
+
+        for job in (*snapshot.queue.jobs.values(), *rebuilt.queue.jobs.values()):
+            assert job.unseatable_process_ids == frozenset()
+            assert job.unseatable_when_free_process_ids == frozenset()
+
     async def test_the_card_count_excludes_the_worker_wide_view(self) -> None:
         """``card_count`` counts real cards only, so a bound expressed in cards is not inflated by one.
 

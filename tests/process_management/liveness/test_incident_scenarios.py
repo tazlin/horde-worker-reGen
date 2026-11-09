@@ -8895,6 +8895,358 @@ async def test_mixed_cards_a_residency_on_the_heads_own_card_holds_it_until_conv
     )
 
 
+@dataclass
+class SeatCheckRow:
+    """The finished world after a head whose preload price exceeds the small card's ceiling waits on mixed cards."""
+
+    world: _DispatchWorld
+    long_job: ImageGenerateJobPopResponse
+    head: ImageGenerateJobPopResponse
+    small_jobs: list[ImageGenerateJobPopResponse]
+    unseatable_at_queue: frozenset[int]
+    """The head's unseatable slots in the snapshot taken as it was queued."""
+    small_card_reserved_ticks: list[int]
+    """Ticks on which the small card held a whole-card residency for the head's model."""
+    small_card_head_load_ticks: list[int]
+    """Ticks on which the small card's lane held or was loading the head's model."""
+
+
+async def drive_krea2_head_beside_a_busy_large_card() -> SeatCheckRow:
+    """Queue a Krea2 head and SD 1.5 jobs while the large card's only lane runs a long SDXL job.
+
+    Each card has one lane. The small card is idle and holds SD 1.5. Krea2's static price fits the large card's
+    ceiling and exceeds the small card's, and the store holds no Krea2 reading for either card, so both cards
+    price it from the seed.
+    """
+    long_job = make_job_pop_response(_SDXL.name, width=1024, height=1024, ddim_steps=30)
+    head = make_job_pop_response(_KREA2.name, width=1024, height=1024, ddim_steps=4)
+    small_jobs = [make_job_pop_response(_SD15.name, width=512, height=512, ddim_steps=20) for _ in range(3)]
+    world = _DispatchWorld(
+        card=_CARD_24GB,
+        lane_count=2,
+        max_threads=1,
+        queue_depth=5,
+        whole_card_enabled=True,
+        closed_loop=True,
+        tick_seconds=1.0,
+        card_max_pixels=_MIXED_CARD_PIXELS,
+        card_total_mb=_MIXED_CARD_TOTALS,
+        service_contexts=True,
+        safety_card_index=0,
+        post_process_card_index=1,
+        sample_seconds_by_job={str(long_job.id_): _MIXED_CARD_LONG_SAMPLE_SECONDS},
+        extra_model_classes=(_KREA2,),
+    )
+    assert world.card_of_lane(0) == 0 and world.card_of_lane(1) == 1, "precondition: one lane per card"
+    world.seed_resident(0, _SDXL, in_vram=True)
+    world.seed_resident(1, _SD15, in_vram=True)
+    await world.pop(long_job)
+    for _ in range(2):
+        await world.step()
+    await world.pop(head)
+    for job in small_jobs:
+        await world.pop(job)
+    unseatable_at_queue = world.scheduler.snapshot().queue.jobs[str(head.id_)].unseatable_process_ids
+    small_card_lane = world._process_map[1]
+    reserved_ticks: list[int] = []
+    load_ticks: list[int] = []
+    for _ in range(_MIXED_CARD_TICKS):
+        await world.step()
+        if any(
+            device_index == 1 and state.model == _KREA2.name
+            for device_index, state in world.scheduler._whole_card_ledger.held()
+        ):
+            reserved_ticks.append(world.tick)
+        map_entry = world.scheduler._horde_model_map.root.get(_KREA2.name)
+        if small_card_lane.loaded_horde_model_name == _KREA2.name or (
+            map_entry is not None and map_entry.process_id == small_card_lane.process_id
+        ):
+            load_ticks.append(world.tick)
+    return SeatCheckRow(
+        world=world,
+        long_job=long_job,
+        head=head,
+        small_jobs=small_jobs,
+        unseatable_at_queue=unseatable_at_queue,
+        small_card_reserved_ticks=reserved_ticks,
+        small_card_head_load_ticks=load_ticks,
+    )
+
+
+async def test_mixed_cards_a_head_the_small_card_cannot_seat_waits_for_the_large_card() -> None:
+    """A Krea2 head the small card cannot seat waits for the large card, and the small card serves its queue.
+
+    The large card's only lane is busy, so the small card's idle lane is the only free slot. Its ceiling is below
+    the head's preload price, so the arbiter would deny the head there on every pass, and the whole-card demand
+    would reserve the small card for a model it cannot run. The preload target skips the small card because the
+    large card can seat the head. The head then samples on the large card once its long job ends, and the SD 1.5
+    jobs queued behind the head run on the small card in the meantime.
+    """
+    row = await drive_krea2_head_beside_a_busy_large_card()
+    world = row.world
+    context = "Krea2 head the small card cannot seat, large card busy"
+
+    assert row.unseatable_at_queue == frozenset({1}), (
+        f"{context}: precondition: the snapshot must mark only the small card's lane unable to seat the head, "
+        f"not {sorted(row.unseatable_at_queue)}. {world.state_dump()}"
+    )
+    assert not row.small_card_reserved_ticks, (
+        f"{context}: the small card held a whole-card residency for Krea2 on tick(s) "
+        f"{row.small_card_reserved_ticks[:6]}, though its ceiling cannot seat Krea2. {world.state_dump()}"
+    )
+    assert not row.small_card_head_load_ticks, (
+        f"{context}: the small card's lane held or loaded Krea2 on tick(s) {row.small_card_head_load_ticks[:6]}. "
+        f"{world.state_dump()}"
+    )
+    assert not world.structural_queue_wedges, (
+        f"{context}: the queue-deadlock detector reported a wedge past the horizon on tick(s) "
+        f"{world.structural_queue_wedges[:6]}, which makes save-our-ship soft-reset the pools. {world.state_dump()}"
+    )
+    long_window = world.job_windows.get(str(row.long_job.id_))
+    assert long_window is not None and long_window.sample_until is not None, (
+        f"{context}: precondition: the large card's long job must finish. {world.state_dump()}"
+    )
+    run_started_at = world.now - world.tick * world.tick_seconds
+    large_card_free_tick = int((long_window.sample_until - run_started_at) / world.tick_seconds)
+    dispatch_tick = world.dispatch_tick(row.head)
+    assert dispatch_tick is not None, (
+        f"{context}: the Krea2 head never sampled, though the large card was free from about tick "
+        f"{large_card_free_tick}. {world.state_dump()}"
+    )
+    head_lanes = [lane for model, lane in world.dispatch_lanes if model == _KREA2.name]
+    assert head_lanes and all(world._card_of(lane) == 0 for lane in head_lanes), (
+        f"{context}: the Krea2 head was dispatched to lane(s) {head_lanes}, not on the large card. "
+        f"{world.state_dump()}"
+    )
+    assert dispatch_tick <= large_card_free_tick + _MIXED_CARD_TICK_CEILING, (
+        f"{context}: the Krea2 head reached sampling on tick {dispatch_tick}, more than "
+        f"{_MIXED_CARD_TICK_CEILING} ticks after the large card freed on tick {large_card_free_tick}. "
+        f"{world.state_dump()}"
+    )
+    late = [
+        str(job.id_)[:8]
+        for job in row.small_jobs
+        if (tick := world.dispatch_tick(job)) is None or tick >= large_card_free_tick
+    ]
+    assert not late, (
+        f"{context}: SD 1.5 job(s) {late} did not run on the small card before the large card freed on tick "
+        f"{large_card_free_tick}, though the small card holds SD 1.5 and the head cannot use it. "
+        f"{world.state_dump()}"
+    )
+
+
+_NO_SEAT_FOREIGN_FLOOR_MB = 4000.0
+"""Device memory another program holds on each card of the no-seat row.
+
+It lowers each 16 GB card's achievable ceiling below Krea2's weights, so the arbiter offers no measured attempt and
+its ceiling DENY is terminal."""
+
+_NO_SEAT_ROW_TICKS = 40
+"""Ticks the no-seat row runs once the head is queued."""
+
+
+@dataclass
+class NoSeatRow:
+    """The finished world after a Krea2 head that neither card can seat is queued on two equal cards."""
+
+    world: _DispatchWorld
+    head: ImageGenerateJobPopResponse
+    small_job: ImageGenerateJobPopResponse
+    unseatable_at_queue: frozenset[int]
+    skipped_at_queue: frozenset[int]
+
+    @property
+    def head_faults(self) -> list[str]:
+        """The head's recorded faults."""
+        return [str(fault.ref) for fault in self.world.scheduler._job_tracker.job_faults.get(self.head.id_, [])]
+
+
+async def drive_krea2_head_neither_card_can_seat() -> NoSeatRow:
+    """Queue a Krea2 head and an SD 1.5 job on two 16 GB cards whose foreign floors put Krea2 above both ceilings.
+
+    Whole-card residency is off, so the preload budget step reaches the arbiter's verdict directly.
+    """
+    world = _DispatchWorld(
+        card=_CARD_16GB,
+        lane_count=2,
+        max_threads=1,
+        queue_depth=3,
+        whole_card_enabled=False,
+        closed_loop=True,
+        tick_seconds=1.0,
+        card_max_pixels=_MIXED_CARD_PIXELS,
+        card_total_mb={0: _MIXED_CARD_TOTALS[1], 1: _MIXED_CARD_TOTALS[1]},
+        foreign_vram_mb_by_card={0: {1: _NO_SEAT_FOREIGN_FLOOR_MB}, 1: {1: _NO_SEAT_FOREIGN_FLOOR_MB}},
+        lane_reports_carry_context=True,
+        extra_model_classes=(_KREA2,),
+    )
+    world.scheduler._foreign_floor_clock = lambda: world.now
+    for _ in range(_FOREIGN_FLOOR_WARMUP_TICKS):
+        await world.step()
+    head = make_job_pop_response(_KREA2.name, width=1024, height=1024, ddim_steps=4)
+    small_job = make_job_pop_response(_SD15.name, width=512, height=512, ddim_steps=20)
+    await world.pop(head)
+    await world.pop(small_job)
+    snapshot = world.scheduler.snapshot()
+    job = snapshot.queue.jobs[str(head.id_)]
+    skipped = preload_mod.slots_unable_to_seat(snapshot, job)
+    for _ in range(_NO_SEAT_ROW_TICKS):
+        await world.step()
+    return NoSeatRow(
+        world=world,
+        head=head,
+        small_job=small_job,
+        unseatable_at_queue=job.unseatable_process_ids,
+        skipped_at_queue=skipped,
+    )
+
+
+async def test_mixed_cards_a_head_neither_card_can_seat_is_faulted_as_unroutable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Krea2 head that neither card can seat is faulted as unroutable, as it is without the seat check.
+
+    Both cards' ceilings are below the head's price, so the seat check does not skip either card. The preload
+    budget step then faults the head with a ceiling hold, and the SD 1.5 job behind it runs.
+    The same row with the seat check removed ends the same way.
+    """
+    row = await drive_krea2_head_neither_card_can_seat()
+    world = row.world
+    context = "Krea2 head neither card can seat"
+
+    lanes = frozenset(world.inference_lane_ids())
+    assert row.unseatable_at_queue == lanes, (
+        f"{context}: precondition: every lane must be unable to seat the head, not only "
+        f"{sorted(row.unseatable_at_queue)}. {world.state_dump()}"
+    )
+    assert row.skipped_at_queue == frozenset(), (
+        f"{context}: the seat check skipped lane(s) {sorted(row.skipped_at_queue)} though neither card can seat "
+        f"the head. {world.state_dump()}"
+    )
+    assert any("unroutable head (ceiling hold)" in fault for fault in row.head_faults), (
+        f"{context}: the head was not faulted as unroutable ({row.head_faults}). {world.state_dump()}"
+    )
+    assert world.dispatch_tick(row.head) is None, f"{context}: the head sampled. {world.state_dump()}"
+    small_tick = world.dispatch_tick(row.small_job)
+    assert small_tick is not None, f"{context}: the SD 1.5 job never ran. {world.state_dump()}"
+
+    monkeypatch.setattr(preload_mod, "slots_unable_to_seat", lambda _snapshot, _job: frozenset())
+    unchecked = await drive_krea2_head_neither_card_can_seat()
+    assert unchecked.head_faults == row.head_faults, (
+        f"{context}: without the seat check the head's faults are {unchecked.head_faults}, not {row.head_faults}. "
+        f"{unchecked.world.state_dump()}"
+    )
+    assert unchecked.world.dispatch_tick(unchecked.small_job) == small_tick, (
+        f"{context}: without the seat check the SD 1.5 job ran on tick "
+        f"{unchecked.world.dispatch_tick(unchecked.small_job)}, not {small_tick}. {unchecked.world.state_dump()}"
+    )
+
+
+_EQUAL_CARD_TICKS = 60
+"""Ticks the equal-card row runs once the queue is filled: the head's measured attempt and the SD 1.5 queue."""
+
+
+@dataclass
+class EqualCardRow:
+    """The finished world after a Krea2 head is queued on two equal 16 GB cards while one card runs a long job."""
+
+    world: _DispatchWorld
+    head: ImageGenerateJobPopResponse
+    small_jobs: list[ImageGenerateJobPopResponse]
+    unseatable_at_queue: frozenset[int]
+    unseatable_when_free_at_queue: frozenset[int]
+    skipped_at_queue: frozenset[int]
+
+
+async def drive_krea2_head_on_equal_cards_beside_a_busy_card() -> EqualCardRow:
+    """Queue a Krea2 head and SD 1.5 jobs on two 16 GB cards, one lane each, while card 0 runs a long SDXL job.
+
+    Both cards are eligible for Krea2. Card 0's running job gives Krea2 the sampler-only price there, which fits the
+    ceiling, while the idle card 1 prices the whole job above it. Once card 0's job ends its price matches card 1's.
+    """
+    long_job = make_job_pop_response(_SDXL.name, width=1024, height=1024, ddim_steps=30)
+    head = make_job_pop_response(_KREA2.name, width=1024, height=1024, ddim_steps=4)
+    small_jobs = [make_job_pop_response(_SD15.name, width=512, height=512, ddim_steps=20) for _ in range(3)]
+    small_card_total_mb = _MIXED_CARD_TOTALS[1]
+    world = _DispatchWorld(
+        card=_CARD_16GB,
+        lane_count=2,
+        max_threads=1,
+        queue_depth=5,
+        whole_card_enabled=True,
+        closed_loop=True,
+        tick_seconds=1.0,
+        card_max_pixels=_MIXED_CARD_PIXELS,
+        card_total_mb={0: small_card_total_mb, 1: small_card_total_mb},
+        sample_seconds_by_job={str(long_job.id_): _MIXED_CARD_LONG_SAMPLE_SECONDS},
+        extra_model_classes=(_KREA2,),
+    )
+    assert world.card_of_lane(0) == 0 and world.card_of_lane(1) == 1, "precondition: one lane per card"
+    world.seed_resident(0, _SDXL, in_vram=True)
+    world.seed_resident(1, _SD15, in_vram=True)
+    await world.pop(long_job)
+    for _ in range(2):
+        await world.step()
+    await world.pop(head)
+    for job in small_jobs:
+        await world.pop(job)
+    snapshot = world.scheduler.snapshot()
+    job = snapshot.queue.jobs[str(head.id_)]
+    skipped = preload_mod.slots_unable_to_seat(snapshot, job)
+    for _ in range(_EQUAL_CARD_TICKS):
+        await world.step()
+    return EqualCardRow(
+        world=world,
+        head=head,
+        small_jobs=small_jobs,
+        unseatable_at_queue=job.unseatable_process_ids,
+        unseatable_when_free_at_queue=job.unseatable_when_free_process_ids,
+        skipped_at_queue=skipped,
+    )
+
+
+async def test_equal_cards_a_card_that_seats_the_head_only_while_busy_does_not_divert_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Krea2 head is not kept off the idle card for a card that can seat it only while that card is busy.
+
+    The busy card prices Krea2 sampler-only beside its running job, which fits its ceiling, but its price rises
+    above the ceiling once the job ends. The seat check reads the other card at that once-free price, so it does
+    not skip the idle card, and the head takes the same path and timing as with the seat check removed.
+    """
+    row = await drive_krea2_head_on_equal_cards_beside_a_busy_card()
+    world = row.world
+    context = "Krea2 head on equal cards, one busy"
+
+    assert row.unseatable_at_queue == frozenset({1}), (
+        f"{context}: precondition: at the verdict's price only the idle card's lane must be unable to seat the head, "
+        f"not {sorted(row.unseatable_at_queue)}. {world.state_dump()}"
+    )
+    assert row.unseatable_when_free_at_queue == frozenset({0, 1}), (
+        f"{context}: precondition: once free, neither card can seat the head, but the snapshot lists only "
+        f"{sorted(row.unseatable_when_free_at_queue)}. {world.state_dump()}"
+    )
+    assert row.skipped_at_queue == frozenset(), (
+        f"{context}: the seat check skipped lane(s) {sorted(row.skipped_at_queue)} for a card that can seat the head "
+        f"only while busy. {world.state_dump()}"
+    )
+    dispatch_tick = world.dispatch_tick(row.head)
+    assert dispatch_tick is not None, f"{context}: the Krea2 head never sampled. {world.state_dump()}"
+
+    monkeypatch.setattr(preload_mod, "slots_unable_to_seat", lambda _snapshot, _job: frozenset())
+    unchecked = await drive_krea2_head_on_equal_cards_beside_a_busy_card()
+    checked_path = (dispatch_tick, world.dispatch_lanes, [world.dispatch_tick(job) for job in row.small_jobs])
+    unchecked_path = (
+        unchecked.world.dispatch_tick(unchecked.head),
+        unchecked.world.dispatch_lanes,
+        [unchecked.world.dispatch_tick(job) for job in unchecked.small_jobs],
+    )
+    assert checked_path == unchecked_path, (
+        f"{context}: with the seat check the head tick, dispatch lanes and SD 1.5 ticks are {checked_path}, and "
+        f"without it {unchecked_path}. {world.state_dump()}"
+    )
+
+
 _MIXED_CARD_STREAM_TICKS = 260
 """Ticks the follow-on row runs: past the establish grace and the cooldown after it, with room to regrow."""
 

@@ -23,7 +23,12 @@ from horde_worker_regen.process_management.resources.resource_budget import (
     StreamForecast,
     effective_inference_reserve_mb,
 )
-from horde_worker_regen.process_management.resources.vram_arbiter import VramArbiter, VramRequestKind
+from horde_worker_regen.process_management.resources.vram_arbiter import (
+    VramArbiter,
+    VramRequest,
+    VramRequestKind,
+    card_can_seat,
+)
 from horde_worker_regen.process_management.scheduling.admission import pricing
 from horde_worker_regen.process_management.scheduling.admission.commands import (
     FaultCause,
@@ -580,6 +585,30 @@ def lanes_committed_elsewhere(snapshot: SchedulingSnapshot, model: str | None) -
     )
 
 
+def slots_unable_to_seat(snapshot: SchedulingSnapshot, job: JobSnapshot) -> frozenset[int]:
+    """The inference slots a preload of the job skips because their card could never seat it.
+
+    A slot is skipped when its card cannot seat the job at the verdict's price and some other inference slot on an
+    eligible card can seat it at the price it will have when free (``JobSnapshot.unseatable_when_free_process_ids``).
+    A busy card prices an extra-large job sampler-only, and that discount ends with the card's running job, so the
+    head does not wait for a card that can seat it only while busy. A preload has no reroute. A head placed on
+    a card that cannot seat it is denied there on every pass, and the whole-card demand reserves that card for it.
+    When the job cannot be seated on any eligible card, the check does not skip a slot, and the preload budget step
+    faults the head as unroutable.
+    """
+    unseatable = job.unseatable_process_ids
+    if not unseatable:
+        return frozenset()
+    seatable_elsewhere = any(
+        slot.process_type is HordeProcessType.INFERENCE
+        and slot.device_index in job.eligible_cards
+        and slot.process_id not in unseatable
+        and slot.process_id not in job.unseatable_when_free_process_ids
+        for slot in snapshot.slots.values()
+    )
+    return unseatable if seatable_elsewhere else frozenset()
+
+
 def select_preload_target(snapshot: SchedulingSnapshot, job_id: str, disallowed: Iterable[int] = ()) -> int | None:
     """The inference slot to preload the job's model onto, choosing the card on a multi-GPU host, or None.
 
@@ -589,10 +618,13 @@ def select_preload_target(snapshot: SchedulingSnapshot, job_id: str, disallowed:
     card. A card holding the model with no spare sampling capacity ranks last instead of first, so a second
     copy the queue is waiting on goes to a card that can run it. Lanes committed to other work
     (:func:`lanes_committed_elsewhere`) and slots carrying the queue head's own copy are excluded first on
-    either topology.
+    either topology, and on a multi-GPU host so are slots whose card cannot seat the job
+    (:func:`slots_unable_to_seat`).
     """
     job = snapshot.queue.jobs[job_id]
-    excluded = sorted(set(disallowed) | lanes_committed_elsewhere(snapshot, job.model))
+    excluded = sorted(
+        set(disallowed) | lanes_committed_elsewhere(snapshot, job.model) | slots_unable_to_seat(snapshot, job)
+    )
     head_slots = slots_holding_the_head_model(snapshot, job_id, excluded)
     if head_slots:
         excluded = [*excluded, *head_slots]
@@ -621,12 +653,12 @@ def select_head_room_target(snapshot: SchedulingSnapshot, job_id: str) -> int | 
     """An eligible idle slot to free for a starved head, overriding the affinity and queued-model guards, or None.
 
     Never overrides card eligibility, never takes live work (a pinned disaggregation sampler is live work even
-    while it idles between stages) or a lane committed to other work (:func:`lanes_committed_elsewhere`), and
-    prefers the cheapest displacement.
+    while it idles between stages), a lane committed to other work (:func:`lanes_committed_elsewhere`) or a lane
+    on a card that cannot seat the job (:func:`slots_unable_to_seat`), and prefers the cheapest displacement.
     """
     job = snapshot.queue.jobs[job_id]
     eligible = job.eligible_cards if snapshot.multi_gpu_routing_active else None
-    committed = lanes_committed_elsewhere(snapshot, job.model)
+    committed = lanes_committed_elsewhere(snapshot, job.model) | slots_unable_to_seat(snapshot, job)
     slots = tuple(
         PreloadSlotSnapshot(process_id=slot.process_id, model_name=slot.model, can_accept_job=slot.can_accept_job)
         for slot in snapshot.slots.values()
@@ -684,7 +716,8 @@ def select_follower_room_target(
     (:func:`duplicate_copy_may_serve`), whose bound on copies has already been applied. Candidate lanes are
     idle, on a card eligible for this job and still under its sampling cap, hold no model an in-progress job
     is using, are not being drained for RAM reclaim, are not a pinned disaggregation sampler, are not committed
-    to other work (:func:`lanes_committed_elsewhere`), do not carry a head's copy, and are not a ready seat
+    to other work (:func:`lanes_committed_elsewhere`), are not on a card that cannot seat the job
+    (:func:`slots_unable_to_seat`), do not carry a head's copy, and are not a ready seat
     (:func:`~pricing.ready_seat_process_ids`), since dispatch runs after this pass and would start a job there
     at once.
     :func:`select_follower_room_process_id` ranks what is left by outstanding demand.
@@ -698,7 +731,7 @@ def select_follower_room_target(
     spared = models_spared_from_displacement(snapshot, head_job_id)
     live = pricing.in_progress_models(snapshot)
     ready_seats = pricing.ready_seat_process_ids(snapshot)
-    committed = lanes_committed_elsewhere(snapshot, job.model)
+    committed = lanes_committed_elsewhere(snapshot, job.model) | slots_unable_to_seat(snapshot, job)
     candidates = tuple(
         PreloadSlotSnapshot(
             process_id=slot.process_id,
@@ -890,10 +923,12 @@ def _decide_preload_gate_ladder(
     # A cold copy is an optimisation for a head that already has a resident lane, so it never escalates as the
     # head and takes neither the displacement fallback nor head-priority pricing and reclaim.
     is_head_blocker = head_job_id is not None and job_id == head_job_id and not cold_copy
-    # The commitment joins the plan's disallowed set as well as every selector below, so a target re-selected
-    # after admission retired the chosen one is held to it too.
-    disallowed = frozenset(preload_disallowed_processes(snapshot, job)) | lanes_committed_elsewhere(
-        snapshot, job.model
+    # The commitment and the seat check join the plan's disallowed set as well as every selector below, so a
+    # target re-selected after admission retired the chosen one is held to them too.
+    disallowed = (
+        frozenset(preload_disallowed_processes(snapshot, job))
+        | lanes_committed_elsewhere(snapshot, job.model)
+        | slots_unable_to_seat(snapshot, job)
     )
     admit_reason = "gates passed"
     if cold_copy:
@@ -1027,7 +1062,13 @@ class PricedPreload:
         return self.priced.max_resident
 
 
-def preload_candidate_delta_mb(snapshot: SchedulingSnapshot, job_id: str, process_id: int | None) -> float | None:
+def preload_candidate_delta_mb(
+    snapshot: SchedulingSnapshot,
+    job_id: str,
+    process_id: int | None,
+    *,
+    co_tenant_discount: bool = True,
+) -> float | None:
     """The VRAM (MB) a preload of the job charges the card at admission.
 
     Without the clearance lease a preload is the VRAM moment (the child loads the weights when the job starts),
@@ -1035,7 +1076,8 @@ def preload_candidate_delta_mb(snapshot: SchedulingSnapshot, job_id: str, proces
     in system RAM and the weights load inside the leased sample call, so the charge is capped at the staging
     encode footprint, the same figure a staged dispatch books; the full fit-or-evict runs at clearance. Pricing
     the stage at the full peak would park the next model's disk read behind the current sample on every model
-    switch, which is exactly the work the stage exists to overlap.
+    switch, which is exactly the work the stage exists to overlap. ``co_tenant_discount`` is passed to
+    :func:`pricing.candidate_delta_mb`.
     """
     job = snapshot.queue.jobs[job_id]
     delta_mb = pricing.candidate_delta_mb(
@@ -1044,10 +1086,43 @@ def preload_candidate_delta_mb(snapshot: SchedulingSnapshot, job_id: str, proces
         job.baseline,
         process_id=process_id,
         disaggregated=job.disaggregation_class_eligible,
+        co_tenant_discount=co_tenant_discount,
     )
     if delta_mb is None or not bool(snapshot.config.gpu_sampling_lease_enabled):
         return delta_mb
     return min(delta_mb, pricing.staging_charge_mb(job.baseline))
+
+
+def preload_slot_can_seat(
+    snapshot: SchedulingSnapshot,
+    job_id: str,
+    process_id: int,
+    *,
+    when_free: bool = False,
+) -> bool:
+    """Whether the slot's card could ever seat a preload of the job, by the arbiter's ceiling test.
+
+    The request has the price :func:`price_preload` gives the arbiter for this slot
+    (:func:`preload_candidate_delta_mb`, with no holdings), so the result matches the structural DENY on this
+    card. With ``when_free`` the price drops the co-tenant discount, which is the price the card will have once
+    its running jobs end and the lane is free to take the job. A card with no arbiter state this cycle can seat,
+    as the verdict admits on a missing measurement.
+    """
+    slot = snapshot.slots[process_id]
+    device_index = snapshot.routing_device_index(slot)
+    state = snapshot.card(device_index).arbiter_state
+    if state is None:
+        return True
+    job = snapshot.queue.jobs[job_id]
+    request = VramRequest(
+        kind=VramRequestKind.PRELOAD,
+        job_label=str(job.model),
+        baseline=job.baseline,
+        device_index=device_index,
+        target_process_id=process_id,
+        candidate_delta_mb=preload_candidate_delta_mb(snapshot, job_id, process_id, co_tenant_discount=not when_free),
+    )
+    return card_can_seat(request, state)
 
 
 def predictive_vram_verdict(snapshot: SchedulingSnapshot, job_id: str, device_index: int | None) -> BudgetVerdict:

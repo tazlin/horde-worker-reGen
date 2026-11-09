@@ -776,6 +776,19 @@ def _whole_need_mb(request: VramRequest) -> float:
     return candidate_delta_mb + max(0.0, request.candidate_held_mb)
 
 
+def card_can_seat(request: VramRequest, state: DeviceVramState) -> bool:
+    """Return whether the request's whole need is within the card's achievable ceiling.
+
+    An unknown total cannot prove the card too small. The structural DENY, the reroute test and the preload
+    target's seat check all read this one comparison, so a card the preload target skips is a card where the
+    verdict would deny the same request.
+    """
+    ceiling_mb = state.achievable_ceiling_mb()
+    if ceiling_mb is None:
+        return True
+    return _whole_need_mb(request) <= ceiling_mb
+
+
 def _relaxed_verdict(request: VramRequest, device_index: int | None) -> VramVerdict:
     """Build the degraded FITS verdict for a card with no cycle snapshot yet (arbiter not begun this tick).
 
@@ -997,7 +1010,7 @@ class VramArbiter:
         partial_seat_verdict = self._partial_seat_admission(request, measured, state)
         if partial_seat_verdict is not None:
             return partial_seat_verdict
-        structurally_impossible = self._structurally_impossible(request, state)
+        structurally_impossible = not card_can_seat(request, state)
         measured_attempt = self._measured_attempt(request, measured, state, impossible=structurally_impossible)
         if measured_attempt is not None:
             return measured_attempt
@@ -1838,23 +1851,6 @@ class VramArbiter:
         )
 
     @staticmethod
-    def _structurally_impossible(request: VramRequest, state: DeviceVramState) -> bool:
-        """Whether the candidate exceeds the card's achievable ceiling, so no escalation could seat it.
-
-        An emptied card offers ``total - noise_buffer - foreign_floor``: every worker reservation released and
-        every worker allocation freed, but the noise buffer and the VRAM other processes sustain (the foreign
-        floor) are not the worker's to reclaim. A candidate larger than that can never fit on this card however
-        much the worker reclaims, so it DENIES rather than deferring forever. An unknown total cannot prove
-        impossibility (returns False); an unknown foreign floor contributes zero, so the boundary collapses to
-        the pre-foreign ``total - noise_buffer``. The candidate is its whole need (:func:`_whole_need_mb`), since
-        an emptied card has released what the job already holds as well.
-        """
-        ceiling_mb = state.achievable_ceiling_mb()
-        if ceiling_mb is None:
-            return False
-        return _whole_need_mb(request) > ceiling_mb
-
-    @staticmethod
     def _impossibility_detail(
         request: VramRequest,
         state: DeviceVramState,
@@ -1883,18 +1879,17 @@ class VramArbiter:
     def any_other_device_can_seat(self, request: VramRequest, *, exclude_device_index: int | None) -> bool:
         """Whether some card other than ``exclude_device_index`` could ever seat this candidate.
 
-        Prices the candidate's structural impossibility against every other card's frozen state: True as soon
-        as one card is not structurally impossible for it (a real reroute target), False when every other card
-        fails the same achievable-ceiling test (or there is no other card). A single-driving-device worker has
-        no other card, so this is always False there. Used by the caller to decide whether an unroutable head
-        must be faulted terminally rather than deferred toward a reroute that cannot arrive.
+        Applies :func:`card_can_seat` to every other card's frozen state with this request's price: True as soon
+        as one card can seat it (a real reroute target), False when every other card fails the same
+        achievable-ceiling test (or there is no other card). A single-driving-device worker has no other card,
+        so this is always False there. Used by the caller to decide whether an unroutable head must be faulted
+        terminally rather than deferred toward a reroute that cannot arrive.
         """
         if self._cycle is None:
             return False
         exclude_key = exclude_device_index if exclude_device_index is not None else 0
-        for device_index, state in self._cycle.devices.items():
-            if device_index == exclude_key:
-                continue
-            if not self._structurally_impossible(request, state):
-                return True
-        return False
+        return any(
+            card_can_seat(request, state)
+            for device_index, state in self._cycle.devices.items()
+            if device_index != exclude_key
+        )

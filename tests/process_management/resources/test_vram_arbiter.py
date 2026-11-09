@@ -26,6 +26,7 @@ from horde_worker_regen.process_management.resources.vram_arbiter import (
     VramDisposition,
     VramRequest,
     VramRequestKind,
+    card_can_seat,
 )
 
 
@@ -1150,6 +1151,26 @@ class TestForeignAwareImpossibility:
         arbiter.begin_cycle(MeasuredVramSnapshot(devices={0: impossible, 1: impossible}))
         request = _preload(candidate_delta_mb=self._CANDIDATE_MB, device_index=0)
         assert arbiter.any_other_device_can_seat(request, exclude_device_index=0) is False
+
+    @pytest.mark.parametrize("candidate_mb", [13000.0, 13644.0, 13645.0, 14573.0])
+    def test_the_seat_predicate_agrees_with_the_ceiling_deny(self, candidate_mb: float) -> None:
+        """A card can seat a request exactly when the arbiter does not deny it for the ceiling on that card."""
+        state = self._state(foreign_floor_mb=self._FOREIGN_MB)
+        arbiter = VramArbiter()
+        arbiter.begin_cycle(_snapshot(state))
+        verdict = arbiter.evaluate(_preload(candidate_delta_mb=candidate_mb))
+        denied_for_ceiling = verdict.disposition == VramDisposition.DENY and "achievable ceiling" in verdict.reason
+        assert card_can_seat(_preload(candidate_delta_mb=candidate_mb), state) is not denied_for_ceiling
+
+    def test_the_seat_predicate_counts_what_the_job_already_holds(self) -> None:
+        """The whole need is the outstanding charge plus the job's holdings, as the ceiling DENY reads it."""
+        state = self._state(foreign_floor_mb=self._FOREIGN_MB)
+        assert card_can_seat(_preload(candidate_delta_mb=12000.0), state) is True
+        assert card_can_seat(_preload(candidate_delta_mb=12000.0, candidate_held_mb=2000.0), state) is False
+
+    def test_a_card_with_an_unknown_total_can_seat(self) -> None:
+        """An unknown total cannot prove the card too small, so the predicate does not refuse it."""
+        assert card_can_seat(_preload(candidate_delta_mb=99000.0), _roomy_state(total_vram_mb=None)) is True
 
     def test_single_device_has_no_reroute_target(self) -> None:
         """A single-driving-device cycle can never report another card that could seat the candidate."""

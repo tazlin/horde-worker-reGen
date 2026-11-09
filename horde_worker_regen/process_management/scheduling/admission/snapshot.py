@@ -15,8 +15,8 @@ from __future__ import annotations
 
 import sys
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING, Protocol
 
 from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
@@ -208,6 +208,16 @@ class JobSnapshot:
     admitted_exclusive_device_index: int | None = None
     """The planned card of the job's exclusive admit, or None when the job is not admitted exclusively or the
     admit has no card."""
+    unseatable_process_ids: frozenset[int] = frozenset()
+    """The inference slots on the job's eligible cards whose card could never seat a preload of the job.
+
+    On these cards the preload price exceeds the achievable ceiling, which is the arbiter's structural DENY.
+    Filled for pending jobs on a multi-GPU host only, since a single-GPU host has no other card to skip to."""
+    unseatable_when_free_process_ids: frozenset[int] = frozenset()
+    """The inference slots on the job's eligible cards whose card could not seat a preload of the job once free.
+
+    Priced without the co-tenant discount a busy card gives an extra-large job, which ends with the card's running
+    job. Filled only for a job with an unseatable slot, since the preload target reads it only then."""
 
 
 @dataclass(frozen=True)
@@ -600,6 +610,7 @@ def build_scheduling_snapshot(
     dispatch_overhead_seconds: Callable[[ImageGenerateJobPopResponse, bool], float | None] | None = None,
     dominance: Callable[[int | None], CardDominance | None] | None = None,
     pop_claim_model: str | None = None,
+    preload_slot_can_seat: PreloadSeatCheck | None = None,
 ) -> SchedulingSnapshot:
     """Freeze the worker for one cycle.
 
@@ -608,7 +619,9 @@ def build_scheduling_snapshot(
     measurements. ``remaining_sampling_seconds``, ``dispatch_overhead_seconds`` (job, resident at dispatch) and
     ``dominance`` are optional. Without them every slot and job carries None for those figures and every card
     carries no dominance verdict. ``pop_claim_model`` is the model the standing claim over the pop offer names,
-    and without it the snapshot reads the offer as unclaimed.
+    and without it the snapshot reads the offer as unclaimed. ``preload_slot_can_seat`` prices a pending job's
+    preload on a slot from the frozen snapshot. It fills ``JobSnapshot.unseatable_process_ids`` and
+    ``unseatable_when_free_process_ids`` on a multi-GPU host, and without it every job reads as seatable everywhere.
     """
     multi_gpu = len(card_runtimes) > 1
     card_keys: list[int | None] = [None]
@@ -722,7 +735,7 @@ def build_scheduling_snapshot(
         processes_with_model_for_queued_job=frozenset(process_lifecycle.get_processes_with_model_for_queued_job()),
     )
 
-    return SchedulingSnapshot(
+    snapshot = SchedulingSnapshot(
         now=now,
         multi_gpu_routing_active=multi_gpu,
         cards=cards,
@@ -787,3 +800,47 @@ def build_scheduling_snapshot(
             ram_budget=ram_budget,
         ),
     )
+    if not multi_gpu or preload_slot_can_seat is None:
+        return snapshot
+    return _with_unseatable_slots(snapshot, preload_slot_can_seat)
+
+
+class PreloadSeatCheck(Protocol):
+    """Whether a slot's card could seat a preload of the job, at the verdict's price or at its price once free."""
+
+    def __call__(self, snapshot: SchedulingSnapshot, job_id: str, process_id: int, *, when_free: bool = False) -> bool:
+        """Return whether the slot's card could seat a preload of the job."""
+        ...
+
+
+def _with_unseatable_slots(
+    snapshot: SchedulingSnapshot,
+    preload_slot_can_seat: PreloadSeatCheck,
+) -> SchedulingSnapshot:
+    """Return the snapshot with each pending job's unseatable slots filled in.
+
+    The price is read from the finished snapshot, so the seat check prices a slot exactly as the preload verdict
+    on that slot would.
+    """
+    in_progress = set(snapshot.queue.in_progress)
+    inference_slots = [slot for slot in snapshot.slots.values() if slot.process_type is HordeProcessType.INFERENCE]
+    jobs = dict(snapshot.queue.jobs)
+    for job_id, job in snapshot.queue.jobs.items():
+        if job_id in in_progress or job.model is None:
+            continue
+        eligible_slots = [slot.process_id for slot in inference_slots if slot.device_index in job.eligible_cards]
+        unseatable = frozenset(
+            process_id for process_id in eligible_slots if not preload_slot_can_seat(snapshot, job_id, process_id)
+        )
+        if not unseatable:
+            continue
+        jobs[job_id] = replace(
+            job,
+            unseatable_process_ids=unseatable,
+            unseatable_when_free_process_ids=frozenset(
+                process_id
+                for process_id in eligible_slots
+                if not preload_slot_can_seat(snapshot, job_id, process_id, when_free=True)
+            ),
+        )
+    return replace(snapshot, queue=replace(snapshot.queue, jobs=jobs))

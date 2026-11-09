@@ -179,6 +179,7 @@ from horde_worker_regen.process_management.scheduling.admission.preload import (
     preload_candidate_delta_mb,
     preload_head,
     preload_ram_stage_mb,
+    preload_slot_can_seat,
     price_preload,
     select_idle_lane_warms,
 )
@@ -6903,6 +6904,7 @@ class InferenceScheduler:
             ),
             remaining_sampling_seconds=self._sampling_slot_remaining_seconds,
             dispatch_overhead_seconds=self._expected_dispatch_overhead_seconds,
+            preload_slot_can_seat=preload_slot_can_seat,
         )
 
     def _sampling_slot_remaining_seconds(self, process_info: HordeProcessInfo) -> float | None:
