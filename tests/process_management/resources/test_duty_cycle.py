@@ -134,7 +134,7 @@ class TestSummarizeDutyCycle:
         assert summary.no_jobs_available_fraction == 30.0 / 300.0
 
     def test_falls_back_to_phase_derived_without_nvml(self) -> None:
-        """Off NVML (e.g. non-NVIDIA), the phase-derived ratio carries the headline."""
+        """Off NVML (e.g. non-NVIDIA), the phase-derived ratio is used for the headline."""
         summary = summarize_duty_cycle([_phase_rich_job()], window_seconds=300.0)
         assert summary.headline_source() == "phase-derived"
         duty = summary.effective_duty_percent()

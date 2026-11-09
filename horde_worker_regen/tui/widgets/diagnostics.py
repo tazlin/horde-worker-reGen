@@ -368,7 +368,7 @@ class DiagnosticsView(Vertical):
         """A one-line selector label: position, worker version, and how the session ended.
 
         The position is "latest" for the latest worker session and the shared session label otherwise, so a
-        benchmark run always carries its tag.
+        benchmark run always includes its tag.
         """
         session = diagnosis.session
         is_benchmark_run = session.log_kind is OrchestratorLogKind.HARNESS

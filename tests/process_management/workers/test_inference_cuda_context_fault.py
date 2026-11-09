@@ -2,7 +2,7 @@
 
 A CUDA runtime error can leave a process's CUDA context failing every later kernel while its siblings on the card
 run normally, so the parent replaces the process on the first one. The child recognises it by type: torch raises
-``AcceleratorError`` directly, and the backend's pipeline error carries the type name ComfyUI recorded for the
+``AcceleratorError`` directly, and the backend's pipeline error includes the type name ComfyUI recorded for the
 failing node. The allocator's out-of-memory error leaves the context usable and must not be mistaken for one.
 """
 

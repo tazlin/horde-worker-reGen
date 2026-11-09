@@ -350,7 +350,7 @@ class ProcessMap(dict[int, HordeProcessInfo]):
                     self[process_id].last_process_state_started_at = time.time()
             self[process_id].last_iterations_per_second = iterations_per_second
 
-        # Step counts are taken from any beat that carries a real position, not only from INFERENCE_STEP.
+        # Step counts are taken from any beat with a real position, including beats outside INFERENCE_STEP.
         # A sampler saturated at the final step reports that position on pipeline-state beats, and the
         # stuck-step watchdog can only grant the final-step overtime allowance if the parent's view of the
         # position is the true one rather than the last advancing step.
@@ -1126,7 +1126,7 @@ class ProcessMap(dict[int, HordeProcessInfo]):
 
         Ages each contributing process's last VRAM-inclusive report against ``now`` and returns the maximum
         (the least-fresh tenant). Returns None when no process currently contributes to the ledger (nothing to
-        age). A contributor that has never carried a ``report_sampled_at`` (an older child) is treated as
+        age). A contributor that has never had a ``report_sampled_at`` (an older child) is treated as
         maximally stale (``inf``): its contribution cannot be dated, so the ledger it is part of cannot be
         trusted as current. The reconciler uses this to treat a stale ledger as an UNKNOWN, incomparable
         tenant rather than reconciling a device anchor against figures a process may have moved far past.

@@ -49,7 +49,7 @@ _ACTIVE_STATES = frozenset(
         "EVALUATING_SAFETY",
     },
 )
-# Only these states have a live, meaningful sampling step/it-s; the snapshot may still carry the last
+# Only these states have a live, meaningful sampling step/it-s. The snapshot may still include the last
 # job's numbers, so the panel renders the progress row only while the process is genuinely sampling.
 _SAMPLING_STATES = frozenset({"INFERENCE_STARTING", "POST_PROCESSING", "ALCHEMY_STARTING"})
 _FAILED_STATES = frozenset({"INFERENCE_FAILED", "ALCHEMY_FAILED", "SAFETY_FAILED", "PROCESS_ENDED"})
@@ -370,7 +370,7 @@ class LiveView(VerticalScroll):
 
         Nothing an inference panel shows applies here: there are no sampling steps, no allocator readings
         and no component cache. What a text backend can say about itself is a flat list of facts, so it is
-        rendered as one, and a fact the backend did not answer is left out rather than shown as a dash.
+        rendered as one. Fields omitted by the backend are left out rather than shown as a dash.
         """
         body = Table.grid(padding=(0, 2))
         body.add_column(justify="right", style="bold cyan", no_wrap=True)

@@ -945,7 +945,7 @@ class _DispatchWorld:
         Args:
             host_ram: Opt-in conserved host RAM, including private pages and reclaimable checkpoint cache. With
                 it, a device load of a RAM-held checkpoint also reads back whatever pages the host reclaimed and
-                a monolithic job's load carries its text encoder and VAE, so a lane that idled under host
+                a monolithic job's load includes its text encoder and VAE, so a lane that idled under host
                 pressure pays for its cold pages where the parent still books the model as held.
             ram_reserve_mb: Single additive host headroom reserve.
             ram_pause_percent: Hard danger-floor percentage for host-RAM rows.
@@ -1006,7 +1006,7 @@ class _DispatchWorld:
                 (liveness over pricing) and the world records the degradation. Off, dispatch is the VRAM
                 moment, which is what every row that does not vary this runs against.
             two_phase: Whether the lease grants a job in two permits, as the spawn site builds a lane's proxy under
-                ``gpu_sampling_lease_two_phase``. Each lane's proxy carries a stage permit, and each controller
+                ``gpu_sampling_lease_two_phase``. Each lane's proxy has a stage permit, and each controller
                 step is given the scheduler's stage admission, so the head waiter of a card whose sampler is
                 running may upload its weights alone while that sampler runs. The weights land at the stage grant
                 and load while the lane reads ``INFERENCE_PRIMED``; the activation and the sampling window start
@@ -1019,7 +1019,7 @@ class _DispatchWorld:
                 lease; off, the whole read is paid after clearance.
             idle_lane_warm: Whether a lane honours the parent's warm message: an idle lane holding the named
                 model in RAM reads its checkpoint's reclaimed pages back and keeps them resident while it idles.
-                A dispatch of that model to the lane carries the read on, so clearance pays only what the warm
+                A dispatch of that model to the lane retains the reading, so clearance pays only what the warm
                 has not finished. Needs ``host_ram`` and the lease; off, the lane ignores the message and reads
                 nothing before its job is staged.
             unretained_components_pinned: Whether a lane's unretained components survive its allocator-cache
@@ -1141,7 +1141,7 @@ class _DispatchWorld:
                 are pinned round-robin over those indices and the scheduler is handed a per-card runtime whose
                 effective config differs only in this ceiling, so a job's resolution alone decides which cards
                 may serve it. Each index also gets its own entry in the VRAM ledger, so the cards are
-                independent memory domains: every card carries its own total, its own committed tenants and its
+                independent memory domains: every card includes its own total, its own committed tenants and its
                 own measured free reading. None keeps the single card every other row runs on, where routing is
                 a strict no-op and the ledger holds one entry.
             card_total_mb: Per-card device totals for a multi-card pool of mixed sizes, keyed by device index. A
@@ -1230,14 +1230,14 @@ class _DispatchWorld:
             lane_start_seconds: How long a lane the pool regrows spends in ``PROCESS_STARTING`` before it waits for
                 jobs. Its CUDA context is not on the card until the start completes, so the card is charged for
                 it only then. Zero adds the lane waiting for jobs with its context charged at once.
-            lane_reports_carry_context: Whether each process's reservation carries its share of the card's
+            lane_reports_carry_context: Whether each process's reservation includes its share of the card's
                 context charge, as a live NVML per-process figure does. The parent adds one resolved context
                 constant per reporting process, while the world charges a card 1354 MB for its first context, 384
                 MB for each further one and safety's whole-process figure. So each process reports its own
                 context less that constant: 384 MB for an inference lane, the post-processing lane or the
                 utilities lane, and safety's weights, any restore transient and any check growth for safety. The
                 lowest-id inference lane on the card, or the lowest-id process where the card has none, also
-                carries the rest of the card's charge, which is the first-context premium of 970 MB plus the
+                includes the rest of the card's charge, which is the first-context premium of 970 MB plus the
                 context of any process the parent's ledger no longer counts. That lane carries it because the
                 world charges the premium once per card for its inference pool. The sum then equals the
                 card's context charge less the constant per counted process, and the parent's instantaneous
@@ -1720,14 +1720,14 @@ class _DispatchWorld:
                     image_models_to_load=[model.name for model in self._model_classes],
                     max_pixels=max_pixels,
                     # Keep a routed card on the same explicit virtual-card physics as the global config. A card with
-                    # a different total carries the margin that production sizes from that total.
+                    # a different total includes the margin that production sizes from that total.
                     vram_admission_noise_mb=(
                         noise_mb
                         if admission_noise_mb is not None or card_total == card.total_mb
                         else admission_noise_buffer_mb(card_total)
                     ),
                     # safety_on_gpu is a per-card permission read off the effective card config, so a card
-                    # here carries the same answer the global config gives (no per-card delta in this world).
+                    # here includes the same answer the global config gives (no per-card delta in this world).
                     safety_on_gpu=service_contexts,
                     # Resolution is the only per-card eligibility axis these worlds vary; batch size is
                     # scaffolding some rows use to size a peak, so every card accepts the protocol maximum.
@@ -1853,7 +1853,7 @@ class _DispatchWorld:
         self._clearance_proxies: dict[int, ClearanceLeaseProxy] = {}
         """Per lane, the lease object the world's child acquires through, the one the controller grants through.
 
-        Built with a shared device-free figure as the spawn site builds it, so a grant carries the device free
+        Built with a shared device-free figure as the spawn site builds it, so a grant includes the device free
         the parent admitted the child against and the child rebases its free-VRAM view on it."""
         self.clearance_timeouts: list[tuple[int, int, str]] = []
         """Every lane that sampled unpriced because its clearance never came, as (tick, lane, job).
@@ -2033,7 +2033,7 @@ class _DispatchWorld:
                 charge += SAFETY_GPU_LOAD_CHARGE_MB
                 if self._safety_transition_until is not None:
                     # A restore is still materialising: the classifier weights are being read and copied, so the
-                    # card carries the load peak rather than the at-rest footprint until the process settles.
+                    # card is charged for the load peak rather than the at-rest footprint until the process settles.
                     charge += self.safety_load_transient_mb
                 charge += self._safety_check_growth_on_card_mb()
         return charge
@@ -2351,7 +2351,7 @@ class _DispatchWorld:
         """How much free VRAM the child on ``lane_id`` believes the card has while serving ``job_id``.
 
         Its own view is the truth plus whatever the process-local reading overstates. When its dispatch
-        carried the parent's device reading, that reading caps the view: the child ages it by its own growth
+        included the parent's device reading, that reading caps the view: the child ages it by its own growth
         since the dispatch (the only allocations it can account for) and takes the lower of the two, which is
         what keeps a shortfall computed against the device rather than against the process. Under the lease a
         grant's figure replaces the dispatch reading and the growth is counted from the grant.
@@ -2510,7 +2510,7 @@ class _DispatchWorld:
     def _load_margin_mb(self, job_id: str) -> float:
         """Return the free VRAM (MB) the child's weight load for ``job_id`` keeps clear.
 
-        Under ``partial_loads`` a grant that carried an activation reserve raises ComfyUI's memory estimate to it,
+        Under ``partial_loads`` a grant that had an activation reserve raises ComfyUI's memory estimate to it,
         so the partial load leaves the reserve standing, and hordelib's overflow check charges it beside a forced
         load. The child's margin is the floor either way.
         """
@@ -2979,7 +2979,7 @@ class _DispatchWorld:
 
         Some unloads go out on the pipe alone, ahead of START_INFERENCE, and set no control flag. The child acts
         on the message whatever the slot's flag says, so the card gives back the device weights before the next
-        message is read. While the slot's flag carries an unload, the flag's path releases the whole lane and
+        message is read. While the slot's flag has an unload, the flag's path releases the whole lane and
         owns the release. An allocator-cache release is sent on the pipe alone too, and is delivered the same way.
         """
         pipe: object = lane.pipe_connection
@@ -3891,7 +3891,7 @@ class _DispatchWorld:
                 )
             if self.closed_loop and self._resident_model.get(lane_id) not in (None, admitted.model):
                 # Weights the slot is still holding for a previous model are not displaced by a new load:
-                # the card carries both until something explicitly returns the old ones. Modelling the
+                # the card holds both until something explicitly returns the old ones. Modelling the
                 # load as a replacement would make the eviction that runs ahead of a cross-model dispatch
                 # unfalsifiable, since the double residency it exists to prevent could never occur.
                 self._resident_mb[lane_id] = self._resident_mb.get(lane_id, 0.0) + staged_mb
@@ -5035,7 +5035,7 @@ class _DispatchWorld:
         Three commitments outlive whatever the lane's child is currently reporting, and each one makes the
         slot something other than spare capacity: an owned dispatched job (a pinned sampler waiting on the
         encode lane owns its job while reporting itself idle), a load in flight, and the slot a whole-card
-        pre-stage is loading its head into (recorded on the residency before any lane carries its model
+        pre-stage is loading its head into (recorded on the residency before any lane includes its model
         name). Reading them here rather than judging the run by its outcome is what makes the verdict name
         the seam: the alternative, a job that never finished or a residency that never converged, is several
         ticks downstream of the decision and reachable by unrelated causes.
@@ -5314,7 +5314,7 @@ class _DispatchWorld:
         else:
             dispatched = await self._dispatch_until_full()
         # The control loop prices the tick's slot time after the dispatch pass, so a head the pass dispatched
-        # counts as in progress and each decline it recorded carries its gate.
+        # counts as in progress and each decline it recorded includes its gate.
         self._scheduler.record_slot_duty(self._reference)
         # After the dispatch pass, which is the only point that knows which pending jobs this tick left unseated,
         # as the parent's control loop orders it.
@@ -5758,7 +5758,7 @@ class _DispatchWorld:
         }
 
     def safety_card_index(self) -> int:
-        """The card the on-GPU safety process is pinned to, and whose ledger carries its charge."""
+        """The card the on-GPU safety process is pinned to, and whose ledger includes its charge."""
         return self._safety_card_index
 
     @property

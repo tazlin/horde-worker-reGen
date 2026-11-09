@@ -243,7 +243,7 @@ def default_variant() -> KoboldcppVariant:
 
 
 def koboldcpp_asset(*, variant: KoboldcppVariant | None = None) -> KoboldcppAsset:
-    """Return the pinned asset for this host, defaulting the variant to what the hardware wants.
+    """Return the pinned asset for this host, defaulting the variant to what the hardware supports.
 
     Args:
         variant: Force a variant instead of deriving it from the detected hardware.
@@ -275,7 +275,7 @@ def _versioned_path(root: Path) -> Path:
 def _version_stamp_path(root: Path) -> Path:
     """Return the sidecar recording which release and variant the stable path currently holds.
 
-    The stable path cannot carry the version in its name and still be the one name a launcher knows, and a
+    The stable path cannot include the version and still be a fixed launcher path, and a
     600 MB binary is not worth storing twice, so ``<release tag> <variant>`` is recorded beside it instead.
     """
     return paths.bin_dir(root) / "koboldcpp-version"
@@ -315,7 +315,7 @@ def _write_version_stamp(root: Path, variant: KoboldcppVariant) -> None:
 def _published_is_usable(root: Path, *, variant: KoboldcppVariant | None) -> bool:
     """Return whether the published binary is the pinned release and can run the variant being asked for.
 
-    The CUDA build also carries the Vulkan and CPU backends, so it serves either ask; the asset is 600 MB
+    The CUDA build also includes the Vulkan and CPU backends, so it supports both choices. The asset is 600 MB
     and an operator moving between compute paths should not pay for it each way. A stamp that records no
     variant was published by detection alone, so it is read as what detection picks.
 

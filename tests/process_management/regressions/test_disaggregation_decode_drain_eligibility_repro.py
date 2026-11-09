@@ -54,7 +54,7 @@ def _insert_disagg_job(manager: HordeWorkerProcessManager, *, stage: DisaggJobSt
 
     Builds the held state directly (the same duck-typed job_info the orchestrator's own unit tests use, of which
     only ``sdk_api_job_info`` is read on this path) so the test pins a precise pipeline stage without driving the
-    full encode/sample/decode DAG. A decode-stage job carries a sampled latent, matching the real state in which
+    full encode/sample/decode DAG. A decode-stage job has a sampled latent, matching the real state in which
     the VAE lane is the only thing standing between a finished sample and its images.
     """
     job_info = SimpleNamespace(sdk_api_job_info=make_job_pop_response(model="SDXL 1.0"))

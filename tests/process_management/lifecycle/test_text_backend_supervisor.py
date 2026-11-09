@@ -374,7 +374,7 @@ async def test_an_exit_before_ready_is_relaunched_after_backoff(tmp_path: Path) 
 async def test_the_launch_and_the_readiness_reach_the_event_ring(tmp_path: Path) -> None:
     """A first launch and the readiness that followed it are what the dashboard's feed shows of a backend.
 
-    Both carry the launch number, and the readiness carries how long the backend took, which is the only
+    Both include the launch number, and the readiness reports how long the backend took, which is the only
     honest basis for telling a contributor how long the next start will take.
     """
     handle = FakeLaunched(pid=fake_pid(31))
@@ -767,7 +767,7 @@ async def test_the_ready_row_carries_the_description_footprint_pid_and_buffer_si
 
 
 def _kv_buffer_reported(supervisor: TextBackendSupervisor) -> bool:
-    """Return whether the serving row carries the KV figure, which is set in the same step as the VRAM check."""
+    """Return whether the serving row includes the KV figure, which is set in the same step as the VRAM check."""
     detail = supervisor.to_process_snapshot().text_backend
     return detail is not None and detail.kv_buffer_mb is not None
 

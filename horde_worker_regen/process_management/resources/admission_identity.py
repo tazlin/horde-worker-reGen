@@ -218,7 +218,7 @@ def evaluate_admission(
     (``available_known=False``, ``fits=False``) so the caller defers rather than denying or fabricating room.
 
     The reservations figure must already exclude the requester's own outstanding reservation: the identity
-    subtracts it whole, so a re-ask that still carries its own admitted-but-unmaterialized plan is not deferred
+    subtracts it whole, so a repeated request with its admitted-but-unmaterialized plan is not deferred
     on its own footprint. Every other unit's reservation stays fully charged.
 
     Args:

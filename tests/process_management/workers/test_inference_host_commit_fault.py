@@ -1,7 +1,7 @@
 """Pins how an inference child recognises the host refusing a checkpoint commit inside a running job.
 
 The backend's mapping guard raises ``HostCommitError`` before any weight is adopted. Inside a job, ComfyUI catches
-the node's exception, so the backend's pipeline error carries the type by name. The child marks the faulted result
+the node's exception, so the backend's pipeline error includes the type by name. The child marks the faulted result
 so the parent requeues the job against host memory, and it does not retry the job itself.
 """
 

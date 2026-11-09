@@ -91,7 +91,7 @@ def test_recent_limits_to_most_recent_sessions(tmp_path: Path) -> None:
     logs = _logs_dir(tmp_path)
     recent = diagnose(logs, recent=1)
     assert len(recent) == 1
-    # The active (newer) session carries the OOM finding; the older rotation does not.
+    # The active (newer) session includes the OOM finding. The older rotation does not.
     assert any(f.id == "oom" for f in recent[0].findings)
 
 

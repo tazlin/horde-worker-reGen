@@ -1,6 +1,6 @@
 """Contracts for advertised SDXL work that stalls after preload.
 
-An image job inside the advertised ``max_power`` envelope can carry a predicted VRAM demand above the
+An image job inside the advertised ``max_power`` envelope can have a predicted VRAM demand above the
 arbiter's achievable ceiling. The same job can nevertheless be executable through the backend's ordinary
 memory management. A static prediction must therefore not create a dispatch hold with no actuator and no
 path to a real load; either intake must exclude the work before pop or scheduling must try it within a bound.

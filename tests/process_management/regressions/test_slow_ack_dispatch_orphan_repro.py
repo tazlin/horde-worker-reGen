@@ -189,7 +189,7 @@ async def test_dropped_result_retires_the_slots_dispatch_stamp() -> None:
     msg = Mock(spec=HordeInferenceResultMessage)
     msg.process_id = 3
     msg.sdk_api_job_info = dropped_job
-    # A real result carries its generation state, which the retention settle reads to tell a finished job
+    # A real result includes its generation state, which the retention settle reads to tell a finished job
     # from a faulted one; the mock has to carry it too or it is not the message the handler is given.
     msg.state = GENERATION_STATE.ok
     await pm._message_dispatcher._handle_inference_result(msg)

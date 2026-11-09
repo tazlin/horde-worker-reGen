@@ -179,7 +179,7 @@ class HordeProcessInfo:
     """The stable index of the GPU this process is pinned to (0 on a single-GPU host).
 
     Set at spawn so the scheduler can route a job to a process on an eligible card and aggregate
-    per-card VRAM/residency. Inference memory reports carry the same index, measured from the child."""
+    per-card VRAM/residency. Inference memory reports include the same index, measured from the child."""
     capabilities: WorkerCapability
     """The kinds of work this process can be dispatched (job routing keys on this)."""
     last_process_state: HordeProcessState

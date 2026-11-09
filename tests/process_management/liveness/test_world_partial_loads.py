@@ -134,7 +134,7 @@ _STREAK_OFFLOAD_MB = _STREAK_TRANSIENT_MB + _CHILD_FREE_MARGIN_MB - (_LANE_ROOM_
 
 
 async def test_an_offload_outlives_its_job_and_the_next_job_pays_to_return_it() -> None:
-    """A same-model streak under a sampling shortfall carries the offload across jobs and pays for its return."""
+    """A same-model streak retains offloaded weights across jobs and pays to upload them again."""
     world = _one_lane_world(true_footprint_mb=_stated(_STREAK_WEIGHTS_MB, _STREAK_TRANSIENT_MB))
 
     first, second = await _serve_streak(world, [_job(_SDXL), _job(_SDXL)])
@@ -507,7 +507,7 @@ def test_the_encoder_release_needs_the_lease_and_the_support_tenant() -> None:
 async def test_a_partial_load_leaves_the_grants_activation_reserve() -> None:
     """A skip-listed load cleared under the lease leaves the reserve its grant carried in place of the child's margin.
 
-    The grant carries the activation reserve the parent priced the window with, and hordelib raises ComfyUI's
+    The grant includes the activation reserve the parent priced the window with, and hordelib raises ComfyUI's
     partial sizing to it, so the load leaves that room for the activation in place of the child's smaller estimate.
     """
     weights_mb = 25_000.0

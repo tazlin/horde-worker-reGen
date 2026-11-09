@@ -5,7 +5,7 @@ click selects a row, Choose dismisses with its name, and the config editor write
 input. Typing a path into that same input is the other way to answer the field, which is why the modal
 never has to express "a file of my own".
 
-Models the reference knows but declares no file for are listed under a divider and cannot be chosen:
+Models without download files appear under a divider and cannot be selected:
 the worker would have no artefact to load for them.
 """
 
@@ -64,7 +64,7 @@ def _column_widths(app: App[object]) -> tuple[int, ...]:
 
 
 class TextModelPickerModal(ResponsiveModalScreen[str | None]):
-    """Browse the text models the reference knows; dismisses with one name, or None when cancelled."""
+    """Browse the text models listed in the reference. Return one name, or None when cancelled."""
 
     BINDINGS = [
         Binding("enter", "choose", "Choose"),

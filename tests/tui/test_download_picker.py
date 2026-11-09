@@ -26,7 +26,7 @@ def test_intro_counts_missing() -> None:
 
 
 def test_prompt_labels_presence() -> None:
-    """Each row's label carries its name, baseline, and on-disk vs missing state."""
+    """Each row's label includes its name, baseline, and on-disk vs missing state."""
     present = DownloadPickerModal._prompt(_ROWS[0]).plain
     missing = DownloadPickerModal._prompt(_ROWS[1]).plain
     assert "Present" in present and "on disk" in present

@@ -59,7 +59,7 @@ def test_dry_run_lane_cleanup_is_safe_without_a_client() -> None:
 
 
 def test_text_encode_fault_carries_exception_text(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A faulted text-encode result carries the originating exception summary, not a blank reason.
+    """A faulted text-encode result includes the originating exception summary.
 
     Drives the real (non-dry-run) fault path with a backend whose encode raises: the reported result must be
     faulted and its ``fault_reason`` must be the ``"{type}: {message}"`` summary the parent threads on so the

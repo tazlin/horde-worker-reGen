@@ -2,7 +2,7 @@
 
 A run leaves two things behind that only mean something together: the definition artifact and the
 stats parts the worker wrote while the run's jobs flowed. Both are named by a local-clock stamp, neither
-name carries the machine, and the two stamps differ, so on a maintainer's disk holding several
+name includes the machine, and the two timestamps differ, so on a maintainer's disk holding several
 contributors' runs the pairing is guesswork. The bundle removes the guesswork: one directory named by
 machine, tier and a UTC stamp, holding copies of exactly those files plus a manifest with their hashes.
 """

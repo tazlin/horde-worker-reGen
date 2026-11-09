@@ -530,7 +530,7 @@ def assert_free_floor(world: _DispatchWorld, floor_mb: float, *, context: str) -
 
 
 def assert_no_duplicate_vram_copy(world: _DispatchWorld, model: str, *, context: str) -> None:
-    """Assert no two lanes carry a committed VRAM copy of ``model`` at once.
+    """Assert no two lanes have a committed VRAM copy of ``model`` at once.
 
     Read off the card's live state, so a scenario that needs the guarantee to hold at every instant calls it
     inside its own drive loop rather than only at the end.

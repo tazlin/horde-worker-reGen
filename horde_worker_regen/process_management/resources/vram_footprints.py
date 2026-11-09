@@ -220,31 +220,28 @@ class MeasuredJobFootprint(Protocol):
 
 
 FOOTPRINT_STORE_SCHEMA_VERSION = 6
-"""Bumped when the file format changes, or when observations written by an older build can no longer be trusted.
-A file with another version is discarded on read, except those in :data:`_CARD_BLIND_SCHEMA_VERSIONS`.
-Version 2 drops files written before observations were bounds-checked (see
-:meth:`LearnedFootprintStore.observe_peak`): those can hold activation watermarks at the size of the card and
-resident figures smaller than the checkpoint's weights, and since watermarks only ever rise, the store would price
-from them forever. Version 3 marks :attr:`FootprintStage.SAMPLE` windows that hold one figure per job. Version 4
-adds job-class keys (:meth:`FootprintKey.for_job_class`). A build that predates them discards the file, since it
-would read a class key as its pooled key. In version 5, :attr:`FootprintStage.SAMPLE` and
-:attr:`FootprintStage.SAMPLE_ACTIVATION` keys are filed under the job's own model. Version 6 adds the card-size
-class (:attr:`FootprintKey.card_total_gb`)."""
+"""Version of the persisted footprint format.
+
+Increment this when the format or observation validity rules change. The loader accepts this
+version and the schemas in :data:`_CARD_BLIND_SCHEMA_VERSIONS`. Other versions are discarded.
+The migration rules below discard readings that cannot be attributed reliably to a model or card.
+"""
 
 _CARD_BLIND_SCHEMA_VERSIONS = frozenset({2, 3, 4, 5})
-"""Older schemas whose keys carry no card identity, still loaded when the card they were measured on is known.
+"""File schemas whose keys do not include a card size.
 
-A worker that drives exactly one card of known size measured every entry on it, so the entries are re-keyed to
-that card. On more than one card, or a card of unknown size, the file does not record which card an entry
-describes, so the entry is dropped."""
+Entries can be assigned to a card only when the worker drives exactly one card of known size.
+Otherwise the entries are dropped because the file does not identify the card used for each reading.
+"""
 
 _MISKEYED_SAMPLING_SCHEMA_VERSIONS = frozenset({2, 3, 4})
-"""Older schemas still loaded, without any entry of a stage in :data:`_MISKEYED_SAMPLING_STAGES`.
+"""File schemas whose monolithic sampling entries cannot be attributed reliably to the job's model.
 
-Their monolithic sampling figures were filed under the model the lane had loaded rather than the job's model, so
-a small model's key can hold a large model's peak. The watermark carries it as well as the window, and it only
-rises, so the whole entry is dropped and the key prices from its static seed until it is learned again. The
-isolated sampler's keys and the at-rest stages were always filed under their own model and load as written."""
+Entries in :data:`_MISKEYED_SAMPLING_STAGES` are dropped because a lane's loaded model can differ
+from the job's model. Both the window and watermark can then contain another model's peak.
+The affected keys use static seeds until new observations are available. Isolated sampling and
+at-rest stages load unchanged.
+"""
 
 FOOTPRINT_STORE_FILENAME = "vram_footprints.json"
 """Name of the persisted store inside the worker's app-state directory (beside ``perf_model.json``)."""
@@ -258,7 +255,7 @@ class ResolutionBucket(enum.StrEnum):
     key space small. Batch size is deliberately NOT folded into the bucket: peaks are observed per
     request exactly as the hardware reported them, so a batched request's larger peak is recorded
     against the same key as a single image and naturally raises the learned watermark for that band.
-    The job-class key (:meth:`FootprintKey.for_job_class`) carries the batch beside the bucket, so the
+    The job-class key (:meth:`FootprintKey.for_job_class`) includes the batch beside the bucket, so the
     measured price of a single image is not its band's batched peak.
     """
 
@@ -374,7 +371,7 @@ class FootprintKey(BaseModel):
       baseline and resolution band, and leave ``checkpoint`` unset: the activation peak scales with the
       architecture and the request size, so every checkpoint of a baseline shares one population and a
       per-checkpoint split would only fragment it.
-    - :attr:`FootprintStage.RESIDENT` carries the checkpoint name and no resolution band: resident weights
+    - :attr:`FootprintStage.RESIDENT` includes the checkpoint name and no resolution band: resident weights
       are a property of the specific file (two SDXL checkpoints differ by gigabytes) and do not move with
       the request size.
     - :attr:`FootprintStage.SAFETY` carries neither, keyed under :data:`SAFETY_PROCESS_BASELINE`.
@@ -399,7 +396,7 @@ class FootprintKey(BaseModel):
 
     ComfyUI keeps a component resident when it fits, so a 24 GB card's Flux sampling peak includes the text
     encoder that a 16 GB card releases. Priced on the smaller card, that figure would refuse a model the card can
-    run. The field is required so that every key carries a card."""
+    run. The field is required so that every key includes a card size."""
     stage: FootprintStage
     """The pipeline stage the peak was observed for."""
     checkpoint: str | None = None
@@ -851,7 +848,7 @@ class LearnedFootprintStore:
         the floor are the whole of the conservatism, held here rather than folded into the estimate's
         basis, so a reader can see and change what the worker is paying for safety. The floor is the same
         charge the reserve prices a CUDA context at: a consumer sizing a device against this figure must
-        cover the context of the process holding it, and where an observation already carries its context
+        cover the context of the process holding it, and where an observation already includes its context
         it is additional margin in the direction this store exists to fail in.
 
         Returns None while the window holds fewer than :data:`_MIN_OBSERVATIONS_FOR_MEASURED` entries, which
@@ -875,7 +872,7 @@ class LearnedFootprintStore:
     def has_measurement(self, key: FootprintKey) -> bool:
         """Return whether ``key`` holds enough recent observations for :meth:`measured_estimate_mb` to return a figure.
 
-        The key carries the card, so this reports whether that card has measured the figure, whatever other cards hold.
+        The key includes the card size, so measurements on other card sizes do not affect this result.
         """
         observation = self._observations.get(key)
         return observation is not None and len(observation.recent_mb) >= _MIN_OBSERVATIONS_FOR_MEASURED

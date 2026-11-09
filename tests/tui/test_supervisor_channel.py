@@ -201,7 +201,7 @@ def test_a_recent_job_defaults_to_image_generation() -> None:
 
 
 def test_text_counters_and_scribe_identity_survive_the_wire() -> None:
-    """A scribe worker's snapshot carries its backend identity and its own job counters."""
+    """A scribe worker's snapshot includes its backend identity and its own job counters."""
     snapshot = _make_snapshot()
     snapshot.config = WorkerConfigSummary(
         dreamer_name="Tester",

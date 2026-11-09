@@ -34,7 +34,7 @@ a second into `bridge.log` and crowds out the job-flow story an operator is actu
 
 Such lines are time-boxed per subject (per process, per device): at most one emission per 30 seconds lands
 at `DEBUG`, and the repeats in between are emitted at `TRACE` instead. Nothing is dropped. `bridge.log`
-carries a periodic sample and `trace.log` carries the full series, so a per-tick reconstruction is still
+includes a periodic sample and `trace.log` includes the full series, so a per-tick reconstruction is still
 possible after the fact.
 
 If you are adding a log line that fires on a timer rather than on an event, use
@@ -43,7 +43,7 @@ it returns.
 
 ## Deadlock snapshot free-VRAM figures
 
-The deadlock diagnostics carry two free-VRAM figures and they are not interchangeable:
+The deadlock diagnostics include two free-VRAM figures and they are not interchangeable:
 
 - `device_free_vram=` is derived from the children's torch view of the card. Under WDDM demand-paging that
   view counts paged-out blocks as free and has been seen overstating a card by gigabytes, which reads as a
@@ -133,7 +133,7 @@ to survive the peak that card is committed to (card 0: measured free 5210MB, ...
 
 `marginal need` is what the card still has to find for the heaviest sampling peak it is committed to, net of
 what the process holding that model already has on the device; it is the figure both sides forecast against.
-A `Runtime safety placement inputs:` line at DEBUG carries the same evidence on every change to it, so a capture
+A `Runtime safety placement inputs:` line at DEBUG includes the same evidence on every change to it, so a capture
 can attribute a flip to what the policy saw; unchanged repeats drop to TRACE. For the policy itself see
 [VRAM arbiter](../explanation/vram_arbiter.md#runtime-safety-placement).
 

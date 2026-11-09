@@ -80,7 +80,7 @@ prices. The scheduler copies re-implement the `pricing` helpers, and a change to
 | --- | --- | --- |
 | The figure the verdict prices a model at | `pricing.model_sampling_peak` | The measured figure of the baseline's pooled `SAMPLE` key at its most-observed band, else the static seed of a plain batch-1 job at that band (or at `DOMINANCE_SEED_BAND`). The watermark is never read, since it carries card-sized child peaks and would price a model off the card on one reading. |
 | The verdict's rung and its hysteresis | `pricing.dominance_rung`, `decide_card_dominance`, `DOMINANCE_HYSTERESIS_MB` (256 MB); scheduler `card_dominance` | Rung 2 when the peak, both contexts, the foreign floor and the margin exceed the card. Rung 1 when no offered partner, the model itself included, fits beside it. A held rung moves only when the slack crosses zero by more than 256 MB, so a peak drifting about a threshold does not flip the teardown. |
-| Whether a model wants the whole card | `pricing.forecast_streaming` (`wants_whole_card`) | True for an operator pin or a rung-2 verdict. |
+| Whether a model requires the whole card | `pricing.forecast_streaming` (`wants_whole_card`) | True for an operator pin or a rung-2 verdict. |
 
 The verdict reads the pooled key, which holds batched and hires-fix jobs, while its seed branch prices a plain
 batch-1 job. One batched job can therefore move every model of a baseline to a higher rung, while

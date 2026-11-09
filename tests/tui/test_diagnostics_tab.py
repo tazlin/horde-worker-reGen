@@ -165,7 +165,7 @@ async def test_diagnostics_tab_renders_findings(tmp_path: Path, monkeypatch: pyt
 async def test_a_benchmark_run_is_tagged_in_the_selector_and_status(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A session read from the harness log carries the same tag the text reports print; a worker session does not."""
+    """A session read from the harness log includes the same tag as the text reports. A worker session does not."""
     results = [
         _diagnosis(
             0,

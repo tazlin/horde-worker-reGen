@@ -30,7 +30,7 @@ def _isolated_dashboard_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) 
 
 
 def test_served_command_attaches_to_host() -> None:
-    """The per-session dashboard command points at the host socket and carries the worker mode."""
+    """The per-session dashboard command points at the host socket and includes the worker mode."""
     args = web._parse_args(["--process-mode", "fake"])
     command = web._build_served_command(args, 7717, remote_exposed=False)
     # Invoked via ``python -m`` so cmd.exe cannot shadow it with the repo's horde-worker.cmd launcher.

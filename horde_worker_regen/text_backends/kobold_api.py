@@ -3,15 +3,15 @@
 koboldcpp and sonar are different programs with different internals, but both expose the KoboldAI
 routes, so one driver serves both and the worker does not grow a branch per backend.
 [`KoboldApiTextBackend`][horde_worker_regen.text_backends.kobold_api.KoboldApiTextBackend] is the only
-place in the worker that knows those routes exist; above it there is just the protocol in
+module that uses these routes directly. Other worker modules use the protocol in
 [`protocol`][horde_worker_regen.text_backends.protocol].
 
 Generation is driven through the backend's server-sent-events stream rather than the blocking route.
-Both carry the same payload and finish at the same moment, and the stream costs nothing in throughput,
-but the stream says something while it runs: how much text has arrived and when. Without that the worker
-learns nothing until a generation returns, so a slow generation and a wedged backend look identical for
-minutes at a time. Token counts are a separate question the stream cannot answer, because one record
-carries an arbitrary number of tokens; those come from the statistics route on a backend that has one.
+Both include the same payload and finish at the same moment, and the stream costs nothing in throughput,
+but the stream reports how much text has arrived and when. Without streaming, progress is not available
+until generation finishes, so a slow generation and a stuck backend appear identical for
+minutes at a time. Stream records do not provide token counts, because one record
+has an arbitrary number of tokens. Counts come from the statistics route on a backend that supports it.
 The blocking route remains the fallback for a backend whose stream route is missing or refuses to start.
 
 Two choices are worth stating because they look like omissions:
@@ -119,11 +119,11 @@ class KoboldApiJsonKeys:
 
 
 class KoboldApiTimeouts:
-    """Deadlines for the calls whose protocol signature carries none.
+    """Deadlines for calls without a timeout in the protocol signature.
 
     `ready` and `generate` are given a deadline by their caller, because how long to wait for them is a
     scheduling decision. The metadata reads, the statistics samples and the abort are small, fixed
-    requests against a local program, so they carry their own ceiling rather than inheriting the
+    requests against a local program, so they have a separate timeout instead of inheriting the
     session's default, which is minutes long and would let a wedged backend hold a shutdown open.
     """
 
@@ -144,9 +144,8 @@ a lock the stream poll already takes every twenty milliseconds, so the cost is t
 CAPABILITY_PROBE_GENERATION_KEY: Final = "regen-capability-probe"
 """The key the statistics route is probed with: deliberately not a generation key anything will use.
 
-The probe asks whether the route exists at all, so it wants an answer that costs the backend nothing.
-A key belonging to no generation gets `found: false` from a backend that has the route and a 404 from
-one that does not, which is the whole of the question.
+The probe checks whether the route exists without starting a generation. A key that does not match
+any generation gets `found: false` when the route is available, or 404 when it is not.
 """
 
 _SSE_DATA_FIELD_PREFIX: Final = "data:"
@@ -161,10 +160,9 @@ _REJECTED_PAYLOAD_STATUSES: Final = frozenset({HTTPStatus.BAD_REQUEST, HTTPStatu
 _REFUSED_CREDENTIAL_STATUSES: Final = frozenset({HTTPStatus.UNAUTHORIZED, HTTPStatus.FORBIDDEN})
 """The statuses that mean the credential is wrong rather than the request or the backend.
 
-koboldcpp guards its text routes with the password it was launched with and answers 401 to a request
-carrying the wrong one or none; 403 is here because a backend behind a proxy answers that way for the
-same thing. The model route is the exception: it answers 200 naming `koboldcpp/protected-model`, so a
-refused credential can first show at the generation rather than at the readiness probe.
+koboldcpp guards its text routes with the configured password and returns 401 when the password is
+missing or incorrect. A proxy may return 403 for the same condition. The model route returns 200 with
+`koboldcpp/protected-model`, so invalid credentials may be detected during generation rather than readiness.
 """
 
 _BODY_SUMMARY_CHARACTER_LIMIT: Final = 300
@@ -172,7 +170,7 @@ _BODY_SUMMARY_CHARACTER_LIMIT: Final = 300
 
 
 class _RouteNotImplemented(TextBackendUnavailable):
-    """A route answered 404, so this backend does not implement it.
+    """The backend returned 404 for a route it does not implement.
 
     A subclass of `TextBackendUnavailable` so a caller that does not care still sees the failure the
     protocol promises, while the reads of optional routes catch this narrower type and carry on.
@@ -256,11 +254,10 @@ class _KoboldStreamRecord(_KoboldResponseModel):
 
 
 class _KoboldGenerationStats(_KoboldResponseModel):
-    """Represents the statistics route's answer about one generation.
+    """Statistics returned for one generation.
 
-    Every field past `found` is optional because the route answers two different shapes: the full one
-    for a request the backend is running in its batching path, and a smaller one for a request on the
-    legacy single-generation path, which knows its prompt tokens only once it has finished.
+    Fields after `found` are optional. The batching path returns a full response, while the legacy
+    single-generation path returns fewer fields and reports prompt tokens only after completion.
     """
 
     found: bool = False
@@ -305,11 +302,11 @@ def _summarise_body(body_text: str) -> str:
 
 
 def _reported_count(count: int | None) -> int | None:
-    """Return a token count the backend actually knows, or None for the zero it sends when it does not.
+    """Return a positive token count, or None when the count is missing or nonpositive.
 
-    The statistics route answers zero prompt tokens for a generation on the legacy path that has not
-    finished, and the perf counters are zero before any generation has run, so a zero is "not known
-    yet" rather than "no tokens".
+    The statistics route returns zero prompt tokens for an unfinished generation on the legacy path.
+    The perf counters are also zero before any generation has run. A zero indicates that the count is
+    not yet available.
     """
     if count is None or count <= 0:
         return None
@@ -322,8 +319,8 @@ class _StreamedGeneration:
     Two writers, one reader: the loop reading the stream appends text, and the statistics sampler (a
     task running beside it) records counts and timings. Both then build a
     [`TextGenerationProgress`][horde_worker_regen.text_backends.protocol.TextGenerationProgress] from
-    whatever is known at that moment, so a chunk report carries the last counts seen and a statistics
-    report carries the text arrived so far.
+    whatever is known at that moment, so a chunk report includes the last counts seen and a statistics
+    report includes the text received so far.
 
     Thread Safety:
         Not thread-safe and does not need to be: both writers run on the same event loop, and neither
@@ -347,7 +344,7 @@ class _StreamedGeneration:
         self._completion_tokens: int | None = None
         self._tokens_per_second: float | None = None
         self._last_counted_sample: tuple[float, int] | None = None
-        """When the last sample that carried a generated-token count arrived, and that count."""
+        """The arrival time and count from the last sample with a generated-token count."""
 
     @property
     def text(self) -> str:
@@ -371,11 +368,11 @@ class _StreamedGeneration:
 
     @property
     def completion_tokens(self) -> int | None:
-        """Generated tokens from the last statistics sample that knew them, or None."""
+        """Generated tokens from the last sample with a count, or None when unavailable."""
         return self._completion_tokens
 
     def note_record(self, record: _KoboldStreamRecord) -> None:
-        """Take in one stream record: its text, its arrival, and a finish reason if it carries one."""
+        """Record the received text, arrival time and any finish reason from a stream record."""
         self._chunks_received += 1
         self._last_chunk_at = time.monotonic()
         if record.token:
@@ -385,10 +382,10 @@ class _StreamedGeneration:
             self._finish_reason = record.finish_reason
 
     def note_stats(self, stats: _KoboldGenerationStats) -> None:
-        """Take in one statistics sample, keeping only the figures it actually knows.
+        """Record available counts from a statistics sample.
 
-        A sample that has lost a count it reported before (the legacy path answers zero prompt tokens
-        until the generation finishes) leaves the earlier figure in place rather than unsetting it.
+        Missing counts do not clear earlier readings. The legacy path returns zero prompt tokens
+        until generation finishes, so such samples must not overwrite an available count.
         """
         prompt_tokens = _reported_count(stats.prompt_tokens)
         if prompt_tokens is not None:
@@ -536,10 +533,10 @@ class KoboldApiTextBackend:
         """Return the parsed answer from a GET, as `response_model`.
 
         Raises:
-            _RouteNotImplemented: The backend answered 404, so it has no such route.
+            _RouteNotImplemented: The backend returned 404 for the route.
             TextBackendCredentialRefused: The backend refused the worker's credentials.
-            TextBackendUnavailable: The backend did not answer, answered another non-200 status, or
-                answered a body that is not the expected shape.
+            TextBackendUnavailable: The backend did not respond, returned another non-200 status, or
+                returned a body with an unexpected shape.
         """
         try:
             raw = await self._request(method=hdrs.METH_GET, route=route, timeout_seconds=timeout_seconds)
@@ -619,7 +616,7 @@ class KoboldApiTextBackend:
         """Return the model name and caps the backend advertises, plus any soft prompts it exposes.
 
         Raises:
-            TextBackendUnavailable: Any of the required routes did not answer or answered unreadably.
+            TextBackendUnavailable: A required route did not respond or returned an unreadable response.
         """
         model_response = await self._read_json(
             route=KoboldApiRoutes.MODEL,
@@ -772,11 +769,11 @@ class KoboldApiTextBackend:
             where anything the backend offers reported them.
 
         Raises:
-            TextBackendBusy: The backend answered 503, its generation slots being taken.
+            TextBackendBusy: The backend returned 503 because its generation slots were busy.
             TextBackendCredentialRefused: The backend refused the worker's credentials.
             TextBackendRejectedPayload: The backend refused the payload itself.
             TextBackendUnavailable: The backend was unreachable, outlived the deadline, failed with a
-                server error, answered without a usable generation, or stopped part way through one.
+                server error, returned a response without a usable generation, or stopped part way through one.
         """
         self._generations_in_flight += 1
         try:
@@ -834,7 +831,7 @@ class KoboldApiTextBackend:
         """Return the generation from the blocking route, which says nothing until it is finished.
 
         Raises:
-            TextBackendBusy: The backend answered 503.
+            TextBackendBusy: The backend returned 503.
             TextBackendCredentialRefused: The backend refused the worker's credentials.
             TextBackendRejectedPayload: The backend refused the payload.
             TextBackendUnavailable: Anything else, including a 200 with no usable generation.
@@ -862,8 +859,8 @@ class KoboldApiTextBackend:
                 f"without a usable '{KoboldApiJsonKeys.RESULTS}' entry: {_summarise_body(raw.body_text)}",
             ) from parse_error
 
-        # The blocking answer carries its own counts, so this path needs no second request to learn
-        # them and is not subject to the perf counters' one-generation-at-a-time limitation.
+        # The blocking response includes token counts, so a second request is not needed. This avoids
+        # the perf counters' one-generation-at-a-time limitation.
         generation = generate_response.results[0]
         return TextGenerationResult(
             text=generation.text,
@@ -885,7 +882,7 @@ class KoboldApiTextBackend:
         Raises:
             _RouteNotImplemented: This backend has no stream route.
             _StreamUnusable: The stream would not start, or started and ended without one record.
-            TextBackendBusy: The backend answered 503.
+            TextBackendBusy: The backend returned 503.
             TextBackendCredentialRefused: The backend refused the worker's credentials.
             TextBackendRejectedPayload: The backend refused the payload.
             TextBackendUnavailable: The generation outlived its deadline, or the stream broke after
@@ -1022,10 +1019,9 @@ class KoboldApiTextBackend:
             _report_progress(on_progress, generation)
 
     async def _read_generation_stats(self, generation_key: str) -> _KoboldGenerationStats | None:
-        """Return one statistics sample for a generation, or None when the route did not answer one.
+        """Return a generation's statistics sample, or None when it is unavailable.
 
-        A 404 also settles the capability the other way: a route the backend answered the probe for and
-        now denies is a route it does not have, so nothing asks again.
+        A 404 disables further statistics requests even if the initial probe succeeded.
         """
         try:
             raw = await self._request(

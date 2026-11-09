@@ -1,6 +1,6 @@
 """Typed remedy commands the governance decision functions return.
 
-Each action names one concrete remedy and carries the values its execution (and its log line) needs.
+Each action specifies a concrete remedy and includes the values needed for execution and logging.
 Decisions return ``list[GovernanceAction]``; the scheduler owns a single dispatcher that executes them
 against the live process map, lifecycle manager, and worker state. Keeping the actions as inert values
 separates deciding from acting: tests assert on the returned actions, and every side effect has exactly
@@ -77,8 +77,8 @@ class ReduceWorkerProcesses:
 class ReduceCardProcesses:
     """Shed idle inference processes on one card toward a per-card target count.
 
-    Execution records the card as shed when the count actually fell, so the restore path knows which
-    cards to grow back once the host recovers.
+    Execution records which cards had their process counts reduced. Those cards can have their counts
+    restored once the host recovers.
     """
 
     device_index: int

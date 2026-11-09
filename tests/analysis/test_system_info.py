@@ -176,7 +176,7 @@ class TestRotationalStorage:
         assert system_info._linux_rotational(major=8, minor=1) is expected
 
     def test_linux_whole_disk_reads_its_own_flag(self, fake_sysfs: Path) -> None:
-        """A device-mapper or unpartitioned disk carries the flag itself."""
+        """A device-mapper or unpartitioned disk has the flag on the device itself."""
         _write_block_device(fake_sysfs, number="253_0", device_name="dm-0", device_type="disk")
         (fake_sysfs / "block" / "dm-0" / "queue").mkdir(parents=True)
         (fake_sysfs / "block" / "dm-0" / "queue" / "rotational").write_text("0\n", encoding="utf-8")

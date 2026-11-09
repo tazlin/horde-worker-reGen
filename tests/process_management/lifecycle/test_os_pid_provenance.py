@@ -40,7 +40,7 @@ def test_reconcile_absent_process_is_a_no_op() -> None:
 
 def test_worker_state_change_message_carries_the_reporters_own_pid() -> None:
     """The base send helper stamps the message with the sender's real os.getpid()."""
-    # A minimal HordeProcess is abstract; assert instead that the message model carries the field and the
+    # A minimal HordeProcess is abstract. Assert instead that the message model includes the field and the
     # send helper (verified by construction here) populates it with the reporter's own pid, matching what the
     # parent adopts. This pins the field contract the dispatcher reconciles against.
     from horde_worker_regen.process_management.ipc.messages import HordeProcessStateChangeMessage

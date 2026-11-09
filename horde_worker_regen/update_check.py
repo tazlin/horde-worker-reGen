@@ -34,7 +34,7 @@ NEWER_RELEASE_ENV_VAR = "AIWORKER_NEWER_RELEASE_AVAILABLE"
 DISABLE_ENV_VAR = "HORDE_WORKER_NO_UPDATE_CHECK"
 """When set, every update check is skipped (offline/air-gapped installs, or to silence the nag)."""
 
-# The in-place updater carries the canonical version/channel/origin logic. Reuse it when present so the
+# The in-place updater includes the canonical version/channel/origin logic. Reuse it when present so the
 # notifier never reports a different verdict than the applier; fall back to a local check when the bundle's
 # bootstrap package is not importable (e.g. a worker installed standalone into a user-managed venv).
 _bootstrap_updater: ModuleType | None

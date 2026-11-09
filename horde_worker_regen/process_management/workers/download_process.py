@@ -335,10 +335,10 @@ class HordeDownloadProcess(HordeProcess):
         self._prefetch_jobs: dict[tuple[DownloadKind, str, str], set[GenerationID]] = {}
         # Terminal ad-hoc aux rejections (LoRA or TI: invalid/too-large/NSFW/permanently-unavailable) keyed by
         # task dedup key, stashed by the fetch path and drained when its per-task outcome is emitted, so the
-        # outcome can carry the reason and mark the fetch non-retryable.
+        # outcome can include the reason and mark the fetch non-retryable.
         self._aux_rejections: dict[tuple[DownloadKind, str, str], str] = {}
         # Ad-hoc aux fetches the engine skipped for a condition that can clear (its typed skip reason, such as a
-        # full cache volume), keyed and drained like the rejections, so the outcome carries the failure kind.
+        # full cache volume), keyed and drained like the rejections, so the outcome includes the failure kind.
         self._aux_skip_kinds: dict[tuple[DownloadKind, str, str], AuxPrefetchFailureKind] = {}
         # Aux-prefetch entries whose model manager was not yet loaded when their request arrived are stashed
         # here (never failed: a still-loading downloader is transient, and faulting would self-inflict a job

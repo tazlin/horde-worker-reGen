@@ -477,7 +477,7 @@ class OverviewView(Vertical):
         }
         for node_id, is_shown in show.items():
             self.query_one(node_id, Static).display = is_shown
-        # The ops row carries the worker/alchemy/text/residency panels; show it while any of them do.
+        # The ops row contains the worker/alchemy/text/residency panels. Show it while any of them are visible.
         self.query_one("#overview-ops-row").display = (
             show["#overview-worker"]
             or show["#overview-alchemy"]
@@ -2639,7 +2639,7 @@ class OverviewView(Vertical):
 
     @staticmethod
     def _external_heartbeat_cell(row: _ProcessRow) -> Text:
-        """Render how long ago an external process last answered a health probe.
+        """Render how long ago an external process last responded to a health probe.
 
         Uncoloured by the staleness thresholds above: a text backend is asked whether it is ready while it
         starts and not again while it serves, so a growing age here is the expected reading rather than a

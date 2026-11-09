@@ -388,7 +388,7 @@ class HarnessConfig:
 
     soak_alchemy_templates: Sequence[SoakAlchemyForm] = field(default_factory=list)
     """Weighted ``(form, weight)`` or ``(form, weight, control_type)`` entries the soak generates alchemy
-    forms from (optional). The control type carries an ``annotation`` form's detector identity."""
+    forms from (optional). The control type has an ``annotation`` form's detector identity."""
 
     soak_drain_timeout_seconds: float = 60.0
     """After the soak period, how long to wait for in-flight work to drain before shutting down."""
@@ -551,7 +551,7 @@ class HarnessResult:
     """True when a fixed-scenario run ended with no job accounted for (none completed, none faulted) via an
     early graceful shutdown rather than a timeout: the worker gave up (or never brought a child up) before it
     could do any work. Distinguishes this boot failure from a legitimately scored run so a driver cannot read
-    a zero-work early exit as a real (if poor) result; the run's ``exit_reason`` carries the underlying cause."""
+    a zero-work early exit as a real (if poor) result. The run's ``exit_reason`` includes the underlying cause."""
 
     @property
     def all_jobs_accounted_for(self) -> bool:
@@ -739,7 +739,7 @@ def _needs_controlnet(features: ImageGenerationFeatureFlags) -> bool:
 
 
 def _needs_source_image(features: ImageGenerationFeatureFlags) -> bool:
-    """Whether a workload's features carry a source image (and so require ``allow_img2img``)."""
+    """Whether a workload's features have a source image (and so require ``allow_img2img``)."""
     return bool(
         features.extra_source_images
         or features.controlnets_feature_flags

@@ -60,7 +60,7 @@ def test_bootstrap_package_is_staged_by_workflows() -> None:
 
 
 def test_utilities_project_is_staged_by_workflows() -> None:
-    """Both staging scripts must recursively copy requirements/, which carries the utilities uv project.
+    """Both staging scripts must recursively copy requirements/, which includes the utilities uv project.
 
     The bootstrap provisions the image-utilities capability venv with `uv sync --locked` against
     requirements/utilities/ (its pyproject.toml + uv.lock). That directory rides in as a recursive copy (not

@@ -158,7 +158,7 @@ class StatsView(Vertical):
     def _shows_workload_split(snapshot: WorkerStateSnapshot) -> bool:
         """Whether the by-workload table earns its space on this worker.
 
-        The headline counters carry the whole worker's jobs and kudos, so an image-only worker learns
+        The headline counters include the whole worker's jobs and kudos, so an image-only worker learns
         nothing from a table that restates them. A non-image workload is measured in figures the headline
         has no room for (a text flow's mean generated tokens has nowhere else to appear), so one row is
         worth showing as soon as such a workload has totals.
@@ -356,7 +356,7 @@ class StatsView(Vertical):
         """Render this session's completed, faulted and earned figures split by workload.
 
         The headline counters are one pair for the whole worker, which says nothing about which flow
-        earned what on a worker serving more than one. Only text carries a mean token count, and only
+        earned what on a worker serving more than one. Only text has a mean token count, and only
         against a backend that counts its own tokens, so the column is otherwise a dash rather than a
         zero a reader would take for a measurement.
         """

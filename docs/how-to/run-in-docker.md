@@ -13,7 +13,7 @@ container does not pull or reinstall anything at startup. To update, pull a newe
 container.
 
 Because one torch CUDA build cannot cover every GPU architecture, the image is published per build: the
-unsuffixed `:latest` / `:vX.Y.Z` tags carry the `cu130` build (Turing through Blackwell / RTX 50-series,
+unsuffixed `:latest` / `:vX.Y.Z` tags include the `cu130` build (Turing through Blackwell / RTX 50-series,
 the common datacenter case), and explicit `:latest-cu126`, `:latest-cu130`, and `:latest-cu132` variants
 are also published. **Pre-Turing cards** (Maxwell/Pascal/Volta, e.g. GTX 10-series) must pull the
 `-cu126` variant. If the pulled image's build does not carry kernels for your GPU, the container fails fast at

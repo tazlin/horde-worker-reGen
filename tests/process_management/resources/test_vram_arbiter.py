@@ -1259,7 +1259,7 @@ class TestPartialSeatUnderTheCeiling:
     """What the job already holds, more than the seat's weight share, so the seat fits by netting it."""
 
     def _held_dispatch(self) -> VramRequest:
-        """A seat-carrying dispatch whose holdings exceed its weight share and whose grant carries the reserve."""
+        """A seat-carrying dispatch whose holdings exceed its weight share and whose grant includes the reserve."""
         return self._dispatch(
             candidate_held_mb=self._HELD_MB,
             sampling_reserve_mb=self._RESERVE_MB,

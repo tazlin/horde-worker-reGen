@@ -1,6 +1,6 @@
 """Offline view of a learned VRAM footprint store, in the figures the worker prices sampling from.
 
-A support bundle carries the worker's ``vram_footprints.json``. Reading which sampling keys price high, and
+A support bundle includes the worker's ``vram_footprints.json``. Reading which sampling keys price high, and
 against which resident weights, otherwise means loading the file by hand. This module loads it through
 :class:`~horde_worker_regen.process_management.resources.vram_footprints.LearnedFootprintStore` and reads each
 figure through the store's own estimate methods, so the view moves with the production statistic.
@@ -8,7 +8,7 @@ figure through the store's own estimate methods, so the view moves with the prod
 - :func:`learned_sampling_footprints`: one row per sampling key with its two pricing terms, the resident
   figures for its baseline and the activation watermark for its band.
 - :func:`render_learned_sampling_footprints`: the terminal rendering.
-- :func:`card_blind_entries_dropped`: how many entries of a file written before keys carried a card were dropped.
+- :func:`card_blind_entries_dropped`: how many entries of a file written before keys had a card were dropped.
 - :func:`default_footprint_store_path`: the bundle's copy beside a bundle's ``stats/``, else the worker's store.
 """
 

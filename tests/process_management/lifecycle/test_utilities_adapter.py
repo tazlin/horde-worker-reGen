@@ -325,7 +325,7 @@ def test_start_annotation_round_trips_bytes_into_a_result(http_service: tuple[_S
 
 
 def test_annotation_missing_weights_faults_with_reason(http_service: tuple[_ServiceState, str]) -> None:
-    """A 409 from the annotators endpoint faults the result and carries the error reason."""
+    """A 409 from the annotators endpoint faults the result and includes the error reason."""
     state, base_url = http_service
     state.annotate_status = 409
     q: queue.Queue[object] = queue.Queue()
@@ -462,7 +462,7 @@ def test_strip_background_form_routes_to_utilities_and_matches_pp_shape(
         # Mirrors the post-processing lane's result shape: WebP image bytes, no inline payload.
         assert result.image_bytes is not None and result.image_bytes[:4] == b"RIFF"
         assert result.result_payload is None
-        assert state.hits("/rembg/remove-background") == 0  # path carries a query string; counted below
+        assert state.hits("/rembg/remove-background") == 0  # The path has a query string and is counted below.
         assert any(p.startswith("/rembg/remove-background") for p in state.paths_hit)
     finally:
         adapter.stop()

@@ -1417,7 +1417,7 @@ class TestGrantCarriesMeasurementTime:
         assert proxy.take_cleared_device_free_measured_at() is None
 
     def test_a_proxy_without_the_shared_time_carries_none(self) -> None:
-        """A proxy built before the time existed still carries the figure, and no time."""
+        """A proxy built before the time existed still includes the figure, and no time."""
         controller = _controller()
         proxy = _StubProxy(cleared_device_free=_shared_figure())
         controller.register(2, proxy)
@@ -1451,7 +1451,7 @@ class TestGrantCarriesMeasurementTime:
         assert proxy.take_cleared_device_free_measured_at() == 300.0
 
     def test_a_stage_grant_carries_its_own_time(self) -> None:
-        """A stage grant beside a running sampler carries its reading's time, apart from the sample permit."""
+        """A stage grant beside a running sampler includes its reading's time, apart from the sample permit."""
         controller = _controller(slot_cap=1, tail=False)
         sampler = _StubProxy(with_stage=True)
         proxy = _timed_proxy(with_stage=True)
@@ -1783,7 +1783,7 @@ class TestControllerLiveness:
 
 
 class TestStageLeaseProxy:
-    """The stage view takes its permit once per job and carries the stage grant's figure once."""
+    """The stage view takes its permit once per job and includes the stage grant's figure once."""
 
     def _proxy(self) -> tuple[ClearanceLeaseProxy, _FakeSemaphore, Synchronized[float]]:
         stage = _held_empty_clearance()

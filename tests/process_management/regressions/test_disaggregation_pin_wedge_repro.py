@@ -135,7 +135,7 @@ async def test_classifier_names_the_pinned_residency_wait_with_owner_and_samplin
     """The classifier attributes the held head to the pin, its owning job, and that sampling is in flight.
 
     The stall text is compared across cycles by the log throttle and by recovery's judgement of whether a
-    remedy moved the head's blocker, so it carries the count (which changes only when work starts or stops)
+    remedy moved the head's blocker, so it includes the count (which changes only when work starts or stops)
     and not the sampling megabytes, which drift on every measurement while the block is the same.
     """
     scheduler, head, _process_map = await _scheduler_with_pinned_resident_head(with_free_slot=False)

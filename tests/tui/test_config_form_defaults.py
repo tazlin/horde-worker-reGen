@@ -28,7 +28,7 @@ from horde_worker_regen.tui.config_form import (
 )
 
 # Keys whose editor display is intentionally blank to prompt the operator to set their own value,
-# even though the model carries a placeholder/default. Aligning these to the SDK placeholder
+# even though the model has a placeholder/default. Aligning these to the SDK placeholder
 # ("An Awesome Dreamer", "0000000000", "./") would be worse UX, so they are exempt from parity.
 _INTENTIONALLY_BLANK = frozenset(
     {

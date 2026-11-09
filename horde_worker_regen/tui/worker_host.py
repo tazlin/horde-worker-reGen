@@ -169,7 +169,7 @@ class WorkerHost:
         broadcast (within one control interval). Keeping every supervisor read on the control thread
         avoids racing its start/stop/tick mutations from this per-client thread.
 
-        The client socket carries a timeout so a peer that stops reading (a suspended browser tab behind a
+        The client socket has a timeout so a peer that stops reading (a suspended browser tab behind a
         dashboard session) cannot block the control thread's broadcast indefinitely; the reader loop here
         simply waits out its own receive timeouts, since a quiet client is not a dead one.
         """

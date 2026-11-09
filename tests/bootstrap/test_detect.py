@@ -81,7 +81,7 @@ def test_parse_gpu_query_reads_driver_version() -> None:
 @pytest.mark.parametrize(
     ("version", "compute_cap", "expected"),
     [
-        # Floor: Blackwell (sm_120 / sm_100) does not carry a kernel image in cu126, so lift to cu130.
+        # Floor: Blackwell (sm_120 / sm_100) does not have a kernel image in cu126, so lift to cu130.
         ((12, 8), (12, 0), detect.CU130),  # old CUDA 12.x driver, known Blackwell card
         ((0, 0), (12, 0), detect.CU130),  # driver CUDA unreadable but the card is known Blackwell
         ((10, 0), (10, 0), detect.CU130),  # sm_100 datacenter Blackwell, same floor

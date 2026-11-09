@@ -40,7 +40,7 @@ deletion; a foreign file, a leftover `.tmp`, or a nested folder is never touched
 | `job_completed`  | Per finished job or alchemy form | The full [`JobMetricsRecord`][horde_worker_regen.process_management.resources.run_metrics.JobMetricsRecord] (stage timings, queue-wait/e2e/sampling seconds, model, resolution, sampler/scheduler/cfg_scale, post-processing, VRAM high-water) and its resolved `baseline`. |
 | `stats_sample`   | At most once per second | A periodic [`StatsSample`][horde_worker_regen.process_management.ipc.supervisor_channel.StatsSample] (throughput, kudos/hr, VRAM/RAM, duty cycle). Written whether or not a dashboard is attached: a headless worker is the one whose stream gets read afterwards, and every duty figure is a difference between adjacent samples. |
 | `decision`       | On an admission/dispatch/reclaim verdict (coalesced) | `decision_kind`, `subject`, `verdict`, `reason`, and a flat `inputs` map of the quantities the arbiter decided from. |
-| `resource_state` | On a device/overflow transition (edge-triggered) | `state_kind` (governor / WDDM paging / saturation-unresolved / dispatch hold), `state`, `device_index`, and flat `inputs`. A `dispatch_hold` record is written when a head's dispatch is first held by the residency gate (`standing`), when it is admitted (`released`, with `reason` `measured_attempt`, `reclaim` or `natural_free`), or when the job leaves the queue unadmitted (`abandoned`); its inputs carry the measured room breakdown described below plus `hold_seconds`. |
+| `resource_state` | On a device/overflow transition (edge-triggered) | `state_kind` (governor / WDDM paging / saturation-unresolved / dispatch hold), `state`, `device_index`, and flat `inputs`. A `dispatch_hold` record is written when a head's dispatch is first held by the residency gate (`standing`), when it is admitted (`released`, with `reason` `measured_attempt`, `reclaim` or `natural_free`), or when the job leaves the queue unadmitted (`abandoned`). Its inputs include the measured room breakdown described below plus `hold_seconds`. |
 
 A `stats_sample` carries card 0's free memory from the reading admission prices against (`device_free_mb`,
 with `device_free_provenance`) and three figures recorded for comparison that nothing acts on:
@@ -52,7 +52,7 @@ traffic. The adapter figure comes from a counter sampled every two seconds, so i
 
 A `job_completed` record pairs the priced request with what it cost to serve: alongside resolution, steps
 and batch count it carries `sampler_name` (as the horde advertised it, uncanonicalized), `scheduler`
-(the schedule sampled on, `karras`/`normal` when the request only carried the legacy karras bool) and
+(the schedule sampled on, `karras`/`normal` when the request only included the legacy karras bool) and
 `cfg_scale`, against measured `sampling_seconds` and the horde's `kudos_reward`. `dispatch_hold_seconds` is
 the share of `queue_wait_seconds` the residency gate held the job for (None when it was never held), so a
 wait the card's tenancy caused can be told apart from scheduling and auxiliary fetching. The `session_end`
@@ -85,7 +85,7 @@ child, so a slow load before the first acquire does not count. It is the job's m
 ### Worker-condition fields on `job_completed`
 
 Two jobs of identical shape can cost very different amounts depending on what the worker was doing around
-them, so a record also carries the conditions it was served under. All of these are optional: a record
+them, so a record also includes the conditions it was served under. All of these are optional: a record
 that could not measure one omits it (or writes `null`), which is distinct from a measured zero.
 
 | Field | Meaning |
@@ -97,7 +97,7 @@ that could not measure one omits it (or writes `null`), which is distinct from a
 | `post_processing_chain_seconds` | Seconds the post-processing lane spent inside the hordelib chain for this job, summed over its images. Absent when the job had no post-processing or the lane faulted. |
 | `post_processing_encode_seconds` | Seconds the lane spent encoding the post-processed images for upload. |
 | `post_processing_output_width`, `post_processing_output_height` | Size of the job's first post-processed image. |
-| `whole_card` | Whether a [whole-card exclusive residency](../explanation/resource_governance.md) for this job's model was held on its card at dispatch. Such a job ran with the card to itself and carries the amortized cost of establishing that residency. |
+| `whole_card` | Whether a [whole-card exclusive residency](../explanation/resource_governance.md) for this job's model was held on its card at dispatch. Such a job ran with the card to itself and is charged the amortized cost of establishing that residency. |
 | `process_age_seconds` | How long the inference process serving the job had been alive at dispatch. A young process has cold component and RAM caches, so its first jobs pay loads a long-lived process does not; a mid-session respawn contaminates the jobs around it. |
 
 A re-dispatched job (one whose first attempt failed and was retried) reports the dispatch conditions of the
@@ -158,7 +158,7 @@ last three of which are *resolving*). Preload admission records under `vram_admi
 decision and its reason, so a head that never loads can be attributed offline without a log.
 
 A `clearance` record is one staged job's pass at the clearance lease, the moment its weights would load. A hold
-(`defer`, or `deny` past its deadline on evidence of a native crash) carries the price and the reading it was
+(`defer`, or `deny` past its deadline on evidence of a native crash) includes the price and the reading it was
 judged on (`candidate_delta_mb`, `candidate_held_mb`, `partial_seat_mb`, `device_free_mb`, `available_mb`,
 `outstanding_reservations_mb`, `noise_buffer_mb`), both clocks against their limits (`starved_seconds` against
 `probe_after_seconds`, `lease_wait_seconds` against `attempt_deadline_seconds`), whether the card still reads as
@@ -168,7 +168,7 @@ having something to reclaim (`reclaimable_idle_model`, `reclaimable_idle_tenancy
 resolving `admit` names how the job was granted: by price, at its partial-load seat, as a measured load
 attempt, unpriced, or with the budget inactive.
 
-An `inference_dispatch` deferral (and every `dispatch_hold` record) carries the measured room the hold was
+An `inference_dispatch` deferral (and every `dispatch_hold` record) includes the measured room the hold was
 judged against: `room_candidate_mb`, `room_available_mb`, `room_deficit_mb`, `room_reclaimable_mb`,
 `room_unpausable_mb` and `room_closable` (whether the permitted reclaim rungs together cover the deficit);
 `tenancy_<lane>_mb` for each class of holder on the card (`inference_target`, `inference_idle`,
@@ -206,7 +206,7 @@ sees an unchanged tab). It reports pool readiness and pop outcomes split by lane
   points to seated models the horde is not feeding; a low free-lane rate points to a thin wider offer.
 
 In the same tab, the **By model totals** table marks any model that currently holds a pool seat with a `◆`
-suffix (the panel subtitle carries the legend), so a seated model's jobs, megapixelsteps, and latency read in
+suffix (the panel subtitle includes the legend), so a seated model's jobs, megapixelsteps, and latency read in
 place rather than in a duplicate per-seat table.
 
 ## See also

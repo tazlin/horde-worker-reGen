@@ -221,7 +221,7 @@ class TestModelPoolDesiredSetUnion:
     """A config reconcile send unions the pool's pending downloads into the authoritative desired set."""
 
     def test_reconcile_desired_set_includes_pool_pending(self) -> None:
-        """The desired-image-model set on a reconcile send carries the pool-pending model so it is not pruned."""
+        """The desired-image-model set on a reconcile send includes the pool-pending model so it is not pruned."""
         process_lifecycle = Mock()
         desired_state = Mock()
         plan = Mock()

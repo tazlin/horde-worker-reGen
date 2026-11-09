@@ -10,7 +10,7 @@ the change's parent, never by a live figure.
 Values chosen without a live figure: the host's foreign RAM, the service-lane exit time, the safety placement
 readiness (the world's default of zero), and the jobs in flight at a window's start, which are not replayed. The
 scheduler's performance model starts unseeded and learns sampling rates and dispatch-to-first-step overheads
-from the replay's jobs, where the live worker carried a model learned over earlier sessions.
+from the replay's jobs, where the live worker had a model learned over earlier sessions.
 """
 
 from __future__ import annotations
@@ -606,7 +606,7 @@ async def test_the_w3_window_teaches_the_flux_sample_figure_a_released_child_rep
     The fixture's figure was learned from a child that kept its text encoder on the card, so a child that releases
     it reports less, and the parent's figure moves down toward the diffusion weights and activation the world
     charges, priced through the store's margin. A figure that rises is teaching the parent figures no child
-    reported. Each of the world's reports carries the job's sampling peak without the context share or the decode
+    reported. Each of the world's reports includes the job's sampling peak without the context share or the decode
     spike. Truth figures are read without the store's margin, which the parent adds when it learns from them.
     """
     start_store = load_footprint_store(SESSION_FOOTPRINTS_PATH, scratch_directory=tmp_path / "start")

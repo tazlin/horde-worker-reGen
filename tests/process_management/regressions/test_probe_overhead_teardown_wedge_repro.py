@@ -96,7 +96,7 @@ def _build_scheduler_at_idle_residency() -> InferenceScheduler:
             state=HordeProcessState.WAITING_FOR_JOB,
             process_type=HordeProcessType.INFERENCE,
         )
-        # Children report device-wide used / total, so every idle process carries the same figures.
+        # Children report device-wide used / total, so every idle process includes the same figures.
         proc.vram_usage_mb = _IDLE_DEVICE_USED_ALL_CONTEXTS_MB
         proc.total_vram_mb = _DEVICE_TOTAL_VRAM_MB
         # An idle, model-less context holds no allocator reservation; a zero (not None) figure makes the

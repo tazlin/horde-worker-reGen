@@ -35,7 +35,7 @@ _CARD_GB = 24
 
 
 def _card_blind_dump(key: FootprintKey) -> dict[str, object]:
-    """Return ``key`` as a file written before keys carried a card stores it."""
+    """Return ``key`` in the format used before card sizes were recorded."""
     dumped = key.model_dump(mode="json")
     del dumped["card_total_gb"]
     return dumped
@@ -258,7 +258,7 @@ class TestFootprintKeyIdentity:
 
 
 class TestResidentAndSafetyStages:
-    """The resident-weight and safety stages carry the same raise-only contract on their own keys."""
+    """The resident-weight and safety stages include the same raise-only contract on their own keys."""
 
     def test_a_resident_key_never_collides_with_the_sampling_key(self) -> None:
         """A checkpoint's resident weights and its baseline's sampling peak are separate populations.
@@ -1004,7 +1004,7 @@ class TestCardKeyedFigures:
 
 
 class TestCardBlindFileMigration:
-    """A file written before keys carried a card is re-keyed to the one card that measured it, else dropped."""
+    """A file without card sizes is re-keyed to the one card that measured it, or dropped."""
 
     _READINGS = (9000.0, 9100.0, 9050.0, 9200.0, 9000.0)
 

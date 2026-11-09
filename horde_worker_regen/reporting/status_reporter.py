@@ -276,7 +276,7 @@ class StatusReporter:
         """Print one compact model-pool runtime line in headless status output.
 
         The disabled line names the normal advertising behavior so operators can distinguish an intentional
-        default from a missing feature. The enabled line carries the same seats, lane, hit-rate, bench, demand,
+        default from a missing feature. The enabled line includes the same seats, lane, hit-rate, bench, demand,
         and budget vocabulary as the TUI without turning the periodic status block into another table.
         """
         if not enabled:

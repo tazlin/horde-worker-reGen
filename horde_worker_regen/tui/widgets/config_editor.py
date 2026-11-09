@@ -107,7 +107,7 @@ _SIMPLE_SUBTABS: frozenset[str] = frozenset(
 )
 """Sub-tab labels offered in the Simple experience.
 
-These carry the decisions a contributor makes about their own worker: its identity, the models and forms
+These include the decisions a contributor makes about their own worker: its identity, the models and forms
 it offers, and the content it accepts. Alchemy belongs here because an alchemist is a worker role in the
 same sense a dreamer is; its role switch, name, and offered forms answer the same questions the dreamer
 settings on Essentials and Features do, and Simple is the level an alchemist lands in by default. Text

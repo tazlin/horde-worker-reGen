@@ -61,7 +61,7 @@ class _ReasonedRejectionTiManager(_FakeTiManager):
 
 
 def test_ti_terminal_rejection_surfaces_reason_not_bare_failure(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A terminally-rejected TI reports ok False, not retryable, and carries the rejection reason string.
+    """A terminally-rejected TI reports ok False, not retryable, and includes the rejection reason string.
 
     This is LoRA parity: the reason tells the parent to skip the embedding and dispatch the job without it
     rather than fault every requesting job on a permanent upstream refusal.

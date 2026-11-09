@@ -219,7 +219,7 @@ class TestModelServiceabilityAdmission:
         assert plan.pass_control is PreloadPassControl.NEXT_JOB
         assert plan.commands == (FaultJob(job, FaultCause.UNSERVICEABLE, plan.reason),)
         # The doomed job is faulted terminally through the existing fault machinery before any child preload:
-        # its stage moves to PENDING_SUBMIT and the tracked job info carries the faulted generation state.
+        # its stage moves to PENDING_SUBMIT and the tracked job info includes the faulted generation state.
         scheduler.executor.execute_commands(plan.commands)
         assert scheduler._job_tracker.get_stage(job.id_) is JobStage.PENDING_SUBMIT
         assert scheduler._job_tracker.jobs_lookup[job].state is GENERATION_STATE.faulted
@@ -2904,7 +2904,7 @@ class TestDominantRunEndsForAStarvedHead:
         assert list(scheduler._whole_card_ledger.held()) == []
 
     async def test_the_starved_run_end_is_recorded_in_the_ledger(self) -> None:
-        """The record carries the run model, the cause, the head's model and its age since pop."""
+        """The record includes the run model, the cause, the head's model and its age since pop."""
         head_age_seconds = self._TTL_SECONDS * (ANTI_STARVATION_TTL_FRACTION + 0.1)
         scheduler = await self._scheduler_with_run_and_head(head_model="head-model", head_age_seconds=head_age_seconds)
 
@@ -3659,7 +3659,7 @@ class TestRetentionAffinityDispatch:
         assert "process 1" in reason
 
     async def test_a_fitting_second_copy_dispatches_without_waiting(self) -> None:
-        """Where the card can carry a second copy beside the retained one, nothing is held back."""
+        """Where the card can have a second copy beside the retained one, nothing is held back."""
         scheduler, _retainer, _sibling, job_tracker = self._card(retainer_busy=True, predicted_peak_mb=3000.0)
         await track_popped_job_async(job_tracker, make_job_pop_response(model=self._MODEL))
 

@@ -589,7 +589,7 @@ class TestStartPostProcessing:
         assert lane.last_control_flag == HordeControlFlag.START_POST_PROCESS
 
     async def test_dispatch_carries_the_jobs_facefixer_strength(self) -> None:
-        """The control message carries the payload's face-fixer strength to the lane."""
+        """The control message sets the payload's face-fixer strength for the lane."""
         process_manager = make_testable_process_manager()
         lane = _make_lane_process()
         process_manager._process_map.clear()
@@ -740,7 +740,7 @@ class TestStartPostProcessing:
         self,
         monkeypatch: object,
     ) -> None:
-        """A deferred chain's ladder carries the coldest-resident rung and the scheduler unloads that one model.
+        """A deferred chain's ladder includes the coldest-resident rung and the scheduler unloads that one model.
 
         The idle inference slot's model is the only reclaimable tenant on the full card, so the verdict names
         the single-step eviction. It reaches the scheduler's ``evict_coldest_idle_model``, the idle resident is

@@ -212,7 +212,7 @@ def test_build_command_emits_one_exclude_capability_per_deselected_kind() -> Non
 
 
 def test_build_plan_command_previews_without_running() -> None:
-    """The plan command targets the `plan` subcommand with --json and carries the same selection flags."""
+    """The plan command targets the `plan` subcommand with --json and includes the same selection flags."""
     options = BenchmarkOptions(tiers=["sd15"], include_features=False, force=True)
     command = options.build_plan_command()
     assert command[1:4] == ["-m", "horde_worker_regen.benchmark.cli", "plan"]

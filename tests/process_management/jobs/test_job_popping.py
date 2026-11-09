@@ -2205,7 +2205,7 @@ class TestApiJobPopFullFlow:
         self,
         _mock_req_cls: Mock,
     ) -> None:
-        """The ring carries the pop that arrived and, once, the maintenance it proved was over.
+        """The ring includes the pop that arrived and, once, the maintenance it proved was over.
 
         The latch is cleared on every successful pop, so a second pop must not report the horde lifting
         maintenance again: a feed of that would read as the worker flapping in and out of maintenance.

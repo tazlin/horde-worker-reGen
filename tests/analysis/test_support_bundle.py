@@ -1,7 +1,7 @@
 """Tests for the support-bundle generator, led by the safety guarantee: secrets never ship.
 
 The single most important property of this feature is that a generated bundle contains no API key. These
-tests build a bundle from a synthetic worker directory whose config and logs carry a real-looking key,
+tests build a bundle from a synthetic worker directory whose config and logs have a real-looking key,
 then read every member of the produced zip and assert the secret appears nowhere.
 """
 
@@ -559,7 +559,7 @@ class TestBenchmarkRuns:
         assert diagnose_json[0]["session_label"] == f"#0  {BENCHMARK_RUN_TAG}"
 
     def test_a_worker_only_bundle_labels_its_sessions(self, tmp_path: Path) -> None:
-        """Without a harness log, each ``diagnose.json`` entry still carries the label the CLI prints."""
+        """Without a harness log, each ``diagnose.json`` entry still includes the label the CLI prints."""
         logs = _worker_dir(tmp_path)
         out = tmp_path / "bundle.zip"
         build_support_bundle(logs, out, config_path=tmp_path / "bridgeData.yaml")

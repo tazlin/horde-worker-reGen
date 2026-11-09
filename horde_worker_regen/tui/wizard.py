@@ -669,7 +669,7 @@ class GettingStartedScreen(Screen[bool]):
     def _preset_text(self, preset: Preset, plan: PresetPlan | None) -> Text:
         """One option: its marker and title, what it offers, and what it costs (or that we are looking).
 
-        The radio marker carries the mutual exclusivity, so the three options read as one choice before
+        The radio marker shows that only one option can be selected, so the three options read as one choice before
         anything is clicked. ``plan`` is None while the figures are still being gathered.
         """
         chosen = preset.kind is self._chosen

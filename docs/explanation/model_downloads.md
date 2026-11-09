@@ -81,7 +81,7 @@ lane to reload their references, so the new file resolves there without a restar
 Every per-file fetch (image **and** auxiliary) goes through the same validated
 download in
 [`model_download_core`][horde_worker_regen.model_download_core]: after the fetch it
-verifies the on-disk file (sha256 when the record carries a checksum, otherwise a
+verifies the on-disk file (sha256 when the record has a checksum, otherwise a
 presence check) and re-downloads once on a mismatch, via
 [`ensure_aux_model_present`][horde_worker_regen.model_download_core.ensure_aux_model_present].
 Previously only image checkpoints were validated and the auxiliary path reported
@@ -169,7 +169,7 @@ applied at generation time from live disk state, never snapshotted at preload.
 
 While the operator-facing view is concerned: a job held on its auxiliary files leaves every
 inference process reporting `WAITING_FOR_JOB` with a non-empty queue, which is otherwise
-indistinguishable from a stall. The status dump therefore carries a census of current holds
+indistinguishable from a stall. The status dump therefore has a census of current holds
 (how many jobs, how many files, the oldest age) and the log names a hold once it has lasted
 longer than a few seconds. Before the
 enforced disk floor a missing LoRA is fetched, the download process constrains the shared
@@ -229,7 +229,7 @@ Each auxiliary class holds its own escalating download backoff. A strike starts 
 strike. A strike is taken at most once per open window. A reference that fails while the
 window is open leaves the ladder where it is, so a burst of references failing together is
 one incident. The ladder advances only when a failure follows the window's expiry. The LoRA backoff also
-gates pop-time LoRA advertising, because the pop request carries an `allow_lora`
+gates pop-time LoRA advertising, because the pop request has an `allow_lora`
 capability flag the worker can withhold. The pop request has no per-request
 textual-inversion capability flag (no textual-inversion analogue to `allow_lora`), so
 the textual-inversion backoff influences fault classification only: it cannot suppress
@@ -383,7 +383,7 @@ own. `waiting` clears itself once a download lands; `failed` does not.
 The same readiness drives the display, so the table can never disagree with what
 the worker advertises: the Downloads tab shows the full per-feature table
 (with the install hint when deps are missing), and the Overview health panel
-carries a compact one-line summary of the engaged features. Ad-hoc LoRA and textual
+has a compact one-line summary of the engaged features. Ad-hoc LoRA and textual
 inversion prefetch (fetched per job by the download process, see
 [pop-time auxiliary prefetch](#pop-time-auxiliary-prefetch)) and the safety models
 keep their own gating and appear as read-only rows.

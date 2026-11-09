@@ -106,7 +106,7 @@ class TestEpochReport:
     """End-to-end: the per-epoch aggregates a tuning comparison reads."""
 
     def test_two_epochs_with_config_and_aggregates(self) -> None:
-        """Each epoch carries its own config, duty stats, churn totals, and disk-pressure low-water."""
+        """Each epoch includes its own config, duty stats, churn totals, and disk-pressure low-water."""
         reports = analyze_log(_LOG.splitlines())
         assert len(reports) == 2
 
@@ -606,7 +606,7 @@ class TestIdleAttributionInTheDutyReport:
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        """The JSON carries the same totals and buckets."""
+        """The JSON includes the same totals and buckets."""
         bundle = _write_idle_bundle(tmp_path / "bundle", stats_stamp="20260620-010203")
         monkeypatch.setattr(
             sys,

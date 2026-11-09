@@ -192,7 +192,7 @@ class TestGeneratingSources:
         assert widths.count(768) > widths.count(512)
 
     def test_minted_jobs_carry_template_loras_and_tis(self) -> None:
-        """Every job a LoRA/TI template mints carries the same configured references (repeated per template)."""
+        """Every job a LoRA/TI template mints includes the same configured references (repeated per template)."""
         source = GeneratingJobSource(
             [
                 SoakImageTemplate(

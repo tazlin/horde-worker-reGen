@@ -78,7 +78,7 @@ only after its condition clears, so a steady problem does not spam. Two sources 
 | `download_no_progress` | An active download's byte count has not advanced for over 120 s. |
 | `supervisor_overrun` | A single poll cycle took longer than twice the interval (the loop is running behind). |
 
-Each line carries a `severity` (`warning`/`critical`), a human `summary`, and the key numbers behind it. The
+Each line has a `severity` (`warning`/`critical`), a human `summary`, and the key numbers behind it. The
 `supervisor_overrun` self-alert is edge-triggered like the rest: it fires once when the loop falls behind and
 re-arms only after a cycle returns to time, so any regression that slows the poll loop announces itself here.
 

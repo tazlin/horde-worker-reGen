@@ -45,7 +45,7 @@ async def test_executor_runs_static_catalog_and_synthesizes(tmp_path: Path) -> N
     # The baseline established the tier it/s reference the criteria gate compares later probes against.
     assert "sd15" in report.tier_baselines_its
 
-    # Concurrency probes carry their value in the capability magnitude, so the recommendation lifts to it.
+    # Concurrency probes include their value in the capability magnitude, so the recommendation lifts to it.
     assert report.suggested_bridge_data.max_threads >= 2
     assert report.suggested_bridge_data.queue_size >= 2
 

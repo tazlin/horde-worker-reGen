@@ -96,7 +96,7 @@ def is_disagg_optimized_candidate(record: ImageGenerationModelRecord) -> bool:
 def _record_component_hashes(record: GenericModelRecord) -> dict[ComponentKind, str]:
     """Return the component content hashes ``record`` itself declares, keyed by kind.
 
-    Split-file components carry their hash on the download entry; monolithic checkpoints carry theirs in
+    Split-file components store their hash on the download entry. Monolithic checkpoints store theirs in
     ``embedded_component_hashes``. The embedded map wins over a same-kind download entry (it is the
     checkpoint's own embedded identity).
     """

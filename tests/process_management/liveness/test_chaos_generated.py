@@ -20,7 +20,7 @@ with one command:
 
     pytest tests/process_management/liveness/test_chaos_generated.py -m chaos_sweep
 
-Every failure message carries the seed and the full scenario summary, so a red run is reproducible from the
+Every failure message includes the seed and full scenario summary, so a failed run is reproducible from the
 message alone. The full-worker counterpart of this module is ``tests/e2e/test_chaos_generated_e2e.py``,
 which drives the same seeds against real child processes.
 """

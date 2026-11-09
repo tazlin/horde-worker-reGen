@@ -224,7 +224,7 @@ def loaded_or_loading_models(snapshot: SchedulingSnapshot) -> frozenset[str | No
 
 
 def pending_models(snapshot: SchedulingSnapshot) -> frozenset[str | None]:
-    """The models the pending queue wants."""
+    """Models required by pending jobs."""
     return frozenset(snapshot.queue.jobs[job_id].model for job_id in snapshot.queue.pending_in_placement_order)
 
 
@@ -717,7 +717,7 @@ def select_follower_room_target(
     idle, on a card eligible for this job and still under its sampling cap, hold no model an in-progress job
     is using, are not being drained for RAM reclaim, are not a pinned disaggregation sampler, are not committed
     to other work (:func:`lanes_committed_elsewhere`), are not on a card that cannot seat the job
-    (:func:`slots_unable_to_seat`), do not carry a head's copy, and are not a ready seat
+    (:func:`slots_unable_to_seat`), do not have a head's copy, and are not a ready seat
     (:func:`~pricing.ready_seat_process_ids`), since dispatch runs after this pass and would start a job there
     at once.
     :func:`select_follower_room_process_id` ranks what is left by outstanding demand.
@@ -855,7 +855,7 @@ def _decide_preload_gate_ladder(
     job = snapshot.queue.jobs[job_id]
     if job.model is None:
         raise ValueError(f"job.model is None ({snapshot.queue.payloads[job_id]})")
-    # Set once the already-resident gate has let a single-card copy through. Every plan after it carries the mark.
+    # Set once the already-resident gate has let a single-card copy through. Every plan after it includes the mark.
     cold_copy = False
 
     def plan(
@@ -1325,7 +1325,7 @@ def decide_ram_admission(snapshot: SchedulingSnapshot, job_id: str, process_id: 
     checkpoint is charged net of the reusable pages an idle target retained from its unloaded model (the credit
     is gated on the danger floor inside the budget so it never admits into a floor breach). The two are
     alternative marginal accountings of the same load, so the component charge supersedes the credit.
-    Either checkpoint charge carries the job's feature RAM, so admission prices the whole job's demand.
+    Either checkpoint charge includes the job's feature RAM, so admission prices the whole job's demand.
 
     A swap onto a slot that kept its pages is priced at the checkpoint's learned swap growth once that
     evidence is trusted, in place of the credit heuristic; swaps are most loads on a worker whose models

@@ -165,9 +165,9 @@ same deadline-derived cap it tracks that cap as measured safety speed and the ho
 _SERVER_FORCED_MAINTENANCE_MARKER = "dropping too many jobs"
 """Phrase in the horde's maintenance reason that identifies maintenance the horde imposed on the worker.
 
-The horde returns the same return code whichever side set maintenance and carries the reason as free text,
+The horde returns the same return code whichever side set maintenance and includes the reason as free text,
 so the reason is the only discriminator available: the horde writes its own reason when it pauses a worker
-for dropping too many jobs, where an owner-set pause carries the owner's (or the default owner) message. The
+for dropping too many jobs, where an owner-set pause includes the owner's (or the default owner) message. The
 worker treats a reason it does not recognise as operator intent and leaves it alone, so a phrasing change on
 the horde costs an auto-clear, never an unwanted one.
 """
@@ -664,7 +664,7 @@ class JobPopper:
         self._residency_bias_pop_narrowed = False
         self._residency_bias_last_narrowed_pop_empty = False
         # Fixed-pool advertising: the seat provider and outcome sink are inert by default, so a popper wired
-        # without them is byte-identical to the pre-pool worker. The lane state carries the fixed/free
+        # without them is byte-identical to the pre-pool worker. The lane state includes the fixed/free
         # interleave across pops; the narrowing latch anchors the edge log/ledger; the last-fixed count and
         # most recently routed lane are readable status snapshots.
         self._pool_active_seats_provider = pool_active_seats_provider
@@ -825,7 +825,7 @@ class JobPopper:
         """Return ``pop_max_power`` lowered to what every model in ``models`` can host on some serving card.
 
         The smallest cap over the constrained models (:meth:`_serviceability_model_caps`); unchanged when none
-        is constrained. This is the figure a pop that carries a constrained model must ask with.
+        is constrained. This is the figure a pop that has a constrained model must ask with.
         """
         caps = self._serviceability_model_caps(models, pop_max_power, card_runtimes)
         return min(pop_max_power, *caps.values()) if caps else pop_max_power
@@ -1042,7 +1042,7 @@ class JobPopper:
     def _apply_vram_pressure_model_narrowing(self, models: set[str]) -> set[str]:
         """Drop whole-card (EXTRA_LARGE) models from the offer while every governed card is under VRAM pressure.
 
-        A model that wants the whole card cannot be hosted on a card already below the device-free governor's
+        A model that requires the whole card cannot be hosted on a card already below the device-free governor's
         soft floor, so advertising it only earns work that waits on a reclaim that may never come. The pressure
         reading is the governor's own debounced state (two agreeing samples), so the offer does not flap on a
         single dip.
@@ -2201,7 +2201,7 @@ class JobPopper:
             if target_card is not None:
                 advertised_card_runtimes = {target_card: self._card_runtimes[target_card]}
                 # A popped job is not pinned to the card whose offer fetched it and carries no NSFW marker, so
-                # a card-scoped offer must still carry the fleet-wide nsfw policy or an NSFW job could route
+                # a card-scoped offer must still include the fleet-wide nsfw policy or an NSFW job could route
                 # to a card configured SFW.
                 advertised = dataclasses.replace(
                     advertised_capabilities(advertised_card_runtimes),

@@ -2,7 +2,7 @@
 
 The worker and benchmark start their child processes from an explicit ``spawn`` context. A
 ``multiprocessing.Queue()`` created from the *global* module instead inherits the global default start
-method, which is ``fork`` on Linux. A Queue carries an internal ``SemLock``; pickling a fork-context
+method, which is ``fork`` on Linux. A Queue has an internal ``SemLock``. Pickling a fork-context
 SemLock into a spawn child raises::
 
     RuntimeError: A SemLock created in a fork context is being shared with a process in a spawn context.

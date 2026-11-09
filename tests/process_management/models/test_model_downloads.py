@@ -134,7 +134,7 @@ class TestModelAvailability:
         assert availability.filter_present({"a", "b"}) == set()
 
     def test_status_and_scan_complete_round_trip(self) -> None:
-        """An early (scanning) report is known but not scan-complete, and carries the rich status."""
+        """An early (scanning) report is known but not scan-complete, and includes the rich status."""
         availability = ModelAvailability()
         status = DownloadStatusSnapshot(phase=DownloadPhase.SCANNING)
         availability.update(
@@ -464,7 +464,7 @@ class TestConfigReloadTriggersDownloads:
         manager._process_lifecycle.request_downloads.assert_not_called()
 
     def test_reload_after_a_pre_scan_report_requests_nothing(self) -> None:
-        """The download process's first reports carry an empty set before the scan; that is not "nothing on disk"."""
+        """Reports before the download scan have an empty set without indicating that the disk is empty."""
         manager = self._manager_in_download_mode(image_models_to_load=["a"])
         manager._model_availability.update(
             present=set(), currently_downloading=None, pending=(), failed=(), scan_complete=False
@@ -738,7 +738,7 @@ class TestDownloadsOnlyMode:
         args, kwargs = manager._process_lifecycle.request_downloads.call_args
         assert args[0] == ["x", "y"]
         assert kwargs["download_aux"] is True
-        # Declarative: the authoritative desired set now carries the picker's models alongside config, so a
+        # Declarative: the authoritative desired set now includes the picker's models alongside config, so a
         # later config reconcile keeps fetching them instead of pruning them.
         assert kwargs["desired_image_models"] == ["a", "x", "y"]
 
@@ -2428,7 +2428,7 @@ class TestDownloadMessageRoundTrips:
         assert restored.caption_model_present is None
 
     def test_supervisor_rate_limit_command_round_trip(self) -> None:
-        """The SET_DOWNLOAD_RATE_LIMIT command carries its KB/s value through serialization."""
+        """The SET_DOWNLOAD_RATE_LIMIT command includes its KB/s value through serialization."""
         message = SupervisorControlMessage(
             command=SupervisorCommand.SET_DOWNLOAD_RATE_LIMIT,
             download_rate_limit_kbps=3000,
@@ -2438,7 +2438,7 @@ class TestDownloadMessageRoundTrips:
         assert restored.download_rate_limit_kbps == 3000
 
     def test_supervisor_priority_policy_command_round_trip(self) -> None:
-        """The SET_DOWNLOAD_PRIORITY_POLICY command carries its queue order through serialization."""
+        """The SET_DOWNLOAD_PRIORITY_POLICY command includes its queue order through serialization."""
         message = SupervisorControlMessage(
             command=SupervisorCommand.SET_DOWNLOAD_PRIORITY_POLICY,
             download_priority_policy=DownloadPriorityPolicy.PARALLEL,

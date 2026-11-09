@@ -21,13 +21,13 @@ The give-up is read from the worker's own action ledger rather than inferred fro
 give-up faults accepted work for reissue and that is exactly the outcome the campaign counts as the
 failure rather than the remedy.
 
-Each scenario boots a worker and spawns real child processes, so this module carries both ``slow`` and
+Each scenario boots a worker and spawns real child processes, so this module includes both ``slow`` and
 ``chaos_sweep`` and runs as a pre-release gate and nightly rather than in the default suite:
 
     pytest tests/e2e/test_chaos_generated_e2e.py -m "chaos_sweep and slow"
 
 ``HORDE_CHAOS_SEEDS`` overrides which seeds run (``HORDE_CHAOS_SEEDS=1007`` to replay one), and every
-failure message carries the seed and the whole scenario.
+failure message includes the seed and the whole scenario.
 """
 
 from __future__ import annotations

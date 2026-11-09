@@ -1279,7 +1279,7 @@ class InferenceScheduler:
         # back, the second the context count the budget says already fits. A reduction demanded while
         # max_resident already covers the live processes is a deficit made of the unreclaimable charges.
         # An extra-large model the dominance verdict leaves off rung 2 on measured evidence takes no teardown
-        # although its tier suggests one, so the line carries the evidence behind the release.
+        # although its tier suggests one, so the line includes the evidence behind the release.
         measured_note = ""
         if forecast.measured_retires_whole_card_intent:
             measured_note = (
@@ -2992,7 +2992,7 @@ class InferenceScheduler:
         The same bookkeeping as an establishment (cooldown, restore, wedge grace) minus the teardown, which
         :meth:`_converge_whole_card_residency` performs once the head is staged and the device frees. The spare
         the pre-stage loads into is remembered so the convergence shrink can spare a slot that does not yet
-        carry the model name.
+        include the model name.
         """
         self._end_run_superseded_by(device_index, superseding_model=job.model)
         self._whole_card_ledger.record_grant(
@@ -3395,7 +3395,7 @@ class InferenceScheduler:
 
         Dispatching a pre-staged head before convergence would commit its weights beside sibling contexts and
         force the first step to stream. The residency's stored forecast is preferred for the readiness check,
-        since it carries the target and fits-alone guarantee captured at establishment. Only the residency on the
+        since it includes the target and fits-alone guarantee captured at establishment. Only the residency on the
         card of ``process_with_model`` holds the job, because the job samples there. A residency for the same
         model on another card tears down a card the job does not use.
         """
@@ -3406,7 +3406,7 @@ class InferenceScheduler:
         ):
             return False
         # Re-use the residency's stored forecast for the readiness check rather than re-deriving from the
-        # current (possibly degraded) state: it carries the stable weight footprint, the budget-relative target,
+        # current (possibly degraded) state: it includes the stable weight footprint, the budget-relative target,
         # and the fits_alone guarantee captured at establishment, which the live device reading and the bounded
         # drain backstop in _whole_card_teardown_exhausted then resolve against the real, post-teardown VRAM.
         stored = self._whole_card_ledger.state_for(device_index).forecast
@@ -4382,7 +4382,7 @@ class InferenceScheduler:
         """Whether a whole-card exclusive residency for ``model`` is held on the card a job is dispatched to.
 
         Recorded per job at dispatch so a cost analysis can separate work served with the card to itself
-        (which carries the amortized cost of establishing that residency) from co-resident work of the same
+        (which is charged the amortized cost of establishing that residency) from co-resident work of the same
         shape. A residency held for a different model is not this job's, so it reads False.
         """
         if model is None:
@@ -4968,7 +4968,7 @@ class InferenceScheduler:
             )
 
         # Read before the whole-card convergence branch: a residency head parked behind a post-processing chain
-        # is held by that chain, and the hold ledger carries the dispatch pass's own verdict for it.
+        # is held by that chain, and the hold ledger includes the dispatch pass's own verdict for it.
         # The post-processing co-residency defer gate holds an already-resident head while an in-flight (or
         # imminent) post-processing chain's committed VRAM would collide with this job's sampling peak on the
         # card. The dispatch path records that verdict in the hold ledger on the pass it
@@ -5120,7 +5120,7 @@ class InferenceScheduler:
 
         Only fires once the head has been undispatched past :data:`DISPATCH_STALL_MIN_SECONDS` (so a normal
         between-jobs gap is silent), then at most once per :data:`DISPATCH_STALL_LOG_INTERVAL_SECONDS` for an
-        unchanged reason. The line carries the quantities that advance every cycle (how long the head has been
+        unchanged reason. The line includes the quantities that advance every cycle (how long the head has been
         parked, how often it has been passed) so the compared reason can stay stable across a sustained block.
         Read-only: it explains the stall, it does not change scheduling.
         """
@@ -6475,7 +6475,7 @@ class InferenceScheduler:
     ) -> float:
         """Return the worker's own device memory (MB) the foreign reading subtracts from the card's use.
 
-        Where the reading carries the driver's per-process usage and lists at least one of the worker's
+        Where the reading includes the driver's per-process usage and lists at least one of the worker's
         processes, the footprint is the sum of that usage over the worker's pids on the card. That figure is a
         measurement taken with the free figure, so it neither lags a release nor misses a load in flight, as the
         ledger built from the children's reports can. A worker process the driver does not list holds no
@@ -7565,8 +7565,8 @@ class InferenceScheduler:
         to clear it into its load-and-sample window. A child inside its denoise loop
         (:attr:`HordeProcessState.INFERENCE_STARTING`) is an active sampler. The controller owns each child's
         grant state and derives the held-slot count and tail-overlap sampler from these populations plus the
-        measured free/reserve/paging truth. Each sampler additionally carries its estimated remaining sampling
-        seconds and the card carries the measured median weight-upload cost, the two quantities the handoff
+        measured free/reserve/paging truth. Each sampler also has an estimated remaining sampling time in
+        seconds and the card has a measured median weight-upload cost. These two quantities determine the handoff
         window is sized from. Waiter priority is dispatch order (earlier-dispatched first), so queue position
         decides who samples next; the process id breaks ties deterministically.
 
@@ -7575,7 +7575,7 @@ class InferenceScheduler:
         re-books every job on the card that was granted while the child encoded and whose encode boundary report
         has since arrived (:meth:`_rebook_granted_jobs_at_encode_boundary`).
 
-        Each waiter carries its job's priced non-weight term (:func:`pricing.sampling_reserve_mb`), which the
+        Each waiter includes its job's priced non-weight term (:func:`pricing.sampling_reserve_mb`), which the
         controller writes with the child's grants, and the weights its grant puts on the card, from which the
         controller nets one child's take out of the free figure it hands the next child cleared in the same step.
         """
@@ -7939,7 +7939,7 @@ class InferenceScheduler:
     ) -> StagedWaiterClock:
         """Return the staged job's clearance clock, its card's measured load seconds and its lane-rung grade.
 
-        The clock also carries the job's expected seconds per step and the card's measured weight-upload rate,
+        The clock also includes the job's expected seconds per step and the card's measured weight-upload rate,
         which size the share of weights a partial-load seat must hold.
         """
         job_id = str(job.id_) if job is not None and job.id_ is not None else None
@@ -8950,7 +8950,7 @@ class InferenceScheduler:
             raise ValueError(f"preload admission requires a tracked job ({job})")
 
         # Each return below names why it declined, so the recorded admission decision (and the dispatch-stall
-        # line that quotes it) carries the deciding block instead of the generic gate label. The recorded text
+        # line that quotes it) includes the deciding block instead of the generic gate label. The recorded text
         # is compared across cycles by the stall-line throttle and across recovery settling windows, so it is
         # the stable half of a verdict and never the arithmetic. Cleared per call so a later decline can never
         # inherit an earlier one's reason. The decision is carried beside it, typed, for the one decline that is
@@ -10878,7 +10878,7 @@ class InferenceScheduler:
         """Log a reorder, edge-triggered on the model and slot it seated work onto.
 
         A rotation seats several jobs onto the same retainer in a row, so the (model, slot) pair is the edge
-        worth a line; the count carries the rest.
+        worth a line. The count includes the rest.
         """
         edge = (job.model, process.process_id)
         if edge == self._retention_affinity_logged_edge:

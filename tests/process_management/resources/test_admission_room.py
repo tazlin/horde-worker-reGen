@@ -139,7 +139,7 @@ def test_rungs_to_close_stops_at_the_first_cover() -> None:
 
 
 def test_describe_and_inputs_name_the_deficit_the_tenancy_and_the_rungs() -> None:
-    """The log line and the record carry the same figures a reader needs to act on a hold."""
+    """The log line and the record include the same figures a reader needs to act on a hold."""
     room = _edge_room()
 
     line = room.describe()
@@ -236,7 +236,7 @@ def test_inputs_keep_one_key_per_rung_kind_with_the_permitted_figure() -> None:
 
 
 def test_arbiter_attaches_the_room_to_a_non_fitting_verdict() -> None:
-    """A DEFER on a card with a device-free reading carries the room; an admit carries none."""
+    """A DEFER on a card with a device-free reading includes the room. An admit does not."""
     state = DeviceVramState(
         total_vram_mb=_TOTAL_MB,
         baseline_mb=1000.0,

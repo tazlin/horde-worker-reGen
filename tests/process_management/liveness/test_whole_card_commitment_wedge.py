@@ -87,7 +87,7 @@ def _wedge_world(*, head: _ModelClass = _QWEN, clearance_lease: bool = False) ->
     """Three lanes on a 24 GB card with safety and the post-processing lane on it, and a foreign tenant.
 
     With ``clearance_lease`` the row runs two-phase clearance and models partial loads, the configuration a
-    partial-load seat is priced under, since only a clearance grant carries the free figure and activation room a
+    partial-load seat is priced under, since only a clearance grant includes the free figure and activation room a
     child sizes its partial load against.
     """
     return _DispatchWorld(

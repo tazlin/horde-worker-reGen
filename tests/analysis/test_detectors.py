@@ -980,7 +980,7 @@ def _managed_text_backend_released(ts: str, *, device: int = 0) -> str:
 
 
 def _session_line(ts: str) -> str:
-    """An unrelated line that carries the session on to ``ts``."""
+    """An unrelated line that extends the session to ``ts``."""
     return f"2026-06-25 {ts} | INFO     | x:y:1 - working"
 
 
@@ -1089,7 +1089,7 @@ class TestSafetyStartEscalatedToCpu:
         )
 
     def test_a_stalled_wait_states_how_long_the_card_failed_to_free_room(self, tmp_path: Path) -> None:
-        """The headline carries the wait and the requirement; the evidence says safety stayed on the CPU."""
+        """The headline includes the wait and the requirement. The evidence shows safety stayed on the CPU."""
         bridge = self._bridge(_safety_start_escalated("01:26:33.000"), _session_line("04:00:00.000"))
 
         finding = _diagnose(tmp_path, bridge)["safety_start_escalated_to_cpu"]
@@ -2019,7 +2019,7 @@ class TestFaultedJobCensus:
         )
 
     def test_no_faults_produces_no_finding(self, tmp_path: Path) -> None:
-        """A clean session must not carry a census."""
+        """A clean session must not have a census."""
         assert "faulted_job_census" not in _diagnose(tmp_path, self._bridge())
 
     def test_every_faulted_job_is_enumerated_with_its_model(self, tmp_path: Path) -> None:
@@ -2358,7 +2358,7 @@ class TestHeadDispatchStall:
     def test_reconcile_hold_is_not_a_head_dispatch_stall(self, tmp_path: Path) -> None:
         """A residency-reconciliation hold must not masquerade as the gate-less scheduler-bug stall.
 
-        The reconcile-hold line carries its own attribution now; it is a benign swap-churn wait, so it must
+        The reconcile-hold line includes the wait reason. It is a benign swap-churn wait, so it must
         neither trip the CRITICAL ``no matching gate`` finding nor the generic parked-head warning.
         """
         bridge = "\n".join(
@@ -2643,7 +2643,7 @@ class TestPostProcessingVramStall:
     def test_benign_high_vram_readouts_do_not_count(self, tmp_path: Path) -> None:
         """Routine ~9.8GB-free readouts must not be counted as low-VRAM warnings (the miscount bug).
 
-        Every log_free_ram readout carries the ``reclaimable torch cache`` note, so counting readouts flagged
+        Every log_free_ram readout includes the ``reclaimable torch cache`` note, so counting readouts flagged
         the whole session; only readings that are genuinely low should count. With dedicated activity but no
         genuinely-low reading, the overlap detector must stay silent.
         """

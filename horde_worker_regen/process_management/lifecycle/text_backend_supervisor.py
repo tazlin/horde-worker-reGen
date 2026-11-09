@@ -402,7 +402,7 @@ class TextBackendSupervisor:
 
     @property
     def is_serving(self) -> bool:
-        """Return whether the backend has answered `ready()` and its process is still alive."""
+        """Return whether the backend is ready and the process is alive."""
         return self._state is TextBackendState.SERVING
 
     @property
@@ -688,7 +688,7 @@ class TextBackendSupervisor:
 
         Satisfies
         [`SupervisedProcessSnapshotSource`][horde_worker_regen.process_management.ipc.supervisor_channel.SupervisedProcessSnapshotSource]:
-        the row is marked external and carries a typed
+        the row is marked external and has a typed
         [`TextBackendDetail`][horde_worker_regen.process_management.ipc.supervisor_channel.TextBackendDetail]
         instead of the allocator readings and job progress a pipe-bearing child reports. Every figure the
         supervisor supplies is one it already holds, so the call neither blocks nor asks the backend

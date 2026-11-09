@@ -85,7 +85,7 @@ def _build_resident_whole_card_scheduler(
         bridge_data=bridge_data,
         max_concurrent=1,
         max_inference=3,
-        # Flux carries its reference baseline, so the card's dominance verdict prices it at the Flux sampling seed,
+        # Flux includes its reference baseline, so the card's dominance verdict prices it at the Flux sampling seed,
         # which overflows this card beside one context and puts Flux on rung 2.
         model_metadata=make_test_model_metadata(
             {

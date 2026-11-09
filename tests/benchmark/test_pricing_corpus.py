@@ -126,7 +126,7 @@ class TestDeterminism:
         assert definition_json(reloaded) == definition_json(standard[1])
 
     def test_scenario_identity_travels(self, standard: tuple[Scenario, PricingCorpusDefinition]) -> None:
-        """The scenario carries the corpus name and revision, and one spec per job."""
+        """The scenario includes the corpus name and revision, and one spec per job."""
         scenario, definition = standard
         assert (scenario.name, scenario.revision) == (SCENARIO_NAME, SCENARIO_REVISION)
         assert scenario.total_image_jobs == len(definition.jobs)
@@ -138,7 +138,7 @@ class TestManifestIdentity:
     @_REQUIRES_MANIFEST
     @pytest.mark.parametrize("tier", ["smoke", "standard", "heavy"])
     def test_every_tier_stamps_the_manifest_content_hash(self, tier: str) -> None:
-        """A tier built where the manifest is importable carries its content hash, census or not."""
+        """A tier built where the manifest is importable includes its content hash, census or not."""
         definition = build_pricing_corpus_scenario(tier)[1]  # type: ignore[arg-type]
         assert definition.manifest_sha256 is not None
         assert re.fullmatch(r"[0-9a-f]{64}", definition.manifest_sha256)
@@ -206,7 +206,7 @@ class TestCategoricalArray:
 
     def test_adaptive_sampler_is_excluded(self) -> None:
         """The step-count-ignoring sampler stays out of the array."""
-        # It picks its own step count, so its records would carry a step count the work never obeyed.
+        # Adaptive sampling changes the step count, so the recorded count would not match the work done.
         assert "k_dpm_adaptive" not in _SAMPLERS
 
     def test_img2img_rows_carry_a_partial_denoise(self) -> None:
@@ -219,7 +219,7 @@ class TestCategoricalArray:
         self,
         standard: tuple[Scenario, PricingCorpusDefinition],
     ) -> None:
-        """Every expanded inpainting job carries both inputs; without the mask its cost is not an inpaint's."""
+        """Every expanded inpainting job includes both inputs. Without the mask its cost is not an inpaint's."""
         scenario, _definition = standard
         jobs = scenario.expand_image_jobs()
         inpainting = [job for job in jobs if str(job.source_processing) == "inpainting"]
@@ -469,10 +469,10 @@ class TestPinnedReferences:
 
 
 class TestJobExpansion:
-    """The scenario the harness runs must carry the axis values the definition claims it does."""
+    """The scenario the harness runs must include the axis values the definition claims it does."""
 
     def test_specs_match_their_cells(self, standard: tuple[Scenario, PricingCorpusDefinition]) -> None:
-        """Every canned spec carries its cell's axis values and its job's seed."""
+        """Every canned spec includes its cell's axis values and its job's seed."""
         scenario, definition = standard
         cells = _cells_by_id(definition)
         for spec, job in zip(scenario.image_jobs, definition.jobs, strict=True):
@@ -591,7 +591,7 @@ class TestCensusCoverage:
         self,
         census: tuple[Scenario, PricingCorpusDefinition],
     ) -> None:
-        """No cell carries an excluded sampler, or an excluded sampler and schedule together."""
+        """Cells do not include excluded samplers or excluded sampler/schedule combinations."""
         _scenario, definition = census
         for cell in definition.cells:
             assert cell.sampler_name not in _CENSUS_EXCLUDED_SAMPLERS
@@ -698,7 +698,7 @@ class TestCensusCoverage:
         """No sampler the census measures is confined to a single trajectory length."""
         # A sampler's cost is part per-trajectory-step and part per-job. Observed at one trajectory
         # length the two are a single number, and a fit can only price the sampler by borrowing another
-        # sampler's slope, so the sweep carries the levels rather than leaving them to the conflation draw.
+        # sampler's slope, so the sweep includes the levels rather than leaving them to the conflation draw.
         _scenario, definition = census
         sweep_levels: dict[str, set[int]] = {}
         measured_levels: dict[str, set[int]] = {}
@@ -796,7 +796,7 @@ class TestHeavyTier:
         self,
         heavy: tuple[Scenario, PricingCorpusDefinition],
     ) -> None:
-        """Each heavy model carries its anchor, two resolutions, a batch and a cold cell, at three replicates."""
+        """Each heavy model includes its anchor, two resolutions, a batch and a cold cell, at three replicates."""
         _scenario, definition = heavy
         cells = _cells_by_id(definition)
         models = {cell.model for cell in definition.cells if cell.group != "warmup"}

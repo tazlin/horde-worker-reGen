@@ -807,7 +807,7 @@ class ModelPool:
     ) -> DemotionReason | None:
         """Return why a dwell-eligible seat should demote, or ``None`` if it still earns its place.
 
-        Two distinct non-productive triggers each carry their own reason for the caller to tell apart. A seat
+        Each non-productive trigger has a distinct reason for the caller to check. A seat
         charged the empty-pop threshold while its model's observed queue is near zero demotes as
         :attr:`DemotionReason.EMPTY_POPS`; a seat that has served without any fulfillment for the zero-fulfillment
         window demotes as :attr:`DemotionReason.ZERO_FULFILLMENT`. Whichever condition holds first ends the seat.

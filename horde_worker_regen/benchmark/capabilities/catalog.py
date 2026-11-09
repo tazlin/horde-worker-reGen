@@ -167,8 +167,8 @@ def _add_baseline_probe(add: _ProbeAdder, *, tier: BenchTier, baseline: Capabili
 
 def _add_concurrency_probes(add: _ProbeAdder, *, tier: BenchTier, baseline: Capability, opts: CatalogOptions) -> None:
     """Add the concurrency probes: queue depth, thread count, and batch size (batch 4 builds on batch 2)."""
-    # magnitude carries the proven value (queue depth / thread count) so the recommendation reads it
-    # straight off the result, the same way BATCH carries its size; the runtime value still rides in
+    # magnitude includes the proven value (queue depth / thread count) so the recommendation reads it
+    # straight off the result, as with BATCH's size. The runtime value remains in
     # bridge_data_overrides, which is what the harness applies.
     add(
         capability=Capability(tier=tier, kind=CapabilityKind.QUEUE_SIZE, magnitude=2),

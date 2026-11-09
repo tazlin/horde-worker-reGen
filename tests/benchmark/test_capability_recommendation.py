@@ -47,7 +47,7 @@ def _results(
 ) -> list[CapabilityProbeResult]:
     """A probe result per catalog probe, defaulting to PROVEN but overriding by capability kind.
 
-    A SKIPPED override carries a representative skip reason so the provenance detail is populated.
+    A SKIPPED override has a representative skip reason so the provenance detail is populated.
     """
     verdicts = verdicts or {}
     results: list[CapabilityProbeResult] = []

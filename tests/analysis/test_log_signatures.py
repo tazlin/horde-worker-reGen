@@ -2,7 +2,7 @@
 
 The registry in :mod:`horde_worker_regen.analysis.log_signatures` is the only link between a parser here
 and an f-string in ``process_management/``. These tests hold two ends of it: each pattern must match the
-literal line recorded beside it, and no module in the analysis package may carry a worker-log pattern
+literal line recorded beside it, and modules in the analysis package must not define a worker-log pattern
 that is not in the registry. The other end (that the worker still emits those lines) is
 ``test_log_contract_dry_run.py``.
 """

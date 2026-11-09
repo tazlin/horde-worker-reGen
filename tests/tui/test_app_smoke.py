@@ -67,7 +67,7 @@ def test_attached_launch_flow_waits_for_the_hosts_first_status() -> None:
 
 
 def _capture_messages(level: str) -> tuple[list[tuple[str, bool]], int]:
-    """Attach a loguru sink recording ``(message, carries a traceback)`` and return it with its sink id."""
+    """Attach a loguru sink recording ``(message, has a traceback)`` and return it with its sink id."""
     records: list[tuple[str, bool]] = []
     sink_id = logger.add(
         lambda message: records.append((message.record["message"], message.record["exception"] is not None)),
@@ -742,7 +742,7 @@ async def test_credentials_are_withheld_only_from_a_network_exposed_session(tmp_
             api_key_field = app.query_one("#cfg-api_key", Input).parent
             assert api_key_field is not None
             assert api_key_field.parent is not None
-            # The group carries the tag; the withheld state is the whole field group vanishing.
+            # The group includes the tag. The withheld state is the whole field group vanishing.
             assert api_key_field.parent.has_class("field-secret")
             assert api_key_field.parent.display is expect_visible
 
@@ -775,7 +775,7 @@ async def test_trends_panel_gets_a_wide_band_when_multicolumn(tmp_path: Path) ->
         assert overview.has_class("-cols-3")
         trends = overview.query_one("#overview-trends", Static)
         health = overview.query_one("#overview-health", Static)
-        # Trends must be far wider than the fractional core column Health sits in: it carries a ~48-char
+        # Trends must be far wider than the fractional core column Health sits in: it has a ~48-char
         # sparkline and would scrunch if squeezed into a 1/3 slot.
         assert trends.size.width > health.size.width
 

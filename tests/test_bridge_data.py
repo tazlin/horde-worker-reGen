@@ -185,7 +185,7 @@ def test_ram_safety_defaults() -> None:
 
 
 def test_template_matches_ram_safety_defaults() -> None:
-    """The shipped template must carry the same RAM-safety defaults as the model (no silent drift)."""
+    """The shipped template must include the same RAM-safety defaults as the model (no silent drift)."""
     yaml = YAML(typ="safe")
     with open(str(_TEMPLATE), encoding="utf-8") as f:
         raw = yaml.load(f)

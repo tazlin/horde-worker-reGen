@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import sys
 
-# Above this compute capability, the cu126 wheel does not carry a kernel image (Blackwell sm_100/sm_120), so a
+# Above this compute capability, the cu126 wheel does not have a kernel image (Blackwell sm_100/sm_120), so a
 # rebuild must move to a CUDA 13 build. Mirrors worker_bootstrap.detect._CU126_MAX_COMPUTE_CAP.
 _CU126_MAX_COMPUTE_CAP = (9, 0)
 

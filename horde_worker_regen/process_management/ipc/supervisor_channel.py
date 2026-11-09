@@ -35,126 +35,9 @@ if TYPE_CHECKING:
     from horde_worker_regen.process_management.resources.system_memory import SystemMemorySummary
 
 SUPERVISOR_PROTOCOL_VERSION = 36
-"""Bumped when the snapshot/command schema changes incompatibly; the TUI checks it on connect.
+"""Version checked when a supervisor connects.
 
-v2 added per-process ``num_jobs_completed`` and the snapshot's worker-details maintenance/paused and
-last-pop no-jobs/skip-reason fields.
-v3 added alchemy config/runtime fields, ``pending_jobs``, ``JobFeatureSummary``, and extended
-``RecentJobRecord`` with model name and feature data.
-v4 added the lightweight :class:`WorkerLivenessFrame`, emitted on its own cadence so the supervisor
-can judge worker liveness independently of full-snapshot production.
-v5 added the resolved model ``baseline`` to ``JobQueueEntry`` and ``RecentJobRecord`` so the queue and
-recent-jobs tables can show a model's baseline alongside its name.
-v6 added the snapshot's ``system_memory`` field (:class:`SystemMemorySnapshot`): total/available RAM and
-the worker's per-role RSS share.
-v7 added ``DownloadStatusSnapshot.active`` (the full set of concurrent in-flight downloads) for
-host-parallel downloading; ``current`` is retained as the primary entry for single-download consumers.
-v8 added per-card multi-GPU data: ``ProcessSnapshot.device_index`` (which card each slot is pinned to)
-and the snapshot's ``per_card`` list of :class:`CardSnapshot` (per-card VRAM, contexts, residency, and
-fault/unservable-model health). Additive: a single-GPU host reports exactly one ``CardSnapshot``.
-v9 added the snapshot's ``feature_readiness`` (:class:`FeatureReadinessSummary`): the per-feature
-deps+on-disk readiness the worker uses to decide which gated features it offers to the Horde.
-v10 added ``orchestration_intent`` and ``work_ledger`` so the Overview can show the worker's current
-decision and promote per-job state out of the process table.
-v11 added worker-owned stats samples/history, model/baseline rollups, and the stats JSONL export control.
-v12 added ``pop_governors`` (:class:`PopGovernorsSnapshot`): the live + session-aggregate state of every
-pop/scheduling governor holding back or reshaping job pops, for the Overview strip and the stats tab.
-v14 added :class:`WorkerFatalConfigError`, a one-shot frame the worker sends before exiting on a fatal,
-non-retryable configuration problem (e.g. a worker name taken by another account) so the supervisor can
-stop relaunching and the dashboard can show the specific reason and remedy instead of a generic crash.
-v16 added post-processing lane counters and per-entry queue order so the TUI can show the image job route
-through the dedicated post-processing process.
-v17 added the operator-facing reason post-processing was session-disabled.
-v19 added the snapshot's ``model_pool`` field (:class:`ModelPoolSnapshot`): the fixed model pool's seats,
-bench, current advertising lane, demand-reading age, and download admission budget. Omitted (None) when the pool is
-disabled, so a worker with no pool leaves the field unset and older supervisors are unaffected.
-v20 added the snapshot's ``disagg_job_stages`` list (:class:`DisaggStageRow`): each in-flight
-pipeline-disaggregated job's current stage and the process its stage is dispatched to, so the dashboard
-can show mid-pipeline progress (encode / sample / decode) per job. Empty when disaggregation is disabled
-or no disaggregated jobs are in flight. v20 also added ``ProcessSnapshot.resident_components``
-(:class:`ResidentComponentEntry` entries): the model components a GPU-bearing child holds resident in its
-RAM component cache, so the dashboard can show which models/components a lane actually holds. Empty for a
-process with no component cache. The model-pool snapshot also gained cumulative fixed/free lane pop and
-fulfillment counts for per-lane hit rates.
-v21 distinguishes logical model-pool seating from measured residency. Each seat carries a readiness value,
-resident process/GPU identities, and whether its last matched pop was already resident. The lane tallies add
-resident-hit counts, allowing the TUI to report observed load avoidance rather than infer it from a seat match.
-v22 added ``RecentJobRecord.kudos_reward``: what the horde's submit response paid for that job, so the
-recent-jobs views can attribute earnings per job rather than only in the session total. None when the reward
-is unknown (a faulted job, or one never delivered to the horde).
-v23 added :class:`SamplerSummary` plus the ``sampler``/``batch_size`` fields on ``WorkLedgerEntry`` and
-``RecentJobRecord``, so a job row can state what its sampler asks the model for per step and how many
-images it produces. The worker resolves the sampler's published work profile and measured cost ratio
-(it owns the ``horde_sdk`` import); a dashboard only formats what it is handed. v23 also dropped
-``WorkLedgerEntry.raw_reason``: it carried the worker-wide pop-block reason on every row, which says
-nothing about the job the row is for, and the same text is already on ``orchestration_intent.raw_gate``.
-v24 makes text generation visible: ``RecentJobRecord.workload`` replaces its ``is_alchemy`` boolean (a
-worker serving three workloads cannot be partitioned by one), the snapshot gains the ``text_*`` counters
-and backend identity, and ``WorkerConfigSummary`` gains ``scribe``/``scribe_name``.
-v25 makes a supervised external process a row in the process surfaces without entering ``ProcessMap``:
-``ProcessSnapshot`` gains ``is_external``, ``os_pid``, ``display_state`` and ``text_backend``
-(:class:`TextBackendDetail`), ``device_index`` accepts None for a process pinned to no card, and
-:class:`SupervisedProcessSnapshotSource` is the one method such a process implements to produce its row.
-A map-derived row leaves every added field at its default, so a v25 snapshot of an image-only worker is
-what v24 produced.
-v26 puts a text generation in flight on the surfaces that already show work. ``WorkLedgerEntry`` gains
-``workload``, ``progress_unit`` (:class:`WorkLedgerProgressUnit`) and ``progress_age_seconds`` so a text
-row states what its progress counts and how long since it last moved; :class:`TextBackendActivity` carries
-the requests and token rate only the text flow can see onto the backend's row; ``RecentJobRecord`` gains
-``generated_tokens``; and the snapshot gains ``workload_totals``
-(:class:`WorkloadTotalsSnapshot` per workload), ``text_backend_not_ready_since`` and
-``snapshot_interval_seconds``, with ``text_stall_seconds`` and ``text_backend_ready_patience_seconds``
-on the config summary so the dashboard's text checks derive their thresholds from the worker rather than
-restating them.
-v27 makes the worker's identity and its text backend's posture readable from the summary alone. The config
-summary gains ``dreamer`` (the third role flag, so every surface can name the enabled roles rather than
-guessing from the workload list) and ``text_backend_managed`` (whether the worker launches the backend
-itself, which decides the remedy a stuck backend is given); :attr:`WorkerConfigSummary.enabled_worker_names`
-and :attr:`WorkerConfigSummary.worker_display_name` are the one place that identity is derived.
-``TextBackendDetail`` gains ``launching_since``, the instant the current launch attempt began, which is
-what the readiness patience window is measured from for a backend the worker launches, and
-``provision_error``, why its program could not be obtained; ``port`` becomes optional because the row now
-exists from before the command line is rendered (the supervised backend's life begins at obtaining it, and
-``TextBackendState.PROVISIONING`` is the state it reports meanwhile). The snapshot's whole-worker counters
-(``num_jobs_popped``, ``num_jobs_submitted``, ``num_jobs_faulted``, ``jobs_in_progress``,
-``seconds_since_last_pop``) now include alchemy and text work, so a worker serving either alone reports its
-own headline figures rather than zero; the ``alchemy_*`` and ``text_*`` fields and ``workload_totals`` remain
-the per-workload split.
-v28 adds ``recent_events`` (:class:`WorkerEvent` entries, bounded by :data:`RECENT_EVENTS_IN_SNAPSHOT`): the
-worker's own transitions as they happened (pops, preloads, finished and faulted work, backend launches,
-process recoveries, finished downloads, maintenance and pop-backoff edges), each with a per-session
-``sequence`` so a reconnecting frontend can tell events it has shown from ones it has not. The ring is
-recorded where the finished-job records are, so it and ``recent_jobs`` cannot disagree about a job.
-v29 adds ``text_backend_credentials_refused``: the text backend answered and refused the worker's
-credentials, which the dashboard reports at once with its own remedy instead of as a backend that is
-late.
-v30 adds ``last_process_recovery_time`` and ``last_process_recovery_lane``, which say when the session's
-most recent process recovery happened and which lane it replaced. ``num_process_recoveries`` beside them
-only ever rises, so a frontend reading it alone cannot tell a lane cycling now from one replaced once at
-startup, and reports the latter for the rest of the run. The bounded ``recent_events`` ring cannot answer
-this either: it evicts a startup recovery within the first minutes of ordinary work.
-v31 adds ``pop_gate`` and ``pop_gate_since``, the gate holding the image popper and when it engaged, and
-``seconds_since_last_pop_per_workload``. Without the gate a worker whose image intake is held reads as
-healthy for as long as another flow keeps working, and the whole-worker ``seconds_since_last_pop`` is the
-youngest flow's figure, so a text pop hides an image intake that has been silent for hours. v31 also adds
-``pop_liveness`` (:class:`PopLivenessSnapshot`), the pop-liveness sentinel's verdict on the image intake with
-the line it logs, so the dashboard's pop-intake check shows the worker's own judgement and holds no bounds or
-exemptions of its own.
-v32 makes ``num_jobs_popped`` cumulative: each flow counts at its own pop site, so the figure only climbs
-and a Session card's "Popped" reads as the session's total. Up to v31 it carried the work held at that
-instant; that figure moves to ``jobs_in_hand``, every image job from pop to submit plus the other flows'
-in-flight work, which no sum of the per-stage fields reproduces.
-v33 makes horde maintenance per logical worker. Each enabled role is its own worker on the horde with its
-own maintenance and paused flags, so the snapshot gains ``worker_details_by_workload`` (a
-:class:`HordeWorkerDetailsSnapshot` per role, keyed by the workload it serves) and
-``SET_SERVER_MAINTENANCE`` gains ``server_maintenance_workloads``, the roles it addresses, None meaning all.
-The two aggregate flags stay as "any" over the map, so a reader of the whole-worker view is unchanged.
-v34 adds ``post_processing_offered`` and ``post_processing_offer_withheld_reason``, the ``allow_post_processing``
-value the last image pop carried and why it was withheld, which can differ from the configured flag.
-v35 adds drained ``RESIZE_CAPACITY`` requests, correlated outcomes with retryability, and ``config_revision``.
-v36 adds ``num_lane_start_failures`` and the ``lane_start_failed`` event kind. A service-lane child that dies
-before reporting ready is counted there instead of in ``num_process_recoveries``, which feeds the runaway-recovery
-ceiling. A frontend reads the two counts side by side to show a lane that cannot start.
+Increment this when snapshot or control-message schemas change incompatibly.
 """
 
 RECENT_JOBS_IN_SNAPSHOT = 25
@@ -416,20 +299,18 @@ class WorkerConfigSummary(BaseModel):
     text_stall_seconds: float = 30.0
     """How long the worker lets a begun generation stay silent before it abandons the job.
 
-    Carried so the dashboard's stall check fires on the worker's own patience rather than a figure of its
-    own; the default is the bridge-data default, which is what a worker that predates the field meant."""
+    Included so the dashboard and worker use the same stall timeout. Defaults to the bridge-data value."""
     text_backend_ready_patience_seconds: float = 120.0
-    """How long the readiness gate waits before it says out loud that the backend has not answered.
+    """Delay before reporting that the backend has not responded.
 
-    The same figure the gate's own log line uses, so the check and the log agree about when a cold start
-    has stopped being a cold start. Not operator-configurable today; it rides the config summary because
-    that is where the dashboard's text thresholds come from."""
+    The log and dashboard use this threshold to report a backend that is taking too long to start.
+    The value is not operator-configurable. It is included in the config summary with the other
+    dashboard thresholds."""
     text_backend_managed: bool = False
     """Whether the worker launches the text backend itself rather than reaching one the operator runs.
 
-    The two have different remedies when the backend does not answer, and only the worker knows which
-    arrangement it is in: a managed backend's failure is in the worker's own log and its supervised row,
-    while an attached one is the operator's program at the address they configured."""
+    The remedies differ when the backend does not respond. Managed backend failures appear in the worker
+    log and supervised process row. An attached backend runs independently at the configured address."""
 
     @property
     def enabled_worker_names(self) -> tuple[str, ...]:
@@ -473,7 +354,7 @@ class ResidentComponentEntry(BaseModel):
     The wire twin of the child-reported ``HeldComponentSnapshot``
     (:mod:`~horde_worker_regen.process_management.ipc.messages`), duplicated here rather than imported so this
     module stays a leaf the message layer can depend on without a cycle (as ``SystemMemorySnapshot`` twins
-    ``SystemMemorySummary``). The fields carry the cache's own view, so ``approx_ram_mb`` is only the
+    ``SystemMemorySummary``). The fields include the cache's own view, so ``approx_ram_mb`` is only the
     accounted portion of the process's resident-set size.
     """
 
@@ -516,7 +397,7 @@ class TextBackendActivity(BaseModel):
     """The most recent rate any in-flight generation reported, or None when none of them can report one.
 
     A stock backend counts no tokens, so this stays None for its whole life rather than being derived
-    from stream records, which carry an arbitrary number of tokens each."""
+    from stream records, which have an arbitrary number of tokens each."""
 
 
 class TextBackendDetail(BaseModel):
@@ -564,9 +445,9 @@ class TextBackendDetail(BaseModel):
     A backend that cannot be obtained is never launched, so without this the row and the headline would sit
     at "obtaining" for the rest of the session over a program that is never coming."""
     ready_since: float | None = None
-    """When the backend first answered its readiness probe for the current launch; None when not serving."""
+    """Time of the first successful readiness probe for this launch. None when not serving."""
     last_health_ok_at: float | None = None
-    """When the backend last answered a readiness probe.
+    """When the backend last responded to a readiness probe.
 
     The supervisor probes only while a launch is starting, so while serving this stays the moment readiness
     was reached: the worker asks a black box nothing it does not need, and the process's continued existence
@@ -608,7 +489,7 @@ class ProcessSnapshot(BaseModel):
     last_process_state: str
     """The process's own state-vocabulary name (e.g. ``WAITING_FOR_JOB`` / ``INFERENCE_STARTING``).
 
-    A ``HordeProcessState`` name on a map-derived row. An external row carries its supervisor's state name
+    A ``HordeProcessState`` name on a map-derived row. An external row includes its supervisor's state name
     instead, which is deliberately disjoint from the image vocabulary so no state-keyed reader matches it;
     what an operator reads is :attr:`display_state`."""
     is_alive: bool
@@ -942,7 +823,7 @@ class WorkloadTotalsSnapshot(BaseModel):
     faulted: int = 0
     """Records for work that faulted. With :attr:`completed` this partitions the workload's records."""
     kudos: float = 0.0
-    """Kudos the horde paid for this workload's completed work; 0.0 when no record carried a reward."""
+    """Kudos paid by the horde for completed work in this workload. 0.0 when rewards were not recorded."""
     mean_generated_tokens: float | None = None
     """Mean tokens per record for the records that reported a token count, or None when none did.
 
@@ -1185,7 +1066,7 @@ class FeatureInfoRow(BaseModel):
 class FeatureReadinessSummary(BaseModel):
     """The worker's per-feature readiness: what it offers to the Horde and why anything is withheld.
 
-    ``gated`` carries the features the worker withholds until their models/annotators are on disk
+    ``gated`` includes the features the worker withholds until their models/annotators are on disk
     (ControlNet, SDXL-ControlNet, post-processing); ``informational`` carries read-only lines for
     features with their own gating (LoRA, safety). Built parent-side from the same readiness the pop gate
     enforces, so the table can never disagree with what the worker actually advertises.
@@ -1202,7 +1083,7 @@ class WorkerFatalConfigError(BaseModel):
     name still left at its reserved default, or the dreamer/alchemist names colliding. The worker
     detects these at startup (before spawning any children) and sends this frame so the supervisor stops
     burning its restart budget on a config that cannot work, and the dashboard shows the specific reason
-    and remedy rather than a generic "crashed". ``detail`` carries the full human explanation, including
+    and remedy rather than a generic "crashed". ``detail`` includes the full human explanation, including
     how to fix it.
     """
 
@@ -1575,11 +1456,10 @@ class ModelPoolBenchRow(BaseModel):
 
 
 class ModelPoolSnapshot(BaseModel):
-    """Represents the fixed model pool's operator-facing state for the dashboard, or its disabled marker.
+    """Fixed model pool state displayed on the dashboard.
 
-    Carried on :attr:`WorkerStateSnapshot.model_pool` only when the pool is enabled; a worker with the pool
-    off leaves that field None so older supervisors and the plain (no-pool) case are unaffected. All
-    monotonic timing is resolved to ages/countdowns at snapshot time, so no raw monotonic value travels.
+    :attr:`WorkerStateSnapshot.model_pool` is None when the pool is disabled. Monotonic timestamps are
+    converted to ages and countdowns before publication, so the snapshot does not expose raw monotonic values.
     """
 
     enabled: bool = False
@@ -1616,7 +1496,7 @@ class ModelPoolSnapshot(BaseModel):
 class HordeWorkerDetailsSnapshot(BaseModel):
     """What the horde's worker-details API last reported for one of this worker's logical workers.
 
-    Each enabled role (dreamer, alchemist, scribe) registers under its own name and carries its own
+    Each enabled role (dreamer, alchemist, scribe) registers under its own name and includes its own
     maintenance and paused flags, so a host serving two roles has two of these.
     """
 
@@ -1844,7 +1724,7 @@ class WorkerStateSnapshot(BaseModel):
     stats_baseline_rollups: list[StatsRollupRow] = Field(default_factory=list)
     """Finalized image-job rollups by baseline."""
     stats_form_rollups: list[StatsRollupRow] = Field(default_factory=list)
-    """Finalized alchemy-form rollups by form (``model`` carries the form name); empty for a dreamer worker."""
+    """Finalized alchemy-form rollups by form (``model`` includes the form name). Empty for a dreamer worker."""
     stats_export: StatsExportState = Field(default_factory=StatsExportState)
     """Worker-side stats JSONL export state."""
     stats_history_backfill: StatsHistoryBackfill | None = None
@@ -1876,10 +1756,10 @@ class WorkerStateSnapshot(BaseModel):
     False while the readiness gate is open, which a cold start legitimately holds for minutes, and again
     after a backend failure sends the flow back to the gate. Nothing is popped while it is False."""
     text_model_name: str | None = None
-    """The text model as the worker advertises it, prefix included; None before the backend has answered."""
+    """The advertised text model, including the prefix. None before the backend responds."""
     text_context_length: int | None = None
     """The largest prompt-plus-generation token count offered: the lower of the operator's cap and the
-    backend's. None before the backend has answered."""
+    backend's. None before the backend has responded."""
     text_max_length: int | None = None
     """The largest generation length offered, on the same basis as :attr:`text_context_length`."""
     text_backend_not_ready_since: float | None = None

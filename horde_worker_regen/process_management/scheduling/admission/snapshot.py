@@ -7,7 +7,7 @@ two different cards.
 
 The snapshot carries values, not collaborators. The three pricing services it does carry (model metadata, the
 learned footprint store, the context overhead model) are read-only within a cycle and are consumed only by pure
-pricing functions; the committed reserve ledger is carried the same way until its planned charges are folded
+pricing functions. The committed reserve ledger is passed through in the same way until its planned charges are folded
 into the card snapshot.
 """
 

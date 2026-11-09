@@ -285,7 +285,7 @@ no eviction can meet it and the wait is structural. The next drain escalates a
 safety start to the CPU, or retires an inference slot, exactly as the window
 would. The WARNING and the ledger reason say "structural shortfall" and carry
 the requirement and the room, and the deferral reason logged when the start is
-first deferred carries the same note. A shortfall below the room keeps waiting.
+first deferred includes the same note. A shortfall below the room keeps waiting.
 
 A deferred **inference** start has no CPU fallback. After the same window with no
 progress it is retired, provided another inference lane exists:

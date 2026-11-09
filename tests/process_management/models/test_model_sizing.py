@@ -1,6 +1,6 @@
 """Tests for the shared "very large" model classification (:mod:`model_sizing`).
 
-The tier lookup is the single authority for whether a model wants the whole card. Both the named legacy
+The tier lookup is the single authority for whether a model requires the whole card. Both the named legacy
 VRAM-heavy checkpoints (classified by name, no baseline needed) and the extra-large baselines (Cascade, Flux,
 Qwen, Z-Image) must resolve to :class:`ModelSizeTier.EXTRA_LARGE`, and the worker-wide
 :func:`any_offered_model_wants_whole_card` predicate must agree with the per-model :func:`is_extra_large_model`.
@@ -44,7 +44,7 @@ class TestExtraLargeBaselines:
         assert not is_extra_large_model("an_sdxl_model", KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl.value)
 
     def test_sdxl_class_baselines_are_heavy(self) -> None:
-        """Anima carries an SDXL-sized diffusion model, so it shares SDXL's tier."""
+        """Anima has an SDXL-sized diffusion model, so it shares SDXL's tier."""
         for baseline in (
             KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl,
             KNOWN_IMAGE_GENERATION_BASELINE.anima,

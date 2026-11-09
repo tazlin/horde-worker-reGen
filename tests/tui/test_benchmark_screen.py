@@ -108,7 +108,7 @@ async def test_buttons_gate_on_status(tmp_path: Path, monkeypatch: pytest.Monkey
 
 
 async def test_run_button_posts_request_with_worker_mode(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Pressing Run posts a request whose options carry the worker's process mode and chosen tiers."""
+    """Pressing Run posts a request whose options include the worker's process mode and chosen tiers."""
     monkeypatch.chdir(tmp_path)
     app = _BenchmarkHarness()
     async with app.run_test() as pilot:

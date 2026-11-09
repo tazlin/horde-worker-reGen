@@ -26,10 +26,10 @@ from dataclasses import dataclass, field
 
 
 class Severity(enum.StrEnum):
-    """How urgent a finding is; also its sort key (critical first).
+    """Urgency and sort order for a finding (critical first).
 
-    The reader sees an action word for each level (see :data:`SEVERITY_BADGE_WORDS`); the values here are
-    the ids the JSON output and the catalogue carry.
+    The badge for each level comes from :data:`SEVERITY_BADGE_WORDS`. Enum values are
+    the IDs used in JSON output and the catalogue.
     """
 
     CRITICAL = "critical"
@@ -145,22 +145,17 @@ class FindingKind(enum.StrEnum):
 
 @dataclass(frozen=True)
 class FindingSpec:
-    """Represents everything about a diagnosis that does not depend on the session being read.
+    """Text and references shared by every finding of one kind.
 
-    The title is the catalogue name for the kind. A detector that words its headline differently per
-    severity (a wedge versus the same gate merely parking a head) passes its own title at the emit site;
-    the spec's stays the name the catalogue and the cross-references use.
+    The title is the catalogue name. A finding can override the displayed title without changing
+    the catalogue or its cross-references.
 
-    A finding shows two layers. The plain layer is the headline the detector writes per emit and the
-    "Do this" line: ``action`` is the part of that line that holds for every emit of the kind. Where the
-    fix genuinely depends on what was measured, it is empty and the detector supplies the whole text as an
-    addendum; where both are present the rendered line is the invariant followed by the addendum.
-    ``detail`` is the detail layer's prose: what is going on underneath, in the same voice but free to name
-    the subsystem; the CLI prints it and the dashboard collapses it.
+    ``action`` is the advice common to every finding of the kind. The detector can append advice
+    based on the session. When the spec's action is empty, the detector supplies the full advice.
+    ``detail`` explains the mechanism. The CLI prints it and the dashboard collapses it.
 
-    ``see_also`` points at another diagnosis; ``reference_page`` points at prose. They are separate fields
-    because they are checked differently: a cross-reference has to name a declared kind, a reference page
-    has to be a file that exists, and a kind whose fix needs background has both.
+    ``see_also`` must refer to a declared diagnosis. ``reference_page`` must refer to an existing
+    documentation file. A finding can include both.
     """
 
     kind: FindingKind
@@ -169,10 +164,11 @@ class FindingSpec:
     detail: str = ""
     see_also: FindingKind | None = None
     reference_page: str | None = None
-    """A repo-relative path to the docs page that explains the subsystem behind this diagnosis.
+    """A repository-relative path to the documentation for this diagnosis.
 
-    Set it where acting on the remediation needs background the finding cannot carry inline; a test
-    asserts the page is on disk, so a moved or renamed page fails rather than printing a dead path."""
+    Set this when the remedy needs more explanation than fits in the finding. A test checks that
+    the page exists so a moved or renamed page does not result in a broken link.
+    """
 
 
 def _spec_table(*specs: FindingSpec) -> Mapping[FindingKind, FindingSpec]:
@@ -1135,27 +1131,26 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
 
 @dataclass
 class Finding:
-    """Represents one diagnosis of a session: the headline, the evidence, and what to do about it.
+    """A diagnosis for one session, including the headline, evidence and action.
 
-    The kind carries everything constant about the diagnosis (see :data:`FINDING_SPECS`); the fields here
-    carry what the session itself produced. ``headline`` is always written at the emit site because it
-    carries the measurement: one sentence saying what happened, with the numbers and names.
+    The kind defines the shared text in :data:`FINDING_SPECS`. The remaining fields describe
+    measurements and events from the session. The headline is supplied when the finding is created
+    and includes the measured numbers and names.
     """
 
     kind: FindingKind
     severity: Severity
     headline: str
     title_override: str | None = None
-    """A headline this emit words differently from the catalogue name, for a kind whose severities read as
-    different incidents (a head parked behind a gate versus one with no gate at all)."""
+    """An alternative displayed title when severity changes the meaning of the finding."""
     action_addendum: str | None = None
     """The part of the fix that depends on what was measured, appended to the spec's invariant advice."""
     evidence: list[str] = field(default_factory=list)
     see_also: FindingKind | None = None
-    """The cross-reference for this emit; the spec's default is filled in when none is given."""
+    """Cross-reference for this finding. Uses the spec's default when unset."""
 
     def __post_init__(self) -> None:
-        """Fall back to the kind's declared cross-reference when the emit site named none."""
+        """Use the kind's declared cross-reference when one is not supplied."""
         if self.see_also is None:
             self.see_also = self.spec.see_also
 

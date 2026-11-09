@@ -330,7 +330,7 @@ def _classify_worker_ownership(
     ``worker_ids``, or the worker's ``owner`` matches the authenticated ``username``. The owner-name
     match is a robust fallback because ``worker_ids`` can lag or omit a worker the account genuinely
     owns (a freshly registered worker, or an idle one pruned from the list while still findable by
-    name). Usernames are unique horde-wide (they carry a discriminator), so an owner/username match is
+    name). Usernames are unique horde-wide (they have a discriminator), so an owner/username match is
     a safe same-account signal.
 
     A ``FOREIGN`` verdict requires *positive* proof: the owner is visible and differs from this

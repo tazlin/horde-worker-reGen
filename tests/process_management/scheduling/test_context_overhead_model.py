@@ -282,7 +282,7 @@ class TestPerCardIdleResidency:
         assert model._read_residency_scope(None).effective_total_mb == pytest.approx(9000.0)
 
     def test_card_without_readings_falls_back_to_the_pooled_series(self) -> None:
-        """A card whose readings never carried an index still derives from what the worker observed."""
+        """A card whose readings never had an index still derives from what the worker observed."""
         model = ContextOverheadModel()
         model.set_per_process_overhead_mb(1000)
         model.observe_idle_residency(context_total_mb=9000.0, context_count=3)

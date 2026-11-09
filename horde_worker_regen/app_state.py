@@ -41,7 +41,7 @@ if TYPE_CHECKING:
 APP_STATE_SCHEMA_VERSION = 2
 """The schema version stamped onto every state file this build writes.
 
-Reads never reject an older file: every field carries a default, so an unknown or absent key degrades
+Reads never reject an older file: every field has a default, so an unknown or absent key degrades
 to that default rather than discarding accumulated state. The number exists so a load can tell which
 migrations a file predates, which is how the dashboard knows an installation existed before the
 progressive experience levels and therefore needs to be told the default changed.

@@ -35,10 +35,10 @@ from horde_worker_regen.process_management.simulation._dummy_images import (
 from horde_worker_regen.process_management.simulation._dummy_jobs import DUMMY_R2_UPLOAD_URL, dummy_job_factory
 
 _IMG2IMG_SOURCE_PROCESSING = frozenset({"img2img", "remix"})
-"""Source-processing modes whose jobs carry a start image (and so drive the VAE-encode lane)."""
+"""Source-processing modes whose jobs have a start image (and so drive the VAE-encode lane)."""
 
 _MASKED_SOURCE_PROCESSING = frozenset({"inpainting", "outpainting"})
-"""Source-processing modes whose jobs carry a start image and a mask, as hordelib's masked path expects."""
+"""Source-processing modes whose jobs have a start image and a mask, as hordelib's masked path expects."""
 
 
 def _source_image_seed(seed: str | None) -> int:
@@ -314,7 +314,7 @@ def make_canned_job(
         source_image_base64 = base64.b64encode(
             make_dummy_source_png_bytes(width, height, _source_image_seed(seed)),
         ).decode("utf-8")
-    # A masked job (inpainting or outpainting) carries both a start image and a mask; without the mask the
+    # A masked job (inpainting or outpainting) includes both a start image and a mask. Without the mask the
     # pipeline either faults or quietly regenerates the whole frame, so its measured cost would not be a
     # masked job's. Both inputs are deterministic at the job's own resolution, keeping expanded job lists
     # byte-stable.
@@ -769,7 +769,7 @@ The optional third element is the control type an ``annotation`` form carries (c
 class GeneratingAlchemySource(CannedAlchemySource):
     """A never-exhausting alchemy source that mints fresh forms from weighted form names.
 
-    An ``annotation`` form entry carries the control type to annotate, so the minted spec routes to the
+    An ``annotation`` form entry includes the control type to annotate, so the minted spec routes to the
     image-utilities lane with the control type that lane needs (a control-type-less annotation form
     faults there). Every other form leaves the control type ``None``.
     """

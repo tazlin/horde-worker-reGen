@@ -51,7 +51,7 @@ def _two_card_lifecycle(process_map: ProcessMap) -> ProcessLifecycleManager:
     """A real lifecycle manager driving two cards, each planned for two inference processes (four total).
 
     Mirrors the worker-host topology where one worker identity drives both cards under one queue: the
-    worker-wide ceiling is the summed per-card plan, and each process carries the ``device_index`` of the
+    worker-wide ceiling is the summed per-card plan, and each process includes the ``device_index`` of the
     card it is pinned to.
     """
     bridge_data = make_mock_bridge_data()

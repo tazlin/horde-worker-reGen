@@ -51,7 +51,7 @@ One key says which model a worker-run backend loads: `text_model`. It takes eith
 name, spelled the way the text model reference spells it, or the path to a model file of your own.
 
 ```yaml
-# a catalogued model: the worker knows its file, its size and its digest
+# a catalogued model with a declared file, size and digest
 text_model: "meta-llama/Meta-Llama-3.1-8B-Instruct-Q4_K_M"
 
 # or a file you supply: used where it sits, never fetched
@@ -64,15 +64,15 @@ you run yourself (`text_backend_managed: false`) has already been given its mode
 there.
 
 **The catalogue is part of the model reference, not a list beside it.** The horde's text model reference
-is a name registry: its records carry the publisher's page and a parameter count, and deliberately no
-per-file download entries, because a quantised conversion hosted anywhere is a valid thing for a worker to
+is a name registry. Its records include the publisher's page and a parameter count, but do not specify
+per-file downloads, because a quantised conversion hosted anywhere is a valid file for a worker to
 run. koboldcpp needs one such file. So the worker contributes the models it has measured to the reference
 as one more source (`horde_worker_regen/text_backends/model_catalogue.py`, registered under the source id
 `regen_text`), and a read of the text category sees them beside the canonical records. Each contributed
-record declares its file's name, size and SHA-256 in the fields the reference already has, and carries
+record declares its file's name, size and SHA-256 in the reference fields, and includes
 what running the model showed (its quantisation, the context it was measured at, the VRAM it held, the
 tokens per second, and the card it was measured on) in the record's `settings`. A canonical record of the
-same name wins, so when the reference carries these files itself the worker's copies are shadowed and
+same name takes precedence, so when the reference includes these download entries the worker's copies are shadowed and
 nothing else changes.
 
 Three models are in the catalogue today, each measured on one 16 GB card: Llama-3.2-3B-Instruct Q4_K_M
@@ -157,7 +157,7 @@ Obtaining the program comes before any of that, and is part of the backend's lif
 it: the worker's supervisor owns that step too, so the backend has a row on the dashboard reading
 `provisioning` for as long as a first-run download takes, and the row states the port only once the command
 line has been rendered. A program that cannot be obtained at all is not retried, because a download that
-failed is not something a relaunch ladder recovers; the reason is logged once and carried on the row, where
+failed cannot be resolved by relaunching. The reason is logged once and displayed on the row, where
 the dashboard turns it into an error rather than waiting on a clock that would never run out.
 
 The patience a managed backend is judged by is therefore measured from the launch attempt rather than from
@@ -183,7 +183,7 @@ those, not at the readiness probe.
 ## What the worker advertises, and why it must not be double-prefixed
 
 What a pop offers the horde is a promise about what the backend will accept, so nothing is popped before
-the backend has answered, and every figure offered is the lower of yours and the backend's:
+the backend has responded. Each advertised figure is the smaller of the configured value and the backend's limit:
 
 - **The model name.** A catalogued `text_model` is offered under its record's name. A `text_model` that
   names a file of your own is offered under the file's stem, and an attached backend under whatever model
@@ -201,22 +201,19 @@ The horde spells a text model's name with the backend serving it in front of it,
 like differs per backend: the koboldcpp spelling drops the author segment, so
 `meta-llama/Llama-3.2-3B-Instruct` is offered as `koboldcpp/Llama-3.2-3B-Instruct`, while the aphrodite
 spelling keeps the whole name. The worker derives that from which backend it is attached to, so
-`text_model_name` takes the plain canonical name. A name that already carries a backend prefix would be
+`text_model_name` takes the plain canonical name. A name that already has a backend prefix would be
 prefixed twice and match nothing the horde has work for, so the config refuses one and tells you to drop
 it. An author segment is not a prefix and is kept.
 
 ## Watching a generation arrive
 
-A text generation takes seconds to minutes, and a blocking request says nothing at all until it is over,
-so the worker asks the backend to stream its answer instead. The text then arrives in pieces, and the
-worker knows three things while a job is still running: how much has arrived, when the last of it did,
-and how long the job has been going. That is what the dashboard shows, and it is also how the worker
-tells a slow generation from a backend that has wedged.
+A text generation takes seconds to minutes. A blocking request does not provide progress until it finishes,
+so the worker uses streaming. The dashboard shows how much text has arrived, the time since the last piece,
+and the job's elapsed time. These measurements distinguish a slow generation from a stuck backend.
 
-**Token counts and a token rate are a separate question.** One stream record carries an arbitrary number
-of tokens (fifty-five records carried a hundred and sixty tokens on a measured run), so nothing about
-how many tokens have been produced can be worked out from the text. A backend built with the worker's
-per-request statistics patch answers a route that says so, and a job on such a backend carries real
+**Token counts and rates.** A stream record can contain several tokens, so the number of records does not
+give a token count. A backend built with the worker's
+per-request statistics patch provides a statistics route, and a job on such a backend has measured
 token counts and a real rate: the backend's own generation timing where it reports one live, else the
 growth in its token count between two samples over the time between them. A stock build has no such route, the worker asks once and then stops
 asking, and the counts stay unknown rather than being guessed at from the characters. Either way the
@@ -318,7 +315,7 @@ with one request at a time ran out of shared context. Parallel requests remain a
 the fix is a context pool large enough for them. `horde-log diagnose` reports these episodes as
 `text_backend_wedged`, and also recognises the run of busy-refused faults an older worker left behind.
 The finding's headline states the count of finished generations the backend reported, so a bundle shows
-whether a hold was a stuck backend or one busy with other clients, and a support bundle carries
+whether a hold was a stuck backend or one busy with other clients, and a support bundle includes
 `logs/text_backend.log` for a backend the worker launched.
 
 The worker's own hold and the horde's maintenance flag are independent. The horde sets maintenance when
@@ -349,9 +346,9 @@ another program: it may have no abort route, or may ignore one, and the worker c
 behalf. What the wait does not finish is then ended and reported by the flow itself, under a bound of its
 own, so every job the worker popped is accounted for exactly once and by one reporter.
 
-A submit whose answer was lost in transit is retried, and the horde then says it already holds the
-result. That is a delivery: the job is counted as the outcome it carried, with no kudos figure, because
-the reward was paid against the attempt whose answer went missing.
+A submission is retried if the response is lost in transit. If the horde reports that the result was already
+submitted, the job is counted according to the submitted outcome. The reward from the earlier attempt is
+not available, so a kudos figure is not recorded.
 
 ## Testing against the live horde without serving strangers
 
@@ -379,7 +376,7 @@ so a session's totals split three ways instead of collapsing text into the image
 generated token counts are there when the backend reported them and unknown when it did not, which is
 the difference between a patched build and a stock one described above.
 
-The supervisor snapshot carries the flow's live state for the dashboard: jobs in flight, the session's
+The supervisor snapshot includes the flow's live state for the dashboard: jobs in flight, the session's
 submitted and faulted totals, whether the readiness gate has passed, and the model, context length and
 generation length the worker is advertising.
 
@@ -397,7 +394,7 @@ The row says what a text backend can be held to. Its state is the supervisor's o
 `relaunching in 8 s`), its resident model is the one the backend reported loading, its identity in the id
 column is the OS pid of the launched process, and its VRAM figure is the card's free-memory drop measured
 across the launch, labelled as measured because it is not an allocator reading and cannot be compared with
-one. The Live tab carries the rest as labelled lines: the port and backend kind, the context and
+one. The Live tab includes the rest as labelled lines: the port and backend kind, the context and
 generation caps, how long it has been ready, how many times it has been launched, and the buffer sizes
 llama.cpp printed while loading (see [Logs](../reference/logs.md)). Nothing on the row feeds admission or
 pricing; the arbiter still sees the backend only as the card's foreign floor.
@@ -444,7 +441,7 @@ alchemist-only worker reports its own work rather than the image tracker's zero;
 recent pop any flow made. Each flow contributes its delivered submits plus its fault reports, which is what
 the image tracker's own movement counter means. The `alchemy_*` and `text_*` fields and the by-workload
 totals remain the per-workload split, and the Stats tab shows that split whenever a workload other than
-image generation has totals: a scribe-only worker's single row carries the mean generated tokens, which no
+image generation has totals: a scribe-only worker's single row includes the mean generated tokens, which no
 headline figure states.
 
 ## What is not supported yet
@@ -461,7 +458,7 @@ headline figure states.
   postures in the health checklist, a per-workload split on Stats, and the backend's own section on the
   native page. What is still missing is the editor page, so `scribe` and everything under it are edited
   in `bridgeData.yaml` by hand.
-- **No activity feed carries text events.** Finished text jobs reach the Simple ticker through the
+- **Activity feeds do not include text events.** Finished text jobs reach the Simple ticker through the
   recent-jobs list, so the feed is built from what finished rather than from events the worker emitted at
   the transitions themselves.
 - **Turning `scribe` on mid-run does not start a worker-run backend.** The flow itself follows the live

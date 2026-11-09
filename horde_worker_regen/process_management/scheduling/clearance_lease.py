@@ -16,7 +16,7 @@ waiter once its full materialisation fits.
 A multi-sample job (hires-fix, refiner) consumes one grant for its whole job: the second and later
 ``acquire`` calls pass through so a single job never blocks twice.
 
-A proxy built with a ``stage`` semaphore also carries a stage permit, taken by the child before its sample
+A proxy built with a ``stage`` semaphore also has a stage permit, taken by the child before its sample
 permit to upload the diffusion weights ahead of the denoise loop. The weights alone fit beside a running
 sampler's peak where the whole sampling peak does not, so the parent can grant the stage permit to the head
 waiter while another child samples and the denoise onset waits only on the sample permit. A single clear
@@ -117,7 +117,7 @@ class ClearanceLeaseProxy:
     state: the parent and child hold distinct unpickled copies and never read each other's flag, so the parent
     tracks grants through the controller instead.
 
-    A grant also carries the device free VRAM the parent measured when it admitted the child, written to a
+    A grant also includes the device free VRAM the parent measured when it admitted the child, written to a
     shared figure before the permit is released. The child's free-VRAM clamp was set from the dispatch-time
     reading, taken while the previous sampler still held the card; rebasing it on the clearance figure lets the
     child judge its load against the card the parent just admitted it to. The child reads the figure only on
@@ -134,7 +134,7 @@ class ClearanceLeaseProxy:
     its text encoder between that reading and its acquire, and only the time tells it whether the figure
     counts the encoder. A figure with no reading carries no time. The parent does not decide anything on it.
 
-    A grant also carries the activation reserve the parent priced the window's non-weight memory at
+    A grant also includes the activation reserve the parent priced the window's non-weight memory at
     (:func:`~horde_worker_regen.process_management.scheduling.admission.pricing.sampling_reserve_mb`), in a
     second shared figure written beside the first. ComfyUI sizes a partial load to leave only its own activation
     estimate, which can be smaller. hordelib raises that estimate to the granted figure, so a partial load leaves
@@ -535,7 +535,7 @@ class ClearanceLeaseProxy:
     def _parent_stage_permit_taken(self) -> bool:
         """Return whether the child has taken its stage permit and begun uploading weights.
 
-        Read for a child whose sample grant is outstanding, which always carries a stage permit released with it
+        Read for a child whose sample grant is outstanding, which always has a stage permit released with it
         or before it, so a permit that is not available is one the child took. The probe holds the permit only
         across the check, as a refresh does.
         """
@@ -918,7 +918,7 @@ def decide_clearances(
     ``tail_overlap_margin_mb``. The early clear is bound to the outgoing sampler's job id and suppressed while
     that id is in ``already_tail_cleared_job_ids``, so a given outgoing sampler triggers at most one early
     clear. When the gate is applicable (enabled, with at least one active grant) and does not fire, the plan
-    carries a :class:`TailOverlapDenial` naming the clause that refused.
+    has a :class:`TailOverlapDenial` naming the clause that refused.
     """
     base_slots = max(0, slot_cap - held_grant_count)
 
@@ -1256,7 +1256,7 @@ class ClearanceController:
         """Release one child's stage permit so its weights may land ahead of its sample window. Returns success.
 
         Records the job the grant is issued for, so a staged grant retires by the same job correlation as a
-        cleared one. ``device_free_mb``, ``device_free_measured_at`` and ``sampling_reserve_mb`` carry the same
+        cleared one. ``device_free_mb``, ``device_free_measured_at`` and ``sampling_reserve_mb`` include the same
         meaning as in :meth:`_clear`.
         """
         proxy = self._proxies.get(process_id)
@@ -1363,7 +1363,7 @@ class ClearanceController:
         Between the grant and the child's sample call the child releases its encoder to host RAM and siblings
         unload, so the figure frozen at the grant tick understates the card the child loads into. A step with no
         reading leaves the last figures in place. A staged child's stage figures are refreshed the same way, and
-        a cleared child's stage figures too while the stage permit is untaken. Each rewrite carries the reading's
+        a cleared child's stage figures too while the stage permit is untaken. Each rewrite includes the reading's
         time beside the figure.
 
         Once a cleared child takes its stage permit, keep the sample grant's free-VRAM reading from before upload.

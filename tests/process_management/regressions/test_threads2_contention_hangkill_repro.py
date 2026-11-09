@@ -368,7 +368,7 @@ class TestFeatureAndPhaseWidening:
         """A ControlNet + hires + large-resolution job widens on its features even with a light expectation.
 
         The widening must respond to the job's features, not only its expected sampling seconds: a feature
-        job can carry a modest sampling estimate yet long heartbeat-silent feature phases.
+        job can have a modest sampling estimate yet long heartbeat-silent feature phases.
         """
         bridge_data = _contention_bridge_data()
         tracker, _ = _admitted_job_tracker()

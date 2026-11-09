@@ -47,11 +47,11 @@ does or does not fit:
 - A candidate that cannot fit an even fully-cleared card DENIES: no escalation on this card could seat it,
   unless it clears the achievable ceiling by so little that the prediction is the likelier explanation (see
   :data:`_CEILING_ATTEMPT_OVERSHOOT_FRACTION`), where one real load settles it instead.
-- A staged job that carries a partial-load seat (:attr:`VramRequest.partial_seat_mb`) and does not fit at its
+- A staged job that has a partial-load seat (:attr:`VramRequest.partial_seat_mb`) and does not fit at its
   full charge FITS at that seat ahead of every other non-fitting path, once the card has nothing left to
   reclaim and the seat fits the reading, whether or not the full charge is under the ceiling. ComfyUI serves it
   by loading a share of its weights, and room beyond a converged card only arrives if another tenant frees it.
-- A partial seat or a measured attempt for a job whose grant carries a non-weight reserve
+- A partial seat or a measured attempt for a job whose grant has a non-weight reserve
   (:attr:`VramRequest.sampling_reserve_mb`) DEFERS while the measured free net of the outstanding reservations
   is below that reserve. The child's load keeps the reserve free, so with less than that on the card every
   weight stays in host RAM and the activation alone goes over the card.
@@ -66,7 +66,7 @@ worker-resident model, nothing left for make-room to reclaim), whose demand is u
 the conservative static prediction: a success teaches the learned peak the true figure, a failure is the
 strongest possible evidence and arms the ceiling hold. The attempt rides the ordinary FITS path, so every
 downstream safety applies unchanged, and it fires at most once per head-starvation episode. A shortfall beyond
-the band, or a card with reclaim still to do, keeps deferring. A grant that carries a non-weight reserve is
+the band, or a card with reclaim still to do, keeps deferring. A grant that has a non-weight reserve is
 attempted only once the measured free net of the outstanding reservations holds that reserve: the child's partial
 load leaves room for the activation out of what the card has, and cannot leave room the card does not have.
 
@@ -437,7 +437,7 @@ class VramRequest:
     therefore survives arbiter replacement. An active continuation takes precedence; otherwise a spent
     job/device pair falls through to the ordinary denial or deferral path."""
     candidate_measured: bool = False
-    """Whether the candidate carries a trusted measurement of this job's sampling peak (the learned key has
+    """Whether the candidate has a trusted measurement of this job's sampling peak (the learned key has
     enough observations). A job the hardware has demonstrated at that peak misses the instantaneous reading
     by the room its own staged encoder holds and the backend will evict, not by an unseen tenant, so its one
     real load waits the card's probe delay rather than the starvation horizon a larger shortfall implies."""
@@ -731,7 +731,7 @@ class VramVerdict:
     reason: str
     """What the arbiter decided and the structural facts that distinguish it from another block.
 
-    Stable while the same block persists: it never carries a measurement, a countdown, or a running total.
+    Stable while the same block persists: it never has a measurement, a countdown, or a running total.
     This is what every stored and compared surface takes."""
     measured: AdmissionVerdict
     detail: str = ""
@@ -839,7 +839,7 @@ class VramArbiter:
         self.measured_attempts = 0
         """Count of measured-load attempts emitted (a starved head at a converged-empty card admitted for one
         real load despite not fitting the instantaneous reading). Counts first emissions only, not the
-        in-progress continuations that carry an already-tagged job through preload -> dispatch."""
+        in-progress continuations that have an already-tagged job through preload -> dispatch."""
 
     def begin_cycle(self, snapshot: MeasuredVramSnapshot) -> None:
         """Freeze the measurement this cycle's requests are priced against."""
@@ -1318,7 +1318,7 @@ class VramArbiter:
 
     @staticmethod
     def _partial_seat_eligible(request: VramRequest, state: DeviceVramState) -> bool:
-        """Whether a staged dispatch carries a partial-load seat the emptied card could hold.
+        """Whether a staged dispatch has a partial-load seat the emptied card could hold.
 
         A paging card is excluded here as well as at pricing, since the seat fit is judged by the card's own
         reading and a paging card reports memory it does not have.

@@ -12,7 +12,7 @@ needs.
 Everything above this package (the flow that pops horde jobs, the lifecycle that launches the binary)
 sees these seven verbs, the result models, and the four exception types. It never sees HTTP: no status
 codes, no routes, no response bodies. That keeps the retry decision where it belongs. The flow decides
-what to do about a failure because only the flow knows about the job, the horde and the operator's
+what to do about a failure because only the flow has access to the job, the horde and the operator's
 configuration; a driver that retried on its own behalf would be making that decision blind.
 
 Public surface:
@@ -89,7 +89,7 @@ class TextBackendDescription(BaseModel):
     """Represents what the worker advertises to the horde on behalf of a text backend.
 
     Every field comes from the backend's own answer rather than from worker configuration, because the
-    backend is the only thing that knows which weights it actually loaded and what caps it will honour.
+    backend reports the loaded weights and supported limits.
     Advertising anything else is a promise the worker cannot keep.
     """
 
@@ -162,7 +162,7 @@ class TextGenerationProgress(BaseModel):
     Two independent sources feed it. The stream says how much text has arrived and when the last of it
     did, which is true of every backend. The statistics route, where a backend has one, says how many
     tokens that text actually is and how fast they are coming; where it does not, those fields stay
-    `None`. A chunk carries an arbitrary number of tokens (fifty-five chunks carried a hundred and sixty
+    `None`. A chunk has an arbitrary number of tokens (fifty-five chunks had a hundred and sixty
     tokens on the measured build), so no count and no rate is ever derived from the chunk or character
     totals: a guess presented as a token rate is worse than an absent one.
     """
@@ -202,7 +202,7 @@ class TextGenerationResult(BaseModel):
     """Represents one completed text generation.
 
     A model rather than a bare `str` so that what a backend can say about a finished generation grows
-    here instead of in every signature that carries a result.
+    here instead of in every signature that has a result.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -269,7 +269,7 @@ class TextBackend(Protocol):
 
         Raises:
             TextBackendCredentialRefused: The backend refused the worker's credentials.
-            TextBackendUnavailable: The backend did not answer, or answered something unreadable.
+            TextBackendUnavailable: The backend did not respond, or returned an unreadable response.
         """
         ...
 
@@ -336,7 +336,7 @@ class TextBackend(Protocol):
             TextBackendBusy: The backend is already generating; the same job can be offered again.
             TextBackendCredentialRefused: The backend refused the worker's credentials.
             TextBackendRejectedPayload: The backend refuses this payload and always will.
-            TextBackendUnavailable: The backend is unreachable, too slow, answered unreadably, or
+            TextBackendUnavailable: The backend could not be reached, timed out, returned an unreadable response, or
                 stopped part way through a generation it had begun.
         """
         ...

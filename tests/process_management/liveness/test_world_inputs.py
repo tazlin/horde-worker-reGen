@@ -229,7 +229,7 @@ def _lane_state(world: _DispatchWorld, lane_id: int) -> HordeProcessState:
 async def test_a_regrown_lane_charges_its_context_once_started(lane_start_seconds: float) -> None:
     """A regrown lane is starting, with no context on the card, until its start latency has passed.
 
-    A live process passes ``PROCESS_STARTING`` before its CUDA context exists, so the card carries the lane only
+    A live process passes ``PROCESS_STARTING`` before its CUDA context exists, so the card includes the lane only
     once the start completes. Zero, the default, adds the lane waiting for jobs with its context charged at once.
     """
     world = _DispatchWorld(

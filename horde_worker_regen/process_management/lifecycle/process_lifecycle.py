@@ -3691,7 +3691,7 @@ class ProcessLifecycleManager:
         # clearance semaphore held-empty (its single permit acquired now, so the child blocks until the parent
         # clears it) and a done semaphore the child signals on release, wraps them in a picklable proxy shared
         # into the child by spawn inheritance, and registers it with the card's controller so the parent can
-        # grant and observe this child specifically. Three shared floats beside them carry the device free each
+        # grant and observe this child specifically. Three shared floats beside them store the device free each
         # grant was admitted against, the time of the reading behind it, and the activation reserve its window was
         # priced with. When the lease is disabled no proxy is created and the child gets None. Under two-phase
         # clearance the child also gets a stage semaphore, held empty the same way, with its own set of figures,

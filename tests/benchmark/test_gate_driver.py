@@ -330,7 +330,7 @@ def test_fake_mode_gate_rung_smoke(tmp_path: Path) -> None:
     result = run_gate_rung(config)
 
     assert result.jobs_completed > 0
-    assert result.faults == 0  # img2img jobs carry a source image and must not fault or degrade
+    assert result.faults == 0  # img2img jobs have a source image and must not fault or degrade
     assert result.kudos_per_hour is None  # no checkpoint supplied in the smoke
     assert result.job_records_path is not None
     records_path = Path(result.job_records_path)

@@ -345,7 +345,7 @@ Every exit of the pass is recorded once, as the final decision the job ended on:
   growth hold, no target, exclusive hold, concurrency, budget). The sink coalesces repeats, so a head declined
   for the same reason every cycle costs one event.
 - **Log lines**, each edge-triggered or coalesced: the RAM danger floor notice and the concurrency notice fire
-  once per episode (the plan carries the text, the scheduler the latch); the arbiter's defer names its
+  once per episode. The plan includes the text and the scheduler tracks the episode. The arbiter's deferral gives its
   arithmetic and is coalesced on the stable reason (`VRAM arbiter deferring preload of ...`); the RAM budget's
   defer fires once until a fit (`RAM budget deferring preload of ...`); an unroutable head arms a ceiling hold
   with one warning per arm.
@@ -382,7 +382,7 @@ decision reads the view; the act site updates the ledger.
   decision the job actually ended on, into the head-admission ledger and the decision sink.
 - **Every log line that can fire per tick is edge-triggered or coalesced** through
   [`DiagnosticThrottle`][horde_worker_regen.process_management.scheduling.diagnostic_throttle.DiagnosticThrottle]
-  or a once-per-episode latch; the plan carries the notice text, the scheduler owns the latch.
+  or a once-per-episode flag. The plan includes the notice text and the scheduler tracks the flag.
 - **The snapshot is cheap to build and built more than once per cycle.** The preload pass takes one, re-takes
   it behind a fault, and the budget step takes one after the whole-card demand may have acted. Do not cache a
   snapshot across an actuation.

@@ -374,7 +374,7 @@ def test_disk_full_refusal_reports_the_disk_full_outcome(monkeypatch: pytest.Mon
     """A fetch hordelib skipped for a full cache volume reports the disk-full kind.
 
     hordelib returns the skip as a typed ``AdhocDownloadSkipReason``, distinct from its terminal rejection reasons.
-    The outcome stays retryable and does not carry a rejection reason.
+    The outcome stays retryable and does not have a rejection reason.
     """
     lora = _FakeLoraManager(present=set(), fetch_succeeds=False, reject_reason=AdhocDownloadSkipReason.DISK_FULL)
     process = _make_process(monkeypatch, lora=lora, ti=None)
@@ -394,7 +394,7 @@ def test_disk_full_refusal_reports_the_disk_full_outcome(monkeypatch: pytest.Mon
 
 
 def test_terminal_rejection_reports_non_retryable_outcome_with_reason(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A terminally-rejected LoRA reports ok False, not retryable, and carries the rejection reason string.
+    """A terminally-rejected LoRA reports ok False, not retryable, and includes the rejection reason string.
 
     This is what tells the parent to skip the LoRA and dispatch the job without it rather than fault it.
     """

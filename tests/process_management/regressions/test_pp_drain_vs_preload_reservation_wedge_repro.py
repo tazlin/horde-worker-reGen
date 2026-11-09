@@ -110,7 +110,7 @@ class TestPostProcessDrainIsNotHeldByPreloadPlans:
 
 
 class TestSnapshotCarriesThePreloadShare:
-    """The scheduler's frozen device state carries the preload flow's share alongside the combined overlay."""
+    """The scheduler's frozen device state includes the preload flow's share alongside the combined overlay."""
 
     def test_build_device_state_reports_the_preload_flow_share(self) -> None:
         """A live in-flight preload charge surfaces in both the combined overlay and its preload-flow share."""

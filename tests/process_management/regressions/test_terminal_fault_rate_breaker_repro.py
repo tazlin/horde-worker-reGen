@@ -98,7 +98,7 @@ def _standing_cooldown(manager: HordeWorkerProcessManager) -> float:
 async def _attempt_pop(manager: HordeWorkerProcessManager) -> Mock:
     """Drive one real pop over the manager's own worker state; return the API session it used.
 
-    The popper carries a tracker of its own so the only thing under test is the shared pop gate: a queue
+    The popper has a tracker of its own so the only thing under test is the shared pop gate: a queue
     full of the jobs the breaker was fed would otherwise suppress the pop for an unrelated reason.
     """
     job_tracker = JobTracker()
@@ -155,7 +155,7 @@ class TestTerminalFaultRateBreaker:
         (await _attempt_pop(manager)).submit_request.assert_not_awaited()
 
     async def test_the_trip_is_recorded_on_the_action_ledger(self) -> None:
-        """The arm carries the count, the threshold, the duration, and the models that produced it."""
+        """The arm includes the count, the threshold, the duration, and the models that produced it."""
         manager = _make_manager()
         await _fault_terminally(manager, TERMINAL_FAULT_BREAKER_THRESHOLD)
 

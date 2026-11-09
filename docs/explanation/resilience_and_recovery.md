@@ -143,7 +143,7 @@ lifecycle manager therefore judges each inference slot on its own job results
 
 - **A CUDA runtime error.** The child recognises it by type: torch raises
   `AcceleratorError` for a CUDA runtime error code, and hordelib's
-  `PipelineExecutionError` carries the failing node's exception type. The
+  `PipelineExecutionError` includes the failing node's exception type. The
   child sets `cuda_context_fault` on the faulted result, and the slot is
   replaced on the first one. The allocator's `OutOfMemoryError` leaves the
   context usable, so it does not count. A context fault does not count as a resource
@@ -324,7 +324,7 @@ each overtime iteration arrives as another report of the final step at full
 per-iteration cadence while real GPU work continues. The watchdog therefore
 applies `effective_stuck_step_repeat_limit`: repeats below the final step keep
 the configured limit, and repeats at the final step (the parent knows the true
-`N/N` because the saturated heartbeats carry the step counts) are judged against
+`N/N` because the saturated heartbeats include the step counts) are judged against
 `max(configured_limit, 2 × total_steps)`. An overshoot of roughly the schedule's
 own length is within what such a solver asks for; beyond that the reports are no
 longer explainable as overtime. The reap line names which ceiling was crossed.
@@ -501,7 +501,7 @@ holds anyway:
   **not** treated as a process crash. The "from an inference-active state"
   qualifier is essential, but not sufficient by itself: typed execution ownership
   and the in-progress mark are stamped by the scheduler the instant it *dispatches*
-  a job, before the child has acknowledged it, so a slot can carry a freshly
+  a job, before the child has acknowledged it, so a slot can have a freshly
   dispatched job while it is still draining state messages from *before* the
   dispatch (the idle it reports after unloading the previous model to free VRAM,
   say). The reaper also compares the active dispatch timestamp with the state
@@ -1107,7 +1107,7 @@ close that class:
   next tick.
 - **Source media is bounded.** Fetching an already-popped job's source images is
   capped at `SOURCE_IMAGE_DOWNLOAD_TIMEOUT_SECONDS` (120 s); on expiry the job
-  carries the same per-item download faults an exhausted retry loop would have
+  includes the same per-item download faults an exhausted retry loop would have
   produced and proceeds, so a dead media host cannot hold intake hostage behind
   one job.
 - **Silence is disclosed.** Each early return in the pop coroutine stamps the
@@ -1159,7 +1159,7 @@ makes a maintenance episode unmistakable for as long as it lasts.
 **The bounded auto-clear.** The worker may lift the horde's own pause, and only
 the horde's own pause:
 
-- **Eligibility.** The rejected pop carries the horde's maintenance reason, and
+- **Eligibility.** The rejected pop includes the horde's maintenance reason, and
   the return code is the same whichever side set the flag, so that reason is the
   only discriminator the API offers. A reason the horde writes itself ("dropping
   too many jobs") marks the episode server-forced; any other reason is treated as

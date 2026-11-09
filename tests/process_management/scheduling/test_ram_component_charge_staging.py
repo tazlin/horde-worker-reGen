@@ -175,7 +175,7 @@ class TestMissingSidecarParity:
     async def test_no_sidecar_matches_prefeature_reuse_credit(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A sidecar-less disaggregation-class job is priced identically to the monolithic reuse-credit path.
 
-        A model that can never carry a sidecar (a ``.ckpt`` pickle) must not be admitted more strictly than
+        A model without sidecar support (a ``.ckpt`` pickle) must not be admitted more strictly than
         before component charging existed, or it would re-introduce head-of-queue RAM-defer starvation. Both
         arms fall through to the ordinary path with the retained-page reuse credit; the effective charge and the
         pending record's kind must match.

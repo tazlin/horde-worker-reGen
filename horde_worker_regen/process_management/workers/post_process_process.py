@@ -74,7 +74,7 @@ class _LaneMeasurements:
 
 
 class PostProcessorNotOnDiskError(RuntimeError):
-    """A post-processor the model reference knows has no weight on disk, so the lane cannot run it."""
+    """A post-processor listed in the model reference does not have weights on disk, so the lane cannot run it."""
 
     def __init__(self, model_name: str) -> None:
         """Name the missing model in the message the job's fault carries."""
@@ -475,7 +475,7 @@ class HordePostProcessProcess(HordeProcess):
             logger.error(f"Failed to reload model database: {type(e).__name__}: {e}")
 
     def _require_post_processor_on_disk(self, model_name: str) -> None:
-        """Raise if a post-processor the reference knows is not on disk, before hordelib would download it.
+        """Raise if a post-processor listed in the reference is not on disk, before hordelib would download it.
 
         The download process is the only place weights are fetched: a transfer inside this lane would run
         under the job's own time bound and show no progress. A name no manager owns is left to hordelib to

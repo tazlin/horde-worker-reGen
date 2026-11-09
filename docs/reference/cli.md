@@ -208,7 +208,7 @@ Four more views read what a support bundle carries:
   line` when none was logged, marked `unpriced after timeout` when the lane entered its denoise loop without a
   recorded grant), or `child load after grant` (grant to first step, split by the `from dispatch to first step`
   kind, `cold` or `resident`, and by model). A stretch that reaches the epoch's end is `window end`, named from
-  its samples. Every line carries its seconds split by context: a rung-2 residency spell, a rung-1
+  its samples. Every line shows its seconds split by context: a rung-2 residency spell, a rung-1
   dominant-model run, or neither. The header gives the idle share and the idle seconds above the 90% card-busy
   target, so the biggest segment is where that gap is. The log's host clock is aligned to the stats' epoch
   seconds from the dispatch stamps both record; a session whose epoch has no dispatch of a recorded job, or
@@ -220,7 +220,7 @@ Four more views read what a support bundle carries:
   resident figures of the baseline's checkpoints, each row showing the card size its figures were measured on.
   The report does not list the entries of a store written before figures carried their card, and gives how
   many it left out. The text report prints figures only; the JSON output
-  carries the sampling concurrency, the clearance holds and the idle attribution (`idle_attribution`: totals,
+  includes the sampling concurrency, the clearance holds and the idle attribution (`idle_attribution`: totals,
   per-segment seconds and every bucket; the per-stretch rows are left out), not the footprints.
 
 ## `horde-stats`
@@ -507,7 +507,7 @@ Heavy tiers (`flux`/`qwen`/`zimage`) require explicit selection and are skipped 
 cannot hold them or the checkpoint is absent. A tier whose model is only in the pending reference
 needs `HORDE_MODEL_REFERENCE_PRIMARY_API_URL`. The benchmark sets the beta opt-in automatically.
 
-Every suggested value carries a **provenance basis** so you can tell a setting that is off because it
+Every suggested value has a **provenance basis** so you can tell a setting that is off because it
 was *tested and failed* from one that is off only because its probe was *skipped* (never tested),
 *not in this run*, or *held back* for VRAM headroom or an unstable soak. The basis is printed under the
 completion line, written into the report's "Why each value" table, and shown beside each value in the
@@ -768,7 +768,7 @@ class (an inference pool crashing on start, repeated process restarts that never
 filled and stopped moving, a
 model-reference read that faulted a running sample, a pop that named no model, a model that ends every
 slot it is loaded onto, and the horde repeatedly refusing this worker's pops) and emits the child's
-exception as the root cause where it can. Every session also carries a census of the jobs it faulted,
+exception as the root cause where it can. Every session also has a census of faulted jobs,
 with each one's model and cause. Every finding id, with its severity and what it means, is catalogued in
 [Log findings](log_findings.md); a finding whose remedy needs background prints a `see:` line naming the
 docs page that explains the subsystem behind it. See
@@ -823,7 +823,7 @@ over to the next, stopping at the first that does not (that is a different launc
 read in place, without unpacking anything next to the logs.
 
 Either way the report says what it read: `sessions` prints a `Rotation:` line and the session-summary
-finding carries the same disclosure, naming the archives that were included and, when the walk stopped,
+finding includes the same disclosure, naming the archives that were included and, when the walk stopped,
 the older ones that were left out. A session whose launch line is still missing is reported as starting
 *at or before* its first surviving line, with the span and duration marked as bounds.
 

@@ -56,7 +56,7 @@ class MaterializationRequest:
 
 @dataclass(frozen=True)
 class StagedWaiterTerms:
-    """Represents what clearance knows about a staged waiter beyond its outstanding charge."""
+    """Information available to clearance about a staged waiter beyond its outstanding charge."""
 
     held_mb: float
     """What the job already holds on the card (MB), netted out of its outstanding charge."""
@@ -129,7 +129,7 @@ def build_materialization_request(
     are resident; a preload never does. The idle-context teardown is widened in the measured frame through the
     arbiter's deficit, the one thing here that is not read from the snapshot.
 
-    A staged waiter's dispatch also carries its partial-load seat and the non-weight reserve its grant hands the
+    A staged waiter's dispatch also includes its partial-load seat and the non-weight reserve its grant hands the
     child, since only clearance hands the child a grant whose free figure its partial load is sized against.
     """
     job = snapshot.queue.jobs[job_id]

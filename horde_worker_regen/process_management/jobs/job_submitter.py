@@ -186,7 +186,7 @@ class JobSubmitter:
         """Retry after a transient/remote submit failure, tagging the job remote if the retry ceiling is reached.
 
         A network error or an unreachable endpoint is not the worker's fault; when its retries are finally
-        exhausted the terminal fault carries the remote origin so it does not manufacture the failure pause.
+        exhausted the terminal fault includes the remote origin so it does not manufacture the failure pause.
         """
         new_submit.retry()
         self._record_failed_submit_attempt()
@@ -543,7 +543,7 @@ class JobSubmitter:
                 f"Job {job_info.ids} faulted, removing from completed jobs after submitting the faults to the horde",
             )
             # A fault from an action other than the generation flow is excluded from the consecutive-failure
-            # pop pause: a scheduling-recovery give-up (reissuing a wedged backlog) carries its own escalation
+            # pop pause: a scheduling-recovery give-up (reissuing a wedged backlog) includes its own escalation
             # ladder, and an auxiliary-prefetch failure faults a job the worker never generated for. Counting
             # either here would manufacture the pause on top of an unrelated condition, compounding one outage
             # into a longer one. Genuine generation/submit failures are unaffected and still latch the pause.

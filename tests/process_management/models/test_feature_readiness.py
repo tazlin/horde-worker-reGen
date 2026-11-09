@@ -48,7 +48,7 @@ def test_disabled_feature_with_deps_present_reads_as_off() -> None:
 
 
 def test_missing_deps_surfaces_the_install_hint() -> None:
-    """A disabled feature whose packages are absent reads as missing-deps and carries the install hint."""
+    """A disabled feature whose packages are absent reads as missing-deps and includes the install hint."""
     readiness = build_feature_readiness(
         {
             GatedFeature.POST_PROCESSING: FeatureInputs(

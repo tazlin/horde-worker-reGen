@@ -124,7 +124,7 @@ class BudgetVerdict:
     """The effective predicted cost (MB) the fit was decided against, or None when no estimate could be
     produced. For a RAM verdict that credited a staging target's reusable retained pages, or priced a
     disaggregation-class job at its UNet-only component charge, this is the reduced charge, not the raw model
-    cost; ``uncredited_predicted_mb`` carries the raw whole-checkpoint figure."""
+    cost. ``uncredited_predicted_mb`` stores the raw whole-checkpoint figure."""
     available_mb: float | None
     """The measured available resource (MB) at check time, or None when no telemetry exists yet."""
     reserve_mb: float
@@ -248,7 +248,7 @@ class StreamForecast:
     VRAM nears zero (the latter is invisible to ComfyUI's own offload accounting), so this forecast reasons
     purely about measured/derivable free VRAM rather than any backend offload counter.
 
-    A subtlety this forecast exists to capture: each sibling inference process carries a fixed runtime
+    A subtlety this forecast exists to capture: each sibling inference process has a fixed runtime
     (CUDA) context of roughly a gigabyte that is *not* reclaimed by evicting its model, only by stopping
     the process. That context may not have materialised at the instant a load is admitted (idle processes
     allocate lazily), so the instantaneous free-VRAM measurement can read deceptively high and then collapse
@@ -394,7 +394,7 @@ class StreamForecast:
         context is priced by this marginal.
 
         The seed is capped at the measured first-context overhead when there is one. An additional bare
-        context cannot cost more than the first, which carries the same context plus the one-time runtime
+        context cannot cost more than the first, which includes the same context plus the one-time runtime
         and the device baseline, so a seed above it is incoherent and prices headroom that exists away.
         The cap matters because the seed is not always transient: where the marginal probe cannot measure
         a sibling process (a per-process device reading, as on Windows WDDM) nothing ever displaces it, so
@@ -722,7 +722,7 @@ class WholeCardResidencyState:
     Decouples the worker-side runtime read (assembled by :class:`InferenceScheduler`) from the wire/UI
     model, so the serialization layer and the TUI never reach into scheduler internals. ``possible``
     describes whether the feature *could* engage under the current config and process topology (the
-    operator heads-up); the remaining fields carry the live detail of a residency that is currently held.
+    operator heads-up). The remaining fields include the live detail of a residency that is currently held.
     All MB figures are floats; the snapshot builder rounds them for the wire.
     """
 
@@ -1066,7 +1066,7 @@ def forecast_weight_streaming(
     # multi-GB shortfall. ``overhead`` is still charged once (it sizes free_if_alone below).
     if marginal_process_overhead_mb is None or marginal_process_overhead_mb <= 0:
         # Capped at the measured first-context overhead where there is one: an additional bare context
-        # cannot cost more than the first, which carries the same context plus the one-time runtime. See
+        # cannot cost more than the first, which includes the same context plus the one-time runtime. See
         # StreamForecast._effective_marginal_overhead_mb for why an uncapped seed can become permanent.
         marginal = (
             min(_SEEDED_MARGINAL_CONTEXT_OVERHEAD_MB, overhead)
@@ -1502,7 +1502,7 @@ def _estimate_job_burden(job: ImageGenerateJobPopResponse, baseline: str | None)
 class _PlannedReserve:
     """A planned (admitted, not-yet-materialised) VRAM charge that decays as its target's reservation fills.
 
-    Held separately from the ledger's flat committed entries because it carries the extra state the
+    Held separately from the ledger's flat committed entries because it includes the extra state the
     double-count guard needs: which process the charge will land on, that process's measured allocator
     reservation at admit time, and a high-water mark of the growth observed since, so the outstanding planned
     share can be computed against the target's current reservation (see

@@ -390,7 +390,7 @@ def test_reduced_size_skips_are_named_with_their_size_only_when_outstanding() ->
 
 
 def test_ready_report_lists_the_regular_and_reduced_lanes_separately() -> None:
-    """With both lanes unanswered the report carries a Work line for each; with one, only that one."""
+    """With both lanes unanswered the report has a Work line for each. With one, only that one."""
     both = derive(
         _snapshot(
             processes=[_process("WAITING_FOR_JOB")],

@@ -183,7 +183,7 @@ class TestCommitBoundGovernance:
         assert scheduler._state.ram_pressure_pop_hold is False
 
     def test_commit_bound_reason_matches_the_registered_pop_hold_line(self) -> None:
-        """The pop-hold line carries the commit note in a form the registered log signature still parses."""
+        """The pop-hold line includes the commit note in a form the registered log signature still parses."""
         verdict = assess_ram_pressure(
             _HEALTHY_AVAILABLE_RAM_MB,
             _TOTAL_RAM_MB,

@@ -437,7 +437,7 @@ class TestRetentionFit:
         assert self._fit(None).granted is True
 
     def test_describe_names_the_retained_charge_and_floor_only_when_present(self) -> None:
-        """The log line carries the retained and foreign-floor figures only when each is nonzero."""
+        """The log line includes the retained and foreign-floor figures only when each is nonzero."""
         described = self._fit(1.0).describe()
         assert "retained residents 4000MB" in described
         assert "foreign floor 2000MB" in described

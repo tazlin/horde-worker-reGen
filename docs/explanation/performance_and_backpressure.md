@@ -256,7 +256,7 @@ read rather than a latch: see
 The same "never advertise what cannot be served" rule applies to models. While *every* governed
 card sits below the device-free governor's soft floor, the pop drops the whole-card
 (`EXTRA_LARGE`) models: Flux, Cascade, Qwen, Z-Image, Krea2, MOSS-Image, and the named
-VRAM-heavy checkpoints. A model that wants the whole card has nowhere to go on a card already
+VRAM-heavy checkpoints. A model that requires the whole card cannot run on a card already
 under pressure, so offering it only earns work that waits on a reclaim which may never arrive.
 
 The signal is the governor's own committed state, which requires two agreeing NVML samples, so
@@ -299,7 +299,7 @@ floor charged), or one the operator pins, is judged by its partial-load seat aga
 ceiling instead, since after the teardown that seat is how the card serves it (see
 [The partial-load seat](vram_arbiter.md#the-partial-load-seat)). This holds whatever the recommended minimum
 card says, so a card below that recommendation still serves a model whose seat fits. For the offer the ceiling
-carries the learned foreign floor, so such a model leaves the offer while a tenant does not leave room for the seat,
+includes the learned foreign floor, so such a model leaves the offer while a tenant does not leave room for the seat,
 and returns when the tenant goes. The preload gate checks the same seat against the total net of the admission
 margin only, so a job accepted before the floor rose is not faulted for it. Where an extra-large model's seat cannot
 be priced (a card under WDDM demand paging), the offer withholds the model, since it advertises only what it can
@@ -332,10 +332,10 @@ card follows most jobs.
 
 The horde's pop carries one `max_pixels` for every model in it, so a constrained model cannot share a pop
 with the others without capping them all. The popper lanes it instead
-(`decide_constrained_offer`): a bounded run of full-size pops carries the unconstrained models at the
+(`decide_constrained_offer`): a bounded run of full-size pops includes the unconstrained models at the
 configured `max_power`, then one pop carries only the constrained models at their shared cap, and the
 cadence repeats. An offer made only of constrained models goes out capped as one pop. An idle-fill pop
-wants the quickest work of any model, so it carries the unconstrained models at full size and leaves the
+requests the quickest work of any model, so it includes the unconstrained models at full size and leaves the
 constrained ones for their own pop. A whole-card residency's pop claim pins its model through the lane: a
 claimed constrained model takes the constrained pop at once, so the claim never lands on a full-size pop
 that excludes it and empties the offer. The TUI reports a reduced-size pop's "no work" answer on its own
@@ -775,7 +775,7 @@ noise buffer are charged in full. The parent's own retention record is what says
 there, which is the only truth that covers a disaggregated sampler: its sample stage reports no
 model-load transition, so the model map never shows a pinned sampler's UNet VRAM-resident however
 long the slot holds it. The post-processing co-residency mutex is applied at clearance too, since
-clearance, not dispatch, is now the VRAM moment for a leased job. A grant also carries the measured
+clearance, not dispatch, is now the VRAM moment for a leased job. A grant also includes the measured
 device free the admission priced against. The controller writes it to a shared float beside the
 child's clearance semaphore before releasing the permit, and the child's `ClearanceLeaseProxy` hands
 it to hordelib once, on the acquire that obtained the permit. hordelib then rebases the run's
@@ -786,7 +786,7 @@ its sample call seconds after the grant, after it has moved its own encoder off 
 stops refreshing device free VRAM once the child takes its stage permit. A later reading includes
 uploaded weights that hordelib's clamp also subtracts as allocation growth since the reading.
 Counting those weights twice would cause ComfyUI to unload them immediately. A timed-out or
-passed-through acquire does not carry a reading, a job start unsets the figures until the next step
+passed-through acquire does not have a reading, a job start unsets the figures until the next step
 rewrites the device free and the reserve of a grant still unconsumed, and a grant that retires with
 its permit never taken has that permit taken back by the controller, so a leftover permit never lets
 the next job on the slot sample unpriced. A clearance held for VRAM fit is attributed to the
@@ -830,8 +830,8 @@ job's dispatch reservation from the encode charge to the weights. A refusal runs
 step. The sample grant that follows prices the activation alone, since the child's report already carries the
 landed weights. The next denoise therefore starts one grant latency after the running one ends where the
 weights fit beside the running peak. On a card where they do not fit, every stage is refused and the behaviour
-is the single clearance's. The stage grant carries its own measured device free, which hordelib rebases its
-clamp on before the upload. The duty-cycle summary line carries the session's stage grants and refusals (see
+is the single clearance's. The stage grant includes its own measured device free, which hordelib rebases its
+clamp on before the upload. The duty-cycle summary line includes the session's stage grants and refusals (see
 [GPU duty cycle](duty-cycle.md)). `horde-log diagnose` reports `stage_outlived_sample_grant` when a staged
 child got no sample grant within the lease-acquire timeout, and `stage_refusals` for the share of waiting jobs
 refused an early load.
@@ -957,7 +957,7 @@ never honour a retention grant: a same-model back-to-back job re-uploads the ful
 when the scheduler and the parent model map agree the model is still resident, and residency does not even
 survive the job's own decode load.
 
-Inference children therefore no longer carry the flag. Returning the card at the end of a job is instead an
+Inference children therefore no longer include the flag. Returning the card at the end of a job is instead an
 explicit hordelib eviction, which the scheduler's grant (`defer_vram_unload`) suppresses and nothing else
 does, so an ungranted job ends exactly as before and a granted one keeps its weights. The parent keeps every
 lever it had: the device-free governor reads truthful NVML device-free, and the verified reclaim ladder
@@ -978,7 +978,7 @@ run in VRAM, while still bounding a pool that would otherwise squat the whole ca
 small card keeps the guard tight and leaves the inference pool its share). Because the guard sits above
 real jobs, three cooperating behaviors keep it from faulting work the card can host:
 
-- **Gate reconciliation.** The dispatch gate knows the lane's effective cap. A chain whose estimated
+- **Gate reconciliation.** The dispatch gate checks the lane's effective cap. A chain whose estimated
   peak exceeds it can never run in the lane no matter how idle the card becomes, so the gate faults it
   without images at admission (the horde reissues it to a larger worker) rather than dispatching it into
   a guaranteed out-of-memory.
@@ -1038,7 +1038,7 @@ Each admitted start on a card (inference, safety on a GPU, and every auxiliary l
 in the reservation ledger under `GPU_START_FLOW`, keyed by its process id. The booking decays as the child's own
 reported reservation grows and is dropped once the child leaves `PROCESS_STARTING`. A second start, a preload
 or a dispatch on the card prices the forming context before it shows in the reading. A start deferred on
-reservations says so: its reason carries the reserved figure.
+reservations says so: its reason includes the reserved figure.
 
 The floors scale with card capacity through the same proportional noise buffer admission uses, so a large
 card keeps proportional headroom and a small card is never starved below an absolute floor. State changes
@@ -1100,7 +1100,7 @@ an 8GB card and a 24GB one instead of being tuned to whichever card it was measu
 extends it: a new high-water of realized free restarts the clock, so a release still arriving keeps its rung
 and only a rung that has genuinely moved nothing runs out.
 
-The **safety-off-GPU rung carries a dwell**. It ends the safety process and the placement policy rebuilds it
+The **safety-off-GPU rung has a dwell**. It ends the safety process and the placement policy rebuilds it
 once the card fits again, so the rung and its restore together are a process cycle that stalls result
 submission; a card under recurring pressure that spends it every episode rebuilds safety for relief the
 previous cycle already failed to hold. Inside the cooldown of a card's previous safety actuation the rung is
@@ -1235,7 +1235,7 @@ name retained), alongside the in-flight WARN-slow grading count (`job_slowdown_e
 Windows/WDDM path: where NVML device-free is unavailable no card is governed, so the SATURATION gate never
 holds and the kill never fires.
 
-When granted, the dispatch carries a "keep resident after" hint to the engine, which skips the post-job
+When granted, the dispatch has a "keep resident after" hint to the engine, which skips the post-job
 VRAM cleanup so the following same-model job samples immediately with no reload. Retention is granted on
 evidence, never assumed: a disabled budget, an unreported card total, or a card the governor has not
 graded `HEALTHY` all fall back to eviction, and even a granted retention is a soft hold. The engine's force-load overflow guard and the worker's under-pressure
@@ -1289,7 +1289,7 @@ point. It does not disable model availability, process readiness, post-processin
 co-residency, queue ordering, or other non-budget safety gates; those rules solve
 different problems and remain active.
 
-The system-RAM side of that marginal check carries a **staging credit** so a
+The system-RAM side of that marginal check has a **staging credit** so a
 reload onto a warm slot is not priced as a cold one. An inference process that
 unloads a model keeps the freed weights' pages resident (its RSS does not drop),
 and a subsequent preload onto that same idle slot reuses those pages: the measured
@@ -1312,7 +1312,7 @@ a different allocator-stuck idle slot instead. Cycling is retargeted, not remove
 an idle slot whose RSS climbs past a creep ceiling (above any single resident model
 plus its runtime) is cycled regardless of its unload state or resident model, since
 that footprint is per-job creep the allocator will not otherwise return and reusing
-it would only carry the leak forward. Each credited admission is reconciled against
+it would only preserve the leak. Each credited admission is reconciled against
 measured truth once the target settles: a target that grew past the charge by a wide
 margin logs that the credit was too generous, the signal for retuning the credit
 constants against field data.
@@ -1514,7 +1514,7 @@ multi-GB mid-job working set systematically invisible. The thread reads only
 allocator/`mem_get_info` statistics (safe cross-thread once the device context is
 initialised) and never touches compute state; it withholds the VRAM read until the
 main thread has initialised the device, so it never triggers a device init off the
-main thread. Each report carries the wall-clock instant it was sampled, and the
+main thread. Each report includes the wall-clock instant it was sampled, and the
 attribution reconciler treats a contributor whose report has aged past a staleness
 bound (3x the report interval) as an UNKNOWN, incomparable tenant: it skips the
 drift computation for that card rather than raising a false alarm or a false
@@ -1787,7 +1787,7 @@ than one card. Those ends, and why each is shaped the way it is, are in
 A claim changes what the worker *asks* for rather than what it does with what arrives, so it leaves no trace
 in the job stream: a stretch where one model served everything looks the same whether that was the demand or
 the claim. Three surfaces close that gap. The scheduler states each engage and release once, the release
-naming which of the ends fired. The residency status snapshot carries the standing claim (its model and the
+naming which of the ends fired. The residency status snapshot includes the standing claim (its model and the
 time left on the maximum hold) and, for a short window after a release, which end fired, so the Overview's
 residency panel and hero banner explain both the narrowed offer and its widening back out. And `horde-log`
 pairs the edges into episodes: an informational
@@ -1835,7 +1835,7 @@ whichever site sets the later one holds the pause; no site shortens a deadline i
 RAM-pressure reading arriving under a longer fault throttle leaves the fault throttle's deadline (and its
 attribution) standing. The subsystem that set the standing deadline is recorded as the pause's
 [`PopPauseOwner`][horde_worker_regen.process_management.config.worker_state.PopPauseOwner] alongside a truthful,
-owner-specific reason (the RAM-pressure reason carries the measured free and floor MB it acted on). That owner
+owner-specific reason (the RAM-pressure reason includes the measured free and floor MB it acted on). That owner
 and reason are what the governor reading reports, what the resume log line names when the pause lapses, and what
 the action ledger records: an arm event ([`POP_PAUSE_ARMED`][horde_worker_regen.process_management.ipc.action_ledger.LedgerEventType])
 carrying the owner, duration, and numeric context, and a matching `POP_PAUSE_LAPSED` when it clears. An

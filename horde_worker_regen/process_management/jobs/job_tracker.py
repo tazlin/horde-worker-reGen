@@ -1,6 +1,6 @@
 """Unified, ID-keyed job state management.
 
-Every job the worker knows about is exactly one ``TrackedJob`` in a single
+Every tracked job is exactly one ``TrackedJob`` in a single
 ``dict[GenerationID, TrackedJob]``, with an explicit :class:`JobStage`. All
 stage changes funnel through one transition method that validates legality,
 so "a job is in exactly one stage" is structural rather than emergent.
@@ -234,7 +234,7 @@ a job this host can never commit still leaves within four short attempts, well i
 """Prefix of the metadata note :meth:`JobTracker.fault_post_inference_job` records.
 
 Matched by :meth:`JobTracker.readopt_post_inference_result` to withdraw the note when the work that was
-written off arrives after all, so a job delivered with its images does not also carry a fault report."""
+written off arrives after all, so a job delivered with its images does not also have a fault report."""
 
 
 class JobFaultOrigin(enum.StrEnum):
@@ -531,7 +531,7 @@ class TrackedJob:
     served_whole_card: bool | None = None
     """Whether a whole-card exclusive residency for this job's model was held on its card at dispatch.
 
-    Such a job runs with the card to itself and carries the amortized cost of establishing that residency,
+    Such a job runs with the card to itself and is charged the amortized cost of establishing that residency,
     so it is not comparable to a co-resident job of the same shape. None until the job is dispatched."""
     serving_process_age_seconds: float | None = None
     """How long the inference process serving this job had been alive at dispatch, in seconds.
@@ -890,7 +890,7 @@ class JobTracker:
         that a crash-path resolution here bypasses entirely: on a requeue the orchestrator would otherwise
         re-dispatch its held copy in parallel with the tracker's fresh attempt (the pending head then parks
         behind its own duplicate's sampler pin), and on a terminal fault the held state becomes a zombie that
-        can re-dispatch a job the tracker no longer knows. The manager registers the orchestrator's
+        can re-dispatch a job that is no longer tracked. The manager registers the orchestrator's
         ``release_job`` here so both branches drop that state first; it is idempotent and a no-op for jobs
         the orchestrator does not hold, so calling it for monolithic jobs is safe.
         """
@@ -2856,7 +2856,7 @@ class JobTracker:
         # Drop any disaggregation pipeline state held for this job BEFORE deciding requeue-vs-fault: a requeue
         # must not race the orchestrator's own held-state re-dispatch (the same job would run twice and the
         # pending copy parks behind its duplicate's sampler pin), and a terminal fault must not leave a zombie
-        # registration that later re-dispatches a job this tracker no longer knows.
+        # registration that later re-dispatches a job that is no longer tracked.
         if faulted_job.id_ is not None and self._inference_failure_release_observer is not None:
             self._inference_failure_release_observer(faulted_job.id_)
 

@@ -128,7 +128,7 @@ async def test_headless_run_writes_a_spine_its_consumers_can_read(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """A headless worker's stats stream carries the duty spine, and the analyzers get answers from it."""
+    """A headless worker's stats stream includes the duty spine, and the analyzers get answers from it."""
     monkeypatch.chdir(tmp_path)
     result = await run_harness_async(_spine_harness_config(_SPINE_SECONDS))
     assert not result.timed_out, result.failure_summary()
@@ -160,7 +160,7 @@ def _assert_disaggregated_jobs_carry_phase_metrics(
     result: HarnessResult,
     events: list[dict[str, Any]],
 ) -> None:
-    """Assert every disaggregated job's exported record carries the phase metrics its sampler measured.
+    """Assert every disaggregated job's exported record includes the phase metrics its sampler measured.
 
     A disaggregated job emits its snapshots per lane and none for the whole job, so its exported record is
     the only place an offline reader can attribute its cost from; the sample stage's snapshot is what fills

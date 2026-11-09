@@ -19,7 +19,7 @@ from tests.process_management.conftest import make_mock_bridge_data, make_test_c
 
 
 def _card(*, device_index: int, max_concurrent: int, **config_overrides: object) -> CardRuntime:
-    """A single CardRuntime whose effective config carries the given overrides."""
+    """A single CardRuntime whose effective config includes the given overrides."""
     config = make_mock_bridge_data(**config_overrides)
     runtimes = make_test_card_runtimes(
         device_indices=(device_index,),

@@ -86,7 +86,7 @@ class TestSoakMixSelection:
 
 
 class TestOperatorThroughputOverrides:
-    """The soak carries the operator's throughput-shaping config and nothing else."""
+    """The soak includes the operator's throughput-shaping config and nothing else."""
 
     def test_only_throughput_fields_present_in_the_file_are_carried(self, tmp_path: Path) -> None:
         """Fields outside the throughput set are ignored, and absent fields are not defaulted in."""

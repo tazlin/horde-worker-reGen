@@ -71,7 +71,7 @@ processing state stands as the active-decode signal. Separately, the orchestrato
 conditioning, sampling, awaiting decode) and its current dispatch target are exported on the supervisor
 snapshot, so the dashboard can show where each in-flight disaggregated job sits in its pipeline.
 
-The decode dispatch carries the parent's NVML device-free reading (`HordeVaeDecodeControlMessage.device_free_mb`),
+The decode dispatch includes the parent's NVML device-free reading (`HordeVaeDecodeControlMessage.device_free_mb`),
 and the VAE lane clamps ComfyUI's free-VRAM view to it for the decode, as the sampler does for its sample stage.
 ComfyUI sizes each decode pass by the free VRAM it reads, and a process-local reading under WDDM shows the card
 as nearly empty however full it is, so an unclamped batch decode allocated its whole activation set at once
@@ -88,7 +88,7 @@ safety evaluation pay a CLIP reload.
 Post-processing used to run inline on the inference process that generated the images. That welded an
 unpredictable, output-scaled VRAM spike (a 4x upscale of an SDXL batch peaks at several gigabytes) onto a
 process whose budget was sized for sampling, and it forced every inference process to load its own copies of
-the upscaler/face-fixer models on demand. The scheduler carried a family of compensating mechanisms
+the upscaler/face-fixer models on demand. The scheduler had a family of compensating mechanisms
 (committed/imminent post-processing reserves, a pre-dispatch reclaim planner, an overlap bump) to predict and
 dodge those spikes.
 

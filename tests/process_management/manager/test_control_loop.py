@@ -274,7 +274,7 @@ class TestControlLoopTick:
             process_type=HordeProcessType.SAFETY,
         )
         process_manager._process_map.update({0: inf_proc, 10: safety_proc})
-        # The scenario is a model already resident on the free process, so the model map carries the VRAM
+        # The scenario is a model already resident on the free process, so the model map includes the VRAM
         # residency: dispatch then materialises nothing new and admission treats it as the no-op it is.
         process_manager._horde_model_map.update_entry(
             "stable_diffusion",

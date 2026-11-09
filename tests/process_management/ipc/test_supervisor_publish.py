@@ -291,7 +291,7 @@ def test_the_event_ring_reaches_the_snapshot_oldest_first() -> None:
 
 
 def test_the_event_ring_on_the_snapshot_is_bounded() -> None:
-    """Every snapshot carries the whole ring, so the ring's own bound is the payload's bound."""
+    """Every snapshot includes the whole ring, so the ring's own bound is the payload's bound."""
     manager = make_testable_process_manager()
     for _ in range(RECENT_EVENTS_IN_SNAPSHOT * 2):
         manager._run_metrics.record_event(WorkerEventKind.DOWNLOAD_FINISHED, model="Deliberate")

@@ -278,7 +278,7 @@ def register_text_model_catalogue(manager: ModelReferenceManager) -> None:
 
 
 def text_model_records(manager: ModelReferenceManager) -> dict[str, TextGenerationModelRecord]:
-    """Return every text model *manager* knows, canonical records merged with the measured ones by name.
+    """Return every text model in *manager*, canonical records merged with the measured ones by name.
 
     Registers the catalogue first, so no caller can read a text category that is missing it. A canonical
     record wins its name, which is why a measured record can be shadowed without being removed.

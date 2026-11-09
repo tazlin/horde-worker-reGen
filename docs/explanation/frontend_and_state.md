@@ -44,14 +44,14 @@ defines the structured protocol over it:
   [`CardSnapshot`][horde_worker_regen.process_management.ipc.supervisor_channel.CardSnapshot]
   (one per driven GPU: VRAM headroom, inference contexts, whole-card residency, and
   per-card fault/unservable-model health) that the GPUs tab and the Overview per-card
-  strip render. Each `ProcessSnapshot` also carries the `device_index` of the card its
+  strip render. Each `ProcessSnapshot` also includes the `device_index` of the card its
   slot is pinned to. A single-GPU host reports exactly one `CardSnapshot`. GPU duty is carried both
   per card (`gpu_utilization_mean_percent_per_card`, `gpu_utilization_busy_fraction_per_card` and
   `gpu_utilization_samples_per_card`, keyed by device index) and as the long-standing worker-wide
   scalars, which are reductions across the driven cards. The snapshot also carries
   worker-owned stats data: the latest one-second `StatsSample`, bounded stats-history backfill for
   reconnecting frontends, model/baseline `StatsRollupRow` tables, and `StatsExportState` for the JSONL
-  export toggle and disk-size warning. A scribe worker's snapshot also carries its text flow: jobs in
+  export toggle and disk-size warning. A scribe worker's snapshot also includes its text flow: jobs in
   flight, the session's submitted and faulted totals, whether the backend's readiness gate has passed,
   and the model, context length and generation length being advertised, with `scribe`, `scribe_name` and
   `text_backend_managed` on the config summary. The summary carries all three role flags (`dreamer`,
@@ -79,7 +79,7 @@ defines the structured protocol over it:
   cannot tell a lane cycling now from one replaced once at startup, and the bounded event ring below has
   evicted a startup recovery long before the session ends. The dashboard's health checklist reads the pair
   to warn while a replacement is recent and report the count as information afterwards.
-  `pop_gate` and `pop_gate_since` carry the gate that ended the image popper's last cycle and when it engaged.
+  `pop_gate` and `pop_gate_since` include the gate that ended the image popper's last cycle and when it engaged.
   The Now line and the overview show them, and the overview's pipeline strip marks the Safety stage while the
   gate is `no_safety_process`, which the popper records when no safety process is serving and no deliberate
   safety rebuild is in progress. The
@@ -135,7 +135,7 @@ kind that explains a session.
 
 ### One work ledger for three workloads
 
-`WorkLedgerEntry` carries a `workload`, and the ledger holds every unit of work the worker has in hand:
+`WorkLedgerEntry` has a `workload`, and the ledger holds every unit of work the worker has in hand:
 image jobs first in pop order, then an alchemist's active forms, then a scribe's in-flight generations.
 The alternative, a list per workload, would give every surface that shows work a second data path for
 each new one, and each of them already renders one list.
@@ -623,7 +623,7 @@ Config audience is decided at two granularities, which answer different question
 The sub-tab list decides which *pages* a level offers, and
 [`ConfigField.risk_level`][horde_worker_regen.tui.config_form.ConfigField] decides
 which *fields* within an offered page it shows. The `dangerous` tier is what
-distinguishes Developer from Advanced: it carries the worker's self-policing settings
+distinguishes Developer from Advanced: it includes the worker's self-policing settings
 (hung-process timeouts, the VRAM and RAM budget, whole-card residency, the fault
 breakers), which fail differently from a setting that merely trades throughput. A
 section whose fields all share one tier carries that tier on its heading as well, so a
@@ -646,7 +646,7 @@ otherwise appear to have lost its detail. A state file stamped before schema 2 s
 `needs_experience_introduction`, and the notice is answered before the setup and
 start prompts, so the changed default is visible rather than inferred. This is the
 one thing the schema version is used for: reads never reject an older file, since
-every field carries a default.
+every field has a default.
 
 ### Liveness that the failure cannot satisfy
 

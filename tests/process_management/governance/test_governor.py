@@ -72,7 +72,7 @@ class TestResourceGovernorTick:
         assert EvictIdleModels() in host.executed
 
     def test_recovered_tick_restores_shed_cards_in_the_same_pass(self) -> None:
-        """A recovered host's tick also carries the shed-card restore, so no separate call site exists."""
+        """A recovered host's tick also runs the shed-card restore, so a separate call site is not needed."""
         snapshot = _snapshot(
             shed_card_indices=frozenset({0}),
             cards=(

@@ -1,6 +1,6 @@
 # Write a finding
 
-A finding is what the worker tells a person when something needs attention: in `horde-log diagnose`,
+A finding describes a condition that may need attention. Findings appear in `horde-log diagnose`,
 on the dashboard's Diagnostics tab, and in the live recommendations. The reader may run one card at
 home, may not know the worker's internals, and may not read English as a first language. Write for
 that reader. `tests/analysis/test_finding_copy_style.py` enforces the parts of this page that a test
@@ -12,8 +12,8 @@ Every finding has a plain layer and a detail layer.
 
 The plain layer is what everyone sees:
 
-- **Headline.** One sentence. What happened, with the numbers and names the detector measured. The
-  detector writes it, because only the detector knows the numbers.
+- **Headline.** One sentence. What happened, with the measured numbers and names. The detector
+  writes it because the numbers vary by session.
 - **Do this.** One to three sentences telling the reader what to do. The kind's spec writes it, so
   the advice is the same every time the kind fires. When the fix depends on what was measured, the
   detector adds one sentence to the end. When there is nothing to do, say so: "No action needed."
@@ -30,7 +30,7 @@ The detail layer sits below, collapsed on the dashboard and printed in the CLI:
 - Say what happened, whether it matters, and what to do. In that order.
 - Short sentences, up to 25 words in the plain layer and 30 in the detail layer. One idea per sentence.
 - Plain words. "The worker stopped taking jobs", not "pop liveness was lost". If a plain word exists,
-  the internal term is banned from the plain layer (the test carries the list).
+  the internal term is banned from the plain layer (the test includes the list).
 - Name a config key when the reader has to change it, in backticks, exactly as it appears in the
   config file: `queue_size`. Nothing else goes in backticks except a `horde-log` command.
 - Put text quoted from the log (an error name, a model name) in double quotes. Quoted text is data,
@@ -39,7 +39,7 @@ The detail layer sits below, collapsed on the dashboard and printed in the CLI:
 - Do not tell the reader what the code should do differently. That is a bug report, and it goes in an
   issue or a code comment, never in copy shown to an operator.
 - Do not soften or pad. "This is fine" beats "This is admitted co-residency operating as intended".
-- Do not talk down. The reader is capable; they just have not read the source.
+- Do not talk down. The reader is capable. They just have not read the source.
 - Numbers go in the headline, once. Do not repeat them in the advice.
 
 ## Severity

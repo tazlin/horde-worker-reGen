@@ -73,10 +73,10 @@ and an NVIDIA card whose NVML cannot initialise, never answer the NVML read, so 
 [`select_device_reading`][horde_worker_regen.process_management.resources.device_memory_source.select_device_reading]
 is the one place that orders them:
 
-1. **NVML.** The reading wherever it answers. A card NVML has answered for takes no other source, so a missed
-   sample there leaves the card without a reading until the next one.
-2. **The Windows adapter counter** (`\GPU Adapter Memory(*)\Dedicated Usage`), for a card NVML has never
-   answered for. It counts dedicated memory across every process on the adapter and is vendor-neutral. The
+1. **NVML.** Used for cards with a successful NVML reading. These cards do not use other sources, so a missed
+   sample leaves the card without a reading until the next one.
+2. **The Windows adapter counter** (`\GPU Adapter Memory(*)\Dedicated Usage`), for cards without a successful
+   NVML reading. It counts dedicated memory across every process on the adapter and is vendor-neutral. The
    card's adapter is found from the worker processes holding memory on it. The counters are sampled on the
    paging monitor's thread, every half second once a card depends on them, and a sample more than four
    intervals old is not used.
@@ -94,7 +94,7 @@ covers it. The Windows process-report figure over-read free memory by a median 1
 
 Every reading is a
 [`DeviceMemoryReading`][horde_worker_regen.process_management.resources.device_memory_source.DeviceMemoryReading]
-that carries its source and its provenance with the figure, so a consumer cannot take the number without
+that includes its source and its provenance with the figure, so a consumer cannot take the number without
 knowing what it describes.
 
 | Provenance | Where it comes from | What it describes |

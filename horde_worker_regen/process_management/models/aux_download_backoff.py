@@ -9,7 +9,7 @@ have been healthy for a while. While the window is active a fresh failure of the
 terminal rather than retryable, so a job is not requeued into the same failing path.
 
 One instance is held per auxiliary class (see ``WorkerState``). The LoRA instance additionally gates pop-time
-LoRA advertising, because the pop request carries an ``allow_lora`` capability flag the worker can withhold.
+LoRA advertising, because the pop request has an ``allow_lora`` capability flag the worker can withhold.
 The textual-inversion instance influences fault classification only: the pop request has no per-request
 textual-inversion capability flag, so a textual-inversion window cannot suppress that traffic at the pop.
 

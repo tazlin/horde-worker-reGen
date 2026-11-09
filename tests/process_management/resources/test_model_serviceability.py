@@ -301,7 +301,7 @@ class TestConstrainedOfferLane:
         assert decision.constrained_pop is False
 
     def test_an_idle_fill_pop_carries_the_unconstrained_models_at_full_size(self) -> None:
-        """An idle-fill pop wants the quickest work: the constrained model is left out and nothing is capped."""
+        """An idle-fill pop requests the quickest work: the constrained model is left out and nothing is capped."""
         state = ConstrainedLaneState(full_cycles_taken=3)
         decision = decide_constrained_offer(
             state,

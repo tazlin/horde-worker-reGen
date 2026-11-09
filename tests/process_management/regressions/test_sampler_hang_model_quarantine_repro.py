@@ -222,7 +222,7 @@ class TestHangsAreCountedPerJob:
     """
 
     async def test_the_watchdog_records_the_job_the_slot_was_holding(self) -> None:
-        """The reap carries the hung job's id into the incident, which is what the dedupe reads."""
+        """The incident includes the hung job's id from the reap, which is used for deduplication."""
         manager = _make_storm_manager()
         lifecycle = manager._process_lifecycle
         job = await track_popped_job_async(manager._job_tracker, make_job_pop_response(model=_HANGING_MODEL))

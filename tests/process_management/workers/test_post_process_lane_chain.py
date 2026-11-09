@@ -42,7 +42,7 @@ def _message(facefixer_strength: float | None) -> HordePostProcessControlMessage
 
 
 def test_lane_calls_the_chain_once_with_operations_and_strength() -> None:
-    """One chain call per image carries the requested operations and strength; the result is upload-encoded."""
+    """One chain call per image includes the requested operations and strength. The result is upload-encoded."""
     lane, horde = _make_lane(PIL.Image.new("RGB", (16, 16), "blue"))
 
     results, _ = lane._post_process_all_images(_message(0.4))
@@ -66,7 +66,7 @@ def test_chain_without_an_image_raises() -> None:
 
 
 def test_lane_reports_its_measurements_on_the_result() -> None:
-    """The result message carries the chain and encode times, the first image's size and hordelib's order."""
+    """The result message includes the chain and encode times, the first image's size and hordelib's order."""
     lane, _ = _make_lane(PIL.Image.new("RGB", (32, 24), "blue"))
     lane._dry_run_skip_post_processing = False
     lane.process_id = 3

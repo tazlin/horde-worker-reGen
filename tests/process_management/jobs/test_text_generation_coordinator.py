@@ -332,7 +332,7 @@ def test_the_backend_kind_alone_decides_the_advertised_spelling() -> None:
 
 
 async def test_a_coordinator_on_another_backend_advertises_that_backends_spelling() -> None:
-    """The coordinator carries its backend kind, so the advertisement follows it with no other change."""
+    """The coordinator includes its backend kind, so the advertisement follows it with no other change."""
     coordinator = TextGenerationCoordinator(
         state=WorkerState(),
         shutdown_manager=Mock(),

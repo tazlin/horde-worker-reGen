@@ -318,7 +318,7 @@ class PostProcessOrchestrator:
         """Return the lane's arbiter verdict, or None when admission is intentionally bypassed.
 
         The chain's estimated peak is charged against the frozen cycle measurement, so a FITS verdict admits
-        and a DEFER or DENY carries the reclaim plan the caller must execute. A zero-peak chain and a cold or
+        and a DEFER or DENY includes the reclaim plan the caller must execute. A zero-peak chain and a cold or
         unwired arbiter bypass (every gate admits on missing telemetry). The verdict is evaluated whether or
         not the VRAM budget is on, and the caller decides whether a non-FITS verdict defers or only runs its
         reclaim. The deferral bookkeeping is the caller's, so this stays side-effect free and can be evaluated

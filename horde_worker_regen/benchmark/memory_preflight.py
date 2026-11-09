@@ -1,6 +1,6 @@
 """Memory fail-fast preflight for the multi-model soak.
 
-A multi-model soak wants one resident model per inference process so every process stays busy.
+A multi-model soak needs one resident model per inference process so every process stays busy.
 But N co-resident models can exceed VRAM (or RAM), and the worker's memory-pressure valves would
 then silently evict and reload, defeating the very residency the soak is meant to exercise (and,
 without a worker-owned budget, risking a cross-process OOM). So before committing to an N-model

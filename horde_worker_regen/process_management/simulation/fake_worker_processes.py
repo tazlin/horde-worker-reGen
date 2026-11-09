@@ -391,7 +391,7 @@ class FakeInferenceProcess(HordeProcess):
         """Return plausible per-process allocator stats so parent-side attribution plumbing is exercised.
 
         The fake has no torch allocator nor direct-IO residency pool to read; it reports zeros so the memory
-        report still carries the fields (allocated, reserved, peak, aimdo) and the ledger/drift accounting
+        report still includes the fields (allocated, reserved, peak, aimdo) and the ledger/drift accounting
         runs. A slot holding simulated weights reports none of them per-process, so the parent's
         committed-VRAM attribution sees a card whose device-wide figure moves while its per-process
         reservations stay flat: attribution drift is not modelled here.

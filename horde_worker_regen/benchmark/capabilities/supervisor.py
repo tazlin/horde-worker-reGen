@@ -35,7 +35,7 @@ _CATASTROPHIC_FINDING_KINDS: frozenset[FindingKind] = frozenset(
 
 
 class ProbeAction(StrEnum):
-    """What the supervisor wants the executor to do with a probe this turn."""
+    """The executor's next action for a probe."""
 
     RUN = auto()
     """The machine can host it and every prerequisite is proven: run it."""

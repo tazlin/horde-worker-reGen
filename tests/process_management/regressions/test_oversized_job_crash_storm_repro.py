@@ -1,4 +1,4 @@
-"""Crash classification for jobs that carry the over-budget admission tag.
+"""Crash classification for jobs that include the over-budget admission tag.
 
 Failure mode:
     A job carrying ``admitted_over_budget`` can still crash natively or thrash so badly its first step makes

@@ -115,7 +115,7 @@ def test_lane_roles_count_toward_worker_total_and_shrink_other() -> None:
 
 
 def test_every_role_has_a_label() -> None:
-    """Every ordered role carries a human-readable label so the console/TUI never render a raw key."""
+    """Every ordered role has a human-readable label so the console/TUI never render a raw key."""
     for role in WORKER_ROLE_ORDER:
         assert role in ROLE_LABELS
 

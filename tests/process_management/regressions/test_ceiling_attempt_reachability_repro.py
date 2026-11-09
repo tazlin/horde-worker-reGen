@@ -7,7 +7,7 @@ than the prediction. Two preconditions on that hatch used to make it unreachable
 demonstrably serves, and both exits were the wrong kind: one terminal, one unbounded.
 
 - A candidate over the achievable ceiling by a within-allowance margin was refused the hatch while the card
-  still carried an idle sibling context, because the card was not yet converged-empty. The terminal ceiling
+  still had an idle sibling context, because the card was not yet converged-empty. The terminal ceiling
   DENY is evaluated ahead of the idle-context teardown rung, so the head could never reach the state that
   would make its own attempt eligible: it was faulted for reissue and its model put on the ceiling hold. The
   identical head on a pool the residency forecast happened to collapse first was served, which made

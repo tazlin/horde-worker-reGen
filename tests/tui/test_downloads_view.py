@@ -402,7 +402,7 @@ async def test_queue_order_button_names_the_order_the_worker_reports(
 
 
 async def test_pressing_the_queue_order_button_reports_the_order_in_force() -> None:
-    """A press carries the current order, so the app can ask for the other one."""
+    """A press includes the current order, so the app can ask for the other one."""
     app = _DownloadsHost()
     async with app.run_test(size=(180, 40)) as pilot:
         await pilot.pause()

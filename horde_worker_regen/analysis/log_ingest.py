@@ -235,7 +235,7 @@ def read_records(*paths: Path) -> list[LogRecord]:
     for path in paths:
         all_records.extend(parse_lines(_read_physical_lines(path), path))
 
-    # Stable sort by timestamp; carry the previous good timestamp forward for the rare ts-less head so
+    # Preserve input order when timestamps are equal or missing.
     # it does not all collapse to the epoch and scramble ordering.
     def _sort_key(item: tuple[int, LogRecord]) -> tuple[datetime, int]:
         index, record = item

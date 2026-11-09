@@ -106,7 +106,7 @@ class TestSampleStageEmitter:
         assert fake._sampling_window.last_step >= first
 
     def test_the_reported_window_carries_the_measured_lease_wait(self) -> None:
-        """The window sent with the job's metrics carries the proxy's lease wait, taken once per report."""
+        """The window sent with the job's metrics includes the proxy's lease wait, taken once per report."""
         lease = Mock()
         lease.take_job_lease_wait.return_value = JobLeaseWait(seconds=12.0, timed_out=True)
         fake = SimpleNamespace(

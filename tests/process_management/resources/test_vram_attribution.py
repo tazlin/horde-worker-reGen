@@ -360,7 +360,7 @@ class TestCommittedReportAge:
         assert process_map.oldest_committed_report_age_seconds(now=200.0) == 30.0
 
     def test_missing_sampled_at_is_infinite(self) -> None:
-        """A contributor that never carried a sample timestamp cannot be dated, so it is maximally stale."""
+        """A contributor that never had a sample timestamp cannot be dated, so it is maximally stale."""
         process_map = ProcessMap(
             {
                 0: self._contributor(0, reserved_mb=6000, sampled_at=None),
@@ -642,7 +642,7 @@ class TestCommittedLedgerHygiene:
     def test_process_replacement_drops_old_incarnation_charge(self) -> None:
         """``on_process_ending`` (retire/replace) clears the reserved figure so the dead charge leaves at once.
 
-        Rebuild hygiene: a soft reset that replaces a lane must not carry the old incarnation's footprint into the
+        Rebuild hygiene: a soft reset that replaces a lane must not reuse the old incarnation's footprint in the
         new one's charge. The fresh incarnation re-enters the ledger only when it re-reports a reservation.
         """
         info = make_mock_process_info(0, state=HordeProcessState.WAITING_FOR_JOB)
@@ -790,7 +790,7 @@ class TestManagerPhantomRecalibration:
         # (reserved_mb reported by the single idle lane, device_used_mb) rows: all genuine physical over-commits
         # (committed + captured baseline > total) that are also phantoms (committed far above device-used truth),
         # across a spread of stale-reserved magnitudes. The captured baseline drops to the low device-used, so the
-        # reserved figure carries the whole over-commit.
+        # reserved figure includes the whole over-commit.
         rows = [
             (21683, 1288),  # the incident: ~21926 committed vs ~1288 device
             (18000, 1500),  # a smaller phantom, device near baseline

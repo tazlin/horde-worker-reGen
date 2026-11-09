@@ -739,7 +739,7 @@ def _shared_figure() -> Synchronized[float]:
 
 
 class TestGrantCarriesTheSamplingReserve:
-    """A grant carries the waiter's priced activation reserve to the child, which takes it once per grant.
+    """A grant supplies the waiter's priced activation reserve to the child once per grant.
 
     hordelib raises ComfyUI's partial-load estimate to this figure, so a partial load leaves the room the parent
     priced for the window instead of ComfyUI's smaller estimate.
@@ -821,7 +821,7 @@ class TestGrantCarriesTheSamplingReserve:
         assert proxy.take_cleared_sampling_reserve_mb() is None
 
     def test_the_stage_grant_carries_the_reserve_once(self) -> None:
-        """Under two-phase clearance the stage permit a clear grants carries the same reserve, taken once."""
+        """A two-phase stage grant supplies the same reserve, consumed once."""
         controller = _controller()
         proxy = self._proxy(two_phase=True)
         controller.register(2, proxy)

@@ -17,7 +17,7 @@ own torch build. Because the two environments never share a resolution, one cann
 other.
 
 The service is a small uvicorn server bound to a loopback ephemeral port. The worker talks to it only over
-loopback HTTP, so the consuming side stays lean: the worker's main environment carries a dependency-free
+loopback HTTP, so the consuming side stays lean: the worker's main environment has a dependency-free
 client, never the server's stack.
 
 ### How the venv is provisioned
@@ -188,7 +188,7 @@ withheld.
 Each control-loop tick, before the annotation pass and the scheduling cycle,
 `_fault_unready_extended_controlnet_jobs` sorts the queued extended jobs:
 
-- A job whose type is in the live servable set, or that already carries its derived map, passes on to
+- A job whose type is in the live servable set, or that already includes its derived map, passes on to
   pre-annotation or inference.
 - A job that brings its own control map (`image_is_control`) needs the extended-ControlNet feature and that map,
   and no annotator, since hordelib runs the preprocessor as `none`. It passes on to inference whatever the lane's
@@ -269,7 +269,7 @@ control map as its output, needs its control map derived before generation. Rath
 in the worker's main venv, the control loop parks such a job in the `PENDING_ANNOTATION` stage and
 dispatches `START_ANNOTATION` to an idle utilities lane process. A parked job is held out of the
 inference-eligible set until its control map arrives; the derived control map (PNG bytes) is then stored on
-the tracked job, the job returns to `PENDING_INFERENCE`, and the scheduler carries the bytes on the
+the tracked job, the job returns to `PENDING_INFERENCE`, and the scheduler sends the bytes in the
 inference control message so the inference child injects them and hordelib runs the `none` preprocessor over
 them instead of re-annotating. An annotation goes only to a lane that does not hold another unit of work (see
 [Liveness and recovery](#liveness-and-recovery)), so the single serial lane is paced and the rest of the queue
@@ -373,7 +373,7 @@ Beyond that static provisioning gate the two features diverge at runtime:
   simply dispatched with no premade map. The provisioning coercion, not runtime health, is the controlnet
   gate.
 
-`allow_extended_controlnet` carries a further, server-side gate on top of the operator opt-in
+`allow_extended_controlnet` has a further, server-side gate on top of the operator opt-in
 (`extended_controlnet` in `bridgeData`) and annotator readiness (see
 [Extended ControlNet](#extended-controlnet)). The `allow_extended_controlnet` pop
 field only exists on the AI Horde server from the release that ships extended ControlNet, and a server

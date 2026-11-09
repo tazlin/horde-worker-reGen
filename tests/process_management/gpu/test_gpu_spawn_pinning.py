@@ -97,7 +97,7 @@ class TestSafetyOnGpuPinning:
         assert kwargs["accelerator_kind"] == "cuda"
 
     def test_safety_off_gpu_still_carries_first_card_but_entry_point_skips_pin(self) -> None:
-        """cpu_only safety carries the first card's identity; the pin is gated off by cpu_only in the child.
+        """cpu_only safety includes the first card's identity. The pin is gated off by cpu_only in the child.
 
         The lifecycle always passes the first card's device/kind; the entry point only acts on it when the
         safety process is on-GPU. This keeps the spawn uniform while leaving cpu_only safety unpinned.

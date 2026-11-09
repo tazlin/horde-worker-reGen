@@ -60,7 +60,7 @@ _INFERENCE_STATES = frozenset(
 """States an inference lane is in while it holds work.
 
 Every check keyed on this set, and on the ready/loading sets below, reads only the snapshot's non-external
-rows: a supervised external program (the text backend) carries its own state vocabulary and its own card,
+rows: a supervised external program (the text backend) has its own states and its own card,
 so counting it here would report a lane serving, warming up or starved on evidence from a process that is
 none of those things."""
 _GPU_DUTY_LOW_PERCENT = 5
@@ -823,7 +823,7 @@ class TextBackendWait:
     A backend that cannot be obtained is never launched and so never late, which is exactly why this is
     reported rather than waited on: no clock would ever run out."""
     credentials_refused: bool = False
-    """Whether the backend answered and refused the worker's credentials, reported at once for the same
+    """Whether the backend responded and refused the worker's credentials, reported at once for the same
     reason: it is not late, and waiting changes nothing."""
 
 
@@ -865,7 +865,7 @@ def _text_posture_report(snapshot: WorkerStateSnapshot, checks: list[HealthCheck
     A backend still being obtained or started is warming up, on the same footing as an image worker loading
     its first model. Past the worker's own patience the cold start has stopped being a cold start and the
     worker is serving nothing, which is a degraded worker rather than a slow one; past twice that, the
-    headline carries the remedy, because by then nothing is going to happen without the operator.
+    headline includes the remedy, because by then nothing is going to happen without the operator.
     """
     wait = text_backend_wait(snapshot)
     if wait is None:

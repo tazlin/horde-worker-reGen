@@ -276,7 +276,7 @@ async def test_b_diverse_traffic_earns_almost_no_retention_and_makes_no_pressure
 
     Read as one positive statement and its consequences: the signature is diverse *per slot* (asserted of the
     run's own dispatch series, not assumed), the refusals are for lack of repeat evidence rather than for a
-    card that would not carry the weights, nothing is left holding the card, no copy is evicted unused because
+    card that could not hold the weights, nothing is left holding the card, no copy is evicted unused because
     none was taken, and the card never reaches the band where growth is held.
     """
     world = _signature_world(card=_CARD_24GB)

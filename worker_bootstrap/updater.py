@@ -60,7 +60,7 @@ API every time. The explicit ``update`` command ignores this and always checks."
 UpdateChannel = Literal["stable", "beta"]
 
 InstallMethod = Literal["one-line", "exe", "zip", "winget", "dev", "unknown"]
-"""How the install was performed. The marker carries the first three; ``winget`` and ``dev`` are detected
+"""How the install was performed. The marker includes the first three. ``winget`` and ``dev`` are detected
 from the environment (a winget portable path; a git working tree or an in-repo dev pin). ``unknown`` is an
 unmarked but otherwise ordinary install (a hand-extracted zip), which is allowed to self-update."""
 
@@ -72,7 +72,7 @@ _SHIM_SUFFIXES = frozenset({".cmd", ".sh", ".ps1", ".bat"})
 """Top-level shell launcher shims that are NOT overlaid. A running ``.cmd``/``.sh`` is read incrementally by
 its interpreter, so overwriting the script driving the update corrupts it mid-run (the reason the old updater
 piped a remote installer from memory). The shims are stable and refreshed by the full installer; the
-self-update carries the Python source and lockfile, which is what changes release to release. Python modules
+self-update includes the Python source and lockfile, which is what changes release to release. Python modules
 are safe to overlay: the interpreter reads each file fully and closes it."""
 
 _MIRROR_DIRS = frozenset({"horde_worker_regen", "worker_bootstrap"})
@@ -241,7 +241,7 @@ def installed_version(root: Path) -> str | None:
 
 
 def _has_prerelease(version: str) -> bool:
-    """Whether *version* carries a semver pre-release suffix (a ``-`` in its core, ignoring build metadata)."""
+    """Whether *version* has a semver pre-release suffix (a ``-`` in its core, ignoring build metadata)."""
     core = version.strip().lstrip("vV").split("+", 1)[0]
     return "-" in core
 

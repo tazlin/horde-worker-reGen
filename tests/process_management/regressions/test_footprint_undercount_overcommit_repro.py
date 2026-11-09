@@ -19,7 +19,7 @@ The single root, traced from the live forecast line and confirmed against the bu
     sibling that then pushes it into an out-of-memory sample.
 
 The under-count was a *data* gap, not a logic gap: the worker's forecast is correct given an accurate
-footprint. ``qwen_image`` carries a Qwen2.5-VL text encoder but its burden seed originally charged only part
+footprint. ``qwen_image`` has a Qwen2.5-VL text encoder but its burden seed originally charged only part
 of the DiT and none of the encoder, so :func:`predict_job_footprint_mb` returned ~12000 MB against a real
 resident set of ~27 GB (the hordelib seed has since been corrected from an empirical measurement; these tests
 guard that it, and the forecast built on it, keep the isolating verdict). ``flux_schnell`` always carried its
@@ -204,7 +204,7 @@ class TestQwenImageFootprintUndercountRepro:
 
 
 class TestFluxCompactCorrectlySeededContrast:
-    """Flux Schnell fp8 (Compact) carries its support seed, so it reaches the verdict the Qwen seed must.
+    """Flux Schnell fp8 (Compact) includes its support seed, so it reaches the verdict the Qwen seed must.
 
     Flux and Qwen-Image are the same shape of model on this hardware: a heavy DiT plus a multi-GB text
     encoder, a resident set that fills most of a 24 GB card. The only difference the tests below turn on is

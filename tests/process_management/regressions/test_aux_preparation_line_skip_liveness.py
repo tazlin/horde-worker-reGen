@@ -421,7 +421,7 @@ class TestAuxReadinessAtDispatch:
     async def test_skip_lapsed_before_dispatch_returns_the_job_to_preparation(self) -> None:
         """A head prepared on a skip that lapsed before dispatch is withheld and unprepared instead of being sent.
 
-        Sending it would carry an empty skip list for a file that is not on disk, which the child faults as
+        Sending it would have an empty skip list for a file that is not on disk, which the child faults as
         ``aux-resolve-failed``. Once unprepared, the job goes back to the prefetch reconcile sweep.
         """
         scheduler, tracker, clock, head, head_process = await _skip_prepared_head_setup(

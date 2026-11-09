@@ -142,7 +142,7 @@ def test_pytorch_indexes_defined() -> None:
 
 
 def test_horde_engine_requested_with_layerdiffuse_extra() -> None:
-    """horde-engine must carry the [layerdiffuse] extra in the BASE deps, not an opt-in extra.
+    """horde-engine must include the [layerdiffuse] extra in the BASE deps, not an opt-in extra.
 
     The default Stable Diffusion pipeline wires in the layer_diffuse_apply / LayeredDiffusionApply node
     unconditionally, so that ComfyUI node must import for ANY job to run. horde-engine 3.2.4 demoted the
@@ -162,7 +162,7 @@ def test_horde_engine_requested_with_layerdiffuse_extra() -> None:
 
 
 def test_horde_engine_requested_with_upscale_extra() -> None:
-    """horde-engine must carry the [upscale-extra] extra in the BASE deps, not an opt-in extra.
+    """horde-engine must include the [upscale-extra] extra in the BASE deps, not an opt-in extra.
 
     upscale-extra pulls spandrel-extra-arches, a pure-Python universal wheel (no accelerator-specific
     native blocker) that broadens the upscaler architectures spandrel can load. It gates no feature

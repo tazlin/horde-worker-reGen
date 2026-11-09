@@ -167,7 +167,7 @@ def segment_sessions(
     Prefers the main process's first-line logger-setup marker so a new launch's slow startup does not
     bleed onto the prior session; falls back to the process-manager init banner for captures that have
     no logger-setup line (older logs, a bundle that begins mid-run, or ``bridge_harness.log``, which
-    does not carry the main-process marker). A 30s burst-collapse keeps the several init lines of one
+    does not include the main-process marker). A 30s burst-collapse keeps the several init lines of one
     launch from each opening a session.
 
     A session opened without a boundary record (the capture starts mid-run, e.g. a size-trimmed log)

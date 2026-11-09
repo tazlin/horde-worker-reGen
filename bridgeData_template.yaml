@@ -37,7 +37,7 @@ max_threads: 1
 
 # Preload queue slots: extra jobs/models kept ready so a slot can start quickly.
 # Generally should be 1 or 2. Never set this higher than 2 if your max_threads is 2.
-# Cost: like max_threads, each queue slot spawns an additional inference process, so it carries the same full
+# Cost: like max_threads, each queue slot spawns an additional inference process, so it uses the same full
 # per-context VRAM and system RAM cost described above (multiple GB each), not a small fixed reservation. Close
 # unused programs if you increase this value, and expect the per-card VRAM-fit cap to reduce the spawned count
 # on a card that cannot hold every configured context.
@@ -489,26 +489,25 @@ max_context_length: 1024
 # Prevents the model from being used from the shared pool but ensures no other worker can pretend to serve it.
 branded_model: true
 
-# Which text model a worker-managed backend loads. Required when scribe and text_backend_managed are
-# both true. Either a catalogued model's name, spelled as the text model reference spells it, or the path
-# to a model file of your own (a GGUF for koboldcpp). A catalogued name is fetched into text_models_dir
-# once and checked against the digest the catalogue declares; a path is used where it sits.
+# Text model to load in a worker-managed backend. Required when scribe and text_backend_managed are
+# both true. Use a name from the text model reference or a local model file path (a GGUF for koboldcpp).
+# A catalogued model is downloaded to text_models_dir once and checked against the catalogue's digest.
+# A local file path is used directly.
 # text_model: "meta-llama/Meta-Llama-3.1-8B-Instruct-Q4_K_M"
 
-# Where model files the worker fetches are kept. Unset puts them in <AIWORKER_CACHE_HOME>/text_models.
-# A text_model that names a path is read where it sits and never copied here.
+# Folder for downloaded text models. Unset uses <AIWORKER_CACHE_HOME>/text_models.
+# A local model file is read directly and is not copied here.
 # text_models_dir: "T:/horde-text-models"
 
-# Override the name this worker advertises for its text model, spelled as the text model reference spells
-# it ("author/Model", with a quantisation suffix if the file has one). A catalogued model already carries
-# that spelling, so this is for a file of your own whose name is not the one the horde knows, or for a
-# backend you run yourself that reports a name the horde does not recognise. Give the plain name. The
-# horde expects it prefixed with the backend serving it, and the worker adds that prefix, so a name that
-# already carries one would be prefixed twice and match no work.
+# Override the advertised text model name. Use the name from the text model reference ("author/Model",
+# with a quantisation suffix if the file has one). Catalogued models already use this spelling.
+# Use this setting for a local file with a different name, or for a backend reporting an unrecognised
+# model name. Leave the backend prefix off. The worker adds it. Including the prefix here would add it
+# twice and prevent job matches.
 # text_model_name: "meta-llama/Llama-3.2-3B-Instruct"
 
 # How many text generations your backend can run at once. This is also how many text jobs the worker
-# holds at a time and what it tells the horde about its capacity. Separate from max_threads, which
+# holds at a time and the capacity advertised to the horde. Separate from max_threads, which
 # sizes this worker's GPU inference processes.
 text_threads: 1
 
@@ -715,8 +714,8 @@ gpu_sampling_lease_enabled: false
 # gpu_sampling_lease_slots: 1
 
 # Admit the next job's sampling window during the current one's tail so the GPU never idles between
-# sampling windows. Only meaningful when `gpu_sampling_lease_enabled` is true. The lease carries one
-# extra permit the parent holds; when the outgoing sampler nears the end of its denoise loop and a
+# sampling windows. Only meaningful when `gpu_sampling_lease_enabled` is true. The parent holds one
+# extra lease permit. When the outgoing sampler nears the end of its denoise loop and a
 # staged sibling is primed and waiting (with measured VRAM room and no demand-paging), the parent hands
 # the permit over for one handoff window so the sibling starts sampling before the outgoing job
 # finishes. Defaults to true; set false to keep a strict per-slot denoise gate with no overlap.
@@ -1005,8 +1004,8 @@ capture_kudos_training_data: false
 # gpu_pop_balance_threshold: 0.5
 
 # Per-card deltas over the global config, keyed by the same stable device index. Each card sets ONLY the
-# fields it wants to differ; everything else inherits the global value. A card with no entry inherits
-# wholesale. Overridable per card: max_threads, queue_size, high_performance_mode, moderate_performance_mode,
+# fields to override. Other fields use global values. A card without an entry uses only global values.
+# Overridable per card: max_threads, queue_size, high_performance_mode, moderate_performance_mode,
 # extra_slow_worker, preload_timeout, models_to_load, models_to_skip, dynamic_models, allow_lora,
 # allow_controlnet, allow_sdxl_controlnet, allow_post_processing, allow_painting, allow_img2img, nsfw,
 # max_power, max_batch, safety_on_gpu, enable_vram_budget, vram_reserve_mb,

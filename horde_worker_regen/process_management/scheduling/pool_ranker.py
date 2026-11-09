@@ -167,7 +167,7 @@ def select_rescue_candidate(
     A rescue targets the model the horde will take longest to clear: among non-excluded candidates whose
     reported eta is at least ``eta_threshold_seconds``, the one with the greatest eta is chosen. Candidates
     absent from the snapshot or without a reported eta are ignored (their backlog is unknown). Ties on eta
-    resolve by name ascending for determinism. The returned :class:`RankedModel` carries the model's eta but a
+    resolve by name ascending for determinism. The returned :class:`RankedModel` includes the model's eta but a
     zero score and unclustered defaults, since a rescue is chosen on backlog, not the demand-weighted score.
 
     Args:

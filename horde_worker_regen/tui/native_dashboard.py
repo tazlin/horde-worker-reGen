@@ -104,7 +104,7 @@ class NativeProcessState(BaseModel):
     footprint_mb: int | None = None
     """An external process's measured VRAM footprint, which is not an allocator reading; None otherwise."""
     health_age_seconds: float | None = None
-    """How long ago an external process last answered a health probe; None when it never has."""
+    """Time since an external process last responded to a health probe. None before the first response."""
     active_requests: int = 0
     """Requests an external process is currently producing output for; 0 for every other row."""
     queued_requests: int = 0

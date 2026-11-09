@@ -70,7 +70,7 @@ Only a genuinely unknowable footprint prices at zero, which takes the unverifiab
 credit, escalate on an honest absence of evidence) rather than being graded on the base allowance alone.
 Nothing frees synchronously, so
 grading a rung on a sample count reads a working multi-gigabyte release as a failure; the deepest rung (safety
-off the GPU) additionally carries a per-card dwell, because spending it is a whole process cycle. The teardown
+off the GPU) additionally has a per-card dwell, because spending it is a whole process cycle. The teardown
 rungs (each lane pause and safety off the GPU) are also held until the episode's saturation has persisted for
 `_TEARDOWN_VERIFICATION_BASE_SECONDS`, the teardown rung's fixed verification allowance. A sampler's
 activation peak can cross the hard floor and end a second later, and a lane stopped for it frees nothing in time
@@ -209,7 +209,7 @@ The arbiter keeps four concerns deliberately separate:
     stays pooled. The
     activation keys have no LoRA axis, so LoRA and plain jobs feed one population and
     its measurement cannot see the LoRA patch transient of a job that faulted before reporting. A LoRA job
-    priced from the measurement therefore carries the same LoRA feature delta the static seed charges
+    priced from the measurement therefore includes the same LoRA feature delta the static seed charges
     (`pricing.lora_feature_delta_mb`, read from hordelib's feature impact table).
 
     The two sources meet in one more key. When a monolithic job's footprint arrives, the dispatcher keeps its
@@ -232,12 +232,12 @@ The arbiter keeps four concerns deliberately separate:
     so a small model's key, its watermark included, can hold a large model's peak. Each such key prices from
     its static seed until it is learned again; the `SAMPLE_ISOLATED` and at-rest entries load as written. A
     build that predates class keys discards a newer file, since it would read a class key as its pooled key.
-    Every key carries the class of the card it was measured on (`FootprintKey.card_total_gb`, the card's total
+    Every key includes the class of the card it was measured on (`FootprintKey.card_total_gb`, the card's total
     rounded to the nearest GiB). ComfyUI keeps a component resident when it fits, so a 24 GB card's sampling
     peak can hold a text encoder a 16 GB card releases, and a figure prices only a card of the same size. A
     card with no figure of its own prices from the static seed. A worker-wide view on a multi-card worker
     has no card and does not read a learned figure. Safety's figures are read for the card the safety process
-    sits on. A file written before keys carried a card (`_CARD_BLIND_SCHEMA_VERSIONS`) is re-keyed to the
+    sits on. A file written before keys had a card (`_CARD_BLIND_SCHEMA_VERSIONS`) is re-keyed to the
     worker's card when it drives exactly one card of known size, and dropped, with one log line, otherwise.
 
     Every feeder reads a per-process allocator counter, and a process can hold things its key does not
@@ -291,7 +291,7 @@ The arbiter keeps four concerns deliberately separate:
     prices every checkpoint of an architecture alike, so a heavy file is granted sibling room it does not have;
     a measured at-rest figure raises the seed and re-keys the sibling-room and card-dominance judgments on what
     the file actually costs. A family member whose weight set differs from its family's (a quantized DiT, a
-    different text encoder) instead carries its own burden entry keyed by model name, which is why the
+    different text encoder) instead includes its own burden entry keyed by model name, which is why the
     worker passes the job's model alongside its baseline when it asks for a seed. Two conversions happen at
     that seam. The store records a whole *device* charge, so
     the context constant is netted back out before the figure reaches a forecast that charges contexts
@@ -322,7 +322,7 @@ The arbiter keeps four concerns deliberately separate:
       model, or one the operator pins in `whole_card_models`, is demanded the residency
       (`StreamForecast.wants_whole_card`), and every reader that tears down (the process-count target, the
       safety move, the lane pauses, the pre-stage) acts on rung-2 grants only
-      (`WholeCardResidencyLedger.teardown_held`). The grant carries its rung.
+      (`WholeCardResidencyLedger.teardown_held`). The grant includes its rung.
     - rung 1, *cannot co-sample*: rung 2, or no offered model `B` (a second copy of `M` included) has
       `T - P(M) - P(B) - K1 - KM - F - N >= 0`. Stopping contexts buys such a model nothing it lacks, so it
       is not demanded a residency. Its lever is co-sampling. The concurrent-overlap gate lets a pairing with a
@@ -492,7 +492,7 @@ the boundary report arrives and the entry is booked against it. The grant's timi
 boundary report. The encode itself runs before either acquire and is covered only by the dispatch staging
 charge, whether clearance
 grants early, late or not at all.
-The request also carries the figure it netted (`candidate_held_mb`, from `staged_held_mb`). An emptied card
+The request also includes the figure it netted (`candidate_held_mb`, from `staged_held_mb`). An emptied card
 releases those holdings too, so the achievable-ceiling test compares the outstanding charge plus them, the
 job's whole need, with what the emptied card offers. Every test against the card as it stands reads the
 outstanding charge alone. Without the held figure a job whose whole need exceeds the emptied card reads as
@@ -556,7 +556,7 @@ still take, and a measured-load attempt never grants a stage. A granted stage re
 reservation from the encode charge to the weights, against the encode boundary report as a sample grant does,
 and records the job as granted, so a sibling waiter priced
 beside it keeps the staged job's whole charge as it would a cleared one. The sample grant that follows is the
-clearance re-price above: the slot's reported reservation now carries the landed weights and is netted from
+clearance re-price above: the slot's reported reservation now includes the landed weights and is netted from
 the peak, so the sample grant prices the activation. Retention credit therefore lands at the stage. A
 same-model streak stages at no charge and pays only its activation at the sample grant.
 
@@ -726,7 +726,7 @@ and the parent sends that unload once, because the flag stands until the lane ma
 holding no model never does. The head is then granted at its seat on the next clearance pass rather than
 sampling unpriced at its lease-acquire timeout. A seat that does not fit falls through to the ceiling attempt and
 the `DENY` below. Without the lease the dispatch is the VRAM moment and no seat is priced, because only a
-clearance grant carries the free figure and activation room the child bounds a partial load by. The head is then
+clearance grant includes the free figure and activation room the child bounds a partial load by. The head is then
 held on its full charge until the measured-load probe, which runs only for the starved head of queue.
 
 A head deferred past the 60s diagnostic threshold with reclaim genuinely exhausted and no such teardown target
@@ -788,7 +788,7 @@ cap may offer the job to a different eligible card, but the failure never earns 
 card: the card was already converged and alone. When the normal cap is spent, the job faults through the usual
 terminal path.
 
-At clearance the request also carries the job's non-weight reserve (`VramRequest.sampling_reserve_mb`, from
+At clearance the request also includes the job's non-weight reserve (`VramRequest.sampling_reserve_mb`, from
 `pricing.sampling_reserve_mb`), the room the grant tells the child's load to keep free for the activation. The
 attempt is made only while the measured device free net of the outstanding reservations holds that reserve. The
 child sizes a partial load to the granted free figure less the reserve, so below it every weight stays in host
@@ -888,7 +888,7 @@ the arbiter's ceiling attempt owns that case.
 
 The dispatch head has the same two starved-head escapes the preload head does, so it can never wedge on a
 ledger fiction while its own idle sibling contexts hold the card. The dispatch candidate is an
-activation-inclusive learned high-watermark peak, so it already carries its own headroom; stacking the full
+activation-inclusive learned high-watermark peak, so it already includes headroom. Stacking the full
 admission noise buffer on top of it prices demonstrated-fine dispatches out of existence on a small card.
 Past the starved-head grace, a dispatch head that physically fits the truthful device-free reading net of the
 governor's **hard floor** (`hard_floor_mb`, the band the governor actually defends, not the larger noise
@@ -1131,7 +1131,7 @@ loads or unloads a model.
 
 The identity refuses on one number. A refusal a person or a reclaim policy can act on needs that number
 decomposed by who holds the card, because each class of holder is returned by a different actuator. Every
-non-admit on a card with a device-free reading therefore carries an `AdmissionRoom`
+non-admit on a card with a device-free reading therefore has an `AdmissionRoom`
 (`admission_identity.py`): the device-used reading attributed by tenant class (the requester's own slot, idle
 and busy inference siblings, safety, the post-processing lane, the image-utilities lane, the disaggregation
 lanes, and the foreign remainder), the reclaim rungs that could return room, cheapest first (each idle sibling
@@ -1262,7 +1262,7 @@ seat = f x weights + max(activation, ComfyUI inference reserve)
 
 - **Who qualifies.** A model at `ModelSizeTier.EXTRA_LARGE` or above, without LoRAs (a LoRA's patch
   temporaries have crashed children natively in this regime), on a card the driver is not paging. Only
-  clearance sets the seat, since only its grant carries the free figure the child's partial load is sized
+  clearance sets the seat, since only its grant includes the free figure the child's partial load is sized
   against. Dispatch and preload pricing are unchanged.
 - **Activation.** The measured activation of jobs that sampled whole, from the job class's `SAMPLE_ACTIVATION`
   window, else the pooled band's, at the window's second-highest job times the measured margin once it holds
@@ -1293,7 +1293,7 @@ seat = f x weights + max(activation, ComfyUI inference reserve)
   the one-shot. A seat that does not fit falls through to the ceiling attempt and the DENY unchanged. A seat
   that fits only by netting holdings larger than its weight share takes the measured attempt's reserve
   condition, and defers while the free net of reservations is below the job's non-weight term.
-- **Grant and booking.** The grant carries the measured device free the admission priced against, and
+- **Grant and booking.** The grant includes the measured device free the admission priced against, and
   hordelib rebases ComfyUI's clamp on it. It also carries the seat's non-weight term
   (`pricing.sampling_reserve_mb`, the larger of the activation and ComfyUI's inference reserve), which
   `ClearanceWaiter.sampling_reserve_mb` brings to every cleared job, seat or not. ComfyUI sizes a partial load
@@ -1338,7 +1338,7 @@ per card.
 
 If a doomed job still arrives because the horde answered an older offer or the reference changed, the
 scheduler faults it before any `PRELOAD_MODEL` or inference control message is sent. The fault is
-non-retryable and carries the arithmetic in the job diagnostic, so the submit path reports a no-image fault
+non-retryable and includes the arithmetic in the job diagnostic, so the submit path reports a no-image fault
 and the horde can route the request to a larger worker.
 
 ## Runtime placement policies
@@ -1526,7 +1526,7 @@ and any offer size.
 
 A hold the traffic is still using is never revoked, however long the pressure lasts: each reuse ends its
 episode and starts a fresh one, so a pool-locked slot's hold age resets every job and can never reach the
-horizon. `HordeProcessInfo.retained_resident_since` carries the episode's start, stamped by the scheduler
+horizon. `HordeProcessInfo.retained_resident_since` records the episode's start, stamped by the scheduler
 (which owns the clock every other retention window is measured on) rather than at the settle, which runs on
 the completion path.
 
@@ -1617,7 +1617,7 @@ verified clear, or by the slot's death, so a slot that recovers is a reclaim can
 
 A retained resident is a dispatch destination, not only a charge. `loaded_horde_model_name` records that a
 slot has served a model, not that its weights are still there, so two slots can read as equally resident
-while only one carries the bytes; dispatch selection therefore prefers the slot that retains the model, and a
+while only one holds the bytes. Dispatch selection therefore prefers the slot that retains the model, and a
 same-model head whose retainer is busy waits for it rather than funding a second full copy that cannot fit
 beside the first. The wait is bounded by the same ttl-derived affinity budget the resident-bypass window
 uses, ends the moment the retention record clears, and lets other resident work bypass it meanwhile, so the
@@ -1698,7 +1698,7 @@ residency record, so the child frees the old weights before materializing the ne
 both through the job. This is not left to the child's own free-view, which is untruthful under WDDM in
 exactly the regime double residency creates.
 
-Every dispatch carries the parent's device reading for that reason. `HordeInferenceControlMessage`'s
+Every dispatch includes the parent's device reading for that reason. `HordeInferenceControlMessage`'s
 `device_free_mb` is the parent's NVML device-level free figure at dispatch, and the child forwards it to
 hordelib as `device_free_truth_mb` so the executor's shortfall arithmetic (what it must free before a weight
 load or a sampling window) is computed against the card rather than against the process. A child sees only its
@@ -1711,11 +1711,11 @@ likewise taken as a ceiling on the child-reported free VRAM the scheduler prices
 so the same overstatement cannot buy headroom on the parent side either. Under the clearance lease the
 dispatch reading is taken while the previous sampler still holds the card, so by the time the child is cleared
 it is low by about that sampler's footprint, and a child judging its load against it would load partially
-after the parent has just admitted the full load. The grant therefore carries the device free the clearance
+after the parent has just admitted the full load. The grant therefore includes the device free the clearance
 admission priced against, and hordelib rebases the clamp on it at the acquire. The new figure replaces the
 dispatch reading and the child's growth is counted from that moment, since its earlier allocations are already
 absent from the newer measurement. A grant with no reading, a timed-out acquire, and a run without the lease
-keep the dispatch figure. Under two-phase clearance the stage grant carries the device free its own admission
+keep the dispatch figure. Under two-phase clearance the stage grant includes the device free its own admission
 priced against, and hordelib rebases the clamp on it before the early weight upload. The sample grant's figure
 then replaces it at the sample acquire. Each grant's figure travels with the parent's `time.monotonic()` of the
 reading behind it (`take_cleared_device_free_measured_at` on both leases), rewritten with the figure and absent

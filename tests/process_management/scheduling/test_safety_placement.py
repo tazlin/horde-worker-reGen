@@ -1310,7 +1310,7 @@ class TestPerCardSafetyPermission:
     """``safety_on_gpu`` is a per-card permission to host, so the chooser picks only among granting cards."""
 
     def _harness(self, monkeypatch: pytest.MonkeyPatch, permissions: dict[int, bool]) -> _PlacementHarness:
-        """A harness whose cards carry the given per-card safety permissions."""
+        """A harness whose cards include the given per-card safety permissions."""
         harness = _placement_harness(
             monkeypatch,
             card_runtimes=make_test_card_runtimes(

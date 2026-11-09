@@ -334,7 +334,7 @@ class TestPerDeviceProbeFigures:
 
 
 class TestDetectCarriesPerCardFigures:
-    """``SystemResources.detect`` carries both the per-card figures and the worker-wide maxima."""
+    """``SystemResources.detect`` includes both the per-card figures and the worker-wide maxima."""
 
     def test_per_card_map_and_maxima(self, fake_probe: list[ProbedAccelerator]) -> None:
         """The maxima remain the worker-wide reduction; the maps let a card-scoped forecast price its card."""

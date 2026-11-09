@@ -318,7 +318,7 @@ def platform_neutral_footprint_text(store_text: str) -> tuple[str, list[str]]:
     """Return a footprint store's text with every key's platform replaced by :data:`PLATFORM_PLACEHOLDER`.
 
     The store prices only keys for the host's own ``sys.platform``, so a fixture recorded on one platform
-    carries a placeholder a test substitutes with its own. Nothing else in the store changes.
+    has a placeholder replaced by each test. Nothing else in the store changes.
 
     Args:
         store_text: A persisted ``vram_footprints.json``.

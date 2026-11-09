@@ -903,7 +903,7 @@ class TestAlchemyDispatch:
 
 
 class _StubTypedProcessInfo(_StubProcessInfo):
-    """A dispatch-seam process that also carries its process type."""
+    """A dispatch-seam process that also includes its process type."""
 
     def __init__(self, process_id: int, process_type: HordeProcessType, process_launch_identifier: int = 0) -> None:
         super().__init__(process_id, process_launch_identifier)

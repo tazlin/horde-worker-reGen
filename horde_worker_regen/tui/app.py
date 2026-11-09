@@ -519,7 +519,7 @@ class HordeWorkerTUI(App[None]):
     TITLE = f"AI Horde Worker v{__version__}"
     CSS_PATH = "horde.tcss"
     """The Horde design system projection. Layout rules that depend on runtime intent stay in ``CSS``
-    below; this file carries the shared surfaces (hero, card, muted) and the level/density policy."""
+    below. This file includes the shared surfaces (hero, card, muted) and the level/density policy."""
 
     HORIZONTAL_BREAKPOINTS = [
         (0, PHONE_CLASS),
@@ -1715,7 +1715,7 @@ class HordeWorkerTUI(App[None]):
             return []
         found: list[tuple[str, str]] = []
         for pane in tabs.query(TabPane):
-            # Config nests its own TabbedContent, whose panes carry the "cfgtab-" prefix; only the
+            # Config nests its own TabbedContent, whose panes include the "cfgtab-" prefix. Only the
             # top-level destinations belong in the palette.
             if not pane.id or not pane.id.startswith(_DESTINATION_ID_PREFIX):
                 continue

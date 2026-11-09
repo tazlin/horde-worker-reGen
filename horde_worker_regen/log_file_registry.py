@@ -142,7 +142,7 @@ WORKER_LOG_FILE_SPECS: tuple[LogFileSpec, ...] = (
     ),
 )
 
-# A rotated loguru archive carries a timestamp segment before ``.log`` and a ``.zip``/``.gz`` suffix after
+# A rotated loguru archive has a timestamp segment before ``.log`` and a ``.zip``/``.gz`` suffix after
 # it, e.g. ``bridge.2026-06-22_00-55-59_013989.log.zip``. This mirrors analysis/bundle.py's normalization
 # so the two agree on what base a rotation maps to.
 _COMPRESSION_SUFFIXES = (".zip", ".gz")

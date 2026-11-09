@@ -77,7 +77,7 @@ def _self_throttle_reading(manager: object, now: float) -> object:
 
 
 class TestRamPressurePauseAttribution:
-    """The RAM-pressure governor owns its arm: the reading names RAM and the ledger carries the numbers."""
+    """The RAM-pressure governor owns its arm: the reading names RAM and the ledger includes the numbers."""
 
     def test_decision_pause_carries_measured_free_and_floor(self) -> None:
         """``decide_degrade_response`` stamps the measured free and floor MB onto the pause action.

@@ -30,7 +30,7 @@ terminate/kill, both of which stop the subprocess.
 
 The control thread reads the next control message only after the current one is handled, and a form, annotation
 or background strip is handled by an HTTP call with a timeout of minutes. A parent write larger than the pipe
-buffer (each of these carries its images) waits for that read without a timeout, and after
+buffer (each of these includes its images) waits for that read without a timeout, and after
 :meth:`UtilitiesProcessAdapter.stop` the pipe is not read at all. The sender is the parent's main loop, so a
 second unit of work sent to a busy lane, or any work sent to a stopped one, stalls the whole worker. The parent
 therefore sends a lane one unit of work at a time across every sender (the alchemy dispatcher, pre-annotation and
@@ -675,7 +675,7 @@ class UtilitiesProcessAdapter:
     def _poll_health(self) -> bool:
         """Return whether the service answers its health endpoint promptly (never raises).
 
-        The probe carries its own short timeout where the installed client accepts one, so an unanswered
+        The probe has a short timeout where the installed client supports one, so an unanswered
         probe costs the cadence one interval rather than the client-wide request timeout, which is sized for
         real work and is minutes long. A client without the keyword is called as before; the grace window is
         what bounds the verdict in that case.

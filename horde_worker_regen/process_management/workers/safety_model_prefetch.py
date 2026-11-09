@@ -181,7 +181,7 @@ def ensure_deep_danbooru_present(
     with response:
         response.raise_for_status()
         if existing_bytes > 0 and response.status_code != requests.codes.partial_content:
-            # The server answered the range with the whole file, so the bytes on disk are not a prefix of
+            # The server returned the whole file for the range request, so the bytes on disk are not a prefix of
             # what is arriving; overwrite rather than append.
             existing_bytes = 0
         remaining = int(response.headers.get("content-length", 0))

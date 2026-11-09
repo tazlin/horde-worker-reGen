@@ -26,7 +26,7 @@ Two behaviors compound:
 
 The fix gates both whole-card establish paths (the forecast-driven ``needs_teardown_path`` and the
 verdict-driven context reduction) on the demand being trustworthy: the model is genuinely card-demanding (its
-footprint dominates the device, or its baseline wants the whole card on intent) *or* the per-context cost was
+footprint dominates the device, or its baseline requires the whole card on intent) *or* the per-context cost was
 actually measured (so the contention is real, not an over-count). A card-light model on a host that could not
 measure the marginal falls through to ordinary model eviction instead of reserving the device.
 

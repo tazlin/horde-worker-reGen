@@ -469,7 +469,7 @@ class TestAuxReadinessAtDispatch:
         assert tracked.aux_models_prepared_at is None
 
     async def test_live_skip_dispatches_with_the_skipped_file_listed(self) -> None:
-        """A skip still in force passes the dispatch check, and the skip list carries the file."""
+        """A skip still in force passes the dispatch check, and the skip list includes the file."""
         clock = FakeClock(now=1000.0)
         job_tracker = JobTracker(clock=clock)
         job = await track_popped_job_async(

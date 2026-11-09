@@ -178,7 +178,7 @@ def compute_download_plan(
         model_names: The resolved model names the config will load.
         reference: The model reference (name -> record), as loaded by the worker or
             ``tui.model_catalog.load_image_models``. Any category is accepted; each record's own type
-            determines its folder and whether it carries a size.
+            determines its folder and whether it has a size.
         cache_home: Override for the model-directory base (defaults to ``AIWORKER_CACHE_HOME``).
         extra_model_directories: Additional weights-root directories to search for already-present files.
             When omitted, :data:`ENV_EXTRA_MODEL_DIRECTORIES` is consulted. New downloads always target the

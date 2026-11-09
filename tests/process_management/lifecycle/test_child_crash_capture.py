@@ -218,7 +218,7 @@ def test_enable_child_faulthandler_clears_the_windows_fault_dialog(
 
     monkeypatch.chdir(tmp_path)
     original = msvcrt.GetErrorMode()
-    # The mode is inherited from the launcher, so a test runner may already carry the bit; clear it first.
+    # The mode is inherited from the launcher, so the bit may already be set in the test runner. Clear it first.
     msvcrt.SetErrorMode(original & ~(msvcrt.SEM_NOGPFAULTERRORBOX | msvcrt.SEM_FAILCRITICALERRORS))
     try:
         assert not msvcrt.GetErrorMode() & msvcrt.SEM_NOGPFAULTERRORBOX

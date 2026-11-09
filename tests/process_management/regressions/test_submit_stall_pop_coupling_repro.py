@@ -144,7 +144,7 @@ def _make_popper(
 
 
 def _image_job() -> ImageGenerateJobPopResponse:
-    """A single-image job whose pop response carries an R2 upload target (so it is submittable)."""
+    """A single-image job whose pop response has an R2 upload target (so it is submittable)."""
     return make_job_pop_response("stable_diffusion", r2_upload="https://example.com/upload")
 
 

@@ -840,7 +840,7 @@ def _uniform_cards(count: int, *, max_concurrent_inference: int = 1) -> dict:
     cards: dict = {}
     for index in range(count):
         config = _card_config(models=_ALL_MODELS, max_pixels=5_000_000)
-        # The card's effective config carries the same thread count its semaphores were sized for, as the
+        # The card's effective config includes the same thread count its semaphores were sized for, as the
         # real per-card plan derives both from one figure.
         config.max_threads = max_concurrent_inference
         cards.update(
@@ -1088,7 +1088,7 @@ class TestCrossCardDispatch:
     async def test_the_head_card_is_left_to_the_head(self) -> None:
         """A job resident on an idle lane of the head's own card is not seated ahead of the head.
 
-        The head's card carries a sibling that has taken its one sampling slot, so the head waits for that
+        The head's card has a sibling that has taken its one sampling slot, so the head waits for that
         slot rather than for its own lane. Both the card's cap and the head's claim on it refuse the
         candidate, and the second card's job is what runs instead.
         """

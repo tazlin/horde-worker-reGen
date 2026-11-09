@@ -285,7 +285,7 @@ class TestDispatchRaceIsNotReapedAsLostResult:
         """A sampler re-bound inside the previous job's result tick keeps its new job through the old idle report.
 
         The child's transition to idle for the job it just finished travels behind that job's result, so it can
-        arrive after the parent has already given the slot its next job. Ownership carries the instant it was
+        arrive after the parent has already given the slot its next job. Ownership includes the instant it was
         taken; an idle report whose state began before that instant belongs to the previous job.
         """
         import dataclasses

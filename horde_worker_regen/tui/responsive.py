@@ -192,7 +192,7 @@ def select_columns[T](
 def shed_hint[T](layout: ColumnLayout[T]) -> str | None:
     """A short caption naming how many columns the width clamped away and the width to reveal them.
 
-    Returns None when nothing was hidden, so a table only carries the hint when it is actually clamped.
+    Returns None when nothing was hidden, so a table only includes the hint when it is actually clamped.
     """
     if layout.hidden_count == 0 or layout.needed_width is None:
         return None

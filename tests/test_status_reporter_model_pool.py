@@ -37,7 +37,7 @@ def test_disabled_pool_names_normal_advertising_behavior() -> None:
 
 
 def test_enabled_pool_prints_seats_lanes_demand_and_budget() -> None:
-    """Headless output carries the same compact runtime vocabulary as the TUI."""
+    """Headless output includes the same compact runtime vocabulary as the TUI."""
     record, lines = _collector()
     pool = ModelPoolSnapshot(
         enabled=True,

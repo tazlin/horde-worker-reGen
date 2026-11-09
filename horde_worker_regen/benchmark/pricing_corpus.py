@@ -176,7 +176,7 @@ _SAMPLERS: tuple[str, ...] = (
 """Samplers in the categorical array.
 
 ``k_dpm_adaptive`` is excluded by design: it chooses its own step count and would break the steps
-marginal, since its records would carry a step count the work never obeyed."""
+marginal, since the recorded step count would not match the work performed."""
 
 _SCHEDULERS: tuple[str, ...] = ("karras", "normal", "exponential", "sgm_uniform")
 
@@ -246,7 +246,7 @@ _CENSUS_SAMPLER_TRAJECTORY_STEPS: tuple[int, ...] = (15, 30)
 """Trajectory lengths every census sampler is measured at.
 
 A sampler's cost is part per-trajectory-step and part per-job, and one step count cannot separate them.
-Every sampler carries the same pair so the cells stay comparable across the vocabulary; both levels sit
+Every sampler uses the same pair so the cells stay comparable across the vocabulary. Both levels sit
 on the steps sweep's own grid and span the range requests mostly fall in."""
 
 _CENSUS_EXCLUDED_SAMPLERS: dict[str, str] = {
@@ -309,7 +309,7 @@ _CENSUS_MODEL_WEIGHTS: tuple[tuple[str, float], ...] = ((SDXL_A, 0.45), (SD15_A,
 """Model draw weights for the conflation block: the two anchors carry it, the second SDXL adds switches."""
 
 _CENSUS_CONTROL_SHARE = 0.25
-"""Fraction of the conflation block's SD1.5 cells that also carry a control type.
+"""Fraction of the conflation block's SD1.5 cells that also have a control type.
 
 Controlnet weights exist for the SD1.5 baseline only, so a control type can only conflate with the
 other axes on that model."""
@@ -1042,10 +1042,10 @@ _NO_CONTROL_TYPE = "None"
 """The control_type vocabulary entry meaning "no controlnet", spelled as the manifest spells it."""
 
 _CENSUS_ENLARGING_PP_SHARE = 0.4
-"""Fraction of conflation cells that carry an enlarging post-processor."""
+"""Fraction of conflation cells that have an enlarging post-processor."""
 
 _CENSUS_PLAIN_PP_SHARE = 0.3
-"""Fraction of conflation cells that carry a size-preserving post-processor (face fix, background strip)."""
+"""Fraction of conflation cells that have a size-preserving post-processor (face fix, background strip)."""
 
 
 @dataclass(frozen=True)
@@ -1442,7 +1442,7 @@ def _census_conflation_cells(count: int, runnable: dict[str, tuple[str, ...]]) -
         control_type: str | None = None
         if model == SD15_A and rng.random() < _CENSUS_CONTROL_SHARE:
             control_type = rng.choice(runnable["control_type"])
-            # A control job carries its control image, so it is an img2img-class job whatever else was
+            # A control job includes its control image, so it is an img2img-class job whatever else was
             # drawn; leaving the drawn mode would label the cell with a source mode it does not run.
             source_processing = "img2img"
         if bounded or width * height > _CENSUS_SINGLE_IMAGE_PIXELS:

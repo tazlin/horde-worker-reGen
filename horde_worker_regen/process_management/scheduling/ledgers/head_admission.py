@@ -66,7 +66,7 @@ MISSING_MODEL_LATCH_FALLBACK_SECONDS = 150.0
 STAGING_DEFER_REPEAT_SECONDS = 300.0
 """How long an unchanged staging-defer reason stays suppressed before it is restated with its tally.
 
-The cap is consulted on every dispatch decision, so the reason edge carries the information and a persistent
+The cap is consulted on every dispatch decision, so the reason edge includes the information and a persistent
 hold is worth one restatement every few minutes."""
 
 

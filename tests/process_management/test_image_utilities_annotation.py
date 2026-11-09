@@ -641,7 +641,7 @@ async def _park_strip_job(
 
 
 class TestStripDispatchHappyPath:
-    """A pending strip is dispatched to an idle lane and its result carries the job on to safety."""
+    """A pending strip is dispatched to an idle lane and its result advances the job to safety."""
 
     async def test_strip_dispatched_and_result_moves_job_to_safety(self) -> None:
         """The images are sent to the lane and the stripped result becomes the job's images at safety."""
@@ -1220,7 +1220,7 @@ class TestLateStripResult:
     """Finished strip work is used wherever it still can be, rather than thrown away behind a write-off."""
 
     async def test_late_success_reopens_a_written_off_job(self) -> None:
-        """A strip that completes after the age-out carries the job on to safety with its stripped images."""
+        """A strip completed after the age-out advances the job to safety with its stripped images."""
         pm = make_testable_process_manager(enable_image_utilities=True)
         _add_utilities_process(pm)
         job = await _park_strip_job(pm)
@@ -1857,7 +1857,7 @@ class TestExtendedControlnetWaitsForTheLane:
     ) -> None:
         """A paused lane withholds the offer from new pops, and a job that does not need an annotator is not faulted.
 
-        The job carries its control map, so it needs only the extended-ControlNet feature. It is neither faulted
+        The job includes its control map, so it needs only the extended-ControlNet feature. It is neither faulted
         nor held for the lane, and stays queued for inference.
         """
         rig = _ExtendedLaneRig(monkeypatch)

@@ -32,13 +32,10 @@ PROGRESS_FILENAME = "progress.jsonl"
 """The progress event log written into a run's output directory."""
 
 BENCHMARK_PROGRESS_PROTOCOL_VERSION = 4
-"""Bumped when the event schema changes incompatibly; stamped into every event and checked by readers.
+"""Version stamped into each benchmark progress event and checked by readers.
 
-v2 added ``RAMP_PLANNED`` (the per-level resource-requirements plan). v3 adds
-``RampFinished.suggestion_decisions`` (per-setting recommendation provenance). v4 adds the live
-duty-cycle attribution (``gpu_duty_gap_summary`` + ``no_jobs_available_seconds``) to the level
-progress/finished events. Readers tolerate unknown kinds and unknown fields default in, so an older
-reader simply ignores the additions.
+Increment this when the event schema changes incompatibly. Readers ignore unknown event kinds
+and use field defaults for missing values.
 """
 
 
@@ -294,7 +291,7 @@ class RampFinished(BenchmarkProgressEvent):
     report_path: str | None = None
     suggested_bridge_data_yaml: str = ""
     suggestion_decisions: list[SuggestionDecisionRow] = Field(default_factory=list)
-    """Per-setting provenance for the recommendation; empty for runs from before protocol v3."""
+    """Evidence and reasoning for each recommended setting."""
     consistency_warnings: list[str] = Field(default_factory=list)
     """Warnings about suggested settings that lack supporting results, or an empty list."""
     storage_notes: list[str] = Field(default_factory=list)

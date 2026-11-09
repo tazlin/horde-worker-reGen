@@ -1278,7 +1278,7 @@ class TestWholeCardIntent:
     """A model the card's dominance verdict places on rung 2 claims sole residency even when its weight seed fits.
 
     A conservative weight seed can read as comfortably co-resident on a card where the model's sampling peak
-    cannot sit beside one context. ``wants_whole_card`` carries the verdict, so the knife-edge weight-vs-free fit
+    cannot sit beside one context. ``wants_whole_card`` returns the verdict, so the knife-edge weight-vs-free fit
     never decides the residency.
     """
 

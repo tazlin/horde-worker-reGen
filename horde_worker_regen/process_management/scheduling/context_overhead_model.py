@@ -96,11 +96,9 @@ class ContextOverheadModel:
     measured at startup by the manager's probe; the marginal can also be derived from an observed
     all-contexts idle residency when the probe could not measure it directly.
 
-    Every figure is held twice: once per card, and once worker-wide. A caller that knows which card it is
-    reasoning about passes ``device_index`` and gets that card's own measurement; a caller that does not
-    (or a card that could not be measured) gets the worker-wide reduction, which is the maximum across the
-    cards. The maximum is the conservative direction for an overhead charge, and it is what the whole model
-    returned before the probe measured cards separately, so an unmeasured card behaves exactly as before.
+    Every figure is stored per card and for the worker as a whole. Passing ``device_index`` selects that
+    card's measurement. Without an index or a measurement for the card, the result is the maximum across
+    measured cards. Using the maximum avoids underestimating overhead on an unmeasured card.
     """
 
     def __init__(self) -> None:

@@ -256,7 +256,7 @@ class ChunkPacer:
         now = self._clock()
 
         # The first observation only establishes a baseline: there is no prior sample to rate-limit
-        # against, and the first callback often carries the whole chunk already read, so pacing it would
+        # against, and the first callback often includes the whole chunk already read, so pacing it would
         # freeze the transfer before a single byte of feedback (the "stuck at 0%" report).
         if self._last_time == 0.0:
             self._last_bytes = downloaded

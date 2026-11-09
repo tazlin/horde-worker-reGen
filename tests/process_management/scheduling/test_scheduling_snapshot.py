@@ -226,7 +226,7 @@ class TestSchedulingSnapshot:
         assert all(job.checkpoint_file_mb is None for job in scheduler.snapshot().queue.jobs.values())
 
     async def test_available_commit_is_captured_from_its_provider(self) -> None:
-        """The snapshot carries the commit reading of its build, and None where the host reports none."""
+        """The snapshot includes the commit reading of its build, and None where the host reports none."""
         _initial, scheduler = await self._scheduler()
         assert scheduler.snapshot().host_ram.available_commit_mb is None, "the harness pins commit unreported"
         scheduler.set_available_commit_mb_provider(lambda: 30000.0)
@@ -363,7 +363,7 @@ class TestSchedulingSnapshot:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Each queued job carries the learned resident and cold overheads, and None without a model or samples."""
+        """Each queued job includes the learned resident and cold overheads, and None without a model or samples."""
         snapshot, scheduler = await self._scheduler()
         monkeypatch.setattr(
             scheduler._model_metadata,  # type: ignore[attr-defined]

@@ -340,7 +340,7 @@ class WorkerSupervisor:
         first frame of either kind arrives."""
         self._last_loop_advance_wall: float | None = None
         """Parent wall-clock time when the worker's control loop was last seen to *advance* (a new snapshot
-        arrived, or a liveness frame carried a changed stamp). None until the worker first reports, which is
+        arrived, or a liveness frame had a changed stamp). None until the worker first reports, which is
         the startup grace: a worker that has not yet sent a frame cannot be judged wedged. Drives the
         :data:`WEDGE_LIVENESS_TIMEOUT_SECONDS` backstop."""
         self._last_wedge_kill_attempt_wall: float | None = None
@@ -791,7 +791,7 @@ class WorkerSupervisor:
 
         A worker that exits before sending a single snapshot almost certainly failed during startup, where
         the crash predates hordelib's bridge.log sink; the child's own crash-capture writes the reason to
-        bridge_main_startup.log / bridge_main_console.log instead. The parent only knows the exit code, so
+        bridge_main_startup.log / bridge_main_console.log instead. The parent receives only the exit code, so
         without this pointer the operator has the exit code but no idea where the "why" landed.
         """
         if self.latest_snapshot is not None or (time.time() - self._last_spawn_time) >= _HEALTHY_UPTIME_SECONDS:

@@ -70,7 +70,7 @@ def test_running_host_accepts_a_replacement_dashboard_port() -> None:
 
 
 def test_attach_status_frame_populates_liveness() -> None:
-    """A running status frame carries the host's loop liveness; stopped/restarting frames clear it.
+    """A running status frame includes the host's loop liveness. Stopped/restarting frames clear it.
 
     Regression: app._tick reads supervisor.last_liveness_wall_time on every tick; the attach client must
     expose and update it (it raised AttributeError before), and must drop the host's stale liveness while

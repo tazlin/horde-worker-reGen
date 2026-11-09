@@ -124,7 +124,7 @@ class PhysicalPressureObservation:
 
     Distinct from :class:`DriftObservation` (which reconciles the ledger against a device-used anchor to warn):
     this reasons purely about the worker's own committed ledger against the physical ceiling, and drives a
-    corrective *action* (one idle-model unload), so it carries its own streak and hysteresis state.
+    corrective *action* (one idle-model unload), so it includes its own streak and hysteresis state.
 
     The trigger is the *physical* over-commit ``committed_vram_mb + baseline_estimate_mb > total_vram_mb``, NOT
     an exceedance of the (lower) admission ceiling: legitimate transient sampling peaks routinely exceed the
@@ -197,7 +197,7 @@ class VramAttributionReconciler:
         # committed drops back below the ceiling), so a single sustained over-commit reclaims once, not every tick.
         self._pressure_suppressed = False
         # A phantom over-commit (committed exceeds device-used truth) drives recalibration, not eviction; it
-        # carries its own confirming streak and rate-limit so a transient reading does not fire and a persistent
+        # includes its own confirming streak and rate-limit so a transient reading does not fire and a persistent
         # one recalibrates periodically rather than every tick. The phantom judgement itself lives in
         # committed_ledger_is_phantom, shared with the arbiter.
         self._recalibrate_interval_seconds = _RECALIBRATE_INTERVAL_SECONDS
@@ -250,7 +250,7 @@ class VramAttributionReconciler:
         A stale committed ledger is treated exactly like a missing reading: one contributor whose report has
         aged out makes the whole ledger an UNKNOWN tenant that the device anchor cannot be compared to, so
         reconciling would risk both a false drift alarm and false confidence. The streak resets so a
-        transient staleness window never carries a partial streak into the next comparable observation.
+        transient staleness window never preserves a partial streak for the next comparable observation.
 
         Args:
             device_used_mb: The device-wide used VRAM (MB), or None when no source was available.

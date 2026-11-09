@@ -327,7 +327,7 @@ def learned_sampling_peak_mb(
     """The static sampling-peak seed raised by the card's learned watermark, lowered by the trusted measurement.
 
     Never lowered below the job's own core weights, which is what stops a light sibling's measurements in the
-    same band from underpricing a heavy checkpoint. A LoRA job's measured figure carries the LoRA delta the seed
+    same band from underpricing a heavy checkpoint. A LoRA job's measured figure includes the LoRA delta the seed
     charges (:func:`lora_feature_delta_mb`): the key has no LoRA axis, so its measurement is the maximum over
     mixed jobs and cannot see the patch transient of a LoRA job that faulted before reporting it.
     """
@@ -427,7 +427,7 @@ def sampling_peak_measured(
     process_id: int | None,
     disaggregated: bool,
 ) -> bool:
-    """Whether the key :func:`candidate_delta_mb` prices this job under carries a trusted measured peak."""
+    """Whether the key :func:`candidate_delta_mb` prices this job under has a trusted measured peak."""
     store = snapshot.services.footprint_store
     if store is None:
         return False
@@ -560,7 +560,7 @@ def partial_seat_activation_mb(
 
     The figure is the measured activation of the job's class, else of its pooled band, once that window holds
     enough jobs (:meth:`LearnedFootprintStore.measured_job_estimate_net_of_context_mb`). Until then it is the
-    static seed, the sampler-only peak less the weights. The measured figure carries the VAE and the encoded
+    static seed, the sampler-only peak less the weights. The measured figure includes the VAE and the encoded
     conditioning the seed leaves out, and it may fall below the seed.
 
     The key's raise-only watermark is never read here. A grant carries this figure as room the child's load must

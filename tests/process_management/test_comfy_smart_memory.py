@@ -3,7 +3,7 @@
 ``--disable-smart-memory`` unloads every model after each prompt below anything the worker can suppress, so
 a child carrying it can never honour a retention grant. Inference children launch without it: eviction is
 hordelib's explicit end-of-job free, which the scheduler's per-dispatch grant suppresses. Lane and safety
-children take no grants and always carry the flag. ``legacy_comfy_vram_unload`` restores the flag on
+children take no grants and always include the flag. ``legacy_comfy_vram_unload`` restores the flag on
 inference children; ``comfy_smart_memory`` is deprecated and inert.
 """
 

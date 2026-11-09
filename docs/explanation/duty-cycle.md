@@ -134,7 +134,7 @@ levers, [model stickiness](#tuning-levers-and-what-they-cannot-do) and residency
 A distinct cost hides inside `vram_load` even when no swap or eviction is counted: the engine evicts a
 job's model from VRAM after every run, so the next job re-streams the same weights from RAM, a RAM→VRAM
 reload paid even for the *same* model back-to-back. The scheduler now suppresses that per-job eviction
-whenever the VRAM budget confirms the card can afford to carry the weights, reclaiming an unused hold
+whenever the VRAM budget confirms the card can afford to hold the weights, reclaiming an unused hold
 just-in-time at the next dispatch that needs the card (see
 [keeping a model resident between same-model jobs](performance_and_backpressure.md#keeping-a-model-resident-between-same-model-jobs)),
 so a homogeneous or sticky workload stops paying `vram_transfer` on its hot model and the residual reload
@@ -209,7 +209,7 @@ trailing context confirms there was always a job in flight, ruling out an idle h
 
 The device counters cannot distinguish a saturated one-thread worker from a two-thread worker running
 at half capacity: one busy sampler reads as "busy" either way. The same duty line therefore also
-carries a **slot attribution** fragment from
+has a **slot attribution** fragment from
 [`SlotDutyAccumulator`][horde_worker_regen.process_management.scheduling.slot_duty.SlotDutyAccumulator]:
 every control-loop tick attributes each configured inference slot's elapsed time to `sampling` or to
 exactly one named reason the slot stayed empty, so the shares sum to 100% of `capacity x wall` and
@@ -474,7 +474,7 @@ above; their job is to reduce *avoidable* efficiency loss and to suit the worker
     waiter on the card may upload its weights when they fit beside the running peak, so the next denoise starts
     one grant latency after the running one ends. On a card too small to hold the weights beside a running
     peak, every stage is refused and the behaviour is the single clearance's. The duty-cycle summary line
-    carries the session's tally as `stage: N granted / M refused`, after any tail-overlap figures. The refused
+    includes the session's tally as `stage: N granted / M refused`, after any tail-overlap figures. The refused
     count rises on every check of a waiting job, so one job held for many seconds counts many times.
     `horde-log diagnose` reports refusals per job as `stage_refusals`. Set the key to false to return to one
     grant per job, which is what `stage_outlived_sample_grant` asks for.
@@ -501,7 +501,7 @@ component reload on the critical path:
   same-model runs occur by chance: a softer, more production-like churn profile.
 - **`cluster_shared_vae`** and **`cluster_distinct_vae`** hold the deterministic interleave fixed but swap
   the model pool for one whose checkpoints either share a VAE (so the VAE lane can keep a resident
-  autoencoder across the switch) or each carry a distinct VAE (so the VAE reload is unavoidable). The
+  autoencoder across the switch) or each have a distinct VAE (so the VAE reload is unavoidable). The
   pair isolates the VAE-residency component of the switch cost. Their default pools are real VAE-sharing
   clusters from the horde-model-reference canonical-components backfill; every model named is
   disaggregation-class (SD1.5/SDXL, txt2img/img2img, no controlnet). The pools are parameters, so a

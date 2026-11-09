@@ -269,7 +269,7 @@ def test_scribe_section_is_configurable() -> None:
     assert by_key["scribe"].kind is FieldKind.BOOL
     assert by_key["text_model"].picker is FieldPicker.TEXT_MODEL
     assert by_key["text_backend_managed"].kind is FieldKind.BOOL
-    # The password is a credential and must carry the same masking the other secrets do.
+    # Mask the password like the other credentials.
     assert by_key["text_backend_password"].secret is True
 
     tiers = {key: field.risk_level for key, field in by_key.items()}

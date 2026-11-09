@@ -151,7 +151,7 @@ class _AlchemySubmitRequest(AlchemyJobSubmitRequest):
 
     The wire format (matching the legacy alchemist and the live API) is a JSON object like
     ``{"caption": "..."}`` or ``{"RealESRGAN_x4plus": "R2"}``, despite the SDK's `str`
-    annotation (which carries a FIXME).
+    annotation (which has a FIXME).
     """
 
     result: dict[str, object]  # type: ignore[assignment]
@@ -1734,7 +1734,7 @@ class AlchemyCoordinator:
         self._state.kudos_events.append((submit_time, response.reward))
         submit.succeed(int(response.reward))
         self.num_forms_submitted += 1
-        # A successfully-delivered submit can still carry a faulted generation (e.g. a source-image
+        # A successfully-delivered submit can still have a faulted generation (e.g. a source-image
         # download failure submitted as faulted), so the recorded outcome follows the form's own state.
         # Such a delivery is a fault report the horde pays nothing for, so it records no reward.
         form_faulted = submit.result_message.state == GENERATION_STATE.faulted

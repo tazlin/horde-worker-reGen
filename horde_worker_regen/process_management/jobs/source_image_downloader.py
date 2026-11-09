@@ -152,7 +152,7 @@ class SourceImageDownloader:
         """Record faults for any URL-backed source media still missing from ``job_pop_response``.
 
         Callers that abandon a download rather than letting the retry loop exhaust itself use this so the
-        job carries the same faults it would have carried had the retries run out.
+        job includes the same faults as after exhausted retries.
         """
         if (
             job_pop_response.source_processing not in SOURCE_IMAGE_REQUIRING_PROCESSING

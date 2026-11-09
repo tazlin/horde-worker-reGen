@@ -41,7 +41,7 @@ def compute_level_stats(result: LevelRunResult, *, total_vram_mb: int | None = N
     """Distill a subprocess level runner's on-disk result into the criteria-relevant statistics.
 
     Thin adapter over :func:`~horde_worker_regen.benchmark.capabilities.stats.level_stats_from_metrics`
-    for the subprocess path, whose :class:`LevelRunResult` carries its counts on ``harness`` and its
+    for the subprocess path, whose :class:`LevelRunResult` includes its counts on ``harness`` and its
     metrics alongside.
     """
     return level_stats_from_metrics(result.harness, result.metrics, total_vram_mb=total_vram_mb)

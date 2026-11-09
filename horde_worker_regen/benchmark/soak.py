@@ -306,8 +306,8 @@ def build_production_replay_soak_scenario(
     across three weeks of one worker's logs:
 
     - **Family share by pop count**: SDXL-family ~71%, SD1.5/other ~26%, Flux ~3%. The four SDXL
-      checkpoints carry the bulk, dominated by ``WAI-NSFW-illustrious-SDXL`` (~28% of all pops on its own);
-      two SD1.5 checkpoints carry the small-image band; one Flux checkpoint carries the rare heavy load.
+      checkpoints serve most jobs, led by ``WAI-NSFW-illustrious-SDXL`` (~28% of all pops).
+      Two SD1.5 checkpoints serve small-image jobs. One Flux checkpoint serves rare heavy jobs.
     - **Job size (effective megapixel-steps)**: the measured quantiles are p10=7, p50=31, p90=61, p99=88,
       max=156. The templates span that range: small SD1.5 jobs (512x512 / 512x768 at 20-25 steps), the
       SDXL bulk at ~1024x1024 and 25-30 steps, a heavy band (1216x832 or batched 1024x1024 at 30+ steps,
@@ -358,7 +358,7 @@ def build_production_replay_soak_scenario(
         _ReplayProfile(cyber, 1024, 1024, 28, weight=3),
         _ReplayProfile(cyber, 1024, 1024, 30, weight=5, lora_names=(unique[0],)),
         _ReplayProfile(cyber, 1024, 1024, 28, weight=5, post_processing=upscale),
-        # AlbedoBase XL band: carries the rare TI path and the batch-3 rung.
+        # AlbedoBase XL band: includes the rare TI path and the batch-3 rung.
         _ReplayProfile(albedo, 1024, 1024, 25, weight=6, post_processing=upscale),
         _ReplayProfile(albedo, 1024, 1024, 30, weight=2, ti_names=(shared[2],)),  # rare TI path
         _ReplayProfile(albedo, 1024, 1024, 28, weight=3, n_iter=3),  # batch-3 rung

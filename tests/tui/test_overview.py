@@ -635,7 +635,7 @@ def test_size_cell_is_a_plain_resolution_for_an_alchemy_row() -> None:
 
 
 def test_work_ledger_explains_the_size_cell_under_the_table() -> None:
-    """The cell has no room to name its own parts, so the panel carries the legend beneath the rows."""
+    """The cell has no room to name its own parts, so the panel includes the legend beneath the rows."""
     snapshot = WorkerStateSnapshot(
         config=WorkerConfigSummary(dreamer_name="Tester", worker_version="12.0.0"),
         work_ledger=[
@@ -944,7 +944,7 @@ def test_phone_operational_panels_use_wrapping_rows() -> None:
 
 
 def test_compact_bar_summarizes_worker_in_one_line() -> None:
-    """The thin compact bar carries the phase, kudos, GPU duty, and pipeline counts."""
+    """The thin compact bar includes the phase, kudos, GPU duty, and pipeline counts."""
     snapshot = WorkerStateSnapshot(
         config=WorkerConfigSummary(dreamer_name="Tester", worker_version="12.0.0"),
         processes=[_busy_process()],
@@ -1224,7 +1224,7 @@ def _scheduling_under_pressure() -> SchedulingGovernanceSnapshot:
 
 
 def test_governance_combined_shows_both_sections_in_details() -> None:
-    """The merged governance panel carries both the pop-governor and scheduling sub-sections in details."""
+    """The merged governance panel includes both the pop-governor and scheduling sub-sections in details."""
     text = _render(
         OverviewView._render_governance_combined(
             _one_active_governor(),

@@ -130,7 +130,7 @@ def _gpu_arch_supported(arch_list: list[str], capability: tuple[int, int]) -> bo
 def reportable_step_counts(comfyui_progress: ComfyUIProgress | None) -> tuple[int | None, int | None]:
     """Return the (current, total) step counts worth forwarding from a progress report, or (None, None).
 
-    Every progress report that carries a real sampling position is worth reporting, including the ones
+    Every progress report that has a real sampling position is worth reporting, including the ones
     that do not advance the step. ComfyUI clamps an error-controlled solver's progress at the nominal
     total, so its overshoot iterations all report the final step; a heartbeat that omitted the counts
     there would leave the parent's view of the slot frozen one step short of the truth, which is exactly
@@ -192,7 +192,7 @@ def _is_host_commit_error(error: BaseException) -> bool:
 
     The backend's mapping guard raises before any weight is adopted, so the process holds nothing half-loaded
     and may stay available. Inside a job ComfyUI catches the node's exception, so the backend's pipeline error
-    carries the type by name, built the way ComfyUI builds it. Imported lazily because the guard lives in the
+    includes the type by name, built the way ComfyUI builds it. Imported lazily because the guard lives in the
     backend package, which a dry-run process never imports.
     """
     try:
@@ -214,7 +214,7 @@ def _is_cuda_context_fault(error: BaseException) -> bool:
     """Whether an inference failure is a CUDA runtime error, which leaves the process's CUDA context in doubt.
 
     After one, later kernels in the same process can keep failing while other processes on the card run normally.
-    ComfyUI catches a node's exception inside its executor, so the backend's pipeline error carries the type by name,
+    ComfyUI catches a node's exception inside its executor, so the backend's pipeline error includes the type by name,
     built the way ComfyUI builds it. Imported lazily because a dry-run process never imports torch or the backend.
     """
     try:
@@ -1110,7 +1110,7 @@ class HordeInferenceProcess(HordeProcess):
     def _send_inference_memory_report(self) -> None:
         """Send a precise boundary VRAM report at a stage transition (sampling done, VAE decode).
 
-        These stage-boundary reports carry the working set at a known moment and complement the reporter
+        These stage-boundary reports include the working set at a known moment and complement the reporter
         thread's interval sampling, which runs independently while the main loop is blocked in the GPU op.
         """
         self.send_memory_report_message(include_vram=True)

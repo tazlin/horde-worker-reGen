@@ -23,7 +23,7 @@ from horde_worker_regen.benchmark.progress_channel import (
 def format_progress_event(event: BenchmarkProgressEvent, *, verbose: bool = False) -> str | None:
     """Return a one-line human-readable rendering of a progress event, or None to skip it.
 
-    With ``verbose`` set, level-progress lines also carry the compact per-process state summary, for
+    With ``verbose`` set, level-progress lines also include the compact per-process state summary, for
     operators who want to watch the worker's cold start phase-by-phase.
     """
     if isinstance(event, RampStarting):

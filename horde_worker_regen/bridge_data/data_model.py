@@ -1177,7 +1177,7 @@ class reGenBridgeData(CombinedHordeBridgeData):
     text_model_name: str | None = Field(default=None)
     """Override the advertised model name, spelled as the text model reference spells it (`author/Model`).
 
-    A catalogued model already carries the reference's spelling, so this is for a file of your own whose
+    A catalogued model already uses the reference's spelling, so this is for a file of your own whose
     stem is not the name the horde knows it by, and for an attached backend that reports a name the horde
     does not recognise. Unset follows the resolved model: the record's name, the file's stem, or (for an
     attached backend) whatever model it reports having loaded. A quantisation suffix
@@ -1854,7 +1854,7 @@ class reGenBridgeData(CombinedHordeBridgeData):
         """Map a deprecated positive ``model_stickiness`` onto the fixed model pool when the pool is off.
 
         Runs after ``max_throughput_mode`` so a pool that mode already enabled is seen as enabled here. When the
-        operator still carries a positive ``model_stickiness`` and no enabled pool (neither explicit nor via
+        operator still has a positive ``model_stickiness`` and no enabled pool (neither explicit nor via
         that mode), the pool-residency mechanism that replaced stickiness is turned on for them, honouring any
         explicit ``model_pool`` values. When the pool is already enabled, stickiness is ignored entirely and
         nothing is mapped. The deprecation pointer is logged once per process. See
@@ -1914,7 +1914,7 @@ class reGenBridgeData(CombinedHordeBridgeData):
         """Validate that the advertised text model name carries no backend prefix.
 
         The prefixed spelling the horde expects is derived from the canonical name, so a name that
-        already carries a backend prefix would be prefixed a second time and would match nothing the
+        already has a backend prefix would be prefixed a second time and would match nothing the
         horde has work for. An author segment (`meta-llama/Llama-3.2-3B-Instruct`) is not a prefix and
         is kept.
 

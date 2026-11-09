@@ -295,7 +295,7 @@ class TestFakeInferenceProcess:
 
         primed_at = next(i for i, m in enumerate(queue.messages) if isinstance(m, HordeModelStateChangeMessage))
         result_at = next(i for i, m in enumerate(queue.messages) if isinstance(m, HordeInferenceResultMessage))
-        # The primed state change carries its own report; the one under test is sent after sampling.
+        # The primed state change includes its own report. The one under test is sent after sampling.
         assert isinstance(queue.messages[primed_at + 1], HordeProcessMemoryMessage)
         assert isinstance(queue.messages[result_at - 1], HordeProcessMemoryMessage), (
             f"the result must directly follow a fresh memory report: {queue.messages}"

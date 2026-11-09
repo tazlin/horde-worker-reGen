@@ -1027,7 +1027,7 @@ def _watch_host_liveness(
 ) -> None:
     """Hold a connection to the host and call ``on_host_gone`` once it goes away (the launcher's leash).
 
-    The host outlives any one browser session and carries the tray whose "Stop worker && exit" ends the
+    The host outlives any one browser session and includes the tray whose "Stop worker && exit" ends the
     host process directly, which the launcher's ``serve()`` (a separate process) cannot otherwise notice:
     it would keep serving a dead host as an invisible orphaned console. Watching the host's own control
     socket is the reliable, pid-reuse-immune way to learn it is gone, and it covers both the spawned and

@@ -41,7 +41,7 @@ if TYPE_CHECKING:
     from horde_worker_regen.model_download_plan import DownloadPlan
 
 _CIVITAI_TOKEN_ENV_VARS = ("CIVIT_API_TOKEN", "AIWORKER_CIVITAI_API_TOKEN")
-"""Env vars that carry a CivitAI token. ``load_env_vars`` populates ``CIVIT_API_TOKEN`` from the
+"""Env vars that have a CivitAI token. ``load_env_vars`` populates ``CIVIT_API_TOKEN`` from the
 config's ``civitai_api_token``; the Docker images use ``AIWORKER_CIVITAI_API_TOKEN``."""
 
 
@@ -100,7 +100,7 @@ class LevelRequirements(BaseModel):
     """ROM annotator-checkpoint download size for the level's control types (0 when not a controlnet level).
 
     These annotator weights are fetched lazily on first use and are *not* part of ``download_bytes_needed``
-    (which counts only image checkpoints); a surface that wants the full "to fetch" figure must add them.
+    (which counts only image checkpoints); a surface displaying the full "to fetch" figure must add them.
     """
     controlnet_install_hint: str = ""
     """How to enable controlnet when the level needs it but the extra is absent (empty otherwise)."""

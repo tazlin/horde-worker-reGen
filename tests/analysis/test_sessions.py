@@ -57,7 +57,7 @@ class TestSegmentation:
         assert _sessions()[1].hordelib is None
 
     def test_listing_names_the_hordelib(self) -> None:
-        """The session listing carries the hordelib identity when the run logged one."""
+        """The session listing includes the hordelib identity when the run logged one."""
         listing = render_sessions(_sessions(), root=Path("bridge.log"))
         assert "threads: 1 | hordelib: 7.9.0 (editable hordelib gc3202bd0.modified)" in listing
         assert listing.count("hordelib:") == 1
@@ -297,7 +297,7 @@ class TestBenchmarkRunSessions:
         assert all(session.log_kind is OrchestratorLogKind.WORKER for session in sessions)
 
     def test_listing_and_findings_label_the_benchmark_run(self, tmp_path: Path) -> None:
-        """``sessions`` and ``diagnose`` text name the benchmark run, and the JSON view carries its kind."""
+        """``sessions`` and ``diagnose`` text name the benchmark run, and the JSON view includes its kind."""
         sessions = _bundle_sessions(tmp_path, harness_text=_HARNESS_PREAMBLE + _HARNESS_BODY)
         listing = render_sessions(sessions, root=Path("logs"))
 

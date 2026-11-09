@@ -301,7 +301,7 @@ async def test_a_cleared_job_books_what_clearance_priced_and_spends_it_at_its_pe
 
 
 async def test_clearance_presents_what_the_staged_job_already_holds() -> None:
-    """The request carries the netted holdings, so the outstanding charge plus them is the job's whole peak.
+    """The request includes the netted holdings, so the outstanding charge plus them is the job's whole peak.
 
     Without it the ceiling test reads the netted charge alone, and a job whose whole need exceeds the emptied
     card reads as possible on it.
@@ -1217,7 +1217,7 @@ async def test_a_job_without_a_seat_still_carries_its_sampling_reserve() -> None
 
 
 async def test_the_clearance_waiter_carries_its_jobs_sampling_reserve() -> None:
-    """The staged child's waiter row carries the reserve its grants will write."""
+    """The staged child's waiter row includes the reserve its grants will write."""
     scheduler, job, waiter = await _krea2_staged_waiter()
     waiter.record_inference_ownership(job, attempt_ordinal=1)
 
@@ -1253,7 +1253,7 @@ def _seed_activation_window(
 async def test_the_activation_prices_from_the_measured_window_not_the_watermark() -> None:
     """A card-sized reading keeps the watermark near the whole card, yet the window of 1 to 3 GB jobs sets the reserve.
 
-    The grant carries the reserve as room the child's load leaves free, so pricing it at the watermark would
+    The grant includes the reserve as room the child's load leaves free, so pricing it at the watermark would
     force every later load of the key to be partial. The store clamps the reading to its key's card on attach.
     """
     scheduler, job, waiter = await _krea2_staged_waiter()
@@ -1354,7 +1354,7 @@ def _clearance_records(sink: Mock) -> list[dict[str, object]]:
 
 
 async def test_a_clearance_hold_records_the_figures_and_clocks_it_was_held_on() -> None:
-    """A held waiter's record carries its price, the reading, both clocks and their limits.
+    """A held waiter's record includes its price, the reading, both clocks and their limits.
 
     This row encodes the failure in which a large model was held at clearance for its whole lease-acquire timeout with
     nothing sampling, and the stats stream carried no record of the hold, so a bundle could not say which of the
@@ -1547,7 +1547,7 @@ async def test_a_retention_resident_model_stages_at_no_charge() -> None:
 async def test_the_sample_clearance_after_a_stage_prices_the_activation_alone() -> None:
     """Once the lane reports its staged weights, the sample clearance charges the peak net of them.
 
-    The slot's model is not marked resident: the report alone carries the weights, as the lane reports them.
+    The slot's model is not marked resident: the report alone records the weights, as the lane reports them.
     """
     scheduler, job, waiter = await _staged_waiter(device_free_mb=24000.0, model_metadata=_two_model_metadata())
     job_id = str(job.id_)

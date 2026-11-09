@@ -664,7 +664,7 @@ async def _run_disaggregated_job_through_decode(
     """Route a job through the disaggregated DAG (encode -> sample -> decode) up to its decode result.
 
     Leaves the decode completion queued on the orchestrator; the caller drives ``drive_disaggregation`` to
-    route it into the safety/post-processing pipeline. The decode result carries a single raw image, exactly
+    route it into the safety/post-processing pipeline. The decode result has a single raw image, exactly
     what the VAE lane now returns (no inline post-processing).
     """
     await pm._job_tracker.record_popped_job(job)
@@ -774,7 +774,7 @@ async def test_disaggregated_job_without_post_processing_flows_straight_to_safet
 async def test_disaggregated_completion_carries_a_positive_generation_span() -> None:
     """A completed disaggregated job reports a positive time_to_generate (registration-to-completion span).
 
-    The synthetic result the parent builds carries the orchestrator's measured span, so submit accounting, the
+    The synthetic result the parent builds includes the orchestrator's measured span, so submit accounting, the
     slowdown grader, and the inference-duration histogram see a real duration. Without it every disaggregated
     job completed with a None span: the submitter logged a 0.00s generation, reported 0.00 kudos/second, and
     fired the spurious slowdown warning on every job.
@@ -1107,7 +1107,7 @@ async def test_staged_ahead_job_that_never_binds_returns_its_encode_charge_on_ev
 async def test_faulted_disaggregated_completion_carries_reason_and_faulting_process_id() -> None:
     """The synthetic result the parent builds for a faulted disaggregated job is not blank and names the process.
 
-    A genuine (non-resource) text-encode fault carries the child's exception text to the orchestrator, which
+    A genuine (non-resource) text-encode fault sends the child's exception text to the orchestrator, which
     threads it into the completion. The parent formats it into the synthetic ``HordeInferenceResultMessage``
     ``info`` in the ``Model: ... Error: ...`` shape the fault detectors read, and attributes the result to the
     faulting child (process 1), not the blank/zero default the drop points produced before.
@@ -1147,7 +1147,7 @@ async def test_faulted_disaggregated_completion_carries_reason_and_faulting_proc
     assert result.state == GENERATION_STATE.faulted
     assert result.process_id == 1  # the faulting child, not 0/safety
     assert f"Model: {_MODEL}. Error: RuntimeError: CUDA out of memory" in result.info  # detector-shaped, not blank
-    # A fault completion carries the measured registration-to-completion span, mirroring a monolithic fault
+    # A fault completion includes the measured registration-to-completion span, as with a monolithic fault
     # (which also stamps time_elapsed), so the submitter never sees the missing duration it saw before.
     assert result.time_elapsed is not None
 

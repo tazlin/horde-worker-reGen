@@ -5,7 +5,7 @@ compared against rows from other machines. The failures that make a run worthles
 front: no CUDA, a hordelib without the kudos feature manifest the census vocabularies come from, a
 ComfyUI pin the inference children die on, a model that is not on disk, no CivitAI token for the tiers
 that carry LoRA cells, or another worker already holding the card. Each
-check therefore carries the exact command that clears it, so the operator fixes the machine rather than
+check therefore includes the exact command that clears it, so the operator fixes the machine rather than
 reading a stack trace four hours in.
 
 A check that cannot be decided warns instead of refusing. Whether a card holds a model is the clearest
@@ -154,7 +154,7 @@ class PreflightReport:
 
     @property
     def failures(self) -> list[PreflightCheck]:
-        """The failed checks, for a caller that wants to log only what needs fixing."""
+        """The failed checks, for a caller logging only what needs fixing."""
         return [check for check in self.checks if not check.passed]
 
     @property
@@ -510,7 +510,7 @@ def _measured_need_mb(probes: Probes, model: str, card_gb: int) -> float | None:
     whole-job sampling peak of its baseline, keyed to the resolution band. The sampling peak already holds
     the weights that were resident while it was taken, so the two are alternatives rather than parts, and
     the figure that matters is the larger. A model sampled at several sizes is judged by the highest peak at
-    any band, since a wide band with few observations can carry a lower watermark than a well-sampled one.
+    any band, since a wide band with few observations can have a lower watermark than a well-sampled one.
     """
     baseline = CORPUS_MODEL_BASELINES.get(model)
     if baseline is None:

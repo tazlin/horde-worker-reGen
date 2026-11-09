@@ -164,7 +164,7 @@ class HordeProcessState(enum.Enum):
     A non-retryable hardware/build mismatch detected at inference-process start, once torch is loaded: the
     wheel's compiled architectures do not include the device's compute capability, so every job would die at
     the first kernel launch with ``no kernel image is available for execution on the device`` (which ComfyUI
-    hides behind a generic "no images produced" fault). The child carries the device/build detail in ``info``.
+    hides behind a generic "no images produced" fault). The child includes the device/build detail in ``info``.
     The orchestrator latches a worker-state flag from this and stops popping jobs, and the TUI surfaces it
     prominently, all without importing torch (the invariant is that only the torch-bearing inference child
     ever touches torch; the parent and TUI learn of the problem through this torch-free signal)."""
@@ -175,7 +175,7 @@ class HordeProcessState(enum.Enum):
     The torch build matches the card, and the device still raised when a tensor was moved to it. That is a
     host driver fault, such as NVIDIA user-space libraries that no longer match the loaded kernel module. No
     job can run on the device until the host is repaired, and nothing the worker restarts repairs it. The
-    child carries the error in ``info`` and exits. The orchestrator latches a worker-state flag from this and
+    child includes the error in ``info`` and exits. The orchestrator latches a worker-state flag from this and
     stops popping jobs, without importing torch."""
 
     TORCH_BUILD_CPU_ONLY = auto()
@@ -524,7 +524,7 @@ class HordeInferenceResultMessage(HordeProcessMessage):
     """Whether the job failed because the host refused to commit a checkpoint mapping during the run.
 
     The in-run counterpart of :data:`HOST_COMMIT_FAILED_INFO`. It is a typed field because a faulted result's
-    ``info`` carries the exception summary the parent logs. The child sets it from the exception's type, and the
+    ``info`` includes the exception summary logged by the parent. The child sets it from the exception's type, and the
     parent requeues the job against host memory without counting a fault, up to a cap."""
 
     non_reportable_faults: ClassVar[set[METADATA_TYPE | str]] = {
@@ -702,7 +702,7 @@ class HordeControlFlag(enum.Enum):
 
     The cheaper rung below ``EVICT_COMPONENTS`` on the same ladder: restoring clears a component's patch
     residue and hands back its weight-memory claim while the pristine weights stay resident in host RAM, so
-    the next job that wants it re-uploads instead of re-reading it from disk. Prefer this where the pressure
+    the next job that needs it re-uploads instead of re-reading it from disk. Prefer this where the pressure
     is on device memory rather than host RAM, and where the named entries report residue worth clearing.
     Naming an identity the cache does not hold, or one with nothing to restore, is a no-op, never a fault."""
     RELEASE_ALLOCATOR_CACHE = auto()
@@ -855,7 +855,7 @@ class AuxModelRef(BaseModel):
 
     ``name`` and ``is_version`` are the same fields the API payload carries; the download process resolves
     them to a manager reference key (LoRAs by version or fuzzy name, TIs by fuzzy name) when it fetches or
-    pins the file. TIs never carry a version, so ``is_version`` is meaningful only for LoRAs.
+    pins the file. TIs do not have versions, so ``is_version`` is meaningful only for LoRAs.
     """
 
     kind: AuxModelKind
@@ -1129,7 +1129,7 @@ class HordeStripResultMessage(HordeProcessMessage):
     """The stripped images from a generation job's background-removal stage, from the image-utilities process.
 
     Mirrors the other result-message fault idiom (:class:`HordePostProcessResultMessage`): a successful
-    stage carries the stripped ``images_bytes``; a faulted stage carries an empty list plus ``fault_reason``,
+    stage includes the stripped ``images_bytes``. A faulted stage has an empty list plus ``fault_reason``,
     and ``state`` tells the parent whether the strip succeeded. A fault routes the job to a no-image fault
     exactly as a failed post-processing pass does, because background removal has no in-graph fallback.
     """
@@ -1234,7 +1234,7 @@ class HordePostProcessResultMessage(HordeProcessMessage):
 #
 # A job is split into stages that run in separate processes and exchange small activations, not
 # weights (see the disaggregation plan): text-encode -> sample -> vae-decode, with an optional
-# vae-encode front-end for img2img. Each stage carries the model identity it must load a subset of
+# vae-encode front-end for img2img. Each stage includes the model identity for the partial load
 # (via HordeCheckpointLoader's output_model/clip/vae flags) plus the intermediate blobs, which are the
 # serialized CONDITIONING/LATENT produced by hordelib's stage entry points. sdk_api_job_info rides
 # along (as it does for monolithic inference) so a stage can derive prompts, LoRA/TI, sampler params
@@ -1262,7 +1262,7 @@ class HordeTextEncodeControlMessage(HordeControlMessage, HordeStageModelMixin):
 
     The service loads only the text encoders, encodes the positive/negative prompts (applying any
     CLIP-side LoRa and textual inversions), and returns the two CONDITIONING blobs. The sampler that
-    consumes them never carries the text encoders.
+    consumes them does not hold the text encoders.
     """
 
     control_flag: HordeControlFlag = HordeControlFlag.START_TEXT_ENCODE
@@ -1303,8 +1303,7 @@ class HordeTextEncodeResultMessage(HordeProcessMessage):
 class SampleSliceSpec(BaseModel):
     """One job's sample-stage inputs within a (possibly batched) sample dispatch.
 
-    Same-model jobs can be sampled together; v1 always sends exactly one slice, so batching lands
-    later without an IPC schema change.
+    The list supports same-model jobs sampled together. Dispatch sends exactly one slice.
     """
 
     job_id: GenerationID
@@ -1329,7 +1328,7 @@ class HordeSampleControlMessage(HordeControlMessage, HordeStageModelMixin):
 
     control_flag: HordeControlFlag = HordeControlFlag.START_SAMPLE
     slices: list[SampleSliceSpec]
-    """The per-job sample inputs; v1 sends exactly one."""
+    """The per-job sample inputs. Dispatch sends exactly one slice."""
 
     keep_model_resident_after: bool = False
     """Keep this stage's UNet resident in VRAM after the run instead of evicting it.

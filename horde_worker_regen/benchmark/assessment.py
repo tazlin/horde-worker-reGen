@@ -507,7 +507,7 @@ def _single_lane_joint_jobs(queue_size: int) -> int:
 def _single_thread_follow_up(case: AssessmentCase) -> AssessmentCase:
     """Return a multi-lane joint workload at one thread, so its batch, resolution and queue size can confirm alone.
 
-    The capability magnitude carries the thread count, so the follow-up's evidence id differs from the joint's
+    The capability magnitude includes the thread count, so the follow-up's evidence id differs from the joint's
     and the report keeps both.
     """
     return replace(

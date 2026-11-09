@@ -102,7 +102,7 @@ midrange 12-16 GB balanced). Applying a preset does not save immediately. The
 operator sees every setting the preset would change, grouped by category, each
 change is individually checkable, and changes such as enabling LoRA are left
 unchecked when their precondition (a CivitAI token) is missing. Advanced sections
-carry an explicit warning banner because their defaults are meant to be left
+have an explicit warning banner because their defaults are meant to be left
 alone unless a log message, benchmark, or support instruction points there.
 
 ## Critical sections
@@ -142,7 +142,7 @@ for the safety models' transformers cache, so existing workers already hold thos
 CLIP/BLIP folder (`<cache_home>/clip_blip`) is fixed by the cache root and never follows `HF_HOME`. The
 utilities process keeps its own isolated location under its own policy.
 
-The download process carries the annotators' hub entries across once, on its first start under the
+The download process copies the annotators' hub entries once, on its first start under the
 current cache, from wherever this install's annotator verify marker says they were fetched: an ambient
 cache (`HF_HUB_CACHE`/`HF_HOME`, or the hub's default under the user's cache directory) when the marker
 predates the location key, or the directory a previous worker version named. It copies rather than

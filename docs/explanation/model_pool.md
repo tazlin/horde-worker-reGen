@@ -165,7 +165,7 @@ the ranker.
 Every seat transition (seated, demoted with its reason, rescue engaged/released, download pending/ready) is
 logged once at INFO and recorded as a `MODEL_POOL_*` action-ledger event, and the advertising lanes log their
 narrowing edges the same way the residency-bias duty cycle does. The supervisor status snapshot (protocol v21)
-carries an optional `model_pool` section: per-seat rows (model, source, logical state, measured readiness,
+has an optional `model_pool` section: per-seat rows (model, source, logical state, measured readiness,
 resident process/GPU identities, dwell, last-match age and residency, empty pops, rescue countdown), the bench
 with cooldowns, the most recent routed lane, demand-snapshot age, per-lane pop matches and resident hits, and
 the charged automatic-download admission. The headless periodic status block prints the same facts in a bounded

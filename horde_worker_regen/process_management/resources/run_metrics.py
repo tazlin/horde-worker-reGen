@@ -200,7 +200,7 @@ class ResourceStateKind(enum.StrEnum):
     SATURATION_UNRESOLVED = "saturation_unresolved"
     DISPATCH_HOLD = "dispatch_hold"
     """A head's dispatch entered or left a residency-reconciliation hold; ``state`` is ``standing`` or the
-    release reason, and the inputs carry the measured room breakdown the hold was judged against."""
+    release reason, and the inputs include the measured room breakdown the hold was judged against."""
 
 
 class JobMetricsRecord(BaseModel):
@@ -305,7 +305,7 @@ class JobMetricsRecord(BaseModel):
     whole_card: bool | None = None
     """Whether a whole-card exclusive residency for this job's model was held on its card at dispatch.
 
-    Such a job ran with the card to itself and carries the amortized cost of establishing that residency.
+    Such a job ran with the card to itself and is charged the amortized cost of establishing that residency.
     None when the job never reached dispatch (and on alchemy forms, which do not run under one)."""
     process_age_seconds: float | None = None
     """How long the inference process serving this job had been alive at dispatch, in seconds.
@@ -344,11 +344,11 @@ class WorkloadTotals(BaseModel):
     faulted: int = 0
     """Records for work that faulted. With :attr:`completed` this partitions the workload's records."""
     kudos: float = 0.0
-    """Kudos the horde paid for this workload's completed work; 0.0 when no record carried a reward."""
+    """Kudos paid by the horde for completed work in this workload. 0.0 when rewards were not recorded."""
     mean_generated_tokens: float | None = None
     """Mean tokens per record over the records that reported a count, or None when none did.
 
-    Only text records carry a token count, and only against a backend that counts its own tokens, so
+    Only text records have a token count, and only against a backend that counts its own tokens, so
     this stays None for every other workload and for a session served by a stock backend. Averaged over
     the reporting records rather than all of them, because a record that reported nothing is unknown
     rather than zero."""
@@ -424,7 +424,7 @@ class SessionEndEvent(BaseModel):
 class DecisionEvent(BaseModel):
     """One JSONL export event recording an admission/dispatch/reclaim decision and its inputs.
 
-    ``inputs`` carries the already-computed quantities the arbiter decided from (device-free VRAM,
+    ``inputs`` includes the quantities used by the arbiter (device-free VRAM,
     outstanding reservations, the noise margin, the candidate delta, chosen rung, promised/realized
     frees, ...), so a post-mortem reads the decision arithmetic directly instead of reconstructing it
     from prose.
@@ -1510,7 +1510,7 @@ class WorkerRunMetrics:
         return sorted(self._baseline_rollups.values(), key=lambda row: row.jobs, reverse=True)
 
     def form_rollups(self) -> list[StatsRollupRow]:
-        """Return finalized alchemy-form rollups by form (``model`` carries the form name)."""
+        """Return finalized alchemy-form rollups by form (``model`` includes the form name)."""
         return sorted(self._form_rollups.values(), key=lambda row: row.jobs, reverse=True)
 
     def workload_totals(self) -> dict[WorkloadKind, WorkloadTotals]:

@@ -307,7 +307,7 @@ def _run_sync(uv: str, root: Path, token: str, feature_extras: tuple[str, ...], 
     Falls back to the plain locked sync whenever the preview is disabled, there is no venv yet (nothing
     to limp along on), or the dry-run cannot be produced/parsed: the preview must never block an update.
 
-    A build switch (the installed torch carries a different ``+cuNNN`` tag than ``token``) cannot be
+    A build switch (the installed torch has a different ``+cuNNN`` tag than ``token``) cannot be
     held, because the held override pins torch's public version and the new build's index would still
     supply the new wheel. A hold would download the new build while reporting the old one as kept, so a
     hold requested for a switch declines it (``SYNC_DECLINED_RC``) and the installed build stays.

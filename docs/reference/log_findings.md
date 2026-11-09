@@ -8,18 +8,18 @@ passing the isolated `worker/logs` directory.
 | `benchmark_coverage_incomplete` | info | Some selected checks remain unconfirmed. | Read the reasons in the report. Remove an optional limit or prepare missing models before rerunning. |
 | `benchmark_concurrency_unobserved` | warning | Completed jobs did not establish the sampling overlap the configuration permits (the thread count, lowered to the sampling-lease slot count). | Read the report and worker logs before changing thread settings. |
 
-Every finding `horde-log diagnose` can emit, and every one the dashboard's Insights tab reads from the
-running worker. Each row gives the id the finding prints, its severity, what makes it fire, and what to do
-about it. The id is stable. The JSON output is keyed on it, the dashboard's Diagnostics tab shows it, and a
+Findings from `horde-log diagnose` and the dashboard's Insights tab. Insights uses the running worker's
+state. Each row lists the finding's id, severity, trigger, and action.
+The id is stable. The JSON output is keyed on it, the dashboard's Diagnostics tab shows it, and a
 `see also:` line points at it.
 
-Findings run over every session `horde-log sessions` lists. That includes each `horde-benchmark` run
+`horde-log diagnose` checks every session listed by `horde-log sessions`. That includes each `horde-benchmark` run
 read from `bridge_harness.log`, which is tagged `[benchmark run: bridge_harness.log]` in the text output
-and carries `"log_kind": "harness"` in the JSON. A finding under that tag describes the benchmark, even
+and includes `"log_kind": "harness"` in the JSON. A finding under that tag describes the benchmark, even
 when a worker ran over the same hours. Worker sessions and benchmark runs are numbered from #0 within
 their kind, so a session is identified by its `log_kind` and index together. In a support bundle, each
-`diagnose.json` entry carries `session_index` (that per-kind number), `log_kind`, and `session_label`, the
-heading the text output prints for the session (`#0`, or `#0  [benchmark run: bridge_harness.log]`).
+`diagnose.json` entry includes `session_index` (that per-kind number), `log_kind`, and `session_label`, the
+session heading in the text output (`#0`, or `#0  [benchmark run: bridge_harness.log]`).
 
 The ids are declared as `FindingKind` members in `horde_worker_regen/analysis/finding_kinds.py`, one
 per entry in the `FINDING_SPECS` table. A contract test (`tests/analysis/test_log_findings_doc.py`)
@@ -31,15 +31,15 @@ Severity sets the order of the report. **Critical** findings come first, then **
 **suggestion**, then **info**. The reader sees an action word in place of the level name. `Fix now` is
 critical (the worker is losing work or will be paused). `Check` is warning (something is wrong or
 wasteful). `Try` is suggestion (nothing is wrong, and a change would likely earn more). `Note` is info
-(context, no action). The JSON output carries both, as `severity` and `badge`. Some detectors pick their
+(context, no action). The JSON output includes both, as `severity` and `badge`. Some detectors pick their
 severity from the evidence, such as a one-off against a sustained pattern. Those are marked *varies*.
 Findings report problems. Some also give advisory or informational notes that are useful to an operator
 or maintainer. A report with no `parent_loop_stall` means the main process kept reading messages from the
 workers.
 
-Where acting on a remedy needs background the finding cannot carry, its spec gives a reference page
+When a remedy needs more background than fits in the finding, its spec gives a reference page
 (`FindingSpec.reference_page`). The text output prints it after the finding as a `more:` line, and the JSON
-output carries it as `reference_page`. A test asserts that every such path is a page that exists.
+output includes it as `reference_page`. A test checks that every referenced page exists.
 
 For how the detectors, the log lines they read, and the dashboard stay in step, see
 [Log diagnostics contract](../explanation/log_diagnostics_contract.md). For the commands, see

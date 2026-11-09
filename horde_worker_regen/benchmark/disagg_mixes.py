@@ -18,7 +18,7 @@ Two axes of pressure are expressed:
 - **VAE sharing** (:attr:`DisaggGateMix.CLUSTER_SHARED_VAE`,
   :attr:`DisaggGateMix.CLUSTER_DISTINCT_VAE`) holds the churn shape fixed but swaps the model pool
   for one whose checkpoints either share a VAE (so the VAE lane can retain a resident autoencoder
-  across the switch) or each carry a distinct VAE (so the VAE reload is unavoidable). The pair
+  across the switch) or each have a distinct VAE (so the VAE reload is unavoidable). The pair
   isolates the VAE-residency component of the switch cost from the rest.
 
 The default cluster pools are real measured clusters derived from the horde-model-reference canonical
@@ -53,7 +53,7 @@ class DisaggGateMix(StrEnum):
     CLUSTER_SHARED_VAE = auto()
     """Deterministic interleave over a pool whose checkpoints share one VAE (retainable across a switch)."""
     CLUSTER_DISTINCT_VAE = auto()
-    """Deterministic interleave over a pool whose checkpoints each carry a distinct VAE (reload unavoidable)."""
+    """Deterministic interleave over a pool whose checkpoints each have a distinct VAE (reload unavoidable)."""
 
 
 SHARED_VAE_MODEL_POOL: tuple[str, ...] = (
@@ -118,7 +118,7 @@ def _default_pool_for(mix: DisaggGateMix) -> tuple[str, ...]:
 
 
 def _share_selected(index: int, total: int, fraction: float) -> bool:
-    """Whether job ``index`` of ``total`` carries a feature present on ``fraction`` of the stream.
+    """Whether job ``index`` of ``total`` has a feature present on ``fraction`` of the stream.
 
     Uses the floor-crossing rule, which selects exactly ``floor(total * fraction)`` indices spread as
     evenly as possible, so a fixed list reproduces the target share deterministically without an RNG.
@@ -204,7 +204,7 @@ def _build_seeded_random_templates(
 
     Each model gets up to four feature buckets (plain, img2img-only, LoRA-only, both) whose weights are
     the product of the marginal shares, so across the pool the generated stream reproduces both the
-    img2img and LoRA target fractions independently. ``count`` carries the draw weight (the soak path
+    img2img and LoRA target fractions independently. ``count`` includes the draw weight (the soak path
     treats it as a relative weight, not a job count). The LoRA reference each bucket carries is rotated by
     ``seed`` so different seeds give different but reproducible template sets.
     """

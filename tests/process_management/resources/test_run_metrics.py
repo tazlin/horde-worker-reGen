@@ -272,7 +272,7 @@ class TestJobCorrelation:
         assert record.cfg_scale is None
 
     def test_alchemy_form_carries_its_reward(self) -> None:
-        """An alchemy form's record carries the reward its own submit response paid."""
+        """An alchemy form's record includes the reward its own submit response paid."""
         metrics = WorkerRunMetrics()
         metrics.record_alchemy_form(form_id="f", form="caption", e2e_seconds=1.0, faulted=False, kudos_reward=3.0)
         metrics.record_alchemy_form(form_id="g", form="caption", e2e_seconds=1.0, faulted=True)
@@ -333,7 +333,7 @@ class TestEventRing:
     def test_every_workloads_finished_job_reaches_the_ring_beside_its_record(self) -> None:
         """One recorder writes both, so no surface can show a finished job the other has not.
 
-        The ring carries the same figures the record does (the model, the duration, what the horde paid,
+        The ring includes the same figures the record does (the model, the duration, what the horde paid,
         and a text generation's token count), because a feed built from a second reading of the same job
         is a feed that can disagree with the totals beside it.
         """
@@ -1116,7 +1116,7 @@ class TestDecisionCoalescing:
         assert decisions[0]["resolved"] is False
 
     def test_heartbeat_after_interval_carries_repeat_count(self, tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
-        """Once the heartbeat interval elapses, one further record carries the accumulated repeat count."""
+        """Once the heartbeat interval elapses, one further record includes the accumulated repeat count."""
         import horde_worker_regen.process_management.resources.run_metrics as run_metrics
 
         monkeypatch.chdir(tmp_path)

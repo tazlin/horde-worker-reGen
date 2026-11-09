@@ -38,24 +38,24 @@ CPU = "cpu"
 CUDA_BUILDS: tuple[str, ...] = (CU126, CU130, CU132)
 
 # Drivers that print "CUDA UMD Version" in the bare nvidia-smi header no longer print "CUDA Version" there.
-# Both spellings carry the driver's CUDA ceiling, and `nvidia-smi -q` prints both as "Name : value".
+# Both spellings include the driver's CUDA ceiling, and `nvidia-smi -q` prints both as "Name : value".
 _CUDA_VERSION_RE = re.compile(r"CUDA(?: UMD)? Version\s*:\s*(\d+)\.(\d+)")
 # Whole-line only: when NVML fails, nvidia-smi prints a diagnostic carrying the driver version (e.g.
 # "NVML library version: 580.95") to stdout, which an unanchored match would parse as a capability. A line may
-# carry the driver version as a second CSV field (the query requests both fields).
+# include the driver version as a second CSV field (the query requests both fields).
 _GPU_QUERY_LINE_RE = re.compile(r"^\s*(\d{1,2})\.(\d)\s*(?:,\s*([^\s,]+)\s*)?$", re.MULTILINE)
 # The locked wheels cover overlapping but different architecture windows (verified against PyTorch's
 # CUDA build matrix and the NVIDIA CUDA 13 release notes):
 #   cu126 (CUDA 12.6): sm_50..sm_90  (Maxwell through Hopper; no Blackwell)
 #   cu130/cu132 (CUDA 13.x): sm_75..sm_120  (Turing through Blackwell; pre-Turing dropped in CUDA 13)
-# A build does not carry a kernel image for a card outside its window and dies at the first kernel launch
+# A build does not have a kernel image for a card outside its window and dies at the first kernel launch
 # (cudaErrorNoKernelImageForDevice), so the build must be clamped into the card's valid window in
 # both directions, not just upward. See _cuda_build.
 # Above this (Blackwell sm_100/sm_120), cu126 does not carry kernels, so floor to cu130.
 _CU126_MAX_COMPUTE_CAP = (9, 0)
 # Below this (pre-Turing), cu130/cu132 do not carry kernels, so ceil to cu126.
 _CUDA13_MIN_COMPUTE_CAP = (7, 5)
-# Windows "Display adapters" device class, whose subkeys carry a DriverDesc per adapter.
+# Windows "Display adapters" device class, whose subkeys have a DriverDesc per adapter.
 _DISPLAY_CLASS_KEY = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
 
 
@@ -294,10 +294,10 @@ def gpu_arch_supported(arch_list: list[str], capability: tuple[int, int]) -> boo
 def _clamp_build_to_arch(build: str, compute_cap: tuple[int, int]) -> str:
     """Clamp a CUDA build token into one GPU's valid architecture window.
 
-    A build token names a CUDA toolkit line but is not itself proof the wheel carries a kernel image for
+    A build token names a CUDA toolkit line but is not itself proof the wheel has a kernel image for
     the installed card, whether the token came from the driver-version pick, a persisted ``bin/backend``,
     or a forced override. cu126 carries sm_50..sm_90; the CUDA 13 wheels carry sm_75..sm_120 (pre-Turing
-    was dropped in CUDA 13). A build outside the card's window does not carry a kernel image and dies at the first
+    was dropped in CUDA 13). A build outside the card's window does not have a kernel image and dies at the first
     kernel launch (cudaErrorNoKernelImageForDevice), so the token is clamped both ways:
 
     * a Blackwell+ card (> ``_CU126_MAX_COMPUTE_CAP``) is lifted off cu126 onto cu130; cu126 can never run
@@ -407,7 +407,7 @@ def _format_capabilities(capabilities: tuple[tuple[int, int], ...]) -> str:
 # clamp_action values recorded on a BackendDecision, naming what the architecture clamp did to the
 # driver-ceiling (or persisted) build. These are stable strings a support bundle / test can key on.
 CLAMP_NONE = "in_window"  # the build already carries kernels for the card and is unchanged
-CLAMP_FLOORED = "floored_to_cu130"  # a Blackwell+ card lifted off cu126 (which does not carry a kernel image for it)
+CLAMP_FLOORED = "floored_to_cu130"  # a Blackwell+ card lifted off cu126 (which does not have a kernel image for it)
 CLAMP_CEILED = "ceiled_to_cu126"  # a pre-Turing card held on cu126 (the CUDA 13 wheels dropped it)
 CLAMP_SKIPPED = "skipped_unreadable_cap"  # compute capability could not be read, so no clamp was applied
 CLAMP_NOT_CUDA = "not_cuda"  # a cpu/rocm token, never clamped

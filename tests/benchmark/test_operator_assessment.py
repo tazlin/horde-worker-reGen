@@ -799,7 +799,7 @@ class SampledHttpTestWorker(HttpTestWorker):
 
 
 async def test_evidence_records_configure_and_sampling_seconds(tmp_path: Path) -> None:
-    """Measured evidence carries the check-boundary and sampling durations the report totals."""
+    """Measured evidence includes the check-boundary and sampling durations the report totals."""
     report = await OperatorAssessment(
         catalog_options=CatalogOptions(tiers=[BenchTier.SD15], include_features=False, include_alchemy=False),
         out_dir=tmp_path,

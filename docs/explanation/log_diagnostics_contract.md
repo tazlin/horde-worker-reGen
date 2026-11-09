@@ -67,8 +67,8 @@ regardless of which detector produced them. A finding has two layers: the plain 
 the title, the one-sentence headline and the "Do this" line) is always visible, and the detail layer
 (the mechanism prose, the evidence, the cross-reference, the docs page) is collapsed under it in the
 dashboard and printed after it by the CLI. Several of those fields are properties resolved against the
-finding's kind, so the tab needs no knowledge of the spec table: the only thing it knows about the
-analysis layer is the *shape* of `Finding` and the `Severity` enum used to colour the badge. The badge
+finding's kind. The renderer uses the `Finding` interface and the `Severity` enum to colour the badge.
+It does not access the spec table directly. The badge
 word itself (`Fix now`, `Check`, `Try`, `Note`) comes from the analysis layer so the CLI and the
 dashboard say the same thing. How the copy in each layer is written is the subject of
 [Write a finding](../how-to/write-a-finding.md).
@@ -83,16 +83,11 @@ line per detector (reusing the line builders in `tests/analysis/test_detectors.p
 real worker emits) and asserts two things:
 
 - **Each detector fires on its golden line** at the expected severity. If the worker rewords an emit so
-  a detector's regex no longer matches, that detector's golden line stops firing and this test names
-  exactly which detector broke.
+  a detector's regex no longer matches, that detector's golden line stops firing. The test reports
+  which detector failed.
 - **Every detector has a fixture** (the no-orphan guard): the set of functions in
   [`DETECTORS`][horde_worker_regen.analysis.detectors.DETECTORS] must equal the set of contract
   fixtures. Adding a detector without recording its log signature fails the suite.
-
-This test earned its keep on its first run: it found that the in-progress orphan watchdog's emit
-(`...punting it so the queue can drain (orphaned-job watchdog).`) did not match the orphan detector's
-regex, so `detect_orphan_wedge` had never been able to fire on a real log. Pinning the detector to the
-real emit forced the regex to be corrected.
 
 The contract test also leans on a naming convention: a detector named `detect_X` emits a finding whose
 `id` is `X`. Keeping the id derivable from the function name (rather than a second hand-maintained
@@ -117,7 +112,7 @@ Three tests hold the two ends of that contract:
 - **The live half** (`test_log_contract_dry_run.py`, marked `slow`): the worker is run through the
   dry-run harness, and every pattern the run can exercise must match a line that run actually wrote.
   This is the test that goes red when an emitting f-string is reworded. A line a dry run structurally
-  cannot produce (a fault, the submit success line under `dry_run_skip_api`) carries a `dry_run_reason`
+  cannot produce (a fault, the submit success line under `dry_run_skip_api`) has a `dry_run_reason`
   in the registry and is covered by the literal pin alone.
 - **The catalogue guard** (`test_log_findings_doc.py`): every finding id a detector constructs appears
   in [Log findings](../reference/log_findings.md).
@@ -126,7 +121,7 @@ Three tests hold the two ends of that contract:
 
 Job-shaped facts come from one parse per session:
 [`job_lifecycle_for(context)`][horde_worker_regen.analysis.job_lifecycle.job_lifecycle_for], cached on
-the `SessionContext`. It carries per-job records (pop, dispatch, generation, safety, submit, fault, and
+the `SessionContext`. It includes per-job records (pop, dispatch, generation, safety, submit, fault, and
 the batch that joined several horde jobs to one dispatch), the process-to-card map with its re-spawn
 history, the card count and intake budget, the parsed status prints, the line-skip census, the
 model-movement counts, and the parent's IPC drain timestamps; on top of those sit the derived views (the
@@ -155,7 +150,7 @@ the diagnosis is **declared before it is detected**:
    link that goes nowhere fails a test rather than reaching an operator.
 2. Write `detect_<name>(context) -> list[Finding]` in `detectors.py`, returning a finding with
    `kind=FindingKind.<NAME>`. Read job-shaped facts through `job_lifecycle_for(context)`; if you need a
-   log line the model does not carry, register its pattern in `log_signatures.py` first.
+   log line that is not included in the model, register its pattern in `log_signatures.py` first.
 3. Add it to the `DETECTORS` list.
 4. Add a golden-line fixture for it in `test_detector_contract.py`, and an entry in
    [Log findings](../reference/log_findings.md).
@@ -165,7 +160,7 @@ sentence with the measurement in it, never templated), the evidence, the severit
 genuinely depends on what was measured, an `action_addendum` appended to the spec's "Do this" line. A
 kind whose severities read as different incidents may pass a `title_override`; the spec's title stays
 the catalogue name. Where every emit words its own fix, the spec's `action` is empty and the addendum
-carries it.
+provides it.
 
 The CLI and the Diagnostics tab pick it up with no changes. Step 4's two halves are the manual
 duplication the design accepts, and the no-orphan guard and the catalogue guard make forgetting either

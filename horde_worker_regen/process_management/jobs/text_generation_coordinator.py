@@ -133,7 +133,7 @@ READY_BACKOFF_MAX_SECONDS: Final = 15.0
 """Longest wait between readiness probes, so a backend started late is picked up promptly."""
 
 READY_SLOW_START_NOTICE_SECONDS: Final = 120.0
-"""How long the readiness gate waits before saying out loud that the backend has not answered.
+"""Delay before reporting that the backend has not responded.
 
 A cold start is slow in a way that is entirely normal: a packaged backend unpacks itself and then loads
 weights from disk, which together run to a minute or more, so the gate's patience is minutes and its
@@ -466,7 +466,7 @@ def build_text_backend(
 class TextJobInFlight:
     """Represents one popped text job for as long as the flow is responsible for it.
 
-    Lives from the pop until the submit resolves, so it also carries the two facts that outlive a single
+    Lives from the pop until the submit resolves, so it also includes the two facts that outlive a single
     call: how many times a busy backend has turned the job away, and whether the flow has already asked
     the backend to abandon the generation.
     """
@@ -502,14 +502,14 @@ class TextJobInFlight:
     """The most recent thing the backend said about this generation while it was running.
 
     None before the first chunk arrives and for a job the backend never began. Replaced rather than
-    accumulated: each report already carries the running totals, so the latest one is the whole state.
+    accumulated: each report already includes the running totals, so the latest one is the whole state.
     """
     prompt_tokens: int | None = None
     """Prompt tokens the backend reported for this job, or None when nothing it offers reported them."""
     generated_tokens: int | None = None
     """Generated tokens the backend reported for this job, or None when nothing reported them."""
     busy_attempts: int = 0
-    """How many times the backend has answered busy for this job."""
+    """Number of busy responses returned by the backend for this job."""
     first_busy_at: float | None = None
     """The `time.monotonic()` reading of the backend's first busy answer for this job, or None.
 

@@ -31,7 +31,7 @@ The failures encoded here:
   computes before a load or a sampling window comes out too small: it gives nothing back, allocates anyway, and
   the card's real free figure collapses to the paging cliff. Retention is what makes that reachable, because it
   leaves a footprint standing across job boundaries that the child's own arithmetic is then the last defense
-  over. The remedy is a dispatch that carries the parent's device-level reading, which the child clamps its view
+  over. The remedy is a dispatch that includes the parent's device-level reading, which the child clamps its view
   with. That is the ``device truth`` scenario, and its reinjection is a worker whose dispatches carry no reading.
 - **Strict queue order evicts the copy the queue was about to reuse.** Retention holds weights on a slot
   between jobs, but placement order is the queue's own: on a model rotation wider than the lane pool the cold
@@ -97,7 +97,7 @@ The failures encoded here:
   nobody was making; the card sat empty for the length of the deferral with fitting work already on a lane,
   and the recovery ladder then fired constructive remedies against a governance decision. That is the
   ``governed head`` scenario, and its reinjection is head-protection pricing with the stand-down dropped.
-- **A residency that tore down its own pre-stage target.** A pre-staged whole-card head carries its model on
+- **A residency that tore down its own pre-stage target.** A pre-staged whole-card head records its model on
   no lane until its load lands, and the model-name protection every residency shrink relies on cannot reach a
   slot with no name. A reprice tightening the target in that window is a shrink whose own target is the first
   idle lane it finds. That is the ``pre-stage target`` scenario, and its reinjection is the shrink called
@@ -496,7 +496,7 @@ async def test_a_same_model_streak_is_served_from_one_retained_copy() -> None:
 
     Read as one positive statement and its physical consequences: the streak uploads a bounded number of times
     rather than once per job, every job is seated
-    on the slot holding those weights, the card never carries a second copy, and it stays above its floor
+    on the slot holding those weights, the card does not have a second copy, and it stays above its floor
     while doing so. The duty floor is what stops the memory verdicts from being satisfiable by a worker that
     simply declines to dispatch.
     """
@@ -802,7 +802,7 @@ async def test_d_a_retention_streak_fits_the_card_on_device_truth() -> None:
     and the worker starts relieving the card by taking its own capacity down.
 
     The card here is asked for more than the forecast priced, so a shortfall genuinely arises and somebody has
-    to answer it. Read as one positive statement and its consequences: the dispatch carries the parent's
+    to answer it. Read as one positive statement and its consequences: the dispatch includes the parent's
     device reading, the child's relief comes out of its own footprint, the card keeps its margin, the governor
     never saturates, no lane is taken off the air, and the streak still drains on its first upload alone.
     """
@@ -984,7 +984,7 @@ async def test_e_a_rotation_serves_retained_copies_before_loading_a_cold_head_ov
     lane other than the retainer to go to, the job the retainer can already serve is seated first and the head's
     load runs alongside its sampling, so the run's uploads fall below one per job, the placement order engages
     rather than being incidental, every job still drains (the reordering is bounded, so a cold head is never
-    traded away), and the card carries the co-residency that makes the reuse possible without saturating.
+    traded away), and the card supports the co-residency that makes the reuse possible without saturating.
     """
     world = _streak_world(lane_count=_ROTATION_LANES)
 
@@ -1634,7 +1634,7 @@ async def test_h_recurring_pressure_cycles_safety_at_most_once_per_dwell(monkeyp
     recurring pressure then spends its session rebuilding safety, buying each time exactly the relief the
     previous cycle had already failed to hold.
 
-    Read as one positive statement and its consequences: the rung carries a dwell, so consecutive safety
+    The rung has a minimum hold time, so consecutive safety
     actuations are a cooldown apart however often the card saturates; a ladder-owned pause earns its restore
     with the same sustained-fit evidence the placement policy requires rather than on the first passing sample;
     and the run still completes work, so the dwell is not bought by a worker that stopped serving.
@@ -1751,7 +1751,7 @@ async def test_i_a_rotation_restages_the_model_whose_lane_was_loaded_over(max_th
     the hold itself sustains may be what stops that head. The two residency records are reconciled every
     pass, so a lane loaded over leaves no record of weights it has given up, the displaced model is staged
     again, and the head that the hold defers to arrives. Read as one positive statement and its
-    consequences: the parent never carries a record of weights no lane holds, every job reaches sampling, and
+    consequences: the parent does not record weights that are not held by any lane, every job reaches sampling, and
     the rotation drains inside a bounded schedule at a duty the card earns from.
 
     Run at both sampling capacities: the wedge is reached whether or not a second job may sample, so a fix
@@ -2405,7 +2405,7 @@ async def _drive_prestage_target_scenario(world: _DispatchWorld) -> int:
         f"precondition: the pre-stage load must still be in flight when it is lost. {world.state_dump()}"
     )
     # The child carrying the pre-stage dies mid-load and its slot is rebuilt empty. The residency still names
-    # that slot and no lane carries the head's model, so the convergence shrink (which waits for a holder)
+    # that slot and no lane includes the head's model, so the convergence shrink (which waits for a holder)
     # stands down and the reprice is the only shrink left running over a pool it can still cut.
     assert world.kill_lane_holding(_FLUX), f"the pre-stage load had no lane to lose. {world.state_dump()}"
     for _ in range(_COMMITTED_SLOT_SETTLE_TICKS):
@@ -2416,7 +2416,7 @@ async def _drive_prestage_target_scenario(world: _DispatchWorld) -> int:
 async def test_n_a_reprice_spares_the_slot_a_whole_card_head_is_pre_staging_into() -> None:
     """A tightened residency target does not take the slot its own head is being loaded into.
 
-    This row encodes the failure in which a pre-staged head carries its model on no lane until its load lands, so the
+    A pre-staged head's model is not recorded on any lane until its load finishes, so the
     model-name protection every residency shrink relies on cannot reach the slot the pre-stage chose. A
     reprice that tightens the target in that window is a shrink with nothing protecting its own target, and
     the slot the residency is loading into is the first idle lane it finds.
@@ -2808,7 +2808,7 @@ job is decided by its pixels alone, and the heavy class can only ever land on ca
 
 _TWO_CARD_SAFETY_CARD = 1
 """The card the safety process is pinned to: the one whose own work is light, so its measured evidence says it
-is serving comfortably while its sibling carries the peak the worker cannot give it."""
+is serving comfortably while its sibling requires the peak the worker cannot give it."""
 
 _TWO_CARD_HEAVY_SHAPE = (1280, 1280)
 _TWO_CARD_HEAVY_BATCH = 2
@@ -2843,7 +2843,7 @@ is the share of a job that is neither load nor decode, and this is a comfortable
 def _two_card_safety_world() -> _DispatchWorld:
     """Two independent 10 GB cards, one inference lane each, safety pinned to the lighter card's ledger.
 
-    Both cards carry a resident checkpoint of their own and serve their own class of traffic; safety sits on
+    Both cards have a resident checkpoint of their own and serve their own class of traffic. Safety sits on
     card 1 with that card's context, its resident weights and its sampling activation beside it. Whole-card
     residency is off, so nothing but the placement policy and the reclaim ladder can move safety, and the
     ladder only runs on a saturated card.
@@ -2940,7 +2940,7 @@ def _price_the_peak_worker_wide(
 
 
 async def test_q_safety_stays_on_a_card_committed_only_to_the_work_it_serves() -> None:
-    """A card serving its own light work keeps its safety process while a sibling card carries the heavy peak.
+    """A card serving its own light work keeps its safety process while a sibling card handles the heavy peak.
 
     This row encodes the failure in which safety's placement was judged against a worker-wide sampling peak. On a
     multi-card pool the heaviest queued job is routinely one this card can never be given (its effective
@@ -3568,7 +3568,7 @@ _UNSEEN_TENANT_SLACK_SECONDS = 3.0
 _UNSEEN_TENANT_MODEL = _FLUX
 """The large model the waiter's job runs, as in the shortfall this row encodes.
 
-The job carries a LoRA, so :func:`pricing_mod.partial_seat_mb` does not seat it and clearance prices its whole
+The job has a LoRA, so :func:`pricing_mod.partial_seat_mb` does not seat it and clearance prices its whole
 need. An SDXL head cannot carry this row. Its diffusion weights less the encode it holds once staged are smaller
 than what the three service lanes return, so whenever its reading also leaves room for its non-weight reserve
 (which a measured attempt needs), a lane rung can close its shortfall."""
@@ -5184,7 +5184,7 @@ bias in the arrival sequence rather than in a simulated popper keeps the world's
 here uses, and makes the residency mix a property of the traffic the row is written against."""
 
 _BUNDLE_POST_PROCESSING_SHARE = 1.0 / 3.0
-"""How much of the traffic carries a post-processing chain, and so competes for the single lane."""
+"""How much of the traffic has a post-processing chain, and so competes for the single lane."""
 
 _BUNDLE_ARRIVAL_COUNT = 256
 """Length of the pinned arrival sequence, cycled if a run outlasts it: comfortably more than the jobs a run
@@ -6039,7 +6039,7 @@ _HEADROOM_LEVELS = (
     _HostHeadroom("tight", _SAME_BASELINE_LANES / 2),
 )
 """Every checkpoint the traffic names stays cached at the ample level. The moderate level holds the lanes'
-four only while no lane carries a transient, and the tight level holds half of them, so idle lanes go cold."""
+four only while no lane has a transient, and the tight level holds half of them, so idle lanes go cold."""
 
 
 def _same_baseline_arrivals() -> tuple[tuple[float, _ModelClass], ...]:

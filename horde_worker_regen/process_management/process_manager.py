@@ -583,7 +583,7 @@ def _performance_mode_megapixelsteps(config: reGenBridgeData) -> int:
     """Return one card's megapixelstep intake budget for its effective performance mode.
 
     The flat values predate multi-GPU: they were tuned as a whole worker's budget when the worker was one
-    card, so per card they carry the same meaning. High performance mode trumps moderate when both are set.
+    card, so per card they have the same meaning. High performance mode overrides moderate when both are set.
     """
     if config.high_performance_mode:
         return 80
@@ -884,7 +884,7 @@ class MultiprocessingPrimitives:
         when the child held nothing. The child's own acquire/release stay paired and idempotent, so
         the bound is never hit in normal operation.
         """
-        # ctx.Queue(), NOT multiprocessing.Queue(): a Queue carries an internal SemLock, and the children
+        # ctx.Queue(), NOT multiprocessing.Queue(): a Queue has an internal SemLock, and the children
         # are started from this (spawn) ctx. The global multiprocessing module defaults to fork on Linux, so
         # a global Queue() yields a fork-context SemLock that cannot be pickled into a spawn child ("A SemLock
         # created in a fork context is being shared with a process in a spawn context"). The worker happens to
@@ -1767,7 +1767,7 @@ class HordeWorkerProcessManager:
         # alone. Populated from memory reports and from the backend's per-job footprint, and persisted beside the
         # performance model so a restart keeps its calibration rather than re-learning it from live traffic.
         # In memory only under test, on the same terms as the performance model. A file written before keys
-        # carried a card is re-keyed only when the worker drives one card, the card that measured it.
+        # included a card size is re-keyed only when the worker drives one card, the card that measured it.
         self._learned_footprint_store = LearnedFootprintStore(
             path=None if os.environ.get("AI_HORDE_TESTING") else default_app_state_dir() / FOOTPRINT_STORE_FILENAME,
             driven_card_totals_gb=[card_total_gb(card.total_vram_mb) for card in self._card_runtimes.values()],
@@ -2873,7 +2873,7 @@ class HordeWorkerProcessManager:
     def _all_governed_cards_under_vram_pressure(self) -> bool:
         """Whether every governed card sits below the device-free governor's soft floor.
 
-        The popper's whole-card-model offer narrowing reads this: a model that wants the whole card has nowhere
+        The popper's whole-card-model offer narrowing reads this: a model that requires the whole card has nowhere
         to go while no card is HEALTHY, so it comes off the offer. The question is worker-wide because the offer
         is (the worker routes a popped job to whichever card can serve it), so one healthy card answers no. A
         host with no governed card (no NVML reading yet) also answers no, keeping the offer unnarrowed while
@@ -5237,7 +5237,7 @@ class HordeWorkerProcessManager:
 
         On success the routing forks on the job's requested output: a ``return_control_map`` job's map *is*
         the deliverable, so it goes straight to safety in place of inference; every other controlnet job
-        carries the map back into inference as its premade control map. On any fault both forms fall through
+        passes the map back to inference as its premade control map. On any fault both forms fall through
         to in-graph annotation (a ``return_control_map`` job's in-graph path still produces the map). The lane is
         free for its next unit of work whatever happens to the result.
         """
@@ -5282,7 +5282,7 @@ class HordeWorkerProcessManager:
     def _fault_unready_extended_controlnet_jobs(self) -> None:
         """Hold or reissue each queued extended-controlnet job the worker cannot serve right now.
 
-        A job whose control type the image-utilities lane serves, or that already carries its derived control
+        A job whose control type the image-utilities lane serves, or that already includes its derived control
         map, passes to pre-annotation or inference. A job that needs pre-annotation of a type the lane cannot serve
         yet is held at dispatch while the lane is up or coming up
         (:meth:`ProcessLifecycleManager.utilities_lane_will_serve`), or while its start waits for VRAM headroom
@@ -5465,7 +5465,7 @@ class HordeWorkerProcessManager:
     def _first_available_utilities_process(self) -> HordeProcessInfo | None:
         """Return a live, idle image-utilities lane process that is not holding a unit of work, or None.
 
-        Liveness is checked as well as readiness: a lane that has died still carries its last reported state,
+        Liveness is checked as well as readiness: a lane that has died still includes its last reported state,
         so readiness alone would hand work to a process that is on its way out of the map, which for a
         re-queued strip means feeding it straight back to the lane it was just rescued from. Readiness
         (:meth:`HordeProcessInfo.can_accept_job`) excludes a lane any sender has already given work to.
@@ -6557,7 +6557,7 @@ class HordeWorkerProcessManager:
         behaviour. It is the anchor a later analysis uses to attribute an observed change to the
         configuration it ran under; kept flat and scalar so any downstream reader consumes it directly.
 
-        A harness- or benchmark-driven session additionally carries the identity of the workload it ran
+        A harness or benchmark session also includes the workload identity
         (``scenario_id``/``scenario_revision``, from the environment), which is what lets records gathered
         on different machines be paired by workload rather than only by configuration. Those keys are
         absent for a production run, which has no scenario.
@@ -6868,7 +6868,7 @@ class HordeWorkerProcessManager:
         """The slot-duty attribution for the window since the previous duty-cycle log line, or None.
 
         Differences the scheduler's cumulative slot-second totals against the anchor taken at the last
-        emit, so each duty line carries its own window's capacity-normalized active/idle/gated breakdown
+        emit, so each duty line includes its own window's capacity-normalized active/idle/gated breakdown
         beside the device-utilization figure. Advances the anchor, so call at most once per emit.
         """
         totals, capacity, _hold = self._inference_scheduler.slot_duty_snapshot()
@@ -8721,7 +8721,7 @@ class HordeWorkerProcessManager:
 
     # region whole-worker job counters
 
-    # A worker's headline job figures are the whole worker's. The image job tracker knows only image jobs,
+    # A worker's headline job figures are the whole worker's. The image job tracker records only image jobs,
     # so a worker serving alchemy or text alone would report the tracker's zero while its own counters
     # climbed. Each flow's counters keep the semantics the tracker's have, which is what makes them
     # addable, and the per-workload split stays on the ``alchemy_*``/``text_*`` fields and

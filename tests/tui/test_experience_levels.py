@@ -132,7 +132,7 @@ class _Process:
         self.last_total_steps = total
         self.last_heartbeat_timestamp = heartbeat
         # The Simple helpers read only the worker's own children here; a supervised external program is
-        # skipped, so the stand-in carries the discriminator that says which it is.
+        # skipped, so the stand-in includes the discriminator that says which it is.
         self.is_external = is_external
 
 
@@ -399,7 +399,7 @@ async def test_simple_config_always_offers_the_way_back(tmp_path: Path) -> None:
 
 @pytest.mark.slow
 async def test_every_shortcut_is_discoverable_though_the_footer_truncates(tmp_path: Path) -> None:
-    """The footer shows only what fits, so the palette and help must carry the complete set."""
+    """The footer shows only what fits, so the palette and help must include the complete set."""
     _fake, app = _make_app(tmp_path)
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.pause()
@@ -685,7 +685,7 @@ async def test_the_callout_speaks_only_when_the_figures_warrant_it(tmp_path: Pat
     """The callout appears on the worker's own anomalous figures and is absent otherwise.
 
     A block that is always present teaches a contributor to skip it, so an unremarkable worker has to
-    leave the framing line standing alone. When it does speak, the sentence has to carry the live
+    leave the framing line standing alone. A displayed callout's text must include the live
     figures: an invented number drifts from the table beneath it the moment either changes.
     """
     fake, app = _make_app(tmp_path, level=ExperienceLevel.SIMPLE)

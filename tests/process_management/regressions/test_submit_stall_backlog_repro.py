@@ -163,7 +163,7 @@ def _make_submitter(
 
 
 def _image_job(r2_upload: str = "https://example.com/upload") -> ImageGenerateJobPopResponse:
-    """A single-image job whose pop response carries an R2 upload target (so it is submittable)."""
+    """A single-image job whose pop response has an R2 upload target (so it is submittable)."""
     return make_job_pop_response("stable_diffusion", r2_upload=r2_upload)
 
 

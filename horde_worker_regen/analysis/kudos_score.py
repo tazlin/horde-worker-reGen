@@ -256,7 +256,7 @@ def payload_from_job_record(record: JobMetricsRecord) -> KudosPayload:
 
     The record does not retain sampler/cfg/karras/denoising; the harness's canned jobs hold those
     constant (``k_euler``/7.5/karras/1.0), so the constants are filled here. A control-typed job
-    always carries a source image on the harness path, mirroring ``make_canned_job``.
+    always has a source image on the harness path, mirroring ``make_canned_job``.
     """
     has_control = record.control_type is not None and record.control_type != "None"
     return KudosPayload(

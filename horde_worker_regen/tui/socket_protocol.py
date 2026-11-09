@@ -47,7 +47,7 @@ MSG_HOST_SHUTDOWN = "host_shutdown"
 
 Broadcast to every client just before the host closes its sockets, so a watcher (notably the web launcher)
 learns the host is gone with intent rather than having to infer it from a bare socket EOF. The socket close
-that follows is the authoritative signal; this frame only carries the reason for a precise log line."""
+that follows is the authoritative signal. This frame only includes the reason for a precise log line."""
 
 # Lifecycle actions a client may request of the host (process-level, distinct from worker commands).
 LIFECYCLE_START = "start"

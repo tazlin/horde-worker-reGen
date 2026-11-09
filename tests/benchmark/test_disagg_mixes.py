@@ -211,7 +211,7 @@ def _png_dimensions(source_image_b64: str) -> tuple[int, int]:
 
 
 class TestImg2ImgSourceImages:
-    """The img2img share carries a real, deterministic source image so the VAE-encode lane fires."""
+    """The img2img share has a real, deterministic source image so the VAE-encode lane fires."""
 
     def test_img2img_jobs_carry_a_source_image_and_plain_jobs_do_not(self) -> None:
         """Every expanded img2img job ships a source image; every txt2img job ships none."""

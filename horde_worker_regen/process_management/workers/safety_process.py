@@ -717,7 +717,7 @@ class HordeSafetyProcess(HordeProcess):
 
         Pillow's median-cut quantizer does the clustering, so this needs no model and no optional
         dependency. The image is thumbnailed first because palette fidelity does not benefit from full
-        resolution and the quantizer cost scales with pixel count. Each entry carries the colour as a
+        resolution and the quantizer cost scales with pixel count. Each entry includes the colour as a
         ``#rrggbb`` hex string and its ``proportion`` of sampled pixels (the quantizer's per-bucket
         pixel counts), so a caller can weight by prominence.
         """

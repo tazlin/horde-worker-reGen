@@ -79,7 +79,7 @@ def koboldcpp_launch_spec(settings: TextBackendLaunchSettings) -> TextBackendLau
     With several parallel requests the context is sized for all of them at once. koboldcpp gives its batching
     slots one shared KV pool of ``--contextsize`` cells and clamps each request only to that pool, while the
     worker advertises the full context per job and takes that many jobs at a time. A pool of one context
-    runs out of cells once two long requests overlap, and every later request is answered busy.
+    runs out of cells once two long requests overlap, and every later request gets a busy response.
     """
     context_cells = settings.context_length * settings.parallel_requests
     arguments: list[str] = [

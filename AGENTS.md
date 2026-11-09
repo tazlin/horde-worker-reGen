@@ -232,7 +232,7 @@ Start from the mechanism, not the file. Each line states the owner of one questi
   `worker_entry_points.FORCE_LOAD_SKIP_BASELINES`. The grant can reach the child before the child starts the job.
   The parent clears a staged waiter at dispatch, `ClearanceLeaseProxy.begin_job` unsets the shared figures, and
   `_refresh_unconsumed_grant_figures` rewrites both the device free and the reserve of every unconsumed grant on
-  each step from the staged waiter's price, so a grant issued before the job start carries its reserve one step
+  each step from the staged waiter's price, so a grant issued before the job start includes its reserve one step
   later. The parent stops refreshing device free VRAM when the child takes its stage permit. A reading during
   upload would cause hordelib's clamp to count uploaded weights twice. The lease brackets the stage upload and
   the denoise only; the encoder load, the encode and the VAE decode run outside it. In a run, the released
@@ -297,7 +297,7 @@ uv run pytest -m chaos_sweep        # generated wedge-liveness sweep (pre-releas
   stay here.
 - **Marker contract:** the `slow`, `gpu`, and `chaos_sweep` bands run only when the `-m` expression
   names them (`-m "not slow"` and `-m slow` both behave as written). The chaos sweep's full-worker
-  half is also `slow`: `-m "chaos_sweep and slow"`. `CONTRIBUTING.md` carries the gate commands and
+  half is also `slow`: `-m "chaos_sweep and slow"`. `CONTRIBUTING.md` includes the gate commands and
   the `HORDE_CHAOS_SEEDS` replay/widen override. `golden_regen` is a fourth opt-in band, and the only one
   that writes: it rewrites the committed scheduler traces under
   `tests/process_management/liveness/golden/` (`-m golden_regen`), so a regeneration is always a reviewed
@@ -306,11 +306,11 @@ uv run pytest -m chaos_sweep        # generated wedge-liveness sweep (pre-releas
   after the rest of `process_management`, and cost seconds each, so an iteration gate is
   `-m "not closed_loop"` plus the rows named for the change, and the whole band runs once before a commit.
   That whole-band run takes `-n auto` (`pytest-xdist`, a dev dependency that is never on by default) on its
-  own selection; `CONTRIBUTING.md` carries the command and the two caveats, chiefly that the suite's
+  own selection. `CONTRIBUTING.md` includes the command and the two caveats, chiefly that the suite's
   fastest-first run order is a serial property.
-  Every run prints its thirty slowest tests (`--durations` is in `addopts`); read them off the tee before
+  Every run prints its thirty slowest tests (`--durations` is in `addopts`). Read them off the tee before
   reaching for a stopwatch.
-- **Rerun the failure, not the band.** Every `FAILED` line carries a node id; rerun exactly that
+- **Rerun the failure, not the band.** Every `FAILED` line includes a node id. Rerun exactly that
   (quote parametrized ids verbatim). One chaos seed replays via `HORDE_CHAOS_SEEDS=<seed>`. Tee long
   runs to a file once and grep the tee. Concurrent pytest runs in one checkout are safe: every test gets
   its own run root (`HORDE_WORKER_RUN_ROOT`, set by an autouse fixture), so the `.abort` sentinel, `logs/`
@@ -403,7 +403,7 @@ uv run pytest -m chaos_sweep        # generated wedge-liveness sweep (pre-releas
 - **Faulting a doomed job back to the horde sends the same burn to the next worker.** Before
   automating what follows a failure (retries, quarantines, breakers), ask whether the failure has to
   happen at all.
-- **A card can carry a tenant nobody lists.** A graphics or driver tenancy can hold gigabytes that NVML's
+- **A card can have a tenant that is not listed.** A graphics or driver tenancy can hold gigabytes that NVML's
   compute-process list does not show; the worker learns it only through the foreign floor. The floor is learned
   from positive readings only (a reading at or below zero is an over-charged worker footprint, never evidence of
   zero foreign), and where the driver reports per-process usage the worker's own share is measured from its
@@ -491,7 +491,7 @@ These fail as interactions, not as units, so component tests stay green through 
   ahead of dispatch (off, the lane ignores the message); a dispatch adopts a running warm and clearance pays only
   the unfinished part. All four default to the off or `max_threads` value. `performance_model=True` gives
   the scheduler an in-memory, unseeded `PerformanceModel` fed each finished job's sampling rate and its
-  finalization, so a dispatched slot carries an expected sampling time once a signature has enough samples;
+  finalization, so a dispatched slot has an expected sampling time once a signature has enough samples;
   `learned_footprints=True` sends each lane's per-tick memory report through a real `MessageDispatcher` into
   a `LearnedFootprintStore` the scheduler prices from (`world.footprint_store`), so a row can state what the
   parent learns from what its children report. It is opt-in because a parent that learns the children's
@@ -502,7 +502,7 @@ These fail as interactions, not as units, so component tests stay green through 
   a load allocates when it completes and reports its peak, and a device unload keeps the model in RAM.
   With it, a device load of a RAM-held checkpoint also reads back whatever pages the host reclaimed (least
   recently used first, at the ledger's `read_mb_per_second`, under foreign RAM a row can script per tick with
-  `foreign_mb_by_tick`), and a monolithic load carries its text encoder and VAE.
+  `foreign_mb_by_tick`), and a monolithic load includes its text encoder and VAE.
   `phase_resident_components=True` charges a sampling job its sampler-only footprint and a decode tail its
   weights plus the decode spike, as ComfyUI loads components separately; the encode phase is not modelled.
   `partial_loads=True` models hordelib's and ComfyUI's partial loads: a lane's offloaded remainder survives the

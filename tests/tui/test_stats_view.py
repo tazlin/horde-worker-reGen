@@ -88,7 +88,7 @@ def test_a_workload_whose_backend_counts_no_tokens_shows_no_mean() -> None:
 
 
 def test_the_workload_split_shows_for_a_scribe_only_worker() -> None:
-    """Its single row carries the token mean, which the headline counters have no room for."""
+    """The single row includes the mean token count, which does not fit in the headline counters."""
     snapshot = WorkerStateSnapshot(
         config=WorkerConfigSummary(dreamer_name="Tester", dreamer=False, worker_version="12.0.0", scribe=True),
         workload_totals={

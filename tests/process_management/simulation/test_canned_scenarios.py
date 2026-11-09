@@ -52,7 +52,7 @@ class TestFeatureFactories:
         assert names == ["lora-a", "lora-b", "lora-a"]
 
     def test_ti_scenario_injects_prompt(self) -> None:
-        """TI jobs carry the embedding name with prompt injection."""
+        """TI jobs include the embedding name with prompt injection."""
         jobs = make_ti_scenario(1, ["some-ti"])
         assert jobs[0].payload.tis is not None
         assert jobs[0].payload.tis[0].name == "some-ti"
@@ -70,7 +70,7 @@ class TestFeatureFactories:
         assert jobs[0].payload.post_processing == ["RealESRGAN_x4plus", "GFPGAN"]
 
     def test_hires_fix_scenario(self) -> None:
-        """Hires-fix jobs carry the flag and the requested resolution."""
+        """Hires-fix jobs include the flag and the requested resolution."""
         jobs = make_hires_fix_scenario(1, width=1024, height=1024)
         assert jobs[0].payload.hires_fix
         assert jobs[0].payload.width == 1024
@@ -105,7 +105,7 @@ class TestDeterministicPayloadKnobs:
     """Seed/prompt/source_processing knobs override the pinned canned payload, defaulting to today's pins."""
 
     def test_defaults_reproduce_pinned_seed_and_prompt(self) -> None:
-        """With the knobs unset, a canned job carries the exact historical seed and prompt pins."""
+        """With the knobs unset, a canned job includes the exact historical seed and prompt pins."""
         job = make_canned_job()
         assert job.payload.seed == _PINNED_SEED
         assert job.payload.prompt == _PINNED_PROMPT
@@ -223,7 +223,7 @@ class TestSamplerAndSchedulerAxes:
 
 
 class TestImg2ImgSourceImage:
-    """A plain img2img/remix source-processing job carries a deterministic synthetic start image."""
+    """A plain img2img/remix source-processing job has a deterministic synthetic start image."""
 
     def test_img2img_job_gets_a_source_image_at_its_resolution(self) -> None:
         """An img2img job with no control/workflow still ships a source image sized to the job."""
@@ -237,7 +237,7 @@ class TestImg2ImgSourceImage:
         assert (width, height) == (768, 512)
 
     def test_remix_also_gets_a_source_image(self) -> None:
-        """The remix mode is treated as img2img-class and likewise carries a start image."""
+        """The remix mode is treated as img2img-class and likewise has a start image."""
         job = make_canned_job(source_processing="remix", seed="7")
         assert job.source_image
 
@@ -253,7 +253,7 @@ class TestImg2ImgSourceImage:
 
 
 class TestInpaintingSourceInputs:
-    """An inpainting job carries both a start image and a mask, deterministically.
+    """An inpainting job includes both a start image and a mask, deterministically.
 
     Without the mask the pipeline either faults or quietly regenerates the whole frame, so the job's
     measured cost would not be an inpaint's.

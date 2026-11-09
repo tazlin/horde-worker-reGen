@@ -9,7 +9,7 @@ the run actually produced.
 
 Marked ``slow`` because the harness spawns real child processes for the protocol-faithful fakes.
 
-Lines a dry run cannot produce carry a ``dry_run_reason`` in the registry and are exempted here; the
+Lines a dry run cannot produce have a ``dry_run_reason`` in the registry and are exempted here. The
 literal pin still covers them. Today those are the two fault lines (this scenario completes every job),
 the submit success line (``dry_run_skip_api`` returns before it), the per-step sampling readout (the
 fake children report no step progress), and four lines a short deterministic run reaches only through

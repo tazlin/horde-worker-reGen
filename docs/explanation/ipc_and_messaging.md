@@ -52,12 +52,12 @@ interrogation embedding tables, and the aesthetic head) while retaining the base
 memory and return to `WAITING_FOR_JOB`, which lets pressure recovery and warm benchmark boundaries wait for
 an acknowledged release rather than assuming an asynchronous send already took effect.
 
-The inference, preload, and alchemy control messages also carry an optional
+The inference, preload, and alchemy control messages also have an optional
 `trace_context` (W3C traceparent) so the child's work spans correlate with the
 parent's job span in logfire.
 
 > Control messages are addressed point-to-point over a process's dedicated pipe,
-> so unlike status messages they do **not** carry a `process_launch_identifier`;
+> so unlike status messages they do **not** have a `process_launch_identifier`;
 > the pipe itself identifies the recipient. The launch identifier lives on the
 > child→parent status messages (see below).
 
@@ -87,7 +87,7 @@ so a routing-incapable process is never asked.
 | `HordeSafetyResultMessage`        | Safety check completes                       | `job_id` + per-image safety evaluations (NSFW/CSAM flags, optional replacement image) |
 
 The two metrics messages (`HordeJobMetricsMessage`, `HordeDownloadMetricsMessage`)
-carry the numbers from hordelib's in-process metrics collector into the main
+send the numbers from hordelib's in-process metrics collector into the main
 process's run-metrics aggregator; see
 [Architecture → Metrics and observability](architecture.md#metrics-and-observability).
 

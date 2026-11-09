@@ -59,7 +59,7 @@ class TestHordeInferenceResultMessage:
 
 
 class TestSampleSliceResult:
-    """Tests for the sample stage's per-slice result, which carries the sampler-truncation record."""
+    """Tests for the sample stage's per-slice result, which includes the sampler-truncation record."""
 
     def test_a_slice_without_a_truncation_round_trips_as_none(self) -> None:
         """The field is optional: a slice from an engine without the bounded sampler simply omits it."""

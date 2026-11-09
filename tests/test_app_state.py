@@ -332,7 +332,7 @@ def test_log_benchmark_hint_silent_when_current(tmp_path: Path, monkeypatch: pyt
 
 
 def test_build_capability_benchmark_record_counts_proven_probes() -> None:
-    """The capability-report adapter counts proven probes as passed and carries the same stamps."""
+    """The capability-report adapter counts proven probes as passed and includes the same stamps."""
     from horde_worker_regen.app_state import build_capability_benchmark_record
     from horde_worker_regen.benchmark.capabilities.capability import Capability, CapabilityKind, CapabilityVerdict
     from horde_worker_regen.benchmark.capabilities.result import (

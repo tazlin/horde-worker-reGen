@@ -98,7 +98,7 @@ class PendingRetentionEviction:
     """A retained resident whose eviction was issued and has not yet been seen to land on the card.
 
     Residency tracking clears the instant the unload is sent, but the bytes come back only when the child has
-    freed them. The record carries the card's free reading and the slot's reservation as they stood when the
+    freed them. The record includes the card's free reading and the slot's reservation as they stood when the
     unload went out, so the child's post-free reports are what release a dispatch held against it.
     """
 
@@ -385,7 +385,7 @@ class RetentionLedger:
     def evicted_unused(self) -> int:
         """Retained copies given back this session before any successor reused them.
 
-        A slot whose child died carries its residency out with the process and is not counted here.
+        Residency lost when a child exits is not counted as an unused eviction.
         """
         return self._evicted_unused
 

@@ -550,7 +550,7 @@ class AuxPrefetchCoordinator:
 
     @staticmethod
     def _outcome_key(outcome: AuxPrefetchOutcome) -> tuple[AuxModelKind, str, bool]:
-        """The cooldown/pin identity of one outcome's reference (TIs never carry a version)."""
+        """The cooldown/pin identity of one outcome's reference (TIs do not have versions)."""
         is_version = outcome.kind is AuxModelKind.LORA and bool(outcome.is_version)
         return (outcome.kind, outcome.name, is_version)
 

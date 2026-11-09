@@ -91,7 +91,7 @@ class TestTransferProgress:
         assert "39m 04s left" in rendered
 
     def test_a_transfer_of_unknown_size_still_reports_its_bytes(self) -> None:
-        """No declared total means no bar, which is exactly when the byte counter has to carry the answer."""
+        """The byte counter shows progress when the total is unavailable and the bar cannot be shown."""
         snapshot = _snapshot(
             downloads=DownloadStatusSnapshot(
                 phase=DownloadPhase.DOWNLOADING,

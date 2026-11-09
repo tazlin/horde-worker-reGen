@@ -100,7 +100,7 @@ acknowledgment includes whether a refusal is transient and may be retried.
 
 - hordelib returns without a log line when an acquired grant carries no figure, so whether a child acquired before
   the rewrite that follows its job start cannot be read from a bundle.
-- The parent's clear line does not carry the figures it wrote, and the child logs the rebase figure at DEBUG
+- The parent's clear line does not include the recorded figures, and the child logs the rebase figure at DEBUG
   without the age of the reading behind it. Whether a stale sample-grant figure came from the device reading
   lagging or from a parent loop stall cannot be read from a bundle.
 

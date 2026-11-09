@@ -686,7 +686,7 @@ def _record_retention_reasons(scheduler: InferenceScheduler) -> list[str]:
 
 
 async def test_retention_decision_reports_the_retained_charge(monkeypatch) -> None:  # noqa: ANN001
-    """The grant/denial verdict carries the retained-resident charge, so it names what held the card."""
+    """The grant/denial verdict includes the retained-resident charge, so it names what held the card."""
     job_tracker = JobTracker()
     dispatched = make_job_pop_response(model=_MODEL)
     await track_popped_job_async(job_tracker, dispatched)
@@ -793,7 +793,7 @@ async def test_paging_reclaim_clears_the_retained_resident() -> None:
 async def test_cross_model_dispatch_evicts_the_retained_resident_first() -> None:
     """A dispatch for a different model returns the retained weights to the card before the new load.
 
-    Without this the slot carries both models' weights through the job, which is the overcommit the
+    Without this the slot holds both models' weights through the job, which is the overcommit the
     static fit cannot price away once it has already happened.
     """
     job_tracker = JobTracker()

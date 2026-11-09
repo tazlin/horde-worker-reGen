@@ -1877,7 +1877,7 @@ def test_safety_on_gpu_respected_on_gpu_install(monkeypatch: pytest.MonkeyPatch)
 
 
 def _two_card_plm(*, permissions: dict[int, bool]) -> ProcessLifecycleManager:
-    """A two-card lifecycle manager whose cards carry the given per-card safety_on_gpu permissions."""
+    """A two-card lifecycle manager whose cards include the given per-card safety_on_gpu permissions."""
     plm = _make_plm()
     plm._runtime_config.bridge_data.safety_on_gpu = any(permissions.values())
     plm._card_runtimes.clear()
@@ -2299,7 +2299,7 @@ def test_stuck_starting_names_the_startup_crash_this_launch_wrote() -> None:
     """A child that died before its log opened leaves its cause only in the startup backstop.
 
     The parent sees a process that never reported ready; both the "replacing it" line and the recovery
-    diagnostics carry the exception so the reader is not left with a bare "stuck starting".
+    diagnostics include the exception so the reader is not left with a bare "stuck starting".
     """
     from loguru import logger
 

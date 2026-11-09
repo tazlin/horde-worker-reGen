@@ -398,7 +398,7 @@ async def test_cowaiter_salvage_does_not_regress_with_queue_depth(count: int) ->
 async def test_mixed_job_with_valid_and_unfetchable_lora_dispatches_with_the_valid_one() -> None:
     """A job wanting a valid and an unfetchable LoRA dispatches with the valid one rather than being faulted.
 
-    The job carries a LoRA that caches and one that is unfetchable; a co-waiting job wants only the unfetchable
+    The job has a LoRA that caches and one that is unfetchable. A co-waiting job uses only the unfetchable
     one. Once the unfetchable reference reaches its terminal verdict and is memoized skipped, the mixed job's
     whole set is resolved (one present, one skipped), so it dispatches with the valid LoRA, and the ghost-only
     co-waiter is likewise served without the file. Neither is faulted for the doomed reference they share.

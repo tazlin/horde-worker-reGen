@@ -15,7 +15,7 @@ This module installs two cross-platform, loguru-independent backstops so that wi
 
 - :func:`enable_child_faulthandler` points :mod:`faulthandler` at a per-process file, capturing hard
   faults (segfaults, fatal signals from torch / ComfyUI) that no ``try``/``except`` can catch. That file
-  is kept within a size bound while the process runs, and every segment it is rolled into carries its own
+  is kept within a size bound while the process runs, and every segment it is rolled into includes its own
   identification, so a dump can always be attributed to the worker and launch that wrote it.
 - :func:`write_startup_crash` appends a full, formatted traceback to a discoverable
   ``logs/bridge_{role}_startup.log`` using a plain file write, so a Python exception during preflight is
@@ -77,7 +77,7 @@ _FAULTHANDLER_MAX_BYTES = 1_000_000
 """Size at which a role's fault file is rolled aside to a single ``.1`` companion before reopening.
 
 The file is append-mode and shared across every launch of a role, so a process that faults on most of its
-launches accumulates dumps without bound. Each dump carries the interpreter's full extension-module list,
+launches accumulates dumps without bound. Each dump includes the interpreter's full extension-module list,
 so the file grows by kilobytes per fault and can reach megabytes of history whose oldest entries predate
 anything else in a log bundle. One generation of history is enough to cover the launches a diagnosis
 spans, and rolling rather than truncating keeps the immediately preceding run readable."""
@@ -368,7 +368,7 @@ def read_startup_crash_for_launch(
 
     The startup file is appended across every launch of a slot, and a replaced child that was never reaped
     can still write to it after its successor started. Only a record stamped at or after ``spawned_at``
-    counts, and when both the record and the caller carry a launch identifier they must agree. Every error
+    counts, and when both the record and the caller have a launch identifier they must agree. Every error
     is swallowed, as in :func:`read_last_startup_crash`, because this runs on the recovery path.
 
     Args:

@@ -198,7 +198,7 @@ def test_overview_strip_details_flags_residency_and_unservable() -> None:
 
 
 def test_process_table_shows_gpu_column_and_groups_by_card() -> None:
-    """The process table carries a GPU column and orders rows by card, then slot."""
+    """The process table has a GPU column and orders rows by card, then slot."""
     # Slot 0 is on card 1 and slot 1 is on card 0; grouping by device must render card 0's slot first even
     # though it has the higher slot id and the alphabetically-later model, so neither slot-id nor model order
     # could produce this sequence by accident.

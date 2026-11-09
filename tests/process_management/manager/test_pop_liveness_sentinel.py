@@ -44,7 +44,7 @@ def _strictly_increasing_clock(monkeypatch: pytest.MonkeyPatch) -> None:
 
     The pop path stamps ``last_pop_attempt_completed_at`` with ``time.time()``, and these tests prove a
     completed attempt was recorded by asserting the stamp strictly advanced. The OS clock's resolution can
-    be coarser than a whole stubbed pop cycle, in which case two legitimate recordings carry the same stamp
+    be coarser than a whole stubbed pop cycle, in which case two legitimate recordings include the same stamp
     and the strict proof fails on timing alone. Nudging any repeated reading forward by a microsecond keeps
     readings real while making strict advancement a sound proxy for "the recording happened".
     """
@@ -195,7 +195,7 @@ class TestPopLivenessSentinel:
     """
 
     async def test_silence_past_the_warn_threshold_names_the_gate(self) -> None:
-        """The disclosure has to carry the gate: the gate is what an operator can act on."""
+        """The disclosure has to include the gate: the gate is what an operator can act on."""
         manager, completed_at = await _silenced_at_the_pool_gate()
 
         lines, sink_id = _capture("WARNING")

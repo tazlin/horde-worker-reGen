@@ -719,7 +719,7 @@ class TestPerCardAlchemyAdmission:
 
         # Card 1 has 3000 MB free and the only committed hold is card 0's, so it still fits a 2000 MB form.
         assert coordinator._card_has_headroom(1) is True
-        # Card 0 carries the hold itself: 8000 free less its own 2000 still fits, and a second hold there
+        # Card 0 holds the reservation: 8000 free less its own 2000 still fits, and a second hold there
         # (charged to both cards while unattributable) takes it below the floor.
         coordinator._in_flight["form-unplaced"] = AlchemyFormSpec(
             form_id="form-unplaced",

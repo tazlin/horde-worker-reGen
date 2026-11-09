@@ -23,12 +23,12 @@ The same reasoning applies to the *generation-metadata type* enum
 score to every image generation as a ``gen_metadata`` entry, and the server validates each entry's
 ``type`` against that enum, rejecting the *whole* submit if it sees an unknown type. So the aesthetic
 score is only produced once the server advertises the ``aesthetic_score`` type, letting a worker that
-carries the feature ship ahead of the server's go-live.
+includes the feature ship ahead of the server's go-live.
 
 A third probe is a *property-presence* check rather than an enum-membership one. The
 ``allow_extended_controlnet`` pop field only exists on the server's ``PopInputStable`` schema
 (``definitions.PopInputStable.properties.allow_extended_controlnet``) from the release that ships
-extended ControlNet. A worker that carries the feature must not advertise ``allow_extended_controlnet``
+extended ControlNet. A worker that includes the feature must not advertise ``allow_extended_controlnet``
 until the server proves it understands the field, so this is gated fail-closed the same way: ``False``
 until a probe confirms the property is present. All three probes are read from the one Swagger fetch.
 """
@@ -223,7 +223,7 @@ def server_supports_interrogation_form(form: str) -> bool:
 def server_supports_generation_metadata_type(metadata_type: str) -> bool:
     """Return whether the server accepts *metadata_type* on a generation (fail-closed before probe).
 
-    The server rejects an entire generation submit if it carries a ``gen_metadata`` entry whose
+    The server rejects an entire generation submit if it has a ``gen_metadata`` entry whose
     ``type`` it does not recognise, so an optional metadata attachment must be withheld until this
     returns ``True``.
     """

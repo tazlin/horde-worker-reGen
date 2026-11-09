@@ -518,7 +518,7 @@ def test_the_projection_names_an_alchemist_only_worker_by_its_alchemy_identity()
 
 
 def test_the_native_page_renders_the_text_section_and_the_row_units() -> None:
-    """The page's own markup has to carry the fields the projection now sends, or they render nowhere."""
+    """The page markup must include the projected fields so they can be displayed."""
     page = load_native_dashboard_html()
 
     assert 'id="text-section"' in page

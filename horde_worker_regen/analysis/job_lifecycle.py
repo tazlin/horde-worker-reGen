@@ -10,7 +10,7 @@ sees only one of them will attribute the wait to whatever it happens to measure.
 Every detector that needs job-shaped facts reads :class:`JobLifecycleModel` through
 :func:`job_lifecycle_for`, which parses once per :class:`~horde_worker_regen.analysis.correlate.SessionContext`
 and caches on it, rather than regexing job lines itself. Alongside the per-job records the model
-carries the facts that give those records meaning: which card each inference lane sits on (including
+includes the facts that give those records meaning: which card each inference lane sits on (including
 re-spawns and migrations), how many cards the worker drives and what its intake budget is, a parsed
 series of the ~20s status blocks (each lane's state and model, plus the pending queue), the line-skip
 census, the model preload/unload movement counts, and the timestamps of the parent's IPC drains.

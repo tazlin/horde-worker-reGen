@@ -928,7 +928,7 @@ def test_a_chain_is_learned_as_the_lanes_growth_once_its_last_stretch_is_reporte
     """A finished chain is recorded as the lane's highest peak less its lowest reservation, on the report after it.
 
     Each report's peak covers the time since the report before, so the report after the chain's result still
-    carries its last stretch. The report at the chain's start covers the time before it and gives only the
+    includes its last stretch. The report at the chain's start covers the time before it and gives only the
     reservation the growth is measured from.
     """
     dispatcher, store, job = _post_process_lane_running_chain()

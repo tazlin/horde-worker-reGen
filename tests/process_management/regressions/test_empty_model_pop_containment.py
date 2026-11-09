@@ -88,7 +88,7 @@ class TestPopBoundaryValidation:
         assert tracked_jobs[0].job_info.state is GENERATION_STATE.faulted
 
     async def test_blank_model_fault_is_attributed_to_the_pop_not_a_model(self) -> None:
-        """The fault carries the malformed-pop origin, keeping it out of the generation-verdict pause."""
+        """The fault includes the malformed-pop origin, keeping it out of the generation-verdict pause."""
         job_tracker, _faults, _popper = await _pop_once(make_job_pop_response(model=""))
 
         tracked = job_tracker.tracked_jobs()[0]

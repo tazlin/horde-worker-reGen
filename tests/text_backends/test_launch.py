@@ -53,7 +53,7 @@ def test_every_launchable_backend_is_a_horde_backend_name() -> None:
 
 
 def test_koboldcpp_renders_the_expected_argv(tmp_path: Path) -> None:
-    """Koboldcpp's argv carries the model, loopback port and host, CUDA ordinal, layers, context, and quiet flags."""
+    """Koboldcpp's argv includes the model, loopback port and host, CUDA ordinal, layers, context, and quiet flags."""
     settings = settings_in(tmp_path)
 
     spec = build_launch_spec(TEXT_BACKENDS.koboldcpp, settings)

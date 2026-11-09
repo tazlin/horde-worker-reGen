@@ -1279,7 +1279,7 @@ def _run_pricing_corpus(args: argparse.Namespace) -> int:
         return 2
     ensure_worker_env(args.process_mode, corpus_bench_tiers(definition.tier))
     # The corpus exists to price jobs, and price varies by model class, so every job's stats record must
-    # carry the model's real baseline. Initializing the reference here (a plain sync context, before the
+    # include the model's real baseline. Initializing the reference here (a plain sync context, before the
     # harness event loop starts) is what lets the harness resolve real records instead of stubbing them.
     try:
         ensure_model_reference_manager_initialized()
@@ -1415,7 +1415,7 @@ def _run_soak(args: argparse.Namespace) -> int:
 
     ensure_worker_env(args.process_mode)
     if args.process_mode == "real":
-        # Comparing two arms requires every stats record to carry the model's real baseline. Initializing
+        # Comparing two arms requires every stats record to include the model's real baseline. Initializing
         # the reference here (a plain sync context, before the harness event loop starts) is what lets the
         # harness resolve real records instead of stubbing them.
         try:

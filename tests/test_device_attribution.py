@@ -40,7 +40,7 @@ def test_select_driven_devices_preserves_kind() -> None:
 
 
 def test_memory_message_device_index_default_and_explicit() -> None:
-    """A memory message defaults its device index to 0 but carries an explicit one."""
+    """A memory message defaults its device index to 0 but has an explicit one."""
     base = HordeProcessMemoryMessage(process_id=0, process_launch_identifier=0, info="m", ram_usage_bytes=1)
     assert base.device_index == 0
     pinned = HordeProcessMemoryMessage(

@@ -118,7 +118,7 @@ _TICKER_LINES = 6
 
 
 class SimpleDestination(enum.StrEnum):
-    """Where a Simple action wants to send the contributor.
+    """Destination of a Simple action.
 
     Named by intent rather than by tab identifier so these views stay ignorant of the app's DOM: the
     dashboard owns the mapping onto tabs, and a tab that is renamed or re-identified does not silently
@@ -1132,7 +1132,7 @@ class SimpleHomeView(VerticalScroll):
     def _render_attention(self, report: HealthReport, snapshot: WorkerStateSnapshot | None) -> None:
         """Show what is off-nominal, and nothing at all while everything is.
 
-        Alongside the first concerning health check this carries the postures that explain a worker which
+        Alongside the first concerning health check this includes the postures that explain a worker which
         is running and yet earning nothing: maintenance and pop backoff both stop new work arriving, and
         an absorbed process restart says the totals were interrupted. A nominal worker adds no line here,
         so the card's presence is itself the signal.
@@ -1380,7 +1380,7 @@ class SimpleModelStatusView(VerticalScroll):
 
         Every in-flight transfer gets a bar, the bytes behind it, its rate and its estimate. Those figures
         are what separate "slow" from "stuck": a bar alone cannot, and a model whose size the source never
-        declared has no bar at all, which is precisely when the byte counter has to carry the answer.
+        declared has no bar at all, which is precisely when the byte counter has to show progress.
         """
         activity = snapshot.downloads
         if activity is None:

@@ -98,7 +98,7 @@ def _make_scheduler(
 
     Stubbing ``scale_inference_processes`` / ``pause_safety_on_gpu`` lets a test observe the scheduler's
     *decision* (whether a whole-card residency was recorded for a model) without driving real OS processes.
-    Flux carries its reference baseline, so the card's dominance verdict prices it at the Flux sampling seed,
+    Flux includes its reference baseline, so the card's dominance verdict prices it at the Flux sampling seed,
     which overflows this card beside one context and puts Flux on rung 2.
     """
     scheduler = _make_inference_scheduler(

@@ -2,7 +2,7 @@
 
 Under pipeline disaggregation a job's prompts are encoded to CONDITIONING in this process, which loads
 only the text encoders (not the UNet or VAE), so the sampler that consumes the conditioning never
-carries the text-encoder weights. It holds a hordelib backend across jobs (the text encoders are the
+includes the text-encoder weights. It holds a hordelib backend across jobs (the text encoders are the
 components it keeps resident) and serves ``START_TEXT_ENCODE`` requests, returning the positive and
 negative CONDITIONING blobs the sampler injects.
 

@@ -207,7 +207,7 @@ class _ChainPeak:
     peak_reserved_mb: float = 0.0
     """The highest reservation peak the lane reported during the chain."""
     finished: bool = False
-    """Whether the chain's result has arrived. The lane's next report still carries the chain's last stretch,
+    """Whether the chain's result has arrived. The lane's next report still includes the chain's last stretch,
     since each report's peak covers the time since the one before."""
 
 
@@ -743,7 +743,7 @@ class MessageDispatcher:
         # Adopt the child's self-reported pid (the real interpreter's os.getpid()) as the authoritative
         # os_pid, overriding the parent's spawn-handle guess, so per-PID telemetry addresses the process
         # that actually holds the GPU context even when a launcher stub sits between them. An older child
-        # that does not carry the field reports None and keeps the handle-derived value.
+        # that does not include the field reports None and keeps the handle-derived value.
         self._process_map.reconcile_reported_os_pid(
             message.process_id,
             getattr(message, "reported_os_pid", None),
@@ -1298,7 +1298,7 @@ class MessageDispatcher:
         attributed to a job raises that job's running maximum, and the maximum is committed once when the
         job ends (:meth:`_commit_job_sampling_peak`). Readings after the backend's end-of-run unload stay in
         the fold: the child resets its high-water at each read, so the report sent after the unload still
-        carries the sampling interval before it, and a lower reading cannot raise a maximum anyway.
+        includes the sampling interval before it, and a lower reading cannot raise a maximum anyway.
 
         The measured peaks recorded here raise admission pricing of sampling work (the scheduler reads the
         same store when pricing a job's sampling peak). Only the unambiguous case is wired here: a monolithic
@@ -1660,7 +1660,7 @@ class MessageDispatcher:
         if message.process_state == HordeProcessState.TORCH_GPU_INCOMPATIBLE:
             # A torch-bearing inference child found the installed PyTorch does not carry kernels for this GPU. Latch
             # it here (the parent never imports torch) so the poppers stop popping and the TUI can surface
-            # the reason. The child carries the operator-facing detail in `info`; relay it verbatim. The
+            # the reason. The child includes the operator-facing detail in `info`. Relay it verbatim. The
             # mismatch is a build/hardware fact, so this is sticky for the session.
             if not self._state.gpu_torch_incompatible:
                 logger.critical(
@@ -1781,7 +1781,7 @@ class MessageDispatcher:
 
         That reasoning only holds for a slot returning to idle *after* running the job. Execution ownership
         and the in-progress mark are stamped by the scheduler the instant it dispatches a job, before the
-        child acknowledges it, so a slot can carry a freshly dispatched job while it is still draining
+        child acknowledges it, so a slot can have a freshly dispatched job while it is still draining
         state messages from *before* the dispatch: the ``WAITING_FOR_JOB`` it reports after unloading the
         previous model to free VRAM, for example. Reading that stale idle report against the optimistically
         stamped job would fault a job that never ran (a window that widens on slower disks/model swaps). Which
@@ -2429,7 +2429,7 @@ class MessageDispatcher:
 
             # The aesthetic score (when the safety pass produced one) rides along as gen_metadata so a
             # client can rank/curate generations. The float lives in `ref`; `value` is the categorical
-            # see_ref sentinel, matching how batch_index/information entries carry a non-enum payload.
+            # see_ref sentinel, matching how batch_index/information entries have a non-enum payload.
             aesthetic_score = message.safety_evaluations[i].aesthetic_score
             if aesthetic_score is not None:
                 completed_job_info.job_image_results[i].generation_faults.append(

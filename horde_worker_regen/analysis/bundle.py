@@ -43,7 +43,7 @@ _DOWNLOAD_STARTUP_RE = re.compile(r"^bridge_download_(?P<pid>\d+)_startup\.log$"
 _LANE_STARTUP_RE = re.compile(r"^bridge_(?:post_process|vae_lane|component)_(?P<pid>\d+)_startup\.log$")
 _STDERR_RE = re.compile(r"^stderr_(?P<pid>\d+)\.log$")
 
-# A rotated archive carries a timestamp segment before ".log", e.g. "bridge.2026-06-22_00-55-59.log".
+# A rotated archive has a timestamp segment before ".log".
 _ROTATION_TS_RE = re.compile(r"\.\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}(?:_\d+)?(?=\.log$)")
 
 ROTATION_ABUT_SECONDS = 120.0

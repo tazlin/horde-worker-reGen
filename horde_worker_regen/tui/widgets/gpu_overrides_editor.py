@@ -400,7 +400,7 @@ class GpuOverridesEditor(Vertical):
     def _chip_variant(self, index: int) -> Literal["primary", "success", "default"]:
         """A chip's colour: blue when explicitly driven, green when confirmed present this session, else grey.
 
-        Colour (not a glyph) carries the detected state because the marker characters that read as "present"
+        Colour (not a glyph) shows the detected state because the marker characters that read as "present"
         are East-Asian-ambiguous width and clip the button label. A card known only from the saved list stays
         grey, since nothing this session has confirmed it.
         """
@@ -528,7 +528,7 @@ class GpuOverridesEditor(Vertical):
         """The row naming each column, aligned with the override rows, so the left switch reads as Override.
 
         One header per section instead of a label on every switch: the rows are uniform, so a single header
-        is unambiguous and keeps each row within the narrow two-column layout. Each label carries the class
+        is unambiguous and keeps each row within the narrow two-column layout. Each label includes the class
         of the row widget below it, so the header and the rows read their widths from the same rule.
         """
         return Horizontal(
@@ -684,7 +684,7 @@ class GpuOverridesEditor(Vertical):
 
         Only the two add buttons reveal their section, since that section is new and may land below the fold. A mount
         from a live source or a chip press leaves the scroll alone: sections start expanded and tall, so
-        scrolling to each one would carry the banner and chip strip off screen.
+        scrolling to each one would move the banner and chip strip off screen.
         """
         card = self._card_widgets.get(index)
         if card is not None:

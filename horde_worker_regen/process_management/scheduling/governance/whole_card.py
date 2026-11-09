@@ -18,7 +18,7 @@ is a residency fact, so its state and its early ends (the operator-configured ma
 pops that says the resident model's demand has dried up, and a terminal fault of the claimed model) are
 answered here too.
 
-Each grant carries the dominance rung it was made on (:class:`DominanceRung`). Rung 2 carries the teardown. The
+Each grant includes the dominance rung it was made on (:class:`DominanceRung`). Rung 2 includes the teardown. The
 readers that stop siblings, move safety or pause lanes read :meth:`WholeCardResidencyLedger.teardown_held`, so a rung-1
 grant shares the claim and the cooldown without tearing anything down. A rung-1 grant is a run: the worker keeps
 earning on the dominant model's loaded weights instead of swapping to another large model and back. Since it does
@@ -294,7 +294,7 @@ class WholeCardResidency:
     model: str | None = None
     """The model holding (or being given) sole residency on this card; None when no residency is held."""
     rung: DominanceRung = DominanceRung.CANNOT_CO_RESIDE
-    """The dominance rung the grant was made on. Rung 2 carries the teardown (stopped siblings, safety off the
+    """The dominance rung the grant was made on. Rung 2 includes the teardown (stopped siblings, safety off the
     card, paused lanes). Rung 1 is a run, which shares the claim and the cooldown and does not tear anything down."""
     forecast: StreamForecast | None = None
     """The immutable forecast that granted this residency, cached for diagnostics and its fit guarantee."""
@@ -352,7 +352,7 @@ class WholeCardResidency:
 
     Pruned to :data:`_ESTABLISH_WINDOW_SECONDS` whenever the rate limiter is consulted."""
     prestage_process_id: int | None = None
-    """The slot a pre-staged head's weights are being loaded into, before any lane carries its model name.
+    """The slot a pre-staged head's weights are being loaded into, before its model name is set on any lane.
 
     A convergence shrink spares the residency holder by model name, which a slot mid-load does not yet have,
     so the pre-stage's own target would be a legal victim of the collapse it is loading for. None once the

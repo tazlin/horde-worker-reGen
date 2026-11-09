@@ -241,7 +241,7 @@ _FORECAST_REDUCTION_RE = pattern_for("forecast_reduction")
 # name (``inference_scheduler._send_preload``), ended the slot it was sent to (the recovery reason from
 # ``process_lifecycle``), was then counted and quarantined as if it were a model
 # (``record_model_incident``), after which every later job for it was refused
-# (``_attempt_preload_for_job``). Each of those lines carries the empty name verbatim, which is what makes
+# (``_attempt_preload_for_job``). Each of those lines includes the empty name verbatim, which is what makes
 # the blank identity recognizable at all.
 _EMPTY_MODEL_POP_RE = pattern_for("empty_model_pop")
 _BLANK_PRELOAD_RE = pattern_for("blank_preload")
@@ -257,7 +257,7 @@ _BLANK_INCIDENT_REFUSED_RE = pattern_for("blank_incident_refused")
 # A slot replaced because loading a model ended it, naming the model. Producer: ``process_lifecycle``'s
 # recovery reason. The name is captured (and may be empty) so repeated deaths can be grouped by model: a
 # checkpoint that kills every slot it touches is a loop no per-slot breaker catches.
-# Greedy to the reason's closing paren: model names carry their own parentheses ("AlbedoBase XL (SDXL)"),
+# Greedy to the reason's closing paren: model names include their own parentheses ("AlbedoBase XL (SDXL)"),
 # which a non-greedy match truncates at the first one.
 _LOAD_FAILURE_MODEL_RE = pattern_for("load_failure_model")
 # The horde rejecting a pop, quoting its own message. Producer:
@@ -275,7 +275,7 @@ _RETIRED_SAFETY_RESULT_RE = pattern_for("retired_safety_result")
 # A safety check that found the card full and was rerun on the CPU, and the two residency commands that ran
 # out of device memory. Producers: ``safety_process._evaluate_images_on_cpu``, ``demote_safety_weights`` and
 # ``promote_safety_weights``, all written to the safety process's log. The parent's per-job safety line
-# carries the job id and the duration of every check of the session, which the reruns are compared against.
+# includes the job id and the duration of every check of the session, which the reruns are compared against.
 _SAFETY_CPU_FALLBACK_RE = pattern_for("safety_check_cpu_fallback")
 _SAFETY_WEIGHTS_RELEASE_OOM_RE = pattern_for("safety_weights_release_out_of_memory")
 _SAFETY_WEIGHTS_PROMOTION_OOM_RE = pattern_for("safety_weights_promotion_out_of_memory")
@@ -1060,7 +1060,7 @@ def _longest_narrow_offer(records: list[LogRecord], session_end: datetime) -> _N
     """The longest stretch the advertised offer stayed under half the session's widest, or None.
 
     The advertised line is edge-triggered on the offered set, so a stretch runs from a narrow line to the next
-    wide one or the session end. Empty pops inside it carry the horde's skip counts.
+    wide one or the session end. Empty pops inside it include the horde's skip counts.
     """
     offers = [(r, int(m["models"])) for r in records if (m := _ADVERTISED_MODELS_RE.search(r.message))]
     if not offers:
@@ -3050,7 +3050,7 @@ def detect_text_backend_wedged(context: SessionContext) -> list[Finding]:
     """A text backend refusing every job as busy while it generates nothing, from either worker generation.
 
     A current worker states the episode itself when it holds its text jobs, with the backend's own counters
-    at the decision, and the headline carries the count of finished generations from the first such line.
+    at the decision, and the headline includes the count of finished generations from the first such line.
     An older worker only faulted the refused jobs one by one, so its bundles are read for a long run of
     busy-refused faults with no text job submitted in between; the horde counts each of those faults toward
     maintenance.
@@ -5231,7 +5231,7 @@ def detect_lane_placement(context: SessionContext) -> list[Finding]:
 
     The post-processing, utilities and safety lanes each hold VRAM on whichever card they land on, and
     unlike the inference lanes they are not per-card pools: they are placed once. A re-spawn that lands on
-    a different card silently changes which card carries the auxiliary load, and stacking them onto card 0
+    a different card silently changes which card runs the auxiliary workload, and stacking them onto card 0
     (where GPU safety runs) concentrates that load on the one card that is already carrying it, on a host
     with other cards free. Both are placement facts a per-card duty reading cannot explain on its own.
     """

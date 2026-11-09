@@ -53,7 +53,7 @@ _TICK_SECONDS = 2.0
 """Seconds of world clock per tick, matching the incident scenarios' cadence.
 
 Short enough that a job's load, sampling and decode phases are each sampled several times, so the trace
-carries the intermediate states a coarser tick would step over."""
+includes the intermediate states a coarser tick would step over."""
 
 _PINNED_TOTAL_RAM_MB = 32_768.0
 """Host RAM total every row is priced against.
@@ -366,7 +366,7 @@ class _SequentialJobIds:
     """
 
     def __init__(self) -> None:
-        """Start the sequence at one, so no job carries the nil uuid."""
+        """Start the sequence at one, so no job includes the nil uuid."""
         self._issued = 0
 
     def __call__(self) -> uuid.UUID:

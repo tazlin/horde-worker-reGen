@@ -1006,7 +1006,7 @@ class TestHandleSafetyResult:
         assert replaced.image_encoding is ImageEncoding.PNG
 
     async def test_safety_result_attaches_aesthetic_metadata(self) -> None:
-        """A safety evaluation that carries an aesthetic score attaches it as gen_metadata.
+        """A safety evaluation that has an aesthetic score attaches it as gen_metadata.
 
         The score rides on the per-image generation_faults list (the worker's gen_metadata bucket) as a
         float in the entry's ``ref``, so a client can rank/curate generations.

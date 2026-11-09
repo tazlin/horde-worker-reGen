@@ -85,7 +85,7 @@ class TestDescribeJobRequirements:
     """The requirement extraction reads the right payload fields."""
 
     def test_plain_txt2img(self) -> None:
-        """A bare txt2img job needs no features and carries its pixel count."""
+        """A bare txt2img job needs no features and includes its pixel count."""
         req = describe_job_requirements(
             _make_job(width=640, height=512), baseline="stable_diffusion_xl", weight_mb=None
         )

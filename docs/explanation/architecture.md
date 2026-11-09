@@ -190,7 +190,7 @@ Parent → child communication uses per-process **multiprocessing `Pipe`s**. Chi
 Sends from the parent are **optimistic**: the parent updates `ProcessMap` /
 `HordeModelMap` immediately after a successful send, before the child confirms.
 The child's eventual state-change messages confirm or correct the parent's
-bookkeeping. Messages carry a `process_launch_identifier` so messages from a
+bookkeeping. Messages have a `process_launch_identifier` so messages from a
 replaced (killed and restarted) process incarnation are silently discarded.
 This allows the parent to react immediately to events without waiting for round-trip
 confirmation, while still ensuring the child is the source of truth for its own state.
@@ -290,7 +290,7 @@ touching the network or a GPU. Fake inference children report the injected card'
 capacity through the normal memory-message protocol. When the inventory is injected,
 the measured-truth arbiter consumes that protocol reading rather than consulting the
 host's NVML device; predictive scheduling and measured admission therefore reason about
-the same simulated card. A fake-mode run also carries a mutable shared VRAM ledger by default, so the
+the same simulated card. A fake-mode run also has a mutable shared VRAM ledger by default, so the
 simulated card's free reading moves the way a real one does: each slot charges the resident weights its
 scenario's models commit (priced from the same per-baseline registry the parent's own forecast reads), a
 per-process context overhead taken from the injected topology, and the sampling activation of the window

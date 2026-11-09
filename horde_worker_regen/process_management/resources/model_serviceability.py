@@ -45,7 +45,7 @@ before paging began is owed its load.
 
 A ``CONSTRAINED`` model is not allowed to lower every other model's ``max_power``: the horde's pop carries one
 ``max_pixels`` for the whole offer, so the constrained models are advertised on a pop of their own, one in a
-bounded run of full-size pops (:func:`decide_constrained_offer`). The full-size pops carry the unconstrained
+bounded run of full-size pops (:func:`decide_constrained_offer`). The full-size pops include the unconstrained
 models at the configured ``max_power``; the constrained pop carries only the constrained models at the largest
 size they all fit.
 """
@@ -584,7 +584,7 @@ def serviceability_arithmetic(verdicts: list[tuple[CardRuntime, ModelServiceabil
 _CONSTRAINED_LANE_FULL_CYCLES = 3
 """Full-size pops advertised between two constrained pops while the offer holds a constrained model.
 
-The full-size pops carry the models the card serves at the configured ``max_power``; the constrained pop is
+The full-size pops include models supported by the card at the configured ``max_power``. The constrained pop is
 one in every ``_CONSTRAINED_LANE_FULL_CYCLES + 1``. The constrained models stay reachable (their pop comes
 round on a bounded cadence) while the worker's ordinary intake keeps its full job range for the majority of
 pops, instead of every pop asking for jobs no larger than the most constrained model allows.
@@ -628,8 +628,8 @@ def decide_constrained_offer(
     it fits. With no constrained model the offer is untouched. When every offered model is constrained
     there is nothing to protect, so the whole offer goes out capped at the smallest cap. Otherwise the
     cadence alternates: ``full_cycles`` pops of the unconstrained models at the configured ``max_power``,
-    then one pop of the constrained models at their shared cap. An idle-fill pop wants the quickest available
-    work, so it carries the unconstrained models at full size and leaves the cadence where it is: a reduced
+    then one pop of the constrained models at their shared cap. An idle-fill pop requests the quickest available
+    work, so it includes the unconstrained models at full size and leaves the cadence where it is: a reduced
     size belongs to the constrained models alone, never to the rest of the offer. ``pinned_model`` is a model
     the pop must carry (a whole-card residency's claim): a pinned constrained model takes the constrained pop
     now, whatever the cadence says, so the claim never empties the offer by landing on a full-size pop. Never

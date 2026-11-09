@@ -187,7 +187,7 @@ class TestPreloadCandidatePricing:
     """A preload is priced at its full marginal charge without the lease and at the staging charge under it."""
 
     async def test_full_charge_without_the_lease(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Without the lease the preload is the VRAM moment, so it carries the whole sampling charge."""
+        """Without the lease the preload is the VRAM moment, so it includes the whole sampling charge."""
         _pin_static_predictors(monkeypatch)
         pm = _make_manager()
         scheduler = pm._inference_scheduler
@@ -198,7 +198,7 @@ class TestPreloadCandidatePricing:
         assert preload.preload_candidate_delta_mb(scheduler.snapshot(), str(job.id_), None) == _SEED_MB
 
     async def test_staging_charge_under_the_lease(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Under the lease the preload only stages in RAM, so it carries the staging encode charge."""
+        """Under the lease the preload only stages in RAM, so it includes the staging encode charge."""
         _pin_static_predictors(monkeypatch)
         pm = _make_manager()
         scheduler = pm._inference_scheduler

@@ -157,10 +157,10 @@ earned, a model starting to load and becoming ready to serve, the text backend c
 a process the worker recovered, a download finishing, the horde holding requests back and releasing them,
 and the worker backing off after trouble reaching the horde. Accepted requests are not listed there: one
 line per request would push everything else off the card. The browser page's own **Recent** section
-carries the same lines with how long ago each happened.
+includes the same lines with how long ago each happened.
 
 A scribe worker's text requests sit in the same two places. The offers line names text generation and
-the model the backend loaded; the requests in flight carry a text generation's own progress, as a
+the model loaded by the backend. Requests in flight show a text generation's progress, as a
 percentage where the backend counts tokens and as the count of stream records where it does not; and a
 finished text request names the model, the tokens it produced when they were counted, how long it took
 and what it earned.
@@ -207,9 +207,9 @@ the signal. Fold it away with its ▼ once you have read it.
 
 ### Overview
 
-The Overview carries the headline metrics (jobs submitted and faulted, queue depth, GPU duty cycle,
+The Overview includes the headline metrics (jobs submitted and faulted, queue depth, GPU duty cycle,
 kudos/hr), the **Health** checklist, and a **Now / Next / Why** strip stating what the scheduler is
-doing and what it is waiting on. Panel titles carry counts (`Health · 2 models`,
+doing and what it is waiting on. Panel titles show counts (`Health · 2 models`,
 `Processes · 3/4 alive · 2 hot`, `Queue · 5 pending · 1,234 MP`, `GPUs · 2 cards · 41% duty`), so the
 scale of things reads without expanding a row.
 
@@ -224,14 +224,14 @@ the id column shows its OS pid, the state column shows what the worker's supervi
 `relaunching in 8 s`, or `not obtained` when the program could not be fetched at all) plus its token
 rate while it generates, the GPU column is a dash when it runs on no card, and the baseline column gives
 the context size it was loaded with. The Live tab's Backend line reads "program not yet obtained" until
-the command line has been rendered, and carries the reason on the row when obtaining failed. The
+the command line has been rendered, and includes the reason on the row when obtaining failed. The
 headline above says which of those the worker is in: warming up while the backend is being obtained or
 started, a warning once that has run past the readiness patience, and an error past twice it naming where
 to look (this row and `logs/text_backend.log` for a backend the worker launches, `kai_url` for one you
 run). Its VRAM
 figure is marked **measured**: it is how much the card's free memory dropped while the backend loaded, not
 an allocator reading like the inference slots', so the two are not comparable. The heartbeat column is how
-long ago the backend last answered a readiness probe, which the worker asks only while it is starting, so
+long ago the backend last responded to a readiness probe, which runs only during startup, so
 that figure grows while it serves and is not a sign of trouble.
 
 The worker panel's first line is the worker's identity: every enabled role's horde name, joined with
@@ -275,7 +275,7 @@ the requested steps.
 
 Alchemy forms appear in the ledger and the Queue as their own rows, with the form where a model name
 goes (prefixed `⚗`) and the source image's resolution as the size. In pipeline-disaggregation mode the
-ledger also carries a per-job stage line (prefixed `Disagg:`) showing where each in-flight job sits in
+ledger also has a per-job stage line (prefixed `Disagg:`) showing where each in-flight job sits in
 its pipeline and which process holds its current stage.
 
 Text generations are ledger rows too: queued until the backend takes one, then `inference` while it
@@ -357,7 +357,7 @@ in its title and everything else left as a genuine *Other (OS + apps)* remainder
 
 Each process panel shows its state and temperature phrase (*sampling*, *primed*, *loading*), current
 model and job, a sampling progress bar, iterations per second, VRAM and RAM (current and peak), and
-heartbeat freshness. The text backend's panel carries its own facts instead: the model it loaded, the
+heartbeat freshness. The text backend's panel shows its own details instead: the loaded model, the
 backend kind and port, its OS pid, its context and generation caps, its token rate, the VRAM measured at
 launch, how long it has been ready, how many times it has been launched, and the model, KV and compute
 buffer sizes its loader printed. A GPU-bearing process holding model components in RAM also lists them under
@@ -397,10 +397,9 @@ at one you run yourself.
 
 **Text model** has a *Choose...* button beside it that opens the text model catalogue: one row per
 model with its quantisation, file size, measured VRAM footprint, the context that footprint was
-measured at, and whether the file is already in your text models folder. Models the reference knows
-but publishes no file for are listed below a divider and cannot be chosen, because the worker would
-have nothing to load for them. Choosing fills the field; you can also type the path to a model file of
-your own into it directly, which the worker reads where it sits and never copies.
+measured at, and whether the file is already in your text models folder. Models without download files
+appear below a divider and cannot be selected. Selecting a model fills the field. You can also enter a
+local model file path, which is read directly without copying the file.
 
 A model nobody has measured shows no footprint. That is "unknown", not "free": the picker will not
 guess what a model costs on your card.

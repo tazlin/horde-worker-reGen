@@ -111,7 +111,7 @@ def _default_stream_records() -> tuple[dict[str, object], ...]:
 
 
 def _sonar_stream_records() -> tuple[dict[str, object], ...]:
-    """Return sonar's stream shape, which carries a token and never a finish reason at all."""
+    """Return sonar's stream shape, which includes a token without a finish reason."""
     return tuple({KoboldApiJsonKeys.TOKEN: chunk} for chunk in _STREAM_CHUNKS)
 
 
@@ -173,20 +173,20 @@ class _KoboldBackendBehaviour:
 
 
 def _build_kobold_app(behaviour: _KoboldBackendBehaviour) -> web.Application:
-    """Return an application answering the KoboldAI routes the way `behaviour` says to."""
+    """Return a test application with KoboldAI routes configured by `behaviour`."""
 
     def credential_refused(request: web.Request) -> bool:
-        """Return whether this request carries something other than the password the backend wants."""
+        """Return whether the request fails the configured password check."""
         if behaviour.required_password is None:
             return False
         return request.headers.get(aiohttp.hdrs.AUTHORIZATION) != f"Bearer {behaviour.required_password}"
 
     def unauthorized() -> web.Response:
-        """Return the refusal koboldcpp answers a request whose credential it will not accept."""
+        """Return koboldcpp's response for a request with invalid credentials."""
         return web.json_response(_UNAUTHORIZED_BODY, status=HTTPStatus.UNAUTHORIZED)
 
     async def handle_model(request: web.Request) -> web.Response:
-        """Answer the model route, which is what readiness and the advertised name both read."""
+        """Return the model response used for readiness and the advertised model name."""
         if behaviour.model_delay_seconds > 0:
             await asyncio.sleep(behaviour.model_delay_seconds)
         if behaviour.model_status != HTTPStatus.OK:
@@ -378,7 +378,7 @@ class _ProgressRecorder:
 
     @property
     def chunk_reports(self) -> list[TextGenerationProgress]:
-        """The reports that carried a chunk, in order, ignoring any that only carried statistics."""
+        """The reports with a chunk, in order, ignoring statistics-only reports."""
         seen_chunks = 0
         carried_a_chunk: list[TextGenerationProgress] = []
         for report in self.reports:
@@ -541,7 +541,7 @@ async def test_the_final_stream_record_carries_the_finish_reason() -> None:
 
 
 async def test_a_stream_without_any_finish_reason_still_produces_the_generation() -> None:
-    """A sonar record carries a token and nothing else, so an absent finish reason is not a failure."""
+    """A sonar record includes only a token, so an absent finish reason is not a failure."""
     behaviour = _KoboldBackendBehaviour(stream_records=_sonar_stream_records())
     progress = _ProgressRecorder()
 

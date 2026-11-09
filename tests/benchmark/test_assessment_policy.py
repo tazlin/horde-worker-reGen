@@ -608,7 +608,7 @@ def test_model_guidance_large_families_come_from_the_ladder() -> None:
 
 
 def test_model_guidance_states_the_thread_limit_from_the_installed_model_count() -> None:
-    """The concurrency limit line carries the installed-model count and is absent when concurrency is excluded."""
+    """The concurrency limit line includes the installed-model count and is absent when concurrency is excluded."""
     evidence = [_evidence()]
     two = model_guidance(evidence, MachineInfo(), CatalogOptions(), installed_models=2)
     limit = next(line for line in two if line.startswith("Concurrency checks test at most"))
@@ -623,7 +623,7 @@ def test_model_guidance_states_the_thread_limit_from_the_installed_model_count()
 
 
 def test_report_renders_model_guidance_before_the_suggestion() -> None:
-    """The operator assessment report carries the guidance as its own section ahead of the bridgeData."""
+    """The operator assessment report includes the guidance as its own section ahead of the bridgeData."""
     evidence = [_evidence(combined=True, kind=CapabilityKind.SUSTAINED), _evidence()]
     report = CapabilityReport(
         operator_assessment=True,

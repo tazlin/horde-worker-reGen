@@ -500,7 +500,7 @@ class TestDominantRunCopy:
     async def _stranger_beside_run(self, *, room_closable: bool):  # noqa: ANN202
         """The run's copy idle on slot 1, a different-model job dispatched to slot 0, the run's next job held.
 
-        The next job's dispatch hold carries the room breakdown the reconciliation gate records, which the
+        The next job's dispatch hold includes the room breakdown the reconciliation gate records, which the
         permitted reclaim rungs either cover or do not.
         """
         run_lane = _slot(1, model="run")
@@ -1197,7 +1197,7 @@ class TestDominanceCache:
         assert scheduler.card_dominance(None) is not first
 
     async def test_the_snapshot_and_the_live_forecast_read_the_same_verdict(self) -> None:
-        """Both forecast forms demand the residency for a rung-2 model, and the snapshot carries the cache."""
+        """Both forecast forms demand the residency for a rung-2 model, and the snapshot includes the cache."""
         scheduler = self._scheduler([self._FLUX, self._SD15])
         job = make_job_pop_response(model=self._FLUX, width=1024, height=1024)
         await track_popped_job_async(scheduler._job_tracker, job)  # type: ignore[attr-defined]

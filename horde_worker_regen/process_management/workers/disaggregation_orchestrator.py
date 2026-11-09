@@ -455,7 +455,7 @@ class DisaggregationOrchestrator:
     def discarded_sample_reroute_count(self) -> int:
         """Return how many jobs were rerouted monolithically with a finished sample in hand.
 
-        A job past its sample result carries a completed denoise; rerouting it whole throws that away and pays
+        A job past its sample result has a completed denoise. Rerouting the whole job discards that result and pays
         for it again on the monolithic path. Any nonzero value is lost GPU work, so this is the counter a
         closed-loop run reads to judge that no finished sample was discarded.
         """
@@ -1363,7 +1363,7 @@ class DisaggregationOrchestrator:
         parent-synthesized completion retires ownership on the decode lane, never here. Left standing, it makes
         a finished job read as owned until the slot's next dispatch overwrites it.
 
-        Both acts carry the completion path's guard: a slot that has since been dispatched another job is not
+        Both acts include the completion path's guard: a slot that has since been dispatched another job is not
         this job's sampler any more, and must not have that newer job's grant or ownership resolved early.
         """
         if sampler_process is None:
@@ -1529,7 +1529,7 @@ class DisaggregationOrchestrator:
         self._release_sampling_peak(state)
         self._jobs.pop(self._key(state.job_info), None)
         # The end-to-end generation span (registration to now), threaded through so the synthetic result
-        # carries a real time_elapsed on both success and fault. Left None (never fabricated as 0.0) when no
+        # has a real time_elapsed on both success and fault. Left None (never fabricated as 0.0) when no
         # registration timestamp was recorded, so the submitter's None-guard remains the honest backstop.
         time_elapsed = None if state.registered_at is None else self._clock() - state.registered_at
         self._on_images_ready(state.job_info, images, job_state, fault, time_elapsed)
