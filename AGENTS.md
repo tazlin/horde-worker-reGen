@@ -13,6 +13,12 @@ than duplicating it here.
 > `uv run --no-sync python docs/build_docs.py` (commit new/removed stubs; `git checkout --` any
 > line-ending-only churn it causes). If a doc cannot be fully reconciled in the change, say so in the
 > change description.
+>
+> **The responsibility maps are kept as current as the code.** A change that adds, moves or removes a
+> decision's owner updates that decision's row in the same commit. The same holds for a change to the
+> conditions that set or clear a mark, a receipt, a reservation or a lane pause. A row found wrong or
+> missing while reading is corrected in that change, or reported in the change description when it
+> cannot be.
 
 ## What this is
 
@@ -35,8 +41,9 @@ children over IPC. See [Architecture](docs/explanation/architecture.md).
   [clearance and child loads](docs/reference/responsibility-map-clearance-and-child-loads.md),
   [footprints and pricing](docs/reference/responsibility-map-footprints-and-pricing.md),
   [recovery and safety](docs/reference/responsibility-map-recovery-and-safety.md),
-  [host RAM](docs/reference/responsibility-map-host-ram.md). Read the map for the cluster a change touches
-  before the code; a decision with two owners there is the first thing to fix.
+  [host RAM](docs/reference/responsibility-map-host-ram.md). Read the map for the cluster before the
+  code, whether the task is a change, a bundle diagnosis or a review. A decision with two owners or
+  without an owner is the first thing to fix. A decision that is not in the map is added to it.
 - [Job lifecycle](docs/explanation/job_lifecycle.md),
   [Job state machine](docs/explanation/job_state_machine.md),
   [Resilience and recovery](docs/explanation/resilience_and_recovery.md),
@@ -58,6 +65,11 @@ event stream; `bundle` builds a redacted zip for a maintainer. Every finding id 
 is a session of its own kind: it is listed after the worker sessions, numbered from #0 within its kind,
 and addressed with `--benchmark N` or `--last-benchmark`; `--session` and `--last` are worker-only, so
 worker numbering never moves when a harness log is present.
+
+**Read the responsibility map for the cluster before tracing code.** A wedge, a stranded lane pause or a
+figure counted twice is usually a decision with two owners or without an owner, and the map shows that
+sooner than the code does. A bundle report cites the map row that the defect contradicts, or says that
+the row is missing. A missing or wrong row is fixed in the same change as the defect.
 
 **When a session needs a hand-rolled script, the tool needs a finding: add it there.** The copy a finding
 shows a reader follows [docs/how-to/write-a-finding.md](docs/how-to/write-a-finding.md), enforced by
