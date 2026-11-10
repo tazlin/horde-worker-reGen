@@ -20,9 +20,13 @@ import horde_worker_regen.utils.accelerator_probe as accelerator_probe_module
 from horde_worker_regen.process_management.process_manager import SystemResources
 from horde_worker_regen.utils.accelerator_probe import (
     _RESULT_PREFIX,
+    MAX_CONTEXT_PROBE_RUNS,
+    ContextReadingVerdict,
     ProbedAccelerator,
     _first_context_overhead_mb,
     probe_accelerators,
+    probe_session_accelerators,
+    select_context_readings,
 )
 
 _MB = 1024 * 1024
@@ -113,15 +117,14 @@ def test_detect_marginal_defaults_zero_for_old_probe(fake_probe: list[ProbedAcce
 
 @pytest.mark.gpu
 def test_probe_measures_overhead_and_marginal_on_real_device() -> None:
-    """On real hardware the probe reports a positive first-context overhead and a sane marginal.
+    """On real hardware the session probe reports a positive first-context cost that agrees with the marginal.
 
-    The marginal is measured by bringing up a second process and reading the device-wide used delta. That is
-    only visible cross-process where the platform reports true device-wide VRAM: Linux does, Windows WDDM does
-    not (a process cannot see a sibling's allocation), so there the marginal degrades to 0 and the worker
-    falls back to charging the full overhead per context. The non-Windows assertion is the real validation:
-    the marginal is positive and clearly smaller than the one-time-inclusive overhead.
+    Both figures are device-wide deltas around one new context, so a clean reading gives nearly equal values.
+    The session probe re-measures a reading whose figures disagree, so the reading it returns is consistent
+    unless a foreign tenant changed its allocation during every run. A card whose marginal could not be
+    measured is not compared.
     """
-    accelerators = probe_accelerators(timeout_seconds=240)
+    accelerators = probe_session_accelerators()
     assert accelerators, "probe found no accelerators on a GPU box"
     primary = accelerators[0]
     assert primary.total_vram_mb > 0
@@ -133,10 +136,12 @@ def test_probe_measures_overhead_and_marginal_on_real_device() -> None:
             "on Linux the device-wide second-context delta must be measurable; "
             "a 0 here means the marginal measurement regressed"
         )
-        assert primary.marginal_overhead_mb < primary.runtime_overhead_mb, (
-            "the per-additional-context marginal must be smaller than the one-time-inclusive first-context "
-            f"overhead (got marginal={primary.marginal_overhead_mb} >= overhead={primary.runtime_overhead_mb})"
-        )
+
+    verdict = select_context_readings([[primary]])[0].verdict
+    assert verdict is not ContextReadingVerdict.INCONSISTENT, (
+        "the first-context and marginal figures of the selected reading must agree "
+        f"(got first={primary.runtime_overhead_mb} marginal={primary.marginal_overhead_mb})"
+    )
 
 
 class TestFirstContextOverheadExcludesTheDeviceBaseline:
@@ -379,3 +384,211 @@ class TestDetectCarriesPerCardFigures:
         resources = SystemResources.detect()
         assert resources.per_process_overhead_mb_by_device == {0: 1288}
         assert resources.marginal_process_overhead_mb_by_device == {0: 455}
+
+
+def _context_reading(
+    index: int,
+    *,
+    first_mb: int,
+    marginal_mb: int,
+    baseline_mb: int = 3600,
+) -> ProbedAccelerator:
+    """Return one card's probe reading built from its two figures, with the raw NVML readings behind them."""
+    after_context_mb = baseline_mb + first_mb
+    return ProbedAccelerator(
+        index=index,
+        name=f"GPU{index}",
+        total_vram_mb=24564,
+        device_baseline_mb=baseline_mb,
+        context_device_used_mb=after_context_mb,
+        after_holder_device_used_mb=after_context_mb + marginal_mb,
+        runtime_overhead_mb=first_mb,
+        marginal_overhead_mb=marginal_mb,
+    )
+
+
+class TestContextReadingSelection:
+    """A foreign allocation inside the probe's window inflates one figure, and a re-measure replaces it.
+
+    On a clean launch the first-context and marginal figures read nearly equal, since both are the cost of
+    one context. A reading where they disagree by more than the tolerance had another program allocate or
+    release on the card between two of the readings.
+    """
+
+    def test_consistent_first_run_is_accepted(self) -> None:
+        """Agreeing figures need no second run."""
+        (selection,) = select_context_readings([[_context_reading(0, first_mb=487, marginal_mb=488)]])
+        assert selection.verdict is ContextReadingVerdict.CONSISTENT
+        assert selection.accelerator.runtime_overhead_mb == 487
+        assert selection.accelerator.marginal_overhead_mb == 488
+
+    def test_inflated_first_run_is_replaced_by_a_consistent_one(self) -> None:
+        """The first run that agrees supplies both figures."""
+        (selection,) = select_context_readings(
+            [
+                [_context_reading(0, first_mb=1161, marginal_mb=426)],
+                [_context_reading(0, first_mb=472, marginal_mb=506)],
+            ],
+        )
+        assert selection.verdict is ContextReadingVerdict.CONSISTENT
+        assert selection.accelerator.runtime_overhead_mb == 472
+        assert selection.accelerator.marginal_overhead_mb == 506
+
+    def test_no_consistent_run_takes_the_smallest_first_context(self) -> None:
+        """With no agreeing run, the smallest first-context figure and the marginal from the same run stand."""
+        (selection,) = select_context_readings(
+            [
+                [_context_reading(0, first_mb=1161, marginal_mb=426)],
+                [_context_reading(0, first_mb=900, marginal_mb=300)],
+                [_context_reading(0, first_mb=1000, marginal_mb=200)],
+            ],
+        )
+        assert selection.verdict is ContextReadingVerdict.INCONSISTENT
+        assert selection.accelerator.runtime_overhead_mb == 900
+        assert selection.accelerator.marginal_overhead_mb == 300
+        assert len(selection.readings) == 3
+
+    def test_unmeasured_marginal_is_never_suspect(self) -> None:
+        """A card with the 0 marginal fallback keeps its single reading and is not measured again."""
+        unmeasured = _context_reading(0, first_mb=1161, marginal_mb=0).model_copy(
+            update={"after_holder_device_used_mb": None, "marginal_note": "holder never signalled ready"},
+        )
+        (selection,) = select_context_readings([[unmeasured]])
+        assert selection.verdict is ContextReadingVerdict.UNCHECKED
+        assert selection.accelerator.runtime_overhead_mb == 1161
+        assert selection.accelerator.marginal_overhead_mb == 0
+
+    def test_only_the_suspect_card_takes_a_later_run(self) -> None:
+        """A card that agreed on the first run keeps that run, whatever later runs read."""
+        selections = select_context_readings(
+            [
+                [
+                    _context_reading(0, first_mb=487, marginal_mb=488),
+                    _context_reading(1, first_mb=1161, marginal_mb=426),
+                ],
+                [
+                    _context_reading(0, first_mb=470, marginal_mb=520),
+                    _context_reading(1, first_mb=472, marginal_mb=506),
+                ],
+            ],
+        )
+        by_index = {selection.accelerator.index: selection for selection in selections}
+        assert by_index[0].verdict is ContextReadingVerdict.CONSISTENT
+        assert (by_index[0].accelerator.runtime_overhead_mb, by_index[0].accelerator.marginal_overhead_mb) == (
+            487,
+            488,
+        )
+        assert by_index[1].verdict is ContextReadingVerdict.CONSISTENT
+        assert (by_index[1].accelerator.runtime_overhead_mb, by_index[1].accelerator.marginal_overhead_mb) == (
+            472,
+            506,
+        )
+
+    def test_small_figures_use_the_absolute_floor(self) -> None:
+        """On a small card a few tens of MB of noise stays inside the floor."""
+        (selection,) = select_context_readings([[_context_reading(0, first_mb=150, marginal_mb=200)]])
+        assert selection.verdict is ContextReadingVerdict.CONSISTENT
+
+    def test_child_payload_includes_the_after_holder_reading(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The third raw reading reaches the parent, so the startup line can show all three."""
+        payload = _RESULT_PREFIX + json.dumps(
+            [
+                {
+                    "index": 0,
+                    "name": "GPU0",
+                    "total_vram_mb": 24564,
+                    "context_device_used_mb": 3600 + 487,
+                    "device_baseline_mb": 3600,
+                    "after_holder_device_used_mb": 3600 + 487 + 488,
+                    "marginal_overhead_mb": 488,
+                },
+            ],
+        )
+        monkeypatch.setattr(accelerator_probe_module, "_nvml_device_count", lambda: 1)
+        monkeypatch.setattr(
+            accelerator_probe_module.subprocess,
+            "run",
+            lambda *_args, **_kwargs: subprocess.CompletedProcess(args=[], returncode=0, stdout=payload, stderr=""),
+        )
+        (accelerator,) = probe_accelerators()
+        assert accelerator.after_holder_device_used_mb == 3600 + 487 + 488
+
+
+class TestSessionProbeRetry:
+    """``probe_session_accelerators`` repeats the probe only while a card reads inconsistent, at most three times."""
+
+    def _install_runs(self, monkeypatch: pytest.MonkeyPatch, runs: list[list[ProbedAccelerator]]) -> list[int]:
+        """Substitute the single probe run with canned runs, returning a list that records each call."""
+        calls: list[int] = []
+
+        def _next_run(**_kwargs: object) -> list[ProbedAccelerator]:
+            calls.append(len(calls))
+            return list(runs[min(len(calls) - 1, len(runs) - 1)])
+
+        monkeypatch.setattr(accelerator_probe_module, "probe_accelerators", _next_run)
+        return calls
+
+    def test_stops_at_the_first_consistent_run(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A consistent second run ends the loop."""
+        calls = self._install_runs(
+            monkeypatch,
+            [
+                [_context_reading(0, first_mb=1161, marginal_mb=426)],
+                [_context_reading(0, first_mb=472, marginal_mb=506)],
+                [_context_reading(0, first_mb=480, marginal_mb=490)],
+            ],
+        )
+        (accelerator,) = probe_session_accelerators()
+        assert len(calls) == 2
+        assert accelerator.runtime_overhead_mb == 472
+
+    def test_a_consistent_first_run_is_the_only_run(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The usual launch pays for one probe."""
+        calls = self._install_runs(monkeypatch, [[_context_reading(0, first_mb=487, marginal_mb=488)]])
+        probe_session_accelerators()
+        assert len(calls) == 1
+
+    def test_never_exceeds_the_run_cap(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A card that never agrees costs at most three probes, then takes the smallest first-context run."""
+        calls = self._install_runs(
+            monkeypatch,
+            [
+                [_context_reading(0, first_mb=1161, marginal_mb=426)],
+                [_context_reading(0, first_mb=900, marginal_mb=300)],
+                [_context_reading(0, first_mb=1000, marginal_mb=200)],
+            ],
+        )
+        (accelerator,) = probe_session_accelerators()
+        assert MAX_CONTEXT_PROBE_RUNS == 3
+        assert len(calls) == MAX_CONTEXT_PROBE_RUNS
+        assert accelerator.runtime_overhead_mb == 900
+
+    def test_logs_every_raw_reading_per_card(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The startup line includes the baseline, both later readings and both figures."""
+        from loguru import logger
+
+        self._install_runs(monkeypatch, [[_context_reading(0, first_mb=487, marginal_mb=488, baseline_mb=3600)]])
+        messages: list[str] = []
+        sink_id = logger.add(lambda message: messages.append(message.record["message"]), level="INFO")
+        try:
+            probe_session_accelerators()
+        finally:
+            logger.remove(sink_id)
+        (line,) = [message for message in messages if message.startswith("Accelerator 0 context cost")]
+        for fragment in ("baseline 3600MB", "after context 4087MB", "after holder 4575MB", "first 487MB"):
+            assert fragment in line
+        assert "marginal 488MB" in line
+        assert "1 probe run" in line
+
+    def test_detect_uses_the_checked_probe(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Startup detection takes the re-measured figures, never the contaminated first run."""
+        self._install_runs(
+            monkeypatch,
+            [
+                [_context_reading(0, first_mb=1161, marginal_mb=426)],
+                [_context_reading(0, first_mb=472, marginal_mb=506)],
+            ],
+        )
+        resources = SystemResources.detect()
+        assert resources.per_process_overhead_mb_by_device == {0: 472}
+        assert resources.marginal_process_overhead_mb_by_device == {0: 506}

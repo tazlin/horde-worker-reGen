@@ -104,6 +104,36 @@ Get-Content bridge_1.log -Wait
 less +F bridge_1.log
 ```
 
+## Startup context cost
+
+At startup `bridge.log` has one INFO line per card from the accelerator probe:
+
+```text
+Accelerator 0 context cost: baseline 3600MB, after context 4087MB, after holder 4575MB, first 487MB, marginal 488MB. The two figures agree (1 probe run).
+```
+
+The three readings are device-wide VRAM used on the card: before the probe created any context, after it
+created its own, and after a second process started holding a context on the same card. `first` is the
+first-context cost (after context less baseline) and `marginal` is the cost of each further context (after
+holder less after context). The worker holds both figures for the whole session. A clean launch reads them
+within a few tens of MB of each other. `unread` marks a reading the probe could not take, as on a card
+without NVML.
+
+The sentence after the figures is the check's result:
+
+- `The two figures agree` means the line's run was accepted. A count above one means an earlier run on some
+  card disagreed and the probe ran again.
+- `The two figures disagree on every run` means no run agreed within the tolerance (a quarter of the smaller
+  figure, at least 64 MB) after three runs. The figures are from the run with the smallest first-context
+  figure, and a WARNING beginning `Accelerator N first-context and marginal figures disagree on every probe
+  run` lists every run's readings. Another program allocating on the card while the worker starts is the usual
+  cause, and the baseline readings show whether the card was already busy.
+- `Not checked` means the marginal was not measured as an NVML delta. The figures are the first run's.
+
+`vram_per_process_overhead_mb` in the config, when above 0, replaces the first-context figure regardless of
+this line. The
+figures in use appear on every stream forecast line as `overhead/proc=` and `marginal/ctx=`.
+
 ## VRAM admission diagnostics
 
 A warning beginning `Deferring post-processing for job` records a lane-admission miss. Its candidate is the

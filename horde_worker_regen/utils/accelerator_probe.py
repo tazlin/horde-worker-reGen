@@ -12,33 +12,32 @@ data. The subprocess pays the torch cost and frees it on exit, leaving the calle
 backend-agnostic: the subprocess uses the same hordelib helper, so it reports whatever backend ComfyUI
 supports (CUDA/ROCm, Intel XPU, Apple MPS, DirectML, CPU), not just NVIDIA.
 
-Beyond the inventory, the subprocess also measures two VRAM figures the streaming forecast needs, which
-correspond to two distinct terms of the device's VRAM decomposition (device baseline / per-process
-marginal overhead / model weights / activation peaks; see ``scheduling/context_overhead_model``). Both are
-measured **per card**, one card at a time: the probe materialises its own context on each device in turn and
-brings up a sibling context pinned to that device, so a heterogeneous host gets each card's own figures
-rather than one card's applied to all of them. Where a card cannot be measured (no NVML on a card that is
-not the active torch device) its entry reports the figures as unmeasured and the consumer falls back to the
-worker-wide reduction. The two figures are:
+Beyond the inventory, the subprocess also measures what a torch context costs on each card, for the streaming
+forecast and the other consumers of ``scheduling/context_overhead_model``. Both figures are measured **per
+card**, one card at a time: the probe materialises its own context on each device in turn and brings up a
+sibling context pinned to that device, so a heterogeneous host gets each card's own figures rather than one
+card's applied to all of them. Where a card cannot be measured (no NVML on a card that is not the active torch
+device) its entry reports the figures as unmeasured and the consumer falls back to the worker-wide reduction.
+The two figures are:
 
-- the *first/sole* process's context cost: the one-time, device-wide CUDA runtime allocation plus one
-  context. This is paid once per device and sizes ``free_if_alone``; it is never the cost of an additional
-  context. Like the marginal below it is a before/after delta, so whatever the device already held when the
-  probe started (a desktop compositor, another tenant's process) cancels instead of being charged to the
-  worker: a device-wide *used* reading taken after the context materialises includes every other tenant on
-  the card, and that figure applied as a per-process overhead prices a small card out of models it serves;
-  and
-- the *marginal* cost of each additional sibling context: measured directly by bringing up a second
-  context-holding process and reading the device-wide used *delta*. Because the one-time runtime and the
-  device baseline are already counted in the first figure, the delta isolates term (2) alone, so the
-  forecast can size ``free_after_model_evict`` from the real per-context cost instead of charging the whole
-  one-time-inclusive overhead per process (which over-counts badly on a big card and is what wedged a 24GB
-  worker).
+- the *first-context* cost: device-wide used after the probe's own context materialises, less the reading
+  taken before any context existed. It sizes ``free_if_alone``. Because it is a before/after delta, whatever
+  the device already held when the probe started (a desktop compositor, another tenant's process) cancels
+  instead of being charged to the worker.
+- the *marginal* cost of each additional sibling context: the device-wide used change across a second
+  context-holding process pinned to the card. It sizes ``free_after_model_evict``.
 
-The delta is only visible cross-process where the platform reports true device-wide VRAM; Linux does,
-Windows WDDM does not, so there the marginal reads 0 and the worker seeds a conservative
-per-additional-context constant (``resource_budget._SEEDED_MARGINAL_CONTEXT_OVERHEAD_MB``) rather than
-re-charging the first-context overhead per context.
+Both figures are the cost of one context, and a clean launch reads them within a few tens of MB of each other.
+All three readings are device-wide, so another program that allocates on the card between two of them is
+counted in the figure that spans that window. :func:`probe_session_accelerators` compares the two figures per
+card and repeats the probe while they disagree (see :func:`select_context_readings`), and logs the raw readings
+behind each card's figures once at startup.
+
+The readings come from NVML, which is device-wide on every platform. Where NVML cannot read the card the
+probe falls back to torch's free-VRAM reading, which is per-process on Windows WDDM: there the marginal
+reads 0 and the worker seeds a conservative per-additional-context constant
+(``resource_budget._SEEDED_MARGINAL_CONTEXT_OVERHEAD_MB``) rather than re-charging the first-context overhead
+per context.
 """
 
 from __future__ import annotations
@@ -46,9 +45,11 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from collections.abc import Sequence
+from enum import StrEnum, auto
 
 from loguru import logger
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 # The child only imports the torch-free ``torch_memory`` submodule, then calls the enumeration (which
 # loads torch in *this* short-lived process). The result is emitted on stdout behind a sentinel prefix so
@@ -169,14 +170,15 @@ try:
 
     def _measure_marginal(_accelerator, _context_nvml_mb, _overhead_mb, _torch_basis):
         # Marginal cost of an *additional* sibling context on this card: bring up a second process pinned to
-        # it that materialises its own context, then measure the device-wide used delta. The one-time runtime
-        # (and any device baseline) is already counted, so the delta is what each extra inference process
-        # really costs (the per-context figure the forecast multiplies by (process count - 1) for
-        # free_after_model_evict, instead of charging the whole one-time-inclusive overhead per process).
-        # Best-effort: any failure leaves it 0 and the worker falls back.
+        # it that materialises its own context, then measure the device-wide used delta. The after-context
+        # reading already includes this process's context and the card's prior tenants, so the delta is one
+        # more context's cost (the per-context figure the forecast multiplies by (process count - 1) for
+        # free_after_model_evict). Best-effort: any failure leaves it 0 and the worker falls back. The NVML
+        # reading after the holder is returned as well, so the parent can log and compare the raw readings.
         _index = int(_accelerator.index)
         _marginal_mb = 0
         _marginal_note = "not attempted"
+        _after_holder_mb = None
         _holder = None
         try:
             _holder = subprocess.Popen(
@@ -213,6 +215,7 @@ try:
                 # the active torch device, since those helpers cannot be pointed at another card.
                 _after_nvml_mb = _nvml_used_mb(_index)
                 if _after_nvml_mb is not None and _context_nvml_mb is not None:
+                    _after_holder_mb = _after_nvml_mb
                     _marginal_mb = max(0, _after_nvml_mb - _context_nvml_mb)
                     _marginal_note = f"nvml delta {{_after_nvml_mb}}-{{_context_nvml_mb}}"
                 elif _torch_basis:
@@ -240,7 +243,7 @@ try:
                         _marginal_note += " | holder stderr: " + _holder_err.strip().replace("\\n", " ")[-300:]
                 except BaseException:
                     pass
-        return _marginal_mb, _marginal_note
+        return _marginal_mb, _marginal_note, _after_holder_mb
 
     def _measure_device(_accelerator):
         # One card's measurement, run to completion before the next card starts. The marginal is a
@@ -269,7 +272,7 @@ try:
             _baseline_mb = None
         else:
             _context_used_mb = _context_nvml_mb
-        _marginal_mb, _marginal_note = _measure_marginal(
+        _marginal_mb, _marginal_note, _after_holder_mb = _measure_marginal(
             _accelerator,
             _context_nvml_mb,
             _overhead_mb,
@@ -282,6 +285,7 @@ try:
             "kind": str(_accelerator.kind),
             "context_device_used_mb": _context_used_mb,
             "device_baseline_mb": _baseline_mb,
+            "after_holder_device_used_mb": _after_holder_mb,
             "marginal_overhead_mb": _marginal_mb,
             "marginal_note": _marginal_note,
         }}
@@ -293,6 +297,25 @@ except BaseException as exc:  # noqa: BLE001 - any failure means "no devices"; r
 
 print({_RESULT_PREFIX!r} + json.dumps(_payload))
 """
+
+CONTEXT_FIGURE_TOLERANCE_FRACTION: float = 0.25
+"""How far apart a card's first-context and marginal figures may read, as a fraction of the smaller one.
+
+Both figures are the cost of one context. A clean launch reads them within about 15 MB of each other on every
+card sampled (8 to 32 GB, Linux and Windows), while a foreign allocation inside the probe's window adds
+hundreds of MB to one of them. A quarter of the smaller figure leaves room for driver and allocator noise on a
+large context and still flags such an allocation."""
+
+CONTEXT_FIGURE_TOLERANCE_FLOOR_MB: int = 64
+"""The smallest tolerance (MB) between the two context figures.
+
+A small card's context costs about 150 MB, where a quarter is under 40 MB. The floor keeps ordinary noise on
+such a card from being read as a foreign allocation."""
+
+MAX_CONTEXT_PROBE_RUNS: int = 3
+"""How many probe runs startup takes at most: the first, plus up to two re-measures while a card is suspect.
+
+Each re-measure costs a torch import and one holder process per card, and runs only after a suspect reading."""
 
 
 class ProbedAccelerator(BaseModel):
@@ -306,25 +329,29 @@ class ProbedAccelerator(BaseModel):
     pin each inference process to its device with the right backend mask. Defaults to ``cuda`` for probes/
     serialisations that predate this field."""
     runtime_overhead_mb: int = 0
-    """Approx. VRAM (MB) the *first/sole* fresh torch process consumes on the idle device: the one-time
-    CUDA-runtime/kernel allocation plus one context. Sizes free-if-alone. Derived by the parent as the
-    before/after delta over :attr:`device_baseline_mb`, so VRAM other tenants already held is not charged to
-    the worker. Defaults to 0 for probes/serialisations that predate this field."""
+    """Approx. VRAM (MB) the *first/sole* fresh torch process's context costs on the card. Sizes
+    free-if-alone. Derived by the parent as the before/after delta over :attr:`device_baseline_mb`, so VRAM
+    other tenants already held is not charged to the worker. Defaults to 0 for probes/serialisations that
+    predate this field."""
     context_device_used_mb: int = 0
     """Device-wide VRAM used (MB) measured after the probe materialised its context: the raw reading behind
-    :attr:`runtime_overhead_mb`, before the baseline is netted out. Carried so the derivation is inspectable
-    and the raw figures stay available for diagnostics."""
+    :attr:`runtime_overhead_mb`, before the baseline is netted out. An NVML reading whenever
+    :attr:`device_baseline_mb` is set, else the torch reading of the active device."""
     device_baseline_mb: int | None = None
     """Device-wide VRAM used (MB) on this card *before* the probe created any context, read through NVML so
     the reading itself allocates nothing. None when unmeasurable (a non-NVIDIA backend, no driver), where the
     first-context overhead degrades to the baseline-inclusive raw reading."""
+    after_holder_device_used_mb: int | None = None
+    """Device-wide VRAM used (MB) read through NVML once the sibling holder's context had materialised: the
+    raw reading behind :attr:`marginal_overhead_mb`. None when the marginal was not taken as an NVML delta
+    (no NVML for the card, a holder that never started, a probe that predates this field)."""
     marginal_overhead_mb: int = 0
-    """Approx. VRAM (MB) each *additional* sibling process's context costs once the first has paid the shared
-    one-time runtime cost, measured by bringing up a second context and taking the device-wide used delta.
-    On one GPU this is several times smaller than ``runtime_overhead_mb``. Sizes free-after-model-evict.
-    0 when it could not be measured (single-context backends, probe failure), where the worker seeds a
-    conservative per-additional-context constant (``resource_budget._SEEDED_MARGINAL_CONTEXT_OVERHEAD_MB``)
-    rather than re-charging the first-context ``runtime_overhead_mb`` against every context."""
+    """Approx. VRAM (MB) each *additional* sibling process's context costs, measured by bringing up a second
+    context and taking the device-wide used delta. A clean reading is close to :attr:`runtime_overhead_mb`,
+    since both are the cost of one context. Sizes free-after-model-evict. 0 when it could not be measured
+    (single-context backends, probe failure), where the worker seeds a conservative per-additional-context
+    constant (``resource_budget._SEEDED_MARGINAL_CONTEXT_OVERHEAD_MB``) rather than re-charging the
+    first-context ``runtime_overhead_mb`` against every context."""
     marginal_note: str = ""
     """Why :attr:`marginal_overhead_mb` reads what it does, for diagnosis when it reads 0.
 
@@ -332,6 +359,30 @@ class ProbedAccelerator(BaseModel):
     never started, a raised exception, and a platform where the reading cannot see a sibling process at
     all. This carries which of those happened, including the holder's stderr where one failed, so the
     seeded fallback is a visible decision rather than a silent one. Empty for probes that predate it."""
+
+
+class ContextReadingVerdict(StrEnum):
+    """How a card's context figures were checked across the startup probe runs."""
+
+    CONSISTENT = auto()
+    """A run's first-context and marginal figures agreed within the tolerance, and that run supplies both."""
+    INCONSISTENT = auto()
+    """No run agreed. The run with the smallest first-context figure supplies both figures."""
+    UNCHECKED = auto()
+    """The first run did not measure both figures as NVML deltas, so they could not be compared and it stands."""
+
+
+class SelectedContextReading(BaseModel):
+    """Represents the probe reading chosen for one card, and the readings it was chosen from."""
+
+    model_config = ConfigDict(frozen=True)
+
+    accelerator: ProbedAccelerator
+    """The reading whose figures the session uses."""
+    readings: list[ProbedAccelerator]
+    """This card's reading from every probe run that reported it, in run order."""
+    verdict: ContextReadingVerdict
+    """Whether the chosen reading's two figures agreed."""
 
 
 def _first_context_overhead_mb(*, context_device_used_mb: int, device_baseline_mb: int | None) -> int:
@@ -347,6 +398,8 @@ def _first_context_overhead_mb(*, context_device_used_mb: int, device_baseline_m
     Clamped at 0: the baseline and the post-context reading are separate samples, so an unrelated tenant
     releasing memory in between can invert them, and a negative overhead would credit the worker VRAM it never
     freed. An unmeasurable baseline (None) leaves the raw reading, which over-counts in the safe direction.
+    The opposite case, a tenant allocating in between, is caught by comparing against the marginal
+    (:func:`select_context_readings`).
 
     Args:
         context_device_used_mb (int): Device-wide VRAM used (MB) after the probe materialised its context.
@@ -355,6 +408,124 @@ def _first_context_overhead_mb(*, context_device_used_mb: int, device_baseline_m
     if device_baseline_mb is None:
         return max(0, context_device_used_mb)
     return max(0, context_device_used_mb - device_baseline_mb)
+
+
+def _context_figures_comparable(accelerator: ProbedAccelerator) -> bool:
+    """Return whether both context figures of one reading are NVML deltas that can be compared.
+
+    A missing baseline leaves the first-context figure baseline-inclusive, and a 0 marginal is the
+    unmeasured fallback. Neither can be compared with the other figure.
+    """
+    return (
+        accelerator.device_baseline_mb is not None
+        and accelerator.after_holder_device_used_mb is not None
+        and accelerator.marginal_overhead_mb > 0
+    )
+
+
+def _context_figures_agree(accelerator: ProbedAccelerator) -> bool:
+    """Return whether one reading's first-context and marginal figures are within the tolerance."""
+    smaller_mb = min(accelerator.runtime_overhead_mb, accelerator.marginal_overhead_mb)
+    tolerance_mb = max(CONTEXT_FIGURE_TOLERANCE_FLOOR_MB, int(smaller_mb * CONTEXT_FIGURE_TOLERANCE_FRACTION))
+    return abs(accelerator.runtime_overhead_mb - accelerator.marginal_overhead_mb) <= tolerance_mb
+
+
+def _select_card_reading(readings: list[ProbedAccelerator]) -> SelectedContextReading:
+    """Return the reading one card's session figures come from, given its readings in run order."""
+    first_reading = readings[0]
+    if not _context_figures_comparable(first_reading):
+        return SelectedContextReading(
+            accelerator=first_reading,
+            readings=readings,
+            verdict=ContextReadingVerdict.UNCHECKED,
+        )
+    comparable_readings = [reading for reading in readings if _context_figures_comparable(reading)]
+    for reading in comparable_readings:
+        if _context_figures_agree(reading):
+            return SelectedContextReading(
+                accelerator=reading,
+                readings=readings,
+                verdict=ContextReadingVerdict.CONSISTENT,
+            )
+    # A foreign allocation only inflates a reading, and a platform where the first context really costs more
+    # reads the same on every run, so the smallest first-context figure is the best estimate either way.
+    smallest_reading = min(comparable_readings, key=lambda reading: reading.runtime_overhead_mb)
+    return SelectedContextReading(
+        accelerator=smallest_reading,
+        readings=readings,
+        verdict=ContextReadingVerdict.INCONSISTENT,
+    )
+
+
+def select_context_readings(runs: Sequence[Sequence[ProbedAccelerator]]) -> list[SelectedContextReading]:
+    """Return each card's chosen reading across one or more probe runs, in the first run's card order.
+
+    The first-context figure and the marginal are both the cost of one context, so a clean reading has them
+    within the tolerance (:data:`CONTEXT_FIGURE_TOLERANCE_FRACTION` of the smaller, at least
+    :data:`CONTEXT_FIGURE_TOLERANCE_FLOOR_MB`). Per card, the first run whose figures agree supplies both. When
+    no run agrees, the run with the smallest first-context figure supplies both. A card whose first reading
+    cannot be compared (no baseline, or an unmeasured marginal) keeps that reading. The first run sets the
+    inventory. A card missing from a later run, as after a failed re-measure, keeps the readings it has.
+
+    Args:
+        runs (Sequence[Sequence[ProbedAccelerator]]): Each probe run's per-card readings, in run order.
+
+    Returns:
+        list[SelectedContextReading]: One entry per card of the first run. Empty when there are no runs.
+    """
+    if not runs:
+        return []
+    selections: list[SelectedContextReading] = []
+    for first_run_reading in runs[0]:
+        card_readings = [reading for run in runs for reading in run if reading.index == first_run_reading.index]
+        selections.append(_select_card_reading(card_readings))
+    return selections
+
+
+def _format_reading_mb(reading_mb: int | None) -> str:
+    """Return one raw reading for a log line, or ``unread`` when the probe did not take it."""
+    return "unread" if reading_mb is None else f"{reading_mb}MB"
+
+
+def _describe_raw_readings(accelerator: ProbedAccelerator) -> str:
+    """Return a reading's three device-used readings and two figures as log text."""
+    return (
+        f"baseline {_format_reading_mb(accelerator.device_baseline_mb)}, "
+        f"after context {_format_reading_mb(accelerator.context_device_used_mb)}, "
+        f"after holder {_format_reading_mb(accelerator.after_holder_device_used_mb)}, "
+        f"first {accelerator.runtime_overhead_mb}MB, marginal {accelerator.marginal_overhead_mb}MB"
+    )
+
+
+_VERDICT_LOG_TEXT: dict[ContextReadingVerdict, str] = {
+    ContextReadingVerdict.CONSISTENT: "The two figures agree",
+    ContextReadingVerdict.INCONSISTENT: (
+        "The two figures disagree on every run, so the run with the smallest first-context figure is used"
+    ),
+    ContextReadingVerdict.UNCHECKED: "Not checked, because the marginal was not measured as an NVML delta",
+}
+
+
+def _log_context_selection(selection: SelectedContextReading, *, run_count: int) -> None:
+    """Log one card's startup context figures, the raw readings behind them, and how they were checked."""
+    accelerator = selection.accelerator
+    run_word = "run" if run_count == 1 else "runs"
+    logger.info(
+        f"Accelerator {accelerator.index} context cost: {_describe_raw_readings(accelerator)}. "
+        f"{_VERDICT_LOG_TEXT[selection.verdict]} ({run_count} probe {run_word}).",
+    )
+    if selection.verdict is not ContextReadingVerdict.INCONSISTENT:
+        return
+    every_reading = " | ".join(
+        f"reading {position}: {_describe_raw_readings(reading)}"
+        for position, reading in enumerate(selection.readings, start=1)
+    )
+    chosen_position = selection.readings.index(accelerator) + 1
+    logger.warning(
+        f"Accelerator {accelerator.index} first-context and marginal figures disagree on every probe run "
+        f"({every_reading}). Using reading {chosen_position}, which has the smallest first-context figure. "
+        "Another program allocating on this card while the worker starts inflates the first-context figure.",
+    )
 
 
 def _nvml_device_count() -> int:
@@ -385,6 +556,9 @@ def probe_accelerators(*, timeout_seconds: float = 120.0) -> list[ProbedAccelera
     exits. Never raises: any failure (no backend, subprocess error or timeout, malformed output) is
     logged at debug and yields an empty list, so the caller degrades to "no devices detected" rather than
     crashing. The subprocess reuses this interpreter (``sys.executable``), so it sees the same hordelib.
+
+    This is one run, with no check of the context figures. A caller that holds the figures for a session
+    uses :func:`probe_session_accelerators`.
 
     Args:
         timeout_seconds (float): The budget for measuring *one* card. The child measures each card in turn
@@ -454,3 +628,30 @@ def probe_accelerators(*, timeout_seconds: float = 120.0) -> list[ProbedAccelera
 
     logger.debug("Accelerator probe produced no result line")
     return []
+
+
+def probe_session_accelerators() -> list[ProbedAccelerator]:
+    """Return the machine's accelerators with context figures checked for a foreign allocation.
+
+    The figures are held for the whole session, so a reading inflated by another program allocating on the
+    card during the probe would be charged until the worker restarts. The probe is repeated while any card's
+    figures disagree, up to :data:`MAX_CONTEXT_PROBE_RUNS` runs in all, and each card takes its reading from
+    :func:`select_context_readings`. The repeat runs a fresh subprocess, since a process creates its context
+    once and cannot read the first-context figure again. Each run has the default per-card budget of
+    :func:`probe_accelerators`. Logs one INFO line per card with the raw readings, and a WARNING for a card
+    whose figures never agreed.
+
+    Returns:
+        list[ProbedAccelerator]: The first run's cards, each with its chosen reading. Empty when the first run
+            found no accelerators.
+    """
+    runs: list[list[ProbedAccelerator]] = [probe_accelerators()]
+    selections = select_context_readings(runs)
+    while len(runs) < MAX_CONTEXT_PROBE_RUNS and any(
+        selection.verdict is ContextReadingVerdict.INCONSISTENT for selection in selections
+    ):
+        runs.append(probe_accelerators())
+        selections = select_context_readings(runs)
+    for selection in selections:
+        _log_context_selection(selection, run_count=len(runs))
+    return [selection.accelerator for selection in selections]

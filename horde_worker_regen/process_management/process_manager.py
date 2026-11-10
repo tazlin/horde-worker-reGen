@@ -409,17 +409,16 @@ class SystemResources:
     device_map: TorchDeviceMap
     per_process_overhead_mb: int = 0
     """Approx. VRAM (MB) the *first/sole* inference process consumes for its torch/CUDA context with no model
-    loaded (the one-time runtime cost plus one context), measured by the accelerator probe on the idle
-    device. The streaming forecast subtracts this from total VRAM to estimate the free achievable under sole
-    residency. The worker-wide reduction over :attr:`per_process_overhead_mb_by_device` (the maximum, the
-    conservative direction for an overhead charge), for the callers that have no card in hand. 0 when
-    unmeasured."""
+    loaded, measured by the accelerator probe as the device-wide change across its own context. The
+    streaming forecast subtracts this from total VRAM to estimate the free achievable under sole residency.
+    The worker-wide reduction over :attr:`per_process_overhead_mb_by_device` (the maximum, the conservative
+    direction for an overhead charge), for the callers that have no card in hand. 0 when unmeasured."""
     marginal_process_overhead_mb: int = 0
-    """Approx. VRAM (MB) each *additional* inference process's context costs once the first has paid the
-    shared one-time runtime cost, measured by the probe's second-context delta. The forecast multiplies this
-    (not the one-time-inclusive ``per_process_overhead_mb``) by the sibling count for free-after-model-evict.
-    The worker-wide maximum over :attr:`marginal_process_overhead_mb_by_device`. 0 when unmeasured, where the
-    forecast falls back to charging the full overhead per context."""
+    """Approx. VRAM (MB) each *additional* inference process's context costs, measured by the probe's
+    second-context delta. A clean reading is close to :attr:`per_process_overhead_mb`. The forecast multiplies
+    this by the sibling count for free-after-model-evict. The worker-wide maximum over
+    :attr:`marginal_process_overhead_mb_by_device`. 0 when unmeasured, where the forecast falls back to a
+    seeded per-context constant."""
     per_process_overhead_mb_by_device: dict[int, int] = dataclasses.field(default_factory=dict)
     """Each card's own first-context overhead (MB), keyed by device index; the probe measures every device
     separately. A card the probe could not measure is absent, and its forecasts fall back to the worker-wide
@@ -437,11 +436,13 @@ class SystemResources:
         Intel XPU, Apple MPS, DirectML, CPU) populates the device map; a bare ``torch.cuda.device_count()``
         loop would yield no devices on non-CUDA backends). And it keeps this process torch-free: detect()
         runs in the long-lived orchestrator, enumerating accelerators loads torch (~500MB), so
-        :func:`probe_accelerators` pays that cost in a short-lived subprocess that frees it on exit.
+        :func:`probe_session_accelerators` pays that cost in a short-lived subprocess that frees it on exit.
+        The context figures are held for the session, so the probe is repeated when a card's two figures
+        disagree, as they do when another program allocates on the card during the probe.
         """
         import psutil
 
-        from horde_worker_regen.utils.accelerator_probe import probe_accelerators
+        from horde_worker_regen.utils.accelerator_probe import probe_session_accelerators
 
         total_ram = psutil.virtual_memory().total
 
@@ -451,7 +452,7 @@ class SystemResources:
         # setdefault so a deliberate operator override still wins; the probe subprocess inherits it.
         os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
 
-        accelerators = probe_accelerators()
+        accelerators = probe_session_accelerators()
 
         # Warn once if the declared compute backend (bin/backend) disagrees with what the hardware probe
         # actually found: a GPU install whose driver is broken (would run on CPU or fault), or a CPU
@@ -1872,8 +1873,7 @@ class HordeWorkerProcessManager:
         )
         # Feed the startup-measured per-process VRAM overhead to the scheduler's streaming forecast, so it
         # can estimate the free VRAM achievable under sole residency (total - one process's context) and,
-        # from the probe's second-context delta, the marginal cost of each additional sibling context (so
-        # free-after-model-evict is not the one-time runtime cost multiplied by the process count).
+        # from the probe's second-context delta, the marginal cost of each additional sibling context.
         # Fed per card as well as worker-wide: a card-scoped forecast prices its own card's context, while a
         # card the probe could not measure (and every worker-wide caller) falls back to the maxima.
         self._inference_scheduler.set_measured_per_process_overhead_mb(system_resources.per_process_overhead_mb)

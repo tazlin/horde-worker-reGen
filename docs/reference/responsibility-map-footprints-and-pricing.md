@@ -6,7 +6,8 @@ the parent attribute each reading to a job and a key. The store bounds the readi
 and a recent window per key. From them it gives two prices per key, the seed raised by the watermark and the
 margined measured figure once a key has enough jobs. Four readers price one job from the store, each for a different
 decision (dispatch and preload, clearance, the residency head need and the dominance verdict). The foreign floor and
-the reconciler's baseline sit beside the store and are measured from the card. The reasoning behind the
+the reconciler's baseline sit beside the store and are measured from the card, as are the two context figures,
+which are measured once at startup. The reasoning behind the
 rules is in [VRAM arbiter](../explanation/vram_arbiter.md) and
 [Resource governance](../explanation/resource_governance.md).
 
@@ -85,6 +86,14 @@ prices. The scheduler copies re-implement the `pricing` helpers, and a change to
 The verdict reads the pooled key, which holds batched and hires-fix jobs, while its seed branch prices a plain
 batch-1 job. One batched job can therefore move every model of a baseline to a higher rung, while
 `candidate_delta_mb` prices the job's own class.
+
+## What a context costs
+
+| Decision | Owner | Rule |
+| --- | --- | --- |
+| The first-context and marginal figures | `horde_worker_regen/utils/accelerator_probe.py` `probe_session_accelerators`, `select_context_readings`; held by `scheduling/context_overhead_model.py` `ContextOverheadModel` | Measured once, in a subprocess at construction before any child starts, from three device-wide NVML readings per card: before any context, after the probe's own context, and after a pinned holder process's context. The first-context figure is the second reading less the first, and the marginal is the third less the second. A card whose two figures differ by more than a quarter of the smaller (at least 64 MB) is measured again, up to three runs, and takes the first run that agrees, else the run with the smallest first-context figure. Fixed for the session. `vram_per_process_overhead_mb` above 0 replaces the first-context figure. The idle-residency observation (`capture_idle_context_residency`, `invalidate_idle_context_floor`) can only raise the marginal, and it reads the first-context figure as a fixed input. |
+| Which consumer reads which figure | scheduler `_per_process_overhead_mb`, `_marginal_or_seed_mb`, `resolved_context_constant_mb` | The dominance verdict (`_dominance_inputs`), the stream forecast (`forecast_weight_streaming`), the resident-process count (`max_coresident_for_peak`), the post-processing lane fit under a whole-card residency and the arbiter's sampling headroom (`DeviceVramState`) charge the first-context figure once and the marginal per extra context. The committed ledger charges every process the marginal, else the platform seed (`resolved_context_constant_mb`). The learned footprint store adds the platform seed (`platform_context_constant_mb()` with no argument), and it does not read either measured figure. |
+| Whether the foreign floor reads a context figure | scheduler `_foreign_reading_worker_footprint` | Where the driver reports per-process usage for the worker's pids, the worker footprint is that usage, and it does not read either figure. Otherwise it is the committed ledger, which reads the marginal. Neither branch reads the first-context figure, so an over-read first context is not offset by a lower floor. |
 
 ## VRAM the worker does not hold
 

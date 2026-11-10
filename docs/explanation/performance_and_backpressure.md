@@ -1610,19 +1610,29 @@ work; today the hold rests on the same estimate arithmetic the rest of admission
 
 The job-burden prediction above is *per job*. Sizing residency across several processes that share one
 card needs a second, *per-process* quantity: how much VRAM each inference context costs **on top of** its
-model weights. The first context pays a large one-time cost (the CUDA runtime allocation); each additional
-co-resident context costs only a smaller **marginal** amount. Multiplying the one-time cost by the process
-count would phantom away most of the card and force needless teardowns; ignoring the marginal entirely
+model weights. The scheduler holds two figures: the **first-context** cost, which sizes the free VRAM under
+sole residency, and the **marginal** cost of each additional co-resident context. Charging too much per
+context would phantom away most of the card and force needless teardowns. Ignoring the marginal entirely
 would over-promise reclaimable VRAM. The scheduler needs both figures to forecast what is actually free
 once idle models are evicted.
 
 It derives them from two measurements, preferring hard data and erring conservative:
 
-- **The startup accelerator probe** measures the marginal per-additional-context cost directly (its
-  second-context delta, with the one-time runtime and the fixed device baseline already subtracted). This is
-  the structural per-context cost, available from the first scheduling tick, so it also covers the startup
-  window where sibling processes have not yet reached idle. `vram_per_process_overhead_mb` (config) can
-  override the first-context figure when an operator knows their card.
+- **The startup accelerator probe** (`utils/accelerator_probe.py`) runs in a subprocess before any child
+  starts and takes three device-wide NVML readings per card: before any context, after creating its own
+  context, and after starting a second process that holds a context on the same card. The first-context
+  figure is the second reading less the first. The marginal is the third less the second. Both are the cost
+  of one context, and a clean launch reads them within a few tens of MB of each other on every card sampled.
+  Because the readings are device-wide, another program that allocates on the card between two of them is
+  counted in the figure that spans that window, and the figures are held for the whole session. The probe
+  therefore compares the two per card. When they differ by more than a quarter of the smaller figure (at
+  least 64 MB), it runs again, up to three runs in all, and the card takes the first run whose figures agree.
+  When no run agrees, the card takes the run with the smallest first-context figure, since a foreign
+  allocation only inflates it, and a WARNING lists every run's readings. A card without a baseline reading
+  or a measured marginal is not checked. The startup log has one `Accelerator N context cost` line per card
+  (see [Logs](../reference/logs.md)). The marginal is available from the first scheduling tick, so it also
+  covers the startup window where sibling processes have not yet reached idle. `vram_per_process_overhead_mb`
+  (config) can override the first-context figure when an operator knows their card.
 - **The idle floor** is derived from the worker's bare-context total observed when every inference process
   is up, idle, and holding no model. The reading is supplied by the parent's attribution tick as truthful
   NVML device-used **minus the reconciled shared baseline minus every GPU tenant's byte-exact allocator
