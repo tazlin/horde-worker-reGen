@@ -10,10 +10,11 @@ those few models, so the worker idles waiting for jobs that match them.
 
 The fixed model pool is the deliberate middle path. The worker commits to a bounded set of **seats**, each
 holding one logical model assignment, and shapes its pop requests so the horde preferentially returns work for
-the seated models. A seat creates a residency preference, not a residency guarantee. The scheduler protects an
-idle seat's staged weights during ordinary cleanup, while genuine RAM/VRAM pressure may evict them without
-unseating the model. Runtime status therefore reports **seated** and **resident** separately. A separate lane
-keeps reaching the wider demand so a seat set does not blind the worker to everything else.
+the seated models. A seat is a preference in the pop offer, not a residency guarantee. The built worker does not
+connect seats to the scheduler's residency protection (see
+[Residency protection](#residency-protection-and-the-pressure-yield-precedence)), so a seated model's weights
+are evicted like any other model's. Runtime status therefore reports **seated** and **resident** separately. A
+separate lane keeps reaching the wider demand so a seat set does not blind the worker to everything else.
 
 The whole subsystem is off by default (`model_pool.enabled: false`), leaving model selection exactly as it was.
 It supersedes the older `model_stickiness` knob, which only biased a single pop toward the already-loaded
@@ -46,6 +47,10 @@ sustained empty pops against near-zero measured demand, or a stretch with no suc
 model. A demoted model **benches** with a cooldown, so it does not immediately re-seat and thrash between the
 seat and the bench.
 
+The bench holds back re-seating only. A benched model is not seated, so the free lane advertises it like any
+other unseated model. Pool state does not withhold a model from the pop offer, and rotation, demotion and rescue
+change only which lane offers a model.
+
 ## The two pop lanes and the demand-weighted interleave
 
 While the pool holds seats, a pop advertises one of two lanes, chosen by
@@ -64,9 +69,19 @@ yields the offer back to the wider set rather than starving the worker). Two edg
 round-robin: an empty fixed offer forces the free lane and an empty free offer forces the fixed lane, and when
 both are empty the worker advertises the full eligible set. The TUI surfaces the most recent pool-routed lane.
 
+With the default `seats: 0` the seat count equals the inference process count, so the free lane's weight is 0.
+The free lane is then chosen only when the last two fixed-lane pops both came back empty, or by the edge rules.
+A pop that ends at a gate before it is sent does not record an outcome, so withheld fixed-lane cycles do not add
+to that run of empty pops.
+
 This lane choice **narrows the pop advertisement**, so it is one of the pop-shaping inputs described in
 [Performance and Backpressure](performance_and_backpressure.md). The narrowing runs on top of the ordinary pop
-gauntlet, not instead of it.
+gauntlet, not instead of it. It runs only on a pop that is not an idle-fill pop and while the pool holds at least
+one seat, and it takes the offer as the earlier stages left it. The lane stage runs before the whole-card pop
+claim, and the pool does not read whole-card state. Under a claim, a claimed model that is not seated is withheld on
+every fixed-lane cycle, and a seated claimed model is withheld on every free-lane cycle. Each such cycle withholds
+the pop. The order of every stage is in
+[the runs and residency map](../reference/responsibility-map-runs-and-residency.md#pop-intake).
 
 ## Ranker scoring: demand per worker, weighted by local speed
 
@@ -76,7 +91,8 @@ orders the locally-servable candidates by a single deliberately-simple score. Li
 which reads the horde's `/v2/status/models` endpoint on a jittered interval (`demand_poll_seconds`, floored at
 60 seconds) and keeps the most recent good reading as an immutable snapshot.
 
-- **Demand** is `log1p(queued_per_worker)`, where `queued_per_worker = queued / (worker_count + 1)`. Dividing
+- **Demand** is `log1p(queued_per_worker)`, where `queued_per_worker = queued / (worker_count + 1)`. The
+  horde reports `queued` in megapixelsteps, so the figure is queued work per worker, not queued jobs. Dividing
   by the serving-worker count is what keeps the pool from piling onto a model that already has ample workers;
   a model absent from the snapshot carries demand zero (the horde is not asking for it).
 - **Expected value** is the model's estimated kudos per wall-second on this card: a coarse canonical job price
@@ -86,6 +102,11 @@ which reads the horde's `/v2/status/models` endpoint on a jittered interval (`de
 - **Score** is `demand * expected_value_normalised`. Demand is logarithmically compressed while expected value
   enters at full weight, so a much deeper cheap queue does not automatically displace a healthy queue that pays
   substantially more per second. A zero-demand model always scores zero.
+
+The score does not have a minimum. A low-value model keeps any seat it holds until a challenger beats its score by the
+rotation margin (25%) at its rotation deadline, or until it stops matching demand and is demoted. The job prices
+behind the expected value cover only some baselines, and a model whose baseline is missing from that table is
+priced as an SD1.5 job.
 
 Ties in score are broken first by **shared-VAE cluster size** (favouring models that share components with
 others the worker holds, which the component cache can keep warm) and then by name for determinism. The ranker
@@ -115,9 +136,15 @@ transfer. This is the only path by which the pool itself initiates a download; s
 
 ## Residency protection and the pressure-yield precedence
 
-A seat is a standing commitment, so the scheduler protects a seated model's staged weights from the ordinary
-idle-unload that would otherwise reclaim a model the instant no job references it. That protection is not
-absolute; under genuine memory pressure it yields in a strict precedence, weakest last:
+The scheduler implements seat protection, but the built worker does not connect it. `InferenceScheduler`
+accepts a `pool_protected_models_provider` and an `on_pool_pressure_eviction` callback, and the process manager
+does not pass either, so the scheduler reads the seat set as empty and the pool does not get a report of a
+pressure eviction (`ModelPool.on_pressure_eviction` is not called anywhere). A seat therefore does not protect a
+model's residency. The rest of this section describes the precedence the scheduler applies when a provider is passed.
+
+With a provider, a seat is a standing commitment, so the scheduler protects a seated model's staged weights
+from the ordinary idle-unload that would otherwise reclaim a model the instant no job references it. That
+protection is not absolute. Under genuine memory pressure it yields in a strict precedence, weakest last:
 
 1. **In-flight and imminent work is never evicted.** A model with a pending or in-progress job keeps its
    residency regardless of anything below.

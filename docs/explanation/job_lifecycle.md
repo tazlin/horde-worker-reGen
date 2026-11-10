@@ -121,7 +121,9 @@ gauntlet of gates before any network call, so the worker never pulls work it can
    session, skip. This is a warm-up guard, letting the first output finish before pulling more. A
    `return_control_map` output produced by the annotation lane counts as generation-stage completion even
    though it intentionally bypasses inference.
-4. A safety process and an inference process are available.
+4. A safety process is serving, and some inference process can accept a job now (idle or holding only a
+   preload, with no dispatched job). While every inference process holds a job the worker does not pop, so
+   `queue_size` does not provide a standby job behind a running one.
 5. Megapixelstep backpressure (`PopThrottler.should_wait_for_megapixelsteps`) and pop-rate throttle
    (`is_pop_too_soon`).
 

@@ -1013,8 +1013,9 @@ class JobPopper:
     def _apply_large_model_pop_limits(self, models: set[str], bridge_data: reGenBridgeData) -> set[str]:
         """Withhold very-large models from the offer per the switch throttle and re-entry cooldown.
 
-        Both limiters are off by default (zero durations) and yield to an idle escape (the worker holds no
-        work locally), so the worker never sits idle when the only work it could take is a large model. See
+        The switch throttle is off by default, and the re-entry cooldown inherits the residency cooldown by
+        default. Both yield to an idle escape (the worker holds no work locally), so the worker does not sit idle
+        when a large model is the only work available. See
         :class:`~horde_worker_regen.process_management.jobs.large_model_pop_governor.LargeModelPopGovernor`.
         """
         switch_min, reentry = self._resolve_large_model_pop_durations(bridge_data)

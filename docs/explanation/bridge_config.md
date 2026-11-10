@@ -244,16 +244,26 @@ visible before you save.
 
 ### Performance modes
 
-Three boolean flags interact to determine timings and parallelism:
+Three boolean flags set timings and intake. High performance mode wins when both
+performance modes are set.
 
-| Flag                        | Effect                                                                                                                                                                                                                             |
-| --------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `high_performance_mode`     | Cuts `process_timeout` to 1/3 of default; allows post-processing overlap                                                                                                                                                           |
-| `moderate_performance_mode` | Cuts `process_timeout` to 1/2 of default; allows post-processing overlap                                                                                                                                                           |
-| `extra_slow_worker`         | Disables both performance modes (`high_performance_mode`, `moderate_performance_mode`); forces `queue_size=0`, `max_threads=1`, and `preload_timeout` to at least `150`                                                             |
+| Effect | Normal | `moderate_performance_mode` | `high_performance_mode` |
+| ------ | ------ | --------------------------- | ----------------------- |
+| `process_timeout` | 300 s (the default) | 1/2 of the default | 1/3 of the default |
+| Megapixelstep intake budget, per card | 15 | 60 | 80 |
+| Megapixelstep pause | full length | shortened, see [Megapixelstep backpressure](performance_and_backpressure.md#megapixelstep-backpressure) | shortened further |
+| Concurrent-overlap headway scale | 1.0 | 0.75 | 0.5 |
+| Idle-fill small-job ceiling | 100 megapixelsteps | 200 | 400 |
 
-These flags also affect safety-check timeouts and how aggressively the scheduler
-preloads models.
+`extra_slow_worker` disables both performance modes and forces `queue_size=0`,
+`max_threads=1`, and `preload_timeout` to at least `150`.
+
+On a multi-card host the megapixelstep budget is the sum of each card's figure,
+so two cards in normal mode have a budget of 30. The modes do not change
+`post_process_timeout`, the pop frequency (1 s in every mode), safety-check
+timeouts or preload admission. `very_fast_disk_mode` governs preloading. A
+config can hold a `post_process_job_overlap` key. It is not a setting, and the
+worker ignores it, since the config model accepts unknown keys.
 
 ### VRAM and RAM budget
 
@@ -291,7 +301,18 @@ it is off: `whole_card_exclusive_residency`,
 of them to `true` alongside a disabled budget does nothing, with no symptom to
 notice. The worker therefore names any of them the operator set explicitly in a
 startup warning, so the dependency is visible rather than inferred; the remedy is to
-enable the budget.
+enable the budget. Two more effects follow. Retention is denied for every job
+(`budget_inactive`), so a lane does not keep its weights between jobs. A whole-card grant of either rung is also not made, so the pop claim that advertises one model
+while it holds the card does not engage, and the model switch rate follows what the
+horde sends for the whole offer.
+
+A card sized to one inference context (by `max_threads`, or by the VRAM-fit and
+RAM-fit caps on the process count) does not have a spare context to preload the next model,
+so every model switch loads with the card idle. It also does not hold a standby
+job, because the worker does not pop while every inference process holds a job (see
+[the pop gauntlet](performance_and_backpressure.md#the-pop-gauntlet)). On such a
+card the offer narrowing (the whole-card pop claim and the residency advertising
+bias) is what keeps consecutive jobs on one model.
 
 The host-RAM gates share one headroom model. `ram_reserve_mb` has one meaning: an additive
 reserve above marginal work. It overlaps the absolute `ram_pressure_*` floor, so the larger of

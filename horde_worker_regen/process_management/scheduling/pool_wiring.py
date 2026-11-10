@@ -114,7 +114,9 @@ _CANONICAL_JOB_KUDOS_BY_BASELINE: dict[str, float] = {
 
 The SD1.5 and SDXL figures are exact server-parity prices (the analysis scorer at 512x512 and 1024x1024,
 benchmark step count); the rest are coarse standings in the same currency. Only the ratios matter to seat
-selection, so a missing or drifted price degrades ranking quality, never correctness."""
+selection, so a missing or drifted price degrades ranking quality, never correctness. A baseline absent from
+the table is priced at :data:`_DEFAULT_CANONICAL_JOB_KUDOS`, so a large model whose baseline is missing here
+ranks as if it paid the SD1.5 price."""
 
 _DEFAULT_CANONICAL_JOB_KUDOS = 7.84
 """Price assumed for a baseline absent from the table: the cheap-model figure, so an unknown baseline is

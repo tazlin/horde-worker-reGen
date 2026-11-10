@@ -82,6 +82,19 @@ decode. `lease_wait_seconds` is how long the child blocked on its stage and clea
 child, so a slow load before the first acquire does not count. It is the job's measure of the clearance gate.
 `lease_timed_out` is true when an acquire returned without a permit and the job loaded or sampled unpriced.
 
+The monotonic clock is shared by every process on the host, so one offset maps every lane's step times to the
+epoch timeline of the other fields. The record does not have an epoch step time, so estimate the offset from the file:
+take a low percentile of `stage_timestamps["DETACHED"] - sampling_window.last_step` across its jobs. The
+difference also includes the job's decode and hand-off, so the low percentile is the closest estimate, and
+steps placed with it land slightly early.
+
+### Stage timestamps on `job_completed`
+
+`stage_timestamps` maps each `JobStage` name the job entered to the epoch time of its first entry, plus
+`FINALIZED`. `PENDING_INFERENCE` is the pop. `INFERENCE_IN_PROGRESS` is the dispatch to an inference process.
+`DETACHED` is the hand-off when the inference result arrives, before post-processing or safety.
+`PENDING_SAFETY_CHECK`, `SAFETY_CHECKING` and `PENDING_SUBMIT` follow, and `FINALIZED` is the end of submit. A stage that the job did not enter is absent, and a re-dispatched job keeps the time of its first dispatch.
+
 ### Worker-condition fields on `job_completed`
 
 Two jobs of identical shape can cost very different amounts depending on what the worker was doing around
@@ -97,11 +110,15 @@ that could not measure one omits it (or writes `null`), which is distinct from a
 | `post_processing_chain_seconds` | Seconds the post-processing lane spent inside the hordelib chain for this job, summed over its images. Absent when the job had no post-processing or the lane faulted. |
 | `post_processing_encode_seconds` | Seconds the lane spent encoding the post-processed images for upload. |
 | `post_processing_output_width`, `post_processing_output_height` | Size of the job's first post-processed image. |
-| `whole_card` | Whether a [whole-card exclusive residency](../explanation/resource_governance.md) for this job's model was held on its card at dispatch. Such a job ran with the card to itself and is charged the amortized cost of establishing that residency. |
+| `whole_card` | Whether a [whole-card grant](responsibility-map-runs-and-residency.md) of either rung for this job's model was held on its card at dispatch. Under a teardown (rung 2) the job ran with the card to itself. Under a dominant-model run (rung 1) the other lanes stayed up. A run is granted at its first job's first step, so that first job reads `false`. |
 | `process_age_seconds` | How long the inference process serving the job had been alive at dispatch. A young process has cold component and RAM caches, so its first jobs pay loads a long-lived process does not; a mid-session respawn contaminates the jobs around it. |
 
 A re-dispatched job (one whose first attempt failed and was retried) reports the dispatch conditions of the
 attempt that actually ran, not of its first.
+
+`whole_card` is the stream's only whole-card field. The stream does not record the pop claim, a residency's
+establishment or its release, so a stats-only analysis has to reconstruct the claim windows. The parent log's
+`Whole-card pop claim engaged for` and `Whole-card pop claim released for` lines are the record of them.
 
 The `baseline` on a `job_completed` record is the model's baseline as the loaded model reference states it
 (`stable_diffusion_1`, `stable_diffusion_xl`, `flux_1`, ...), or `null` when no record for the model was

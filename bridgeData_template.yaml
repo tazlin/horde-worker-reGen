@@ -865,11 +865,14 @@ starved_head_utilities_pause: true
 # churn. 0 restores immediately (most responsive, most churn). Only used with enable_vram_budget.
 whole_card_residency_cooldown_seconds: 45
 
-# Longest one whole-card residency may own the card, measured from when it was established. While a
-# residency is held the worker advertises only the resident model, so the horde stops sending work that
-# would push those weights back to system RAM or off the card; this ceiling is what guarantees a
-# multi-model worker returns to its full pool. Past it the residency stops being retained and lets go once
-# its accepted work has drained. A residency whose model runs out of demand releases sooner than this. 0 disables both the ceiling and the single-model offer. Only used with enable_vram_budget.
+# Longest a whole-card residency may limit the offer to its model, measured from when the card was granted.
+# While a residency is held the worker advertises only the resident model, so the horde stops sending work
+# that would push those weights back to system RAM or off the card. This cap is what guarantees a
+# multi-model worker returns to its full offer. Past it the cooldown stops holding the residency, which lets
+# go once a job for its model is neither pending nor running. Jobs for that model popped after the cap keep
+# it held.
+# A residency whose model runs out of demand releases sooner than this. 0 disables both the cap and the
+# single-model offer. Only used with enable_vram_budget.
 whole_card_residency_max_hold_seconds: 180
 
 # Minimum seconds between accepting jobs for *different* very-large models (Flux/Cascade/Qwen/Z-Image and

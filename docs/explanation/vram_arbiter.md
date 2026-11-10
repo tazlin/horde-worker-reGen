@@ -367,7 +367,9 @@ The arbiter keeps four concerns deliberately separate:
     (`InferenceScheduler.card_dominance`) and recomputed only when an input changes: the offered set or the
     pins, the total, either context cost, the margin, the floor moving past its diagnostic bucket, or an
     observation on an offered baseline's pooled sampling key. The scheduling snapshot carries it as
-    `CardSnapshot.dominance`, and each change of a rung is logged once as `Dominance verdict for device N`.
+    `CardSnapshot.dominance`. Every recompute logs `Dominance verdict for device N`, at INFO when a model's
+    rung changed and at DEBUG otherwise, so a session with a moving floor or a learning store has many of
+    these lines.
 - **Arbitration** evaluates the
   [ledger-driven admission identity][horde_worker_regen.process_management.resources.admission_identity]
   plus the concurrent-sampling headroom, then resolves an actuator escalation ladder. It never overcommit-admits

@@ -680,9 +680,11 @@ GATE_REGISTRY: tuple[GateEntry, ...] = (
         kind=GateKind.HOLD,
         subsystem="process_management.scheduling.governance.whole_card",
         engaged_by=(
-            "a whole-card residency claims the offer for its resident model, and that model is not offerable "
-            "this cycle (a quarantine or a serviceability exclusion already took it out), so narrowing the "
-            "offer to it leaves nothing to advertise"
+            "a whole-card residency claims the offer for its resident model, and an earlier offer stage already "
+            "took that model out this cycle, so narrowing the offer to it leaves the offer empty. The "
+            "stages that can do so are the stickiness roll, the per-model queue cap, the locally-unservable "
+            "hold-back, the serviceability hold-back, quarantine, the VRAM-pressure narrowing, the model pool's "
+            "fixed or free lane, the residency advertising bias and the constrained-lane pop"
         ),
         released_by=(
             "the residency's claim ending, whether by the maximum hold elapsing, the empty-pop evidence "
@@ -692,9 +694,9 @@ GATE_REGISTRY: tuple[GateEntry, ...] = (
         ),
         bound_seconds=None,
         bound_source=(
-            "the operator's whole_card_residency_max_hold_seconds, measured from the residency's "
-            "establishment; whole_card._POP_CLAIM_EMPTY_POP_RUN over "
-            "whole_card._POP_CLAIM_EMPTY_POP_WINDOW_SECONDS ends an unwanted claim sooner"
+            "the operator's whole_card_residency_max_hold_seconds, measured from the residency's grant. The "
+            "empty-pop release does not shorten this hold, because a withheld pop is not sent and does not record "
+            "a pop outcome"
         ),
         backstop=_POP_GATE_WEDGE_BACKSTOP,
         observable_at=(

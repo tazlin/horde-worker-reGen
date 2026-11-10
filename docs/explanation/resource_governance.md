@@ -613,13 +613,15 @@ the card through the `dominant_run` seat while the run holds it, and the run's o
 A claim that could stand indefinitely would be a worker that has advertised itself down to one model, so it
 has five ends, and the first to arrive wins:
 
-- **The maximum hold.** `whole_card_residency_max_hold_seconds` caps one residency episode, measured from its
-  establishment and covering the claim, the minimum hold and the cooldown alike. Past it the residency stops
-  being *retained*: the cooldown neither refreshes nor holds, and the residency lets go as soon as its own
-  accepted work has drained. This is what guarantees a multi-model worker returns to its full pool even while
-  the resident model is in continuous demand, and it is deliberately the one operator-facing lever here. It
-  ends retention only; work in flight finishes, and a granted establish or restore grace window still runs its
-  own duration, since that window covers a teardown the scheduler itself commanded.
+- **The maximum hold.** `whole_card_residency_max_hold_seconds` caps the claim and the residency's retention.
+  The clock starts at the grant. For a teardown that is the pre-stage or the establishment, before the weights are on the card. For a run it is the first step of its first job. Later jobs of the same grant do not restart it. Past the cap
+  the offer widens and the residency stops being *retained*. The cooldown neither refreshes nor holds, and the
+  residency lets go as soon as no job for its model is pending or in progress. The cap does not end the
+  residency itself. Jobs for the resident model that the widened offer brings in keep it held, and foreign jobs
+  accepted meanwhile wait until the model drains. This guarantees the offer returns to the full pool even while
+  the resident model is in continuous demand, and it is deliberately the one operator-facing lever here. Work in
+  flight finishes, and a granted establish or restore grace window still runs its own duration, since that window
+  covers a teardown the scheduler itself commanded.
 - **The empty-pop evidence.** The claim narrows the offer to one model, so the only evidence it can generate
   is whether that model has work. A run of consecutive pops that come back with nothing, spanning a short
   window as well as a count, is the finding that the burst is over, and the claim releases early rather than
@@ -642,9 +644,13 @@ The claim engages only where it cannot do harm. A residency is per-card, so on a
 card the claim is skipped entirely: holding the whole worker's intake to one card's model would starve the
 others. The maximum hold still caps retention there. A residency held through lulls in a steady stream lets go
 once it has passed the hold and its work has drained, and a terminal fault of the resident model also ends its
-retention. Setting the maximum hold to zero disables the claim along with the cap that bounds it. The short
-post-release withholding of very large models from the offer is unchanged and sits beneath all of this, so a
-released residency does not immediately re-establish.
+retention. Setting the maximum hold to zero disables the claim along with the cap that bounds it.
+
+The large-model re-entry cooldown sits beneath all of this, and it does not pace the return of the model that
+just held the card. It arms only once no card holds a grant and no very-large model is loaded or queued. A
+restore does not unload the resident model's weights, so after a release whose model stays on a lane the
+cooldown does not arm. The model's next job can then re-establish the residency as soon as it reaches the head,
+subject only to the establish-rate limiter, and a rung-1 run is not subject to that limiter either.
 
 The rate limiter brakes how fast the card may be rotated; it is never a finding that the head cannot be
 served. The held head keeps asking every cycle and is never admitted co-resident. A model whose verdict is

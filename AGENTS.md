@@ -66,6 +66,12 @@ is a session of its own kind: it is listed after the worker sessions, numbered f
 and addressed with `--benchmark N` or `--last-benchmark`; `--session` and `--last` are worker-only, so
 worker numbering never moves when a harness log is present.
 
+**What a bundle does not record.** Most pop gates do not leave a log line, and the action ledger does not have unload, load-finished or model-map rows. [docs/reference/logs.md](docs/reference/logs.md#pop-gates-in-the-parent-log)
+lists which gates log and how to time a job's wait for auxiliary files. A session stopped from the dashboard
+can be labelled `killed_or_crashed` ([cli.md](docs/reference/cli.md#horde-log)). The bundle's
+`config/vram_footprints.json` holds the learned per-card prices, and is their only record when the stats
+window is short.
+
 **Read the responsibility map for the cluster before tracing code.** A wedge, a stranded lane pause or a
 figure counted twice is usually a decision with two owners or without an owner, and the map shows that
 sooner than the code does. A bundle report cites the map row that the defect contradicts, or says that
@@ -93,6 +99,12 @@ line is registered, update the pattern, the sample, and any detector in the same
 | Sampler crawling under WDDM, partial load turned full | none yet | lane log `loaded partially` followed by `loaded completely` for one job; `reserve_mb=0` on the overflow check | `bridge_<n>.log` |
 | Safety on the CPU for a whole session | none yet | `safety_placement` restore lines; replay `restore_headroom_fits` over the status inputs | `bridge.log` |
 | A small model's verdict or price jumps to a large model's | none yet | `Dominance verdict for device` lines; a different model dispatched onto a lane holding this one just before | `bridge.log`, `config/vram_footprints.json` |
+| Kudos per hour down with duty flat | none yet | compare kudos per sampling second and each model family's share of sampling seconds between the two sessions, then count `Whole-card pop claim engaged` by model and `the maximum hold elapsed` | `stats/*.jsonl`, `bridge.log` |
+| Models that sampled side by side now run alone | none yet | compare `contexts A+B MB`, `floor` and each model's rung on the `Dominance verdict for device` lines of the two sessions | `bridge.log` |
+| One card idle with work only it can serve while another card dispatches | none yet | `horde-log jobs --last` for each card's last dispatch, then `inference_dispatched` and `preload_requested` ledger rows per process over the idle span, and `Inference dispatch stalled: head` | `action_ledger.jsonl`, `bridge.log`, `config/vram_footprints.json` |
+| Intake paused while every queued job waits for its files | none yet | pair `Requested aux prefetch for job` with its end line (see logs.md, "Time a job waits for auxiliary files") and look for `Pop governor ENTER:` inside the span | `bridge.log` |
+| A pop claim holding intake with nothing queued | none yet | after `Whole-card pop claim engaged for`, look for `Advertising models in pop request` and `No job available`. When both are absent until `released for`, every pop was withheld | `bridge.log` |
+| Card idle between every job on a one-lane card | none yet | compare each pop (`Advertising models in pop request`) with the previous job's `Inference finished for job` | `bridge.log` |
 
 **Reading duty.** The duty report's "GPU time lost" labels are an order of precedence over what was outstanding
 (a pending submit outranks a pending safety check, which outranks every lane state), not costs; the costs are the
@@ -102,9 +114,18 @@ decode, `ram_to_vram`, the post-processing chain, safety, and the job's measured
 child's own load, encode and upload before its first step. Sessions recorded before `child_preparing` existed book
 both to `clearance_hold`. The stats rows are
 `{"event": "stats_sample", "sample": {...}}` plus `decision`, `resource_state`, `job_completed` and one
-`session_start`; their epochs are UTC while the logs are the host's zone. A recorded session's `job_completed`
+`session_start`; their epochs are UTC while the logs are the host's zone. Read the offset from the bundle (the
+last stats sample against the last parent-log line), since a host's offset changes with daylight saving. A recorded session's `job_completed`
 rows are also the source of a replay fixture for the dispatch-world simulator (`tests/process_management/liveness/replay/`),
 built with `horde-log replay-fixture <bundle> --session N <out_dir>` (see `docs/reference/cli.md`).
+
+**Comparing two sessions' kudos rates.** Kudos per hour is sampling seconds per wall hour times kudos per
+sampling second, and each model family's share of sampling seconds times its own kudos per sampling second
+makes up the second factor. Split each session's wall time by claim class (inside a whole-card pop claim, by
+model, and outside any claim) with the claim's engage and release lines, since the stats stream does not record
+them. Then compare the per-class rates and the class shares separately. The shares follow traffic and the claim,
+and the rates follow the worker, so a change in kudos per hour does not show anything about the worker until it
+is split this way.
 
 ## The map (most important files & classes)
 
@@ -192,7 +213,9 @@ Start from the mechanism, not the file. Each line states the owner of one questi
   A run starts at its first step and ends in `_restore_siblings_after_whole_card`, either drained or with a
   different-model head past `_head_aged_past_anti_starvation`, or when a rung-2 grant for a different model takes
   the card (`_end_run_superseded_by`). Every run end is written by `_end_dominant_run`, and every reader of a run
-  goes through the ledger.
+  goes through the ledger. The pop claim is read by intake, by the resident-bypass seat and by
+  `pricing.copy_belongs_to_dominant_run`, so a change to the claim changes dispatch and retention as well as
+  the offer. Where the claim sits among the offer stages is in the map's "Pop intake" section.
   The establish-rate limiter is the only governor that defers (`DEFER_RESIDENCY_GOVERNOR`, which does not stop the
   preload pass, and a head it withholds at dispatch is stepped past by a `diversity` line-skip); the grace
   allowance only decides whether an excuse window opens (`grace_seconds_to_open`). The owners and rules, and
@@ -444,7 +467,9 @@ uv run pytest -m chaos_sweep        # generated wedge-liveness sweep (pre-releas
   whatever decision a parked head records decides whether anything behind it preloads. After an
   `EXCLUSIVE_IN_PROGRESS` refusal the pass goes on over the held card for that card's exclusive admit alone
   (`is_exclusive_beneficiary`), on one card as on several. `DEFER_RESIDENCY_GOVERNOR` is not a stop, since a head
-  standing down for the establish-rate limiter lets the pass go on.
+  standing down for the establish-rate limiter lets the pass go on. On several cards a head's `NO_TARGET` or
+  `DEFER_BUDGET` still stops every card's preloads for that pass, so a preload sent on another card while a head
+  waits shows that the head's decision in that pass was neither of those two.
 
 ## Changing scheduling, memory, or recovery behaviour
 

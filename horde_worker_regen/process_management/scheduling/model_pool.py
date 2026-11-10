@@ -54,13 +54,14 @@ _SECONDS_PER_MINUTE = 60.0
 _SECONDS_PER_HOUR = 3600.0
 
 _NEAR_ZERO_QUEUE_PER_WORKER = 1.0
-"""At or below this queued-jobs-per-worker figure a model's demand counts as near-zero for empty-pop demotion.
+"""At or below this queued-per-worker figure a model's demand counts as near-zero for empty-pop demotion.
 
-The empty-pop counter alone cannot tell a genuinely dead model from one the worker simply keeps losing pops
-for while real demand exists, so an empty-pop demotion additionally requires the caller-supplied per-worker
-queue depth to sit at or below one queued job per worker. A model with no such demand signal this tick is
-treated as unknown rather than near-zero, so it is not demoted on empty-pop grounds until its demand is
-observed to have dried up.
+The figure is the horde's queued megapixelsteps for the model divided by its serving workers plus one
+(``DemandSnapshot.queued_per_worker``), not a count of jobs. The empty-pop counter alone does not separate a
+dead model from one whose pops the worker keeps losing while demand exists, so an empty-pop demotion also
+requires that figure to sit at or below this value. A model without such a demand signal this tick is treated
+as unknown rather than near-zero, so it is not demoted on empty-pop grounds until its demand is observed to
+have dried up.
 """
 
 

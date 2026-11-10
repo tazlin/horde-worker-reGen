@@ -252,9 +252,41 @@ inferring it from throughput. All are registered in `analysis/log_signatures.py`
 | `Reclaim ladder: restoring the <lane> lane while job <id> still waits, since the job waits on that lane.` | DEBUG | A lane pause booked for a job is restored although the job still waits, because the job waits on the paused lane itself. In practice the post-processing lane. |
 | `Alchemy form <id> was already submitted on the horde. Recorded as delivered with no reward. Horde response: <message>` | WARNING | The horde refused an alchemy submit because it already holds a result for the form. The form counts as submitted. No reward is recorded, because the response does not show whether an earlier attempt or the horde settled the form. |
 
+## Pop gates in the parent log
+
+A pop cycle that ends at a gate stamps `WorkerState.last_pop_gate`. For most gates it does not write a log
+line. The gates are listed in order under
+[Pop intake](responsibility-map-runs-and-residency.md#pop-intake).
+
+| Gate | What the parent log shows |
+| ---- | ------------------------- |
+| The pop governors: `whole_card_residency`, `large_model_switch`, `large_model_reentry`, `post_inference_backpressure`, `unservable_model_holdback`, `consecutive_failure_pause`, `pop_error_backoff`, `lora_pop_backoff`, `self_throttle_pause`, `megapixelstep_wait`, `model_stickiness` | `Pop governor ENTER: <name>` and `Pop governor EXIT: <name>` at each spell's edges |
+| The whole-card pop claim | `Whole-card pop claim engaged for <model>` and `Whole-card pop claim released for <model>: <reason>` |
+| The safety and submit backlogs | `Withholding job pops: ...`, the safety form repeated on a timer |
+| An offer emptied by every stage | `Every advertisable model was narrowed out of this pop's offer`, on the first such cycle |
+| No configured models | an error on every cycle |
+| Queue full, warm-up, no serving safety process, no available inference process, the pop frequency, and a claim whose offer an earlier stage emptied | no line |
+
+A sent pop logs `Advertising models in pop request` (DEBUG), and an empty reply logs `No job available`. When a
+span has both lines absent, its pops were held at a gate. The 60 s pop-liveness line (`Pop liveness: no pop attempt has
+reached the horde`) reports the gate when the silence lasts that long. The live status snapshot's `pop_gate` and
+`pop_gate_since` fields (`WorkerStateSnapshot`) also report it while it holds.
+
+## Time a job waits for auxiliary files
+
+A job's wait for its LoRA or TI files starts at `Requested aux prefetch for job <id>` (DEBUG) and ends at the
+first of `Aux prefetch complete for job <id>` (DEBUG), `Aux prefetch deadline reached for job <id>`,
+`Aux prefetch budget for job <id>`, `prefetch failed terminally for ...; dispatching job(s) <ids>` that lists the job, or the job's
+`Starting inference for job <id>`. A job whose files were all present when it was popped does not have a request line
+and does not appear in this measure. The per-job `lora_wait_seconds` on `job_completed` is the same wait,
+clamped into the job's queue wait ([Stats export](stats.md)).
+
 ## Action-ledger events for runs and safety replacement
 
-`action_ledger.jsonl` records these two events with the fields below in `detail`.
+`action_ledger.jsonl` does not have a row for a model unload, a finished model load, a model-map change or a process
+state change. A lane's residency between dispatches therefore cannot be read from the ledger. The nearest rows
+are `preload_requested` and `inference_dispatched`, and the lane logs and the stats stream's
+`process_state_summary` hold the rest. The ledger records these two events with the fields below in `detail`.
 
 | Event | Fields | Recorded when |
 | ----- | ------ | ------------- |

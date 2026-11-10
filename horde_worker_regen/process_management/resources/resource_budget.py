@@ -170,16 +170,14 @@ The device VRAM a torch/CUDA process holds decomposes into four terms that must 
 3. unloadable model weights; and
 4. transient per-job activation peaks.
 
-Only term (2) is what an *additional* sibling context costs. The one-time, device-wide CUDA runtime
-allocation is paid once by the first/sole context and shared, so it must never be re-charged per extra
-context. When neither the startup probe nor a clean idle-residency reading has measured the marginal,
-the forecast seeds it with this constant rather than reusing ``per_process_overhead_mb`` (the
-first/sole-context figure, roughly 1300MB, which bundles the device baseline and the one-time runtime
-and would therefore double-count the baseline against every extra context, manufacturing a multi-GB
-phantom shortfall that wedges high-VRAM workers). The value is set deliberately a little above the
-measured range (roughly 200-300MB) so an unmeasured host errs toward reserving slightly more than one
-extra context truly needs, never less. ``per_process_overhead_mb`` is still charged exactly once per
-device (it sizes ``free_if_alone``); this seed only ever prices the *additional* contexts."""
+Only term (2) is what an *additional* sibling context costs. When neither the startup probe nor a clean
+idle-residency reading has measured the marginal, the forecast seeds it with this constant rather than
+reusing ``per_process_overhead_mb`` (the first/sole-context figure). That figure is one startup reading,
+and charging it per extra context would multiply any error in it by the process count. The value is set
+deliberately a little above the measured range (roughly 200-300MB) so an unmeasured host errs toward
+reserving slightly more than one extra context truly needs, never less. ``per_process_overhead_mb`` is
+still charged exactly once per device (it sizes ``free_if_alone``); this seed only ever prices the
+*additional* contexts."""
 
 
 _WIN32_CONTEXT_CONSTANT_MB = 243.0
@@ -287,21 +285,18 @@ class StreamForecast:
     total_vram_mb: float | None = None
     """Device total VRAM (MB), or None when unknown. Kept so the forecast can size a partial teardown."""
     per_process_overhead_mb: float = 0.0
-    """VRAM (MB) of the *first/sole* process's runtime context: the one-time CUDA runtime/kernel allocation
-    plus one context. This is what a single fresh process measures and what survives at sole residency, so it
-    sizes ``free_if_alone``. It is NOT the cost of each additional process: on one device the CUDA runtime is
-    loaded once and shared, so every sibling beyond the first costs only ``marginal_process_overhead_mb``."""
+    """VRAM (MB) of the *first/sole* process's context, measured at startup. This is what a single fresh
+    process measures and what survives at sole residency, so it sizes ``free_if_alone``. Every sibling beyond
+    the first is charged ``marginal_process_overhead_mb``, which a clean startup reading puts nearly equal to
+    this figure."""
     marginal_process_overhead_mb: float | None = None
-    """VRAM (MB) each *additional* sibling process's context costs once the first process has paid the shared
-    one-time CUDA runtime cost (measured ~10x smaller than ``per_process_overhead_mb`` on a 24GB CUDA card).
+    """VRAM (MB) each *additional* sibling process's context costs, measured at startup apart from the first.
 
     Sizes ``free_after_model_evict`` (and the partial-teardown depth) as ``per_process_overhead + (contexts-1)
-    * marginal`` rather than ``contexts * per_process_overhead``. The latter multiplies the one-time runtime
-    cost by the process count, manufacturing a multi-GB phantom shortfall that flips a co-residable model into
-    falsely demanding sibling-process teardown. None (or a non-positive value) falls back to the seeded
-    :data:`_SEEDED_MARGINAL_CONTEXT_OVERHEAD_MB` (a conservative bound on one additional context, well below
-    the first-context overhead), so an unmeasured host never re-charges the one-time runtime cost per extra
-    context."""
+    * marginal`` rather than ``contexts * per_process_overhead``, so each figure is charged where it was
+    measured and an over-read first context is not multiplied by the process count. None (or a non-positive
+    value) falls back to the seeded :data:`_SEEDED_MARGINAL_CONTEXT_OVERHEAD_MB`, capped at the first-context
+    overhead."""
     wants_whole_card: bool = False
     """The card's dominance verdict demands sole residency for this model, or the operator pinned it.
 
@@ -387,15 +382,14 @@ class StreamForecast:
 
         A measured marginal (the probe's second-context delta or the idle-floor derivation, resolved
         upstream and passed in as ``marginal_process_overhead_mb``) wins. When none was measured the
-        fallback is the seeded :data:`_SEEDED_MARGINAL_CONTEXT_OVERHEAD_MB`, NOT ``per_process_overhead_mb``:
-        the first/sole-context figure bundles the device baseline and the one-time CUDA runtime, so charging
-        it per additional context double-counts the baseline and over-states the contexts' combined cost.
+        fallback is the seeded :data:`_SEEDED_MARGINAL_CONTEXT_OVERHEAD_MB`, NOT ``per_process_overhead_mb``,
+        since charging the one first-context reading per additional context would multiply any error in it.
         ``per_process_overhead_mb`` is charged once per device (it sizes ``free_if_alone``); every additional
         context is priced by this marginal.
 
         The seed is capped at the measured first-context overhead when there is one. An additional bare
-        context cannot cost more than the first, which includes the same context plus the one-time runtime
-        and the device baseline, so a seed above it is incoherent and prices headroom that exists away.
+        context cannot cost more than the first, so a seed above it is incoherent and prices headroom that
+        exists away.
         The cap matters because the seed is not always transient: where the marginal probe cannot measure
         a sibling process (a per-process device reading, as on Windows WDDM) nothing ever displaces it, so
         an uncapped seed becomes a permanent overcharge multiplied by every additional context.
@@ -658,10 +652,10 @@ class StreamForecast:
         """Largest number of co-resident process contexts that still fits the weights plus the reserve.
 
         Lets a teardown stop only as many sibling processes as the model actually needs gone, rather than
-        always collapsing to sole residency. The loader's own context costs the full ``per_process_overhead``
-        (it pays the one-time CUDA runtime cost); each additional co-resident context costs only the
-        ``marginal``. Returns None when it cannot be sized (unknown weights/total, or no per-process overhead to
-        reason about), and at least 1 otherwise (the loading process must survive).
+        always collapsing to sole residency. The loader's own context is charged ``per_process_overhead`` and
+        each additional co-resident context the ``marginal``. Returns None when it cannot be sized (unknown
+        weights/total, or no per-process overhead to reason about), and at least 1 otherwise (the loading
+        process must survive).
 
         A ``wants_whole_card`` baseline is sized by this same budget arithmetic rather than collapsing straight
         to 1. Its intent is that it never *co-samples* (enforced separately by the concurrency overlap gate),
@@ -932,15 +926,14 @@ def forecast_weight_streaming(
     processes`` is the count of loaded inference processes (including the one that will load this model);
     values below 1 are treated as 1.
 
-    ``per_process_overhead_mb`` is the cost of the *first/sole* context (the one-time, device-wide CUDA
-    runtime/kernel allocation plus one context), the figure a single fresh process measures. Every *additional*
-    sibling context costs only ``marginal_process_overhead_mb`` because the runtime is loaded once per device
-    and shared. Sizing ``free_after_model_evict`` as ``contexts * per_process_overhead`` multiplies that
-    one-time cost by the process count and manufactures a multi-GB phantom shortfall, which flips a
-    co-residable model into falsely demanding a sibling-process teardown. When the marginal was not measured,
-    the seeded :data:`_SEEDED_MARGINAL_CONTEXT_OVERHEAD_MB` prices the additional contexts (a conservative
-    bound well below the first-context cost), never the full overhead. ``free_if_alone`` keeps the full
-    first-context overhead (the surviving process still pays the one-time cost).
+    ``per_process_overhead_mb`` is the cost of the *first/sole* context, the figure a single fresh process
+    measures at startup. Every *additional* sibling context is charged ``marginal_process_overhead_mb``,
+    measured separately at startup, and a clean reading puts the two nearly equal. Sizing
+    ``free_after_model_evict`` as ``contexts * per_process_overhead`` would multiply any error in the one
+    first-context reading by the process count, which can flip a co-residable model into falsely demanding a
+    sibling-process teardown. When the marginal was not measured, the seeded
+    :data:`_SEEDED_MARGINAL_CONTEXT_OVERHEAD_MB` prices the additional contexts, never the full overhead.
+    ``free_if_alone`` keeps the first-context overhead (the surviving process still holds its context).
 
     ``num_extra_resident_contexts`` is the count of *non-inference* processes that also hold a CUDA context
     on the card (the post-processing and VAE lanes). Their contexts are real device-wide commitments that a
@@ -1059,14 +1052,13 @@ def forecast_weight_streaming(
     # it is the co-residency headroom the operator wants preserved while a model samples beside siblings.
     reserve_mb = max(base_reserve_mb, activation_working_set_mb, configured_floor_mb) + max(0.0, committed_reserve_mb)
     overhead = max(0.0, per_process_overhead_mb)
-    # The first context pays the one-time, device-wide CUDA runtime cost; each additional context costs only
-    # the marginal. When the marginal was not measured (probe or idle-floor both absent upstream), seed it
-    # with the conservative per-additional-context constant rather than the full first-context overhead: the
-    # latter re-charges the one-time runtime and the device baseline against every extra context, a phantom
-    # multi-GB shortfall. ``overhead`` is still charged once (it sizes free_if_alone below).
+    # The first context is charged the first-context overhead and each additional context the marginal. When
+    # the marginal was not measured (probe or idle-floor both absent upstream), seed it with the conservative
+    # per-additional-context constant rather than the first-context overhead, which would multiply any error
+    # in that one reading by the extra contexts. ``overhead`` is still charged once (it sizes free_if_alone).
     if marginal_process_overhead_mb is None or marginal_process_overhead_mb <= 0:
         # Capped at the measured first-context overhead where there is one: an additional bare context
-        # cannot cost more than the first, which includes the same context plus the one-time runtime. See
+        # cannot cost more than the first. See
         # StreamForecast._effective_marginal_overhead_mb for why an uncapped seed can become permanent.
         marginal = (
             min(_SEEDED_MARGINAL_CONTEXT_OVERHEAD_MB, overhead)
@@ -1091,7 +1083,7 @@ def forecast_weight_streaming(
         free_if_alone_mb = max(0.0, float(total_vram_mb) - overhead)
         # free_after_model_evict is the current reality with every process's context materialised, including
         # the safety-on-GPU process, since stopping idle *inference* siblings cannot reclaim it. The loading
-        # process's context costs the full first-context overhead (it pays the shared one-time runtime cost);
+        # process's context is charged the first-context overhead;
         # every other inference and service-lane context costs only the marginal, while safety is charged its
         # own whole-process figure below (it is not one of the extra contexts, so nothing is counted twice).
         additional_contexts = (process_count - 1) + extra_contexts

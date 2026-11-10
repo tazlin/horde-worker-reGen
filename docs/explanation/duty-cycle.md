@@ -435,8 +435,10 @@ above; their job is to reduce *avoidable* efficiency loss and to suit the worker
   already overlap across the spare inference processes; it earns its keep mainly on slow-disk workers
   where avoiding a reload is a large, real saving. It is not a general duty lever. See
   [model stickiness](performance_and_backpressure.md#model-stickiness).
-- **`high_performance_mode`** is a **24 GB+** setting: it cuts the process timeouts to one third, which
-  only makes sense when the card has the headroom to keep models resident and switch fast. On a 16 GB
+- **`high_performance_mode`** is a **24 GB+** setting: it cuts `process_timeout` to one third and raises the
+  megapixelstep intake budget (every effect is listed under
+  [Performance modes](bridge_config.md#performance-modes)), which only makes sense when the card has the
+  headroom to keep models resident and switch fast. On a 16 GB
   card it is too aggressive; turning it **off** measured cleaner (fewer swaps, much smaller
   `queue_wait`, slightly higher duty, and fewer transient wedges). Leave it off below 24 GB.
 - **`unload_models_from_vram_often`** is recommended **on** for cards under 16 GB, where freeing VRAM

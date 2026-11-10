@@ -4200,10 +4200,10 @@ class InferenceScheduler:
         claim's end conditions live with the residency (``WholeCardResidencyLedger.pop_claim``); intake only
         reads it.
 
-        Two conditions keep the claim off hosts it would harm. It is skipped entirely while more than one
-        card serves work, because a residency is per-card and holding the whole worker's intake to one card's
-        model would starve the others; and it is skipped when the operator has set the maximum hold to zero,
-        which disables the claim along with the cap that bounds it.
+        Two conditions keep the claim off hosts it would harm. It is skipped entirely on a host with more than
+        one card runtime, whatever each card serves, because a residency is per-card and holding the whole
+        worker's intake to one card's model would starve the others. It is also skipped when the operator has
+        set the maximum hold to zero, which disables the claim along with the cap that bounds it.
         """
         if self._multi_gpu_routing_active:
             self._pop_claim_tracker.disclose_skipped_on_multi_gpu(any_held=self._whole_card_ledger.any_held())
@@ -4379,11 +4379,11 @@ class InferenceScheduler:
         )
 
     def _serving_under_whole_card(self, model: str | None, device_index: int | None) -> bool:
-        """Whether a whole-card exclusive residency for ``model`` is held on the card a job is dispatched to.
+        """Whether a whole-card grant of either rung for ``model`` is held on the card a job is dispatched to.
 
-        Recorded per job at dispatch so a cost analysis can separate work served with the card to itself
-        (which is charged the amortized cost of establishing that residency) from co-resident work of the same
-        shape. A residency held for a different model is not this job's, so it reads False.
+        Recorded per job at dispatch so a cost analysis can separate work served under a grant from other work
+        of the same shape. Only a rung-2 grant gives the job the card to itself. A grant held for a different
+        model is not this job's, so it reads False.
         """
         if model is None:
             return False

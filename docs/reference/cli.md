@@ -748,7 +748,7 @@ an operator sent you.
 
 | Subcommand | Purpose |
 |------------|---------|
-| `sessions [PATH]` | List each worker launch in the log with its span, version, end-reason, and peak process recoveries, then each benchmark run from `bridge_harness.log` as a second list. |
+| `sessions [PATH]` | List each worker launch in the log with its span, version, end-reason, and peak process recoveries, then each benchmark run from `bridge_harness.log` as a second list. A `supervisor_shutdown` end needs both `Supervisor requested shutdown` and `Worker has finished working`. A session stopped from the dashboard that did not log the second line is labelled `killed_or_crashed`, or `still_running` when it is the last session. Confirm a dashboard stop in `bridge_tui.log`. |
 | `diagnose [PATH]` | Run the detectors and print ranked findings (root cause + remediation) per session. |
 | `timeline [PATH]` | Merged, time-ordered parent + child + ledger event stream for a session. |
 | `jobs [PATH]` | Per-job lifecycle table for a session: which lane and card ran each job, and how its wall clock split across pop->dispatch, generation, and finished->submit. |

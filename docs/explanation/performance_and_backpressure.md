@@ -32,9 +32,11 @@ worker stable under load.
 ## The pop gauntlet
 
 Before [`JobPopper`][horde_worker_regen.process_management.jobs.job_popper.JobPopper] makes any network
-call, it runs a series of gates:
+call, it runs a series of gates, in this order:
 
-1. **Shutdown check**: if `WorkerState.shutting_down`, skip.
+1. **Worker-wide holds**: intake paused (shutdown, an operator or self pause, a download-only hold, a
+   terminal-recovery park), the soft RAM hold, an unusable torch build or accelerator, and image generation
+   not served each skip the pop.
 2. **Consecutive failure backoff**: if ≥ 3 consecutive failures, pause for
    `CONSECUTIVE_FAILED_JOBS_WAIT_SECONDS` (180 s). Only *generation/submit* failures
    count here. A job faulted by scheduling recovery (a save-our-ship give-up
@@ -45,21 +47,33 @@ call, it runs a series of gates:
 3. **Queue full**: if the intake budget's worth of jobs is in the pipeline,
    skip. The budget is `queue_size + max_threads` summed over every driven
    card's effective config; a single card with no overrides reduces to the
-   original `queue_size + 1 + (max_threads - 1)`.
-4. **Hold-back gate**: if jobs are pending inference but no jobs have been
+   original `queue_size + 1 + (max_threads - 1)`. The count is
+   `jobs_pending_inference`, which includes running jobs and jobs waiting for
+   auxiliary files.
+4. **Post-inference backpressure**: if the safety backlog cannot clear within
+   the job deadline, or finished jobs are piling up unsubmitted, skip (see below).
+5. **Hold-back gate**: if jobs are pending inference but no jobs have been
    completed yet this session, skip. This is a warm-up guard: let the very first
    job complete before pulling more.
-5. **Process availability**: at least one safety process and one inference
-   process must exist and be healthy.
-6. **Post-inference (safety) backpressure**: if the post-inference backlog
-   cannot clear within the job deadline, skip (see below).
-7. **Megapixelstep backpressure**: if pending megapixelsteps exceed the
-   configured threshold, skip (see below).
-8. **Pop-rate throttle**: if less than `current_pop_frequency` seconds have
-   elapsed since the last pop, skip.
+6. **Safety process**: a safety process must be serving, or the pool must be
+   in a deliberate rebuild.
+7. **Inference process**: some inference process must be able to accept a job
+   now, meaning it is idle or holds only a preload, and has no dispatched job.
+   While every inference process holds a job the worker does not pop, so
+   `queue_size` does not provide a standby job behind a running one. On a card with
+   one inference context each job therefore waits for a horde round trip after
+   the previous one frees the lane.
+8. **Models configured**: an empty `models_to_load` skips with an error.
+9. **Megapixelstep backpressure**: while pending megapixelsteps exceed the
+   threshold, popping pauses for a time scaled by the backlog (see below). An
+   idle-fill pop is exempt.
+10. **Pop-rate throttle**: if less than `current_pop_frequency` seconds have
+    elapsed since the last pop, skip. An urgent pop is exempt.
 
 If any gate says "no," the pop is skipped for this cycle. The popper retries on
-the next 1-second tick.
+the next 1-second tick. A pop that passes every gate then builds its offer
+through a fixed order of narrowing stages, listed with their owners under
+[Pop intake](../reference/responsibility-map-runs-and-residency.md#pop-intake) in the runs and residency map.
 
 Model selection within an allowed pop is further constrained by **on-disk
 availability**: `_select_models_for_pop` filters the advertised models down to
@@ -375,14 +389,16 @@ for the measured analysis.
 **Superseded by the fixed model pool.** `model_stickiness` is deprecated. It
 biased a single pop toward the already-loaded models; the
 [fixed model pool](model_pool.md) commits the worker to a standing logical set of
-seated models and narrows its pop advertisement toward them (its **fixed lane**).
-The scheduler prefers residency for that set and reports cold seats separately, making
-this the durable version of the same swap-avoidance intent. A worker still
+seated models and narrows its pop advertisement toward them (its **fixed lane**),
+and reports cold seats separately, making this the durable version of the same
+swap-avoidance intent. Seats do not change residency in the built worker (see
+[Residency protection](model_pool.md#residency-protection-and-the-pressure-yield-precedence)). A worker still
 carrying a positive `model_stickiness` with the pool off is mapped onto a modest
 pool automatically (ranker on, a 30-minute rotation) wherever the `model_pool`
 fields were left at their defaults, and a one-time deprecation notice is logged.
-With the pool enabled the sticky bias is ignored entirely, because the pool lane
-overwrites the pop's advertised model set.
+With the pool enabled the sticky roll does not run. The pool lane replaces the
+offer only while the pool holds at least one seat, so an enabled pool with no
+seated model does not apply either narrowing.
 
 ## Pop-rate throttling
 
@@ -585,14 +601,15 @@ post-processing gate like any other job. See
 [pop-time auxiliary prefetch](model_downloads.md#pop-time-auxiliary-prefetch) for the full restraint rules.
 
 Two mechanisms keep this live. A per-job prefetch deadline (derived from the configured download timeout and
-checked in the periodic scheduling scan) faults a job whose files never land, so it is never left pending
-forever: the backstop. A reconcile sweep in the same periodic step re-requests any pending auxiliary-bearing
+checked in the periodic scheduling scan and capped at 0.35 of the job's ttl from its pop) dispatches a job
+whose files have not landed without them, so it is not left pending forever. The inference
+child makes its own fetch attempt, and the prefetch never faults a job at a deadline. A reconcile sweep in the same periodic step re-requests any pending auxiliary-bearing
 job with no request in flight (a retryable-failure requeue, a lost result, or a restarted download process),
 and marks a job prepared outright when every file was already reported present for it. This is the liveness that heals. Save-our-ship
 recovery defers to this: while the head-of-queue job is auxiliary-gated with its prefetch still in flight (its
 deadline present and unexpired), give-up holds off exactly as it does for a head whose model is still
 materialising, bounded by that deadline so the coordinator resolves the head the moment it lapses (served
-without its never-in-flight file, or faulted if its transfer stalled) rather than deferring give-up forever.
+without the missing file, whether the transfer never started or stalled) rather than deferring give-up forever.
 
 On the pop side, the same prefetch gate is what keeps an all-LoRA queue from starving the GPU. The job
 popper stops advertising LoRA support once the queue already holds its allowed share of LoRA jobs (the
@@ -1762,14 +1779,16 @@ exactly the set that would claim the card.
   up *and* no very-large model remains loaded or queued, *any* very-large model is withheld for the
   cooldown, so the worker does ordinary work for a beat instead of immediately re-thrashing. `-1` inherits
   `whole_card_residency_cooldown_seconds` (the lease it complements); `0` disables it. A rung-1 run counts as
-  a held lease, so the cooldown opens between runs as it does between teardowns.
+  a held lease, so the cooldown opens between runs as it does between teardowns. A restore does not unload the
+  resident model, so while its weights stay on a lane the cooldown does not open and does not pace that model's
+  return (see [Resource governance](resource_governance.md)).
 
 Both yield to an idle escape: when the worker holds no local work at all (an empty queue, nothing in
 flight), nothing is withheld, so a limiter never leaves the worker idle when the only work it could take is
 a large model. The timing state lives in a pure, worker-wide
-[`LargeModelPopGovernor`][horde_worker_regen.process_management.jobs.large_model_pop_governor.LargeModelPopGovernor];
-both limiters are off by default (zero / inherited-zero durations) and independent of
-`whole_card_exclusive_residency`.
+[`LargeModelPopGovernor`][horde_worker_regen.process_management.jobs.large_model_pop_governor.LargeModelPopGovernor].
+The switch throttle is off by default. The re-entry cooldown is on by default, since its `-1` inherits the
+residency cooldown (45 s unless changed). Both are independent of `whole_card_exclusive_residency`.
 
 ### The whole-card pop claim
 
@@ -1782,9 +1801,11 @@ RAM or be re-read from disk, so continuing to advertise the rest of the pool is 
 own contention.
 
 Unlike the other narrowings, this one is unfloored: if an earlier offer stage has already withheld the
-resident model (a quarantine, a serviceability exclusion), there is nothing this worker should be asking for
-this cycle, so the pop is withheld and the `whole_card_pop_claim` gate is named. Advertising the rest of the
-pool instead would hand the card exactly the work the claim exists to keep off it.
+resident model, the claimed offer is empty this cycle, so the pop is withheld and the cycle ends at the `whole_card_pop_claim` gate. Advertising the rest of the pool instead would bring the card the work that the claim is there to keep away. Many stages can withhold it, the VRAM-pressure narrowing and the model
+pool's lanes among them (the full list is under
+[Pop intake](../reference/responsibility-map-runs-and-residency.md#pop-intake)). A withheld pop is not sent, so
+it does not count toward the empty-pop release, and a claim whose offer is emptied on every cycle withholds
+every pop until its maximum hold, a terminal fault or the residency's release.
 
 A rung-1 run claims the offer the same way. A model no other offered model can sample beside gains nothing
 from a teardown, but each foreign job accepted beside it still costs its weights, so the run's grant

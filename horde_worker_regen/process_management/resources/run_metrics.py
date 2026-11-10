@@ -303,10 +303,11 @@ class JobMetricsRecord(BaseModel):
     post_processing_output_height: int | None = None
     """Height of the first post-processed image."""
     whole_card: bool | None = None
-    """Whether a whole-card exclusive residency for this job's model was held on its card at dispatch.
+    """Whether a whole-card grant of either rung for this job's model was held on its card at dispatch.
 
-    Such a job ran with the card to itself and is charged the amortized cost of establishing that residency.
-    None when the job never reached dispatch (and on alchemy forms, which do not run under one)."""
+    Only a rung-2 grant gives the job the card to itself. Under a rung-1 run the other lanes stay up. A run is
+    granted at its first job's first step, so that job reads False. None when the job never reached dispatch
+    (and on alchemy forms, which do not run under one)."""
     process_age_seconds: float | None = None
     """How long the inference process serving this job had been alive at dispatch, in seconds.
 

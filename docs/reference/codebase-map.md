@@ -22,7 +22,7 @@ these files, read [Architecture](../explanation/architecture.md) first.
 | Pop-rate & megapixelstep throttling    | `process_management/scheduling/pop_throttler.py` (`PopThrottler`)  |
 | Pop/scheduling hold visibility         | `process_management/scheduling/pop_governor_registry.py`           |
 | Fixed model pool (seat engine, ranker, demand poll, config wiring) | `process_management/scheduling/model_pool.py` (`ModelPool`), `pool_ranker.py`, `model_demand_poller.py` (`ModelDemandPoller`), `pool_wiring.py` |
-| Fixed-pool pop lanes (fixed/free interleave)  | `process_management/jobs/pool_lanes.py` (`decide_pool_lane`)      |
+| Fixed-pool pop lanes (fixed/free interleave)  | `process_management/jobs/pool_lanes.py` (`decide_pool_lane`), applied to the offer by `JobPopper._apply_pool_lane` in `jobs/job_popper.py` |
 | Safety-check dispatch                  | `process_management/workers/safety_orchestrator.py` (`SafetyOrchestrator`) |
 | Post-processing lane dispatch          | `process_management/workers/post_process_orchestrator.py` (`PostProcessOrchestrator`) |
 | Disaggregated pipeline stages          | `process_management/workers/disaggregation_orchestrator.py`, `component_lane_process.py`, `inference_process.py`, `vae_lane_process.py` |

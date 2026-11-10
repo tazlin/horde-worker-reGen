@@ -7,18 +7,17 @@ must never be conflated when admitting concurrent work onto one card.
    attributable to no worker process and enters the arithmetic exactly *once*, at device level (it is
    already reflected in the measured device-wide free figure). It must never be charged per process.
 2. **Per-process marginal fixed overhead** (per additional context): the CUDA context plus import-time
-   allocations, roughly 200-300MB on a 24GB CUDA card. It persists after a model unloads and is purgeable
-   only by the process exiting. The *first/sole* context additionally pays the one-time, device-wide CUDA
-   runtime allocation; that one-time cost is paid once and shared, so ``per_process_overhead_mb`` (the
-   first-context figure) sizes sole residency while each *additional* sibling context costs only the
-   marginal above.
+   allocations. It persists after a model unloads and is purgeable only by the process exiting.
+   ``per_process_overhead_mb`` (the first-context figure) sizes sole residency, and each *additional*
+   sibling context is charged the marginal. Both are measured at startup, separately, and a clean reading
+   gives nearly equal values.
 3. **Unloadable model weights** (per resident model): reclaimed by evicting the model.
 4. **Transient per-job activation peaks** (per running job): present only while a job samples/decodes.
 
 A torch/CUDA inference process therefore holds term (2) before any model loads, and the streaming forecast
 needs both the first-context figure and the marginal to size the free VRAM achievable under sole residency
-and after evicting sibling *models* without multiplying the one-time cost (or the device baseline) by the
-process count. A device-wide *used* reading conflates (1) with (2)+(3)+(4), so it is only ever a source for
+and after evicting sibling *models* without multiplying the first-context figure (or the device baseline) by
+the process count. A device-wide *used* reading conflates (1) with (2)+(3)+(4), so it is only ever a source for
 the free-VRAM computation, never a per-process charge: charging an idle process's device-wide reading as
 its own overhead would fold the whole device baseline into a single context.
 
@@ -91,9 +90,9 @@ class _IdleResidencyScope:
 class ContextOverheadModel:
     """Tracks measured per-process and marginal CUDA-context VRAM costs and derives forecast inputs.
 
-    The per-process overhead is the first/sole context cost (it includes the one-time device-wide CUDA
-    runtime allocation); the marginal overhead is the cost of each *additional* sibling context. Both are
-    measured at startup by the manager's probe; the marginal can also be derived from an observed
+    The per-process overhead is the first/sole context cost and the marginal overhead is the cost of each
+    *additional* sibling context. Both are measured at startup by the manager's probe, and a clean reading
+    gives nearly equal values. The marginal can also be derived from an observed
     all-contexts idle residency when the probe could not measure it directly.
 
     Every figure is stored per card and for the worker as a whole. Passing ``device_index`` selects that
