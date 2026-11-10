@@ -138,7 +138,7 @@ async def test_a_timed_head_that_leaves_undispatched_disarms_on_an_empty_queue_c
         job_tracker=job_tracker,
         bridge_data=bridge,
     )
-    scheduler._update_head_starvation_timer(job)
+    scheduler._update_head_starvation_timer(job, scheduler.snapshot())
     scheduler.head_admission.starvation_since -= 30.0
     scheduler._update_idle_fill_arm(bridge)
     assert scheduler._state.wants_idle_fill_candidate is True

@@ -244,6 +244,25 @@ def preload_head(snapshot: SchedulingSnapshot) -> str | None:
     )
 
 
+def preload_restarts_head_starvation(snapshot: SchedulingSnapshot, job_id: str, process_id: int) -> bool:
+    """Return whether a preload of ``job_id`` onto ``process_id`` restarts the timed head's starvation clock.
+
+    Only a preload for the head, or one on a card that can seat the head (:func:`cards_able_to_seat`), is progress
+    for the head. A load for another job on any other card leaves the head as starved as before. Restarting the
+    clock there would hold it below the limits its readers act on, head protection's release among them, for as
+    long as that other card keeps loading. On one card every preload is on the head's card.
+    """
+    timed_head_id = snapshot.ledgers.head_admission.starvation_job_id
+    if timed_head_id is None or timed_head_id == job_id:
+        return True
+    timed_head = snapshot.queue.jobs.get(timed_head_id)
+    slot = snapshot.slots.get(process_id)
+    if timed_head is None or slot is None:
+        return True
+    preload_card = snapshot.routing_device_index(slot)
+    return preload_card is None or preload_card in cards_able_to_seat(snapshot, timed_head)
+
+
 def every_pending_model_accounted_for(snapshot: SchedulingSnapshot, loaded_models: frozenset[str | None]) -> bool:
     """Whether the pass can exit before considering any job: every pending model is resident where its job can use it.
 
@@ -607,6 +626,35 @@ def slots_unable_to_seat(snapshot: SchedulingSnapshot, job: JobSnapshot) -> froz
         for slot in snapshot.slots.values()
     )
     return unseatable if seatable_elsewhere else frozenset()
+
+
+def cards_able_to_seat(snapshot: SchedulingSnapshot, job: JobSnapshot) -> frozenset[int]:
+    """The cards the job can use: its eligible cards less each card whose every inference slot cannot seat it.
+
+    The seat question belongs to :func:`slots_unable_to_seat`, so a card drops out only while another eligible card
+    can seat the job once free. When a card that can seat it does not exist, every eligible card stays, so the
+    starvation clock of such a head still stops and restarts on the eligible cards. The clock's stop condition
+    (``InferenceScheduler._update_head_starvation_timer``) and the preloads that restart it
+    (:func:`preload_restarts_head_starvation`) both read the head's cards from here. On one card the seat
+    check does not mark a slot, so the set is the eligible one.
+    """
+    unseatable = slots_unable_to_seat(snapshot, job)
+    if not unseatable:
+        return job.eligible_cards
+    slots_by_card: dict[int, list[int]] = {}
+    for slot in snapshot.slots.values():
+        if (
+            slot.process_type is HordeProcessType.INFERENCE
+            and slot.device_index is not None
+            and slot.device_index in job.eligible_cards
+        ):
+            slots_by_card.setdefault(slot.device_index, []).append(slot.process_id)
+    unseatable_cards = frozenset(
+        device_index
+        for device_index, process_ids in slots_by_card.items()
+        if all(process_id in unseatable for process_id in process_ids)
+    )
+    return job.eligible_cards - unseatable_cards
 
 
 def select_preload_target(snapshot: SchedulingSnapshot, job_id: str, disallowed: Iterable[int] = ()) -> int | None:

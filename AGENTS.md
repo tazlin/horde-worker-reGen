@@ -230,7 +230,10 @@ Start from the mechanism, not the file. Each line states the owner of one questi
   other hold has its own fixed clock (head protection, the RAM defer barrier, the establish-rate window, the claim's max
   hold, the 60 s lease-acquire timeout, the structural-wedge minimum). Pin-wait, `residency_bypass_models` and the
   `dominant_run` seat do not consult the deadline clocks. A new hold that can delay a head reads
-  `dispatch_affinity`'s clocks rather than adding one.
+  `dispatch_affinity`'s clocks rather than adding one. The head's starvation clock, which head protection's release
+  reads, runs while a card that can seat the head is idle. Only a preload for the head, or one on such a card,
+  restarts it. `preload.cards_able_to_seat` is the one owner of which cards those are, for both the stop and the
+  restart.
 - **Where a learned sampling reading is filed:** three feeders write the footprint store (the monolithic feeder
   `MessageDispatcher._observe_footprint_peak`, the disaggregated feeder in the scheduler and the `RESIDENT` feeder
   in `vram_footprints.py`), every one under the job's model, and a sampling reading counts only while the lane

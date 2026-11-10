@@ -220,7 +220,7 @@ class HeadAdmissionLedger:
         return self._clock() - self.starvation_since
 
     def clear_head_starvation(self) -> None:
-        """Stop timing: a job dispatched, so the wedge, if any, is broken."""
+        """Stop timing, after a preload that is progress for the head or once the timed job leaves the queue."""
         self.starvation_job_id = None
         self.starvation_since = 0.0
 

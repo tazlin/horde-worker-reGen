@@ -821,7 +821,7 @@ class TestPreloadBudgetGate:
         # available clears 15% of 32000 MB, keeping these marginal-budget cases out of the danger-floor path.
         monkeypatch.setattr(scheduler, "_measured_total_ram_mb", lambda: 32000.0)
 
-        scheduler._update_head_starvation_timer(head)
+        scheduler._update_head_starvation_timer(head, scheduler.snapshot())
         # A live job holds the device, so the head's clock must not be running.
         assert scheduler.head_admission.starvation_job_id is None
         assert scheduler._head_starved_seconds(head) == 0.0

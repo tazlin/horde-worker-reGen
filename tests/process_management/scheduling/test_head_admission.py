@@ -1,8 +1,8 @@
 """The head-of-queue admission ledger, stated directly: every clock is bounded and every step is reproducible.
 
 The scheduler's own tests cover the log lines, ledger events and actuations these steps drive; these rows pin the
-state transitions themselves, so a change to a bound or a reset rule is caught where it lives. The one scheduler
-class here pins the card inputs the scheduler feeds the starvation clock.
+state transitions themselves, so a change to a bound or a reset rule is caught where it lives. The scheduler
+classes here pin the card inputs the scheduler feeds the starvation clock and the preloads that restart it.
 """
 
 from __future__ import annotations
@@ -13,6 +13,9 @@ from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 from horde_worker_regen.process_management.ipc.messages import HordeProcessState
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
+from horde_worker_regen.process_management.scheduling import inference_scheduler as inference_scheduler_module
+from horde_worker_regen.process_management.scheduling.admission.preload import PreloadGatePlan, cards_able_to_seat
+from horde_worker_regen.process_management.scheduling.admission.snapshot import SchedulingSnapshot
 from horde_worker_regen.process_management.scheduling.governance.preload_admission import AdmissionDecision
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from horde_worker_regen.process_management.scheduling.ledgers.head_admission import (
@@ -168,7 +171,7 @@ class TestSchedulerStarvationCards:
 
     @staticmethod
     def _clock_runs(scheduler: InferenceScheduler, head: ImageGenerateJobPopResponse) -> bool:
-        scheduler._update_head_starvation_timer(head)
+        scheduler._update_head_starvation_timer(head, scheduler.snapshot())
         return scheduler.head_admission.starvation_job_id == str(head.id_)
 
     @pytest.mark.parametrize("busy_card", [0, 1])
@@ -224,6 +227,247 @@ class TestSchedulerStarvationCards:
         monkeypatch.setattr(scheduler, "_eligible_card_indices", lambda _job: {0})
 
         assert self._clock_runs(scheduler, head) is False
+
+
+class TestPreloadRestartsHeadStarvation:
+    """A sent preload restarts the head's clock only when it is for the head or lands on a card the head may use."""
+
+    _WAITED_SECONDS = 60.0
+
+    @staticmethod
+    async def _scheduler(
+        *,
+        card_count: int,
+        head_cards: set[int],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> tuple[InferenceScheduler, _Clock, ImageGenerateJobPopResponse, ImageGenerateJobPopResponse]:
+        """One idle lane per card, a queued head the scheduler may place on ``head_cards``, and a job behind it."""
+        clock = _Clock()
+        bridge_data = make_mock_bridge_data()
+        tracker = JobTracker()
+        lanes = {
+            card: make_mock_process_info(
+                card,
+                model_name=None,
+                device_index=card,
+                state=HordeProcessState.WAITING_FOR_JOB,
+            )
+            for card in range(card_count)
+        }
+        head = make_job_pop_response(model="flux")
+        other = make_job_pop_response(model="sd")
+        await track_popped_job_async(tracker, head)
+        await track_popped_job_async(tracker, other)
+        scheduler = _make_inference_scheduler(
+            process_map=ProcessMap(lanes),  # type: ignore[arg-type]
+            job_tracker=tracker,
+            bridge_data=bridge_data,
+            max_inference=card_count,
+            card_runtimes=make_test_card_runtimes(device_indices=tuple(range(card_count)), config=bridge_data),
+            clock=clock,
+        )
+        all_cards = set(range(card_count))
+        monkeypatch.setattr(
+            scheduler,
+            "_eligible_card_indices",
+            lambda job: set(head_cards) if job.id_ == head.id_ else set(all_cards),
+        )
+        monkeypatch.setattr(scheduler, "_admit_preload_under_budget", lambda *_args, **_kwargs: True)
+        scheduler._update_head_starvation_timer(head, scheduler.snapshot())
+        clock.now += TestPreloadRestartsHeadStarvation._WAITED_SECONDS
+        return scheduler, clock, head, other
+
+    @staticmethod
+    def _preload(scheduler: InferenceScheduler, job: ImageGenerateJobPopResponse, process_id: int) -> None:
+        """Send ``job``'s preload to ``process_id`` through the admitting act site the preload pass uses."""
+        lane = scheduler._process_map.get(process_id)
+        assert lane is not None
+        plan = PreloadGatePlan(
+            decision=AdmissionDecision.ADMIT,
+            job_id=str(job.id_),
+            reason="admitted",
+            target_process_id=process_id,
+        )
+        decision, _, _ = scheduler._admit_and_send_preload(job, lane, plan, scheduler.snapshot())
+        assert decision is AdmissionDecision.ADMIT
+
+    async def test_another_jobs_preload_on_a_card_the_head_may_not_use_leaves_the_clock_running(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The head is as starved as before, so its clock keeps running."""
+        scheduler, clock, head, other = await self._scheduler(card_count=2, head_cards={0}, monkeypatch=monkeypatch)
+
+        self._preload(scheduler, other, process_id=1)
+
+        assert scheduler._head_starved_seconds(head) == self._WAITED_SECONDS
+        clock.now += 30.0
+        assert scheduler._head_starved_seconds(head) == self._WAITED_SECONDS + 30.0
+
+    async def test_the_heads_own_preload_restarts_the_clock(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A preload for the head is progress for it wherever it lands."""
+        scheduler, _, head, _ = await self._scheduler(card_count=2, head_cards={0}, monkeypatch=monkeypatch)
+
+        self._preload(scheduler, head, process_id=1)
+
+        assert scheduler._head_starved_seconds(head) == 0.0
+        assert scheduler.head_admission.starvation_job_id is None
+
+    async def test_another_jobs_preload_on_a_card_the_head_may_use_restarts_the_clock(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A load on the head's card changes what that card can seat, so the head's wait starts over."""
+        scheduler, _, head, other = await self._scheduler(card_count=2, head_cards={0}, monkeypatch=monkeypatch)
+
+        self._preload(scheduler, other, process_id=0)
+
+        assert scheduler._head_starved_seconds(head) == 0.0
+        assert scheduler.head_admission.starvation_job_id is None
+
+    async def test_one_card_restarts_the_clock_on_every_preload(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """On one card every preload is on the head's card, so the reset fires as it always has."""
+        scheduler, _, head, other = await self._scheduler(card_count=1, head_cards={0}, monkeypatch=monkeypatch)
+
+        self._preload(scheduler, other, process_id=0)
+
+        assert scheduler._head_starved_seconds(head) == 0.0
+
+
+class TestHeadStarvationCardsAreTheCardsThatCanSeatIt:
+    """A card eligible for the head that cannot seat it neither stops the head's clock nor restarts it."""
+
+    _WAITED_SECONDS = 60.0
+
+    @staticmethod
+    async def _scheduler(
+        *,
+        unseatable_cards: set[int],
+        busy_cards: tuple[int, ...],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> tuple[InferenceScheduler, _Clock, ImageGenerateJobPopResponse, ImageGenerateJobPopResponse]:
+        """Two cards with one lane each, a job sampling on each of ``busy_cards``, a queued head and a job behind it.
+
+        The head is eligible on both cards by configuration, and neither busy nor free can a card in
+        ``unseatable_cards`` seat it.
+        """
+        clock = _Clock()
+        bridge_data = make_mock_bridge_data()
+        tracker = JobTracker()
+        lanes: dict[int, object] = {}
+        running: list[tuple[object, ImageGenerateJobPopResponse]] = []
+        for card in range(2):
+            busy = card in busy_cards
+            lane = make_mock_process_info(
+                card,
+                model_name="sd" if busy else None,
+                device_index=card,
+                state=HordeProcessState.INFERENCE_STARTING if busy else HordeProcessState.WAITING_FOR_JOB,
+            )
+            lanes[card] = lane
+            if busy:
+                job = make_job_pop_response(model="sd")
+                await track_popped_job_async(tracker, job)
+                await mark_job_in_progress_async(tracker, job)
+                running.append((lane, job))
+        head = make_job_pop_response(model="flux")
+        other = make_job_pop_response(model="sd15")
+        await track_popped_job_async(tracker, head)
+        await track_popped_job_async(tracker, other)
+        scheduler = _make_inference_scheduler(
+            process_map=ProcessMap(lanes),  # type: ignore[arg-type]
+            job_tracker=tracker,
+            bridge_data=bridge_data,
+            max_inference=2,
+            card_runtimes=make_test_card_runtimes(device_indices=(0, 1), config=bridge_data),
+            clock=clock,
+        )
+        for lane, job in running:
+            lane.record_inference_ownership(job, attempt_ordinal=0)  # type: ignore[attr-defined]
+        monkeypatch.setattr(scheduler, "_eligible_card_indices", lambda _job: {0, 1})
+        monkeypatch.setattr(scheduler, "_admit_preload_under_budget", lambda *_args, **_kwargs: True)
+        head_id = str(head.id_)
+
+        def can_seat(
+            snapshot: SchedulingSnapshot,
+            job_id: str,
+            process_id: int,
+            *,
+            when_free: bool = False,
+        ) -> bool:
+            del when_free
+            return job_id != head_id or snapshot.slots[process_id].device_index not in unseatable_cards
+
+        monkeypatch.setattr(inference_scheduler_module, "preload_slot_can_seat", can_seat)
+        return scheduler, clock, head, other
+
+    @staticmethod
+    def _clock_runs(scheduler: InferenceScheduler, head: ImageGenerateJobPopResponse) -> bool:
+        scheduler._update_head_starvation_timer(head, scheduler.snapshot())
+        return scheduler.head_admission.starvation_job_id == str(head.id_)
+
+    async def test_the_head_can_use_only_the_cards_that_can_seat_it(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The one definition drops the eligible card that cannot seat the head while another card can."""
+        scheduler, _, head, other = await self._scheduler(
+            unseatable_cards={1},
+            busy_cards=(),
+            monkeypatch=monkeypatch,
+        )
+        snapshot = scheduler.snapshot()
+
+        assert cards_able_to_seat(snapshot, snapshot.queue.jobs[str(head.id_)]) == frozenset({0})
+        assert cards_able_to_seat(snapshot, snapshot.queue.jobs[str(other.id_)]) == frozenset({0, 1})
+
+    async def test_another_jobs_preload_on_a_card_that_cannot_seat_the_head_leaves_the_clock_running(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A load on a card the head can never take is no progress for the head."""
+        scheduler, clock, head, other = await self._scheduler(
+            unseatable_cards={1},
+            busy_cards=(),
+            monkeypatch=monkeypatch,
+        )
+        assert self._clock_runs(scheduler, head) is True
+        clock.now += self._WAITED_SECONDS
+
+        TestPreloadRestartsHeadStarvation._preload(scheduler, other, process_id=1)
+
+        assert scheduler._head_starved_seconds(head) == self._WAITED_SECONDS
+
+    async def test_a_job_on_a_card_that_cannot_seat_the_head_does_not_stop_the_clock(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The card that can seat the head is idle, so the head is starved whatever runs on the other card."""
+        scheduler, _, head, _ = await self._scheduler(unseatable_cards={1}, busy_cards=(1,), monkeypatch=monkeypatch)
+
+        assert self._clock_runs(scheduler, head) is True
+
+    async def test_a_job_on_the_card_that_can_seat_the_head_stops_the_clock(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Every card that can seat the head runs a job, so the head waits behind work that can free room."""
+        scheduler, _, head, _ = await self._scheduler(unseatable_cards={1}, busy_cards=(0,), monkeypatch=monkeypatch)
+
+        assert self._clock_runs(scheduler, head) is False
+
+    async def test_a_head_no_card_can_seat_keeps_its_eligible_cards(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """With no card able to seat the head, both eligible cards stop the clock and restart it, as before."""
+        scheduler, clock, head, other = await self._scheduler(
+            unseatable_cards={0, 1},
+            busy_cards=(0,),
+            monkeypatch=monkeypatch,
+        )
+        snapshot = scheduler.snapshot()
+        assert cards_able_to_seat(snapshot, snapshot.queue.jobs[str(head.id_)]) == frozenset({0, 1})
+        assert self._clock_runs(scheduler, head) is True
+        clock.now += self._WAITED_SECONDS
+
+        TestPreloadRestartsHeadStarvation._preload(scheduler, other, process_id=1)
+
+        assert scheduler._head_starved_seconds(head) == 0.0
 
 
 class TestRamDeferBarrier:

@@ -170,6 +170,7 @@ from horde_worker_regen.process_management.scheduling.admission.preload import (
     PreloadPassControl,
     PreloadPassStep,
     RamChargeKind,
+    cards_able_to_seat,
     decide_preload_gates,
     decide_ram_admission,
     every_pending_model_accounted_for,
@@ -179,6 +180,7 @@ from horde_worker_regen.process_management.scheduling.admission.preload import (
     preload_candidate_delta_mb,
     preload_head,
     preload_ram_stage_mb,
+    preload_restarts_head_starvation,
     preload_slot_can_seat,
     price_preload,
     select_idle_lane_warms,
@@ -4541,21 +4543,26 @@ class InferenceScheduler:
             return None
         return self._head_admission.preload_admission_for(str(job.id_))
 
-    def _update_head_starvation_timer(self, head_job: ImageGenerateJobPopResponse | None) -> None:
-        """Track how long the current head-of-queue job has been stuck with a card it may use idle.
+    def _update_head_starvation_timer(
+        self,
+        head_job: ImageGenerateJobPopResponse | None,
+        snapshot: SchedulingSnapshot,
+    ) -> None:
+        """Track how long the current head-of-queue job has been stuck with a card that can seat it idle.
 
         On one card the clock runs only while no job is in progress, including one whose slot is unclassified.
-        On a multi-GPU worker it runs while a card eligible for the head has no job in progress, since a job on
-        another card frees no room on that one. It resets whenever the head changes, so it measures this head's
-        wait, not the queue's age.
+        On a multi-GPU worker it runs while a card that can seat the head (``preload.cards_able_to_seat``, read
+        from the cycle's ``snapshot``) is without a job in progress, since a job on another card does not free room
+        on that one. It resets whenever the head changes, so it measures this head's wait, not the queue's age.
         """
         head_id = str(head_job.id_) if head_job is not None and head_job.id_ is not None else None
-        if head_job is None or not self._multi_gpu_routing_active:
+        head = snapshot.queue.jobs.get(head_id) if head_id is not None else None
+        if head is None or not self._multi_gpu_routing_active:
             work_in_progress = len(self._job_tracker.jobs_in_progress) > 0
         else:
-            eligible_cards = self._eligible_card_indices(head_job)
-            cards_with_work = {card for card in eligible_cards if self._jobs_in_progress_on_card(card)}
-            work_in_progress = head_waits_behind_work(eligible_cards, cards_with_work)
+            head_cards = cards_able_to_seat(snapshot, head)
+            cards_with_work = {card for card in head_cards if self._jobs_in_progress_on_card(card)}
+            work_in_progress = head_waits_behind_work(head_cards, cards_with_work)
         self._head_admission.track_head_starvation(head_id, work_in_progress=work_in_progress)
 
     def _head_starved_seconds(self, job: ImageGenerateJobPopResponse) -> float:
@@ -4598,7 +4605,7 @@ class InferenceScheduler:
             self._disarm_idle_fill()
 
     def _clear_head_starvation_timer(self) -> None:
-        """Reset the head-starvation clock once a job is dispatched (the wedge, if any, is broken)."""
+        """Reset the head-starvation clock and disarm idle fill after a preload that is progress for the head."""
         self._head_admission.clear_head_starvation()
         self._disarm_idle_fill()
 
@@ -8367,9 +8374,10 @@ class InferenceScheduler:
     ) -> bool:
         """Send the preload command for ``job``'s model to ``available_process`` and record the load.
 
-        Resets the preload-delay and head-starvation trackers, sends the PRELOAD_MODEL message inside a
-        telemetry span, and on a successful send records the churn/ledger entry and advances the model map
-        and process map into the LOADING state. ``planned_charge_mb`` is the candidate delta the admission was
+        Resets the preload-delay tracker, sends the PRELOAD_MODEL message inside a telemetry span, and on a
+        successful send records the churn/ledger entry and advances the model map and process map into the LOADING
+        state. The caller restarts the head-starvation clock, since only a preload that is progress for the head
+        may restart it. ``planned_charge_mb`` is the candidate delta the admission was
         priced at, recorded on the reserve ledger as the load's planned charge; ``planned_ram_mb`` is the
         checkpoint RAM it stages, booked the same way against the process's private growth. Returns whether the send
         succeeded: a failed send leaves the model map and the reserve ledger untouched, so the caller records
@@ -8379,7 +8387,6 @@ class InferenceScheduler:
             raise ValueError(f"job.model is None ({job})")
 
         self._preload_delay_notified = False
-        self._clear_head_starvation_timer()
         # Log contract: analysis/log_signatures.py (model_preloading).
         logger.debug(f"Preloading model {job.model} on process {available_process.process_id}")
         logger.debug(f"Available inference processes: {self._process_map}")
@@ -10554,7 +10561,7 @@ class InferenceScheduler:
         # model; a later job whose turn has not come never displaces a resident head.
         head_job_id = preload_head(snapshot)
         head_job = snapshot.queue.payloads[head_job_id] if head_job_id is not None else None
-        self._update_head_starvation_timer(head_job)
+        self._update_head_starvation_timer(head_job, snapshot)
         self._reconcile_head_priority_barrier(head_job)
         cards_yielded_to_head = self._cards_yielded_to_resident_head(head_job)
         if cards_yielded_to_head is None:
@@ -10691,6 +10698,8 @@ class InferenceScheduler:
         send_snapshot = self.snapshot()
         planned_charge_mb = preload_candidate_delta_mb(send_snapshot, plan.job_id, process.process_id)
         planned_ram_mb = preload_ram_stage_mb(send_snapshot, plan.job_id, process.process_id)
+        if preload_restarts_head_starvation(send_snapshot, plan.job_id, process.process_id):
+            self._clear_head_starvation_timer()
         if self._send_preload(
             job,
             process,
