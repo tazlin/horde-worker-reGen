@@ -76,7 +76,10 @@ model is treated as present. See
 [`JobTracker`][horde_worker_regen.process_management.jobs.job_tracker.JobTracker] sums the megapixelsteps of
 pending jobs; when that sum exceeds a threshold,
 [`PopThrottler`][horde_worker_regen.process_management.scheduling.pop_throttler.PopThrottler] pauses popping
-until the backlog drains. The threshold is **not** a config field; each driven
+for a set time. The pause is a timer and does not wait for the backlog to drain. On every pop check the
+pause length is recomputed from the current sum, and popping resumes once the time since the pause began
+exceeds it, whatever the sum is then. If the sum is still over the threshold, the next check starts a new
+pause. The threshold is **not** a config field; each driven
 card contributes its effective performance mode's figure, `15` (normal), `60`
 (`moderate_performance_mode`), or `80` (`high_performance_mode`), and the
 worker-wide threshold is the sum, so one card's backlog cannot pause the intake
@@ -89,6 +92,13 @@ include the active inference job, so a single large SDXL job can exceed the
 normal-mode threshold by itself; without this exception, the worker can finish
 that job and then discover it has no already-popped successor to preload or run.
 After one non-running inference job is queued, the usual threshold applies again.
+
+Only a job that could be dispatched now counts as that standby job. A job that
+is waiting for its LoRA or textual-inversion files is skipped by dispatch
+selection, so it does not hold intake: with only such jobs queued and nothing
+running, the worker keeps popping. The megapixelstep sum, the pause length and
+the queue-size cap still count every queued job, including those waiting for
+files. The queue-size cap is what bounds how many of them can accumulate.
 
 This prevents the worker from accepting a large number of high-resolution jobs
 that would take hours to complete, starving smaller jobs behind them.

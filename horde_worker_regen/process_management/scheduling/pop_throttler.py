@@ -159,8 +159,9 @@ class PopThrottler:
 
         self._job_tracker.reset_megapixelstep_trigger()
         logger.debug(
-            "Pending megapixelsteps decreased below "
-            f"{self._job_tracker._max_pending_megapixelsteps}, continuing with job pops",
+            f"The megapixelstep pause of {round(seconds_to_wait, 2)} seconds elapsed, resuming job pops "
+            f"(pending megapixelsteps: {self._job_tracker.get_pending_megapixelsteps()}, "
+            f"max: {self._job_tracker._max_pending_megapixelsteps})",
         )
         return False
 
@@ -178,13 +179,16 @@ class PopThrottler:
         return remaining if remaining > 0 else None
 
     def _should_preserve_standby_job(self, bridge_data: reGenBridgeData) -> bool:
-        """Return whether popping should continue to fill the first standby slot."""
+        """Return whether popping should continue to fill the first standby slot.
+
+        Only a job that could be dispatched now is standby. A job waiting for its LoRA or textual-inversion
+        files cannot take a free lane, so it does not stop the worker popping.
+        """
         queue_size = bridge_data.queue_size
         if queue_size <= 0:
             return False
 
-        standby_jobs = len(self._job_tracker.jobs_pending_inference) - len(self._job_tracker.jobs_in_progress)
-        return standby_jobs < 1
+        return self._job_tracker.count_dispatchable_queued_jobs() < 1
 
     def _calculate_megapixelstep_wait(self, bridge_data: reGenBridgeData) -> float:
         """Calculate how many seconds to wait based on pending megapixelsteps and config."""

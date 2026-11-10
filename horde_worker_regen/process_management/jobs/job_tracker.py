@@ -2140,6 +2140,19 @@ class JobTracker:
         has_aux = bool(job.payload.loras) or bool(job.payload.tis)
         return has_aux and not self.are_job_aux_models_prepared(job)
 
+    def count_dispatchable_queued_jobs(self) -> int:
+        """Return how many queued jobs could be dispatched now.
+
+        A job counts when no process is running it and it is not waiting for its LoRA or textual-inversion files
+        (``job_requires_aux_preparation``). Dispatch selection skips a job that waits for its files, so such a job
+        cannot go to a free lane.
+        """
+        return sum(
+            1
+            for job in self.jobs_pending_inference
+            if job not in self.jobs_in_progress and not self.job_requires_aux_preparation(job)
+        )
+
     def next_models(self, count: int) -> list[str]:
         """The next ``count`` distinct models in pending order."""
         models: list[str] = []

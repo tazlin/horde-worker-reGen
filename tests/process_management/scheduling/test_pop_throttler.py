@@ -6,6 +6,7 @@ import time
 from unittest.mock import Mock
 
 import pytest
+from horde_sdk.ai_horde_api.apimodels import LorasPayloadEntry
 
 from horde_worker_regen.process_management.ipc.supervisor_channel import WorkerEventKind, WorkerEventSink
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
@@ -41,6 +42,16 @@ def _make_throttler(
 def _make_mock_job() -> Mock:
     """Create a standard mock job with a 1024×1024 image at 50 steps."""
     return make_mock_job(width=1024, height=1024, ddim_steps=50)
+
+
+def _make_mock_job_with_lora() -> Mock:
+    """Create a standard mock job that names one LoRA, so it waits for that file before dispatch."""
+    return make_mock_job(
+        width=1024,
+        height=1024,
+        ddim_steps=50,
+        loras=[LorasPayloadEntry(name="storm_ref", is_version=False)],
+    )
 
 
 async def _track_mock_jobs(job_tracker: JobTracker, count: int) -> None:
@@ -295,6 +306,45 @@ class TestShouldWaitForMegapixelsteps:
 
         assert throttler.should_wait_for_megapixelsteps(bd) is True
         assert job_tracker._triggered_max_pending_megapixelsteps is True
+
+    async def test_job_waiting_for_its_files_is_not_standby(self) -> None:
+        """A queued job that cannot be dispatched until its LoRA arrives does not stop the worker popping."""
+        job_tracker = JobTracker()
+        job_tracker.set_performance_mode_thresholds(15)
+        throttler = _make_throttler(job_tracker=job_tracker)
+        bd = self._make_bridge_data(queue_size=1)
+
+        held_job = await track_popped_job_async(job_tracker, _make_mock_job_with_lora())
+
+        assert job_tracker.job_requires_aux_preparation(held_job) is True
+        assert job_tracker.should_wait_for_pending_megapixelsteps() is True
+        assert throttler.should_wait_for_megapixelsteps(bd) is False
+        assert job_tracker._triggered_max_pending_megapixelsteps is False
+
+    async def test_ready_job_is_standby(self) -> None:
+        """A queued job that can be dispatched now is standby, so the pause engages over the budget."""
+        job_tracker = JobTracker()
+        job_tracker.set_performance_mode_thresholds(15)
+        throttler = _make_throttler(job_tracker=job_tracker)
+        bd = self._make_bridge_data(queue_size=1)
+
+        ready_job = await track_popped_job_async(job_tracker, _make_mock_job())
+
+        assert job_tracker.job_requires_aux_preparation(ready_job) is False
+        assert job_tracker.should_wait_for_pending_megapixelsteps() is True
+        assert throttler.should_wait_for_megapixelsteps(bd) is True
+
+    async def test_ready_job_beside_a_held_job_is_standby(self) -> None:
+        """One ready job is enough standby supply, so a held job beside it does not lift the pause."""
+        job_tracker = JobTracker()
+        job_tracker.set_performance_mode_thresholds(15)
+        throttler = _make_throttler(job_tracker=job_tracker)
+        bd = self._make_bridge_data(queue_size=1)
+
+        await track_popped_job_async(job_tracker, _make_mock_job_with_lora())
+        await track_popped_job_async(job_tracker, _make_mock_job())
+
+        assert throttler.should_wait_for_megapixelsteps(bd) is True
 
     async def test_returns_true_while_within_wait_period(self) -> None:
         """While within the calculated wait window, should keep returning True."""
