@@ -434,8 +434,8 @@ class TestContextReadingSelection:
         assert selection.accelerator.runtime_overhead_mb == 472
         assert selection.accelerator.marginal_overhead_mb == 506
 
-    def test_no_consistent_run_takes_the_smallest_first_context(self) -> None:
-        """With no agreeing run, the smallest first-context figure and the marginal from the same run stand."""
+    def test_no_consistent_run_takes_the_median_first_context(self) -> None:
+        """With no agreeing run, the median first-context figure and the marginal from the same run stand."""
         (selection,) = select_context_readings(
             [
                 [_context_reading(0, first_mb=1161, marginal_mb=426)],
@@ -444,9 +444,50 @@ class TestContextReadingSelection:
             ],
         )
         assert selection.verdict is ContextReadingVerdict.INCONSISTENT
+        assert selection.accelerator.runtime_overhead_mb == 1000
+        assert selection.accelerator.marginal_overhead_mb == 200
+        assert len(selection.readings) == 3
+
+    def test_one_deflated_run_does_not_beat_two_inflated_ones(self) -> None:
+        """A release inside one run's window lowers that run's figure, and work that cannot fit is then admitted."""
+        (selection,) = select_context_readings(
+            [
+                [_context_reading(0, first_mb=1161, marginal_mb=426)],
+                [_context_reading(0, first_mb=120, marginal_mb=480)],
+                [_context_reading(0, first_mb=900, marginal_mb=300)],
+            ],
+        )
+        assert selection.verdict is ContextReadingVerdict.INCONSISTENT
+        assert selection.accelerator.runtime_overhead_mb == 900
+
+    def test_a_first_figure_clamped_to_zero_is_passed_over(self) -> None:
+        """A first figure of 0 is the clamp, so it does not count toward the median while another reading exists."""
+        (selection,) = select_context_readings(
+            [
+                [_context_reading(0, first_mb=0, marginal_mb=480)],
+                [_context_reading(0, first_mb=0, marginal_mb=470)],
+                [_context_reading(0, first_mb=900, marginal_mb=300)],
+            ],
+        )
+        assert selection.verdict is ContextReadingVerdict.INCONSISTENT
         assert selection.accelerator.runtime_overhead_mb == 900
         assert selection.accelerator.marginal_overhead_mb == 300
-        assert len(selection.readings) == 3
+
+    def test_two_disagreeing_runs_take_the_larger_first_context(self) -> None:
+        """With an even count, as after a failed re-measure, the larger of the middle two stands."""
+        (selection,) = select_context_readings(
+            [
+                [_context_reading(0, first_mb=1161, marginal_mb=426)],
+                [_context_reading(0, first_mb=900, marginal_mb=300)],
+            ],
+        )
+        assert selection.verdict is ContextReadingVerdict.INCONSISTENT
+        assert selection.accelerator.runtime_overhead_mb == 1161
+
+    def test_a_zero_first_figure_is_measured_again(self) -> None:
+        """A first figure clamped to 0 disagrees with a measured marginal, so the card is suspect."""
+        (selection,) = select_context_readings([[_context_reading(0, first_mb=0, marginal_mb=480)]])
+        assert selection.verdict is ContextReadingVerdict.INCONSISTENT
 
     def test_unmeasured_marginal_is_never_suspect(self) -> None:
         """A card with the 0 marginal fallback keeps its single reading and is not measured again."""
@@ -549,7 +590,7 @@ class TestSessionProbeRetry:
         assert len(calls) == 1
 
     def test_never_exceeds_the_run_cap(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """A card that never agrees costs at most three probes, then takes the smallest first-context run."""
+        """A card that never agrees costs at most three probes, then takes the median first-context run."""
         calls = self._install_runs(
             monkeypatch,
             [
@@ -561,7 +602,7 @@ class TestSessionProbeRetry:
         (accelerator,) = probe_session_accelerators()
         assert MAX_CONTEXT_PROBE_RUNS == 3
         assert len(calls) == MAX_CONTEXT_PROBE_RUNS
-        assert accelerator.runtime_overhead_mb == 900
+        assert accelerator.runtime_overhead_mb == 1000
 
     def test_logs_every_raw_reading_per_card(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The startup line includes the baseline, both later readings and both figures."""

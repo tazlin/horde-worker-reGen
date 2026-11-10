@@ -124,10 +124,10 @@ The sentence after the figures is the check's result:
 - `The two figures agree` means the line's run was accepted. A count above one means an earlier run on some
   card disagreed and the probe ran again.
 - `The two figures disagree on every run` means no run agreed within the tolerance (a quarter of the smaller
-  figure, at least 64 MB) after three runs. The figures are from the run with the smallest first-context
+  figure, at least 64 MB) after three runs. The figures are from the run with the median first-context
   figure, and a WARNING beginning `Accelerator N first-context and marginal figures disagree on every probe
-  run` lists every run's readings. Another program allocating on the card while the worker starts is the usual
-  cause, and the baseline readings show whether the card was already busy.
+  run` lists every run's readings. Another program allocating or releasing memory on the card while the worker
+  starts is the usual cause, and the baseline readings show whether the card was already busy.
 - `Not checked` means the marginal was not measured as an NVML delta. The figures are the first run's.
 
 `vram_per_process_overhead_mb` in the config, when above 0, replaces the first-context figure regardless of

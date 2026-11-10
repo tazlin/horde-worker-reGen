@@ -1644,8 +1644,11 @@ It derives them from two measurements, preferring hard data and erring conservat
   counted in the figure that spans that window, and the figures are held for the whole session. The probe
   therefore compares the two per card. When they differ by more than a quarter of the smaller figure (at
   least 64 MB), it runs again, up to three runs in all, and the card takes the first run whose figures agree.
-  When no run agrees, the card takes the run with the smallest first-context figure, since a foreign
-  allocation only inflates it, and a WARNING lists every run's readings. A card without a baseline reading
+  When no run agrees, the card takes the run with the median first-context figure, and a WARNING lists every
+  run's readings. Another program can move a reading either way. An allocation inflates it, and a release
+  deflates it down to a clamp at 0. Work that does not fit is admitted when the figure is too low. The median
+  therefore drops a single low run, and an even count resolves to the larger figure. A figure clamped to 0 is
+  passed over while another reading exists. A card without a baseline reading
   or a measured marginal is not checked. The startup log has one `Accelerator N context cost` line per card
   (see [Logs](../reference/logs.md)). The marginal is available from the first scheduling tick, so it also
   covers the startup window where sibling processes have not yet reached idle. `vram_per_process_overhead_mb`

@@ -367,7 +367,7 @@ class ContextReadingVerdict(StrEnum):
     CONSISTENT = auto()
     """A run's first-context and marginal figures agreed within the tolerance, and that run supplies both."""
     INCONSISTENT = auto()
-    """No run agreed. The run with the smallest first-context figure supplies both figures."""
+    """No run agreed. The run with the median first-context figure supplies both figures."""
     UNCHECKED = auto()
     """The first run did not measure both figures as NVML deltas, so they could not be compared and it stands."""
 
@@ -447,14 +447,29 @@ def _select_card_reading(readings: list[ProbedAccelerator]) -> SelectedContextRe
                 readings=readings,
                 verdict=ContextReadingVerdict.CONSISTENT,
             )
-    # A foreign allocation only inflates a reading, and a platform where the first context really costs more
-    # reads the same on every run, so the smallest first-context figure is the best estimate either way.
-    smallest_reading = min(comparable_readings, key=lambda reading: reading.runtime_overhead_mb)
     return SelectedContextReading(
-        accelerator=smallest_reading,
+        accelerator=_median_first_context_reading(comparable_readings),
         readings=readings,
         verdict=ContextReadingVerdict.INCONSISTENT,
     )
+
+
+def _median_first_context_reading(comparable_readings: list[ProbedAccelerator]) -> ProbedAccelerator:
+    """Return the reading with the median first-context figure, the larger of the middle two on an even count.
+
+    Another program can move a reading either way. An allocation inside the probe's window inflates the
+    first-context figure, and a release deflates it, down to the clamp at 0. The admission paths subtract the
+    figure from the card's capacity, so work that does not fit is admitted when the figure is too low. The
+    median drops one outlier on either side, and an even count resolves to the larger figure for the same
+    reason. A figure clamped to 0 is not an estimate of a context's cost, so it is passed over while any other
+    reading exists.
+    """
+    measured_readings = [reading for reading in comparable_readings if reading.runtime_overhead_mb > 0]
+    ordered_readings = sorted(
+        measured_readings or comparable_readings,
+        key=lambda reading: reading.runtime_overhead_mb,
+    )
+    return ordered_readings[len(ordered_readings) // 2]
 
 
 def select_context_readings(runs: Sequence[Sequence[ProbedAccelerator]]) -> list[SelectedContextReading]:
@@ -463,7 +478,8 @@ def select_context_readings(runs: Sequence[Sequence[ProbedAccelerator]]) -> list
     The first-context figure and the marginal are both the cost of one context, so a clean reading has them
     within the tolerance (:data:`CONTEXT_FIGURE_TOLERANCE_FRACTION` of the smaller, at least
     :data:`CONTEXT_FIGURE_TOLERANCE_FLOOR_MB`). Per card, the first run whose figures agree supplies both. When
-    no run agrees, the run with the smallest first-context figure supplies both. A card whose first reading
+    no run agrees, the run with the median first-context figure supplies both, and a figure clamped to 0 is
+    passed over (:func:`_median_first_context_reading`). A card whose first reading
     cannot be compared (no baseline, or an unmeasured marginal) keeps that reading. The first run sets the
     inventory. A card missing from a later run, as after a failed re-measure, keeps the readings it has.
 
@@ -500,7 +516,7 @@ def _describe_raw_readings(accelerator: ProbedAccelerator) -> str:
 _VERDICT_LOG_TEXT: dict[ContextReadingVerdict, str] = {
     ContextReadingVerdict.CONSISTENT: "The two figures agree",
     ContextReadingVerdict.INCONSISTENT: (
-        "The two figures disagree on every run, so the run with the smallest first-context figure is used"
+        "The two figures disagree on every run, so the run with the median first-context figure is used"
     ),
     ContextReadingVerdict.UNCHECKED: "Not checked, because the marginal was not measured as an NVML delta",
 }
@@ -523,8 +539,9 @@ def _log_context_selection(selection: SelectedContextReading, *, run_count: int)
     chosen_position = selection.readings.index(accelerator) + 1
     logger.warning(
         f"Accelerator {accelerator.index} first-context and marginal figures disagree on every probe run "
-        f"({every_reading}). Using reading {chosen_position}, which has the smallest first-context figure. "
-        "Another program allocating on this card while the worker starts inflates the first-context figure.",
+        f"({every_reading}). Using reading {chosen_position}, which has the median first-context figure. "
+        "Another program allocating or releasing memory on this card while the worker starts changes the "
+        "figures.",
     )
 
 
