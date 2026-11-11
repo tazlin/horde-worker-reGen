@@ -138,6 +138,10 @@ The sentence after the figures is the check's result:
 this line. The
 figures in use appear on every stream forecast line as `overhead/proc=` and `marginal/ctx=`.
 
+The dashboard's Stats tab shows the same result per card, and lists every run's readings for a card whose figures
+disagree on every run, as the WARNING does (see
+[Startup memory measurement](../how-to/use-the-dashboard.md#startup-memory-measurement)).
+
 ## VRAM admission diagnostics
 
 A warning beginning `Deferring post-processing for job` records a lane-admission miss. Its candidate is the

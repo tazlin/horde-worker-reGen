@@ -12,6 +12,7 @@ import time
 
 import pytest
 
+import horde_worker_regen.process_management.process_manager as process_manager_module
 from horde_worker_regen.process_management.config.worker_state import PopGate
 from horde_worker_regen.process_management.ipc.messages import HordeProcessState
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
@@ -20,13 +21,19 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     ModelPoolSeatReadiness,
     PopLivenessSnapshot,
     PreloadAdmissionSnapshot,
+    StartupContextReading,
     SupervisorCommand,
     SupervisorControlMessage,
     WorkerEventKind,
 )
 from horde_worker_regen.process_management.jobs.pool_lanes import LaneDecision, PoolLaneState
 from horde_worker_regen.process_management.jobs.text_generation_coordinator import TextJobInFlight
-from horde_worker_regen.process_management.process_manager import HordeWorkerProcessManager
+from horde_worker_regen.process_management.process_manager import (
+    HordeWorkerProcessManager,
+    SystemResources,
+    startup_context_readings,
+)
+from horde_worker_regen.process_management.resources.device_info import TorchDeviceInfo, TorchDeviceMap
 from horde_worker_regen.process_management.scheduling.card_earning import (
     CARD_EARNING_BUCKET_SECONDS,
     CardEarningAccumulator,
@@ -46,6 +53,12 @@ from horde_worker_regen.process_management.scheduling.model_pool import (
     RankedCandidate,
 )
 from horde_worker_regen.process_management.scheduling.workload_kind import WorkloadKind
+from horde_worker_regen.utils.accelerator_probe import (
+    ContextReadingVerdict,
+    ProbedAccelerator,
+    SelectedContextReading,
+    select_context_readings,
+)
 from tests.process_management.conftest import (
     make_job_pop_response,
     make_mock_process_info,
@@ -739,3 +752,153 @@ class TestCardEarningSnapshot:
 
         assert reused.rows[0].jobs == first.rows[0].jobs
         assert refreshed.rows[0].jobs == first.rows[0].jobs + 1
+
+
+def _probe_reading(
+    index: int, *, first_mb: int, marginal_mb: int, baseline_mb: int | None = 3600
+) -> ProbedAccelerator:
+    """Return one card's probe reading built from its two figures, with the raw readings behind them."""
+    after_context_mb = (baseline_mb or 0) + first_mb
+    return ProbedAccelerator(
+        index=index,
+        name=f"GPU{index}",
+        total_vram_mb=24564,
+        device_baseline_mb=baseline_mb,
+        context_device_used_mb=after_context_mb,
+        after_holder_device_used_mb=after_context_mb + marginal_mb if marginal_mb > 0 else None,
+        runtime_overhead_mb=first_mb,
+        marginal_overhead_mb=marginal_mb,
+    )
+
+
+def _resources_with_readings(runs: list[list[ProbedAccelerator]]) -> SystemResources:
+    """Return system resources whose cards and context selection come from canned probe runs."""
+    selections = select_context_readings(runs)
+    device_map = TorchDeviceMap(
+        root={
+            selection.accelerator.index: TorchDeviceInfo(
+                device_name=selection.accelerator.name,
+                device_index=selection.accelerator.index,
+                total_memory=selection.accelerator.total_vram_mb * 1024 * 1024,
+            )
+            for selection in selections
+        },
+    )
+    return SystemResources(total_ram_bytes=32 * 1024**3, device_map=device_map, context_readings=selections)
+
+
+class TestStartupContextReadings:
+    """The snapshot includes each card's startup context measurement, built once for the session."""
+
+    def test_a_consistent_card_gives_its_figures_and_raw_readings(self) -> None:
+        """An agreeing first run gives the chosen figures, the three readings, one run and no run list."""
+        manager = make_testable_process_manager(
+            system_resources=_resources_with_readings([[_probe_reading(0, first_mb=487, marginal_mb=488)]]),
+        )
+        manager._runtime_config.bridge_data.vram_per_process_overhead_mb = 0
+
+        (reading,) = manager._build_worker_state_snapshot().startup_context_readings
+
+        assert reading.device_index == 0
+        assert reading.verdict == ContextReadingVerdict.CONSISTENT.value
+        assert (reading.chosen.first_context_mb, reading.chosen.marginal_mb) == (487, 488)
+        assert (reading.chosen.baseline_mb, reading.chosen.after_context_mb, reading.chosen.after_holder_mb) == (
+            3600,
+            4087,
+            4575,
+        )
+        assert (reading.probe_runs, reading.chosen_run) == (1, 1)
+        assert reading.first_context_override_mb is None
+        assert reading.runs == []
+
+    def test_an_inconsistent_card_lists_every_run(self) -> None:
+        """No agreeing run gives the median first-context run as chosen, and every run's figures in order."""
+        manager = make_testable_process_manager(
+            system_resources=_resources_with_readings(
+                [
+                    [_probe_reading(0, first_mb=1161, marginal_mb=426)],
+                    [_probe_reading(0, first_mb=900, marginal_mb=300)],
+                    [_probe_reading(0, first_mb=1000, marginal_mb=200)],
+                ],
+            ),
+        )
+        manager._runtime_config.bridge_data.vram_per_process_overhead_mb = 0
+
+        (reading,) = manager._build_worker_state_snapshot().startup_context_readings
+
+        assert reading.verdict == ContextReadingVerdict.INCONSISTENT.value
+        assert (reading.chosen.first_context_mb, reading.chosen.marginal_mb) == (1000, 200)
+        assert (reading.probe_runs, reading.chosen_run) == (3, 3)
+        assert [(run.first_context_mb, run.marginal_mb) for run in reading.runs] == [
+            (1161, 426),
+            (900, 300),
+            (1000, 200),
+        ]
+
+    def test_an_unchecked_card_keeps_its_first_run(self) -> None:
+        """An unmeasured marginal leaves the first run unchecked, with no holder reading and no run list."""
+        manager = make_testable_process_manager(
+            system_resources=_resources_with_readings([[_probe_reading(0, first_mb=1161, marginal_mb=0)]]),
+        )
+        manager._runtime_config.bridge_data.vram_per_process_overhead_mb = 0
+
+        (reading,) = manager._build_worker_state_snapshot().startup_context_readings
+
+        assert reading.verdict == ContextReadingVerdict.UNCHECKED.value
+        assert reading.chosen.first_context_mb == 1161
+        assert reading.chosen.after_holder_mb is None
+        assert reading.runs == []
+
+    def test_the_override_setting_is_reported_and_follows_a_reload(self) -> None:
+        """A positive ``vram_per_process_overhead_mb`` is reported, and a changed value rebuilds the readings."""
+        manager = make_testable_process_manager(
+            system_resources=_resources_with_readings([[_probe_reading(0, first_mb=487, marginal_mb=488)]]),
+        )
+        bridge_data = manager._runtime_config.bridge_data
+        bridge_data.vram_per_process_overhead_mb = 600
+
+        (with_override,) = manager._build_worker_state_snapshot().startup_context_readings
+        bridge_data.vram_per_process_overhead_mb = 0
+        (without_override,) = manager._build_worker_state_snapshot().startup_context_readings
+
+        assert with_override.first_context_override_mb == 600
+        assert without_override.first_context_override_mb is None
+
+    def test_the_readings_are_built_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The measurement is fixed for the session, so later snapshots do not build it again."""
+        manager = make_testable_process_manager(
+            system_resources=_resources_with_readings([[_probe_reading(0, first_mb=487, marginal_mb=488)]]),
+        )
+        manager._runtime_config.bridge_data.vram_per_process_overhead_mb = 0
+        builds: list[int] = []
+
+        def _counting_build(
+            selections: list[SelectedContextReading],
+            *,
+            first_context_override_mb: int | None,
+        ) -> list[StartupContextReading]:
+            builds.append(len(builds))
+            return startup_context_readings(selections, first_context_override_mb=first_context_override_mb)
+
+        monkeypatch.setattr(process_manager_module, "startup_context_readings", _counting_build)
+
+        first = manager._build_worker_state_snapshot().startup_context_readings
+        second = manager._build_worker_state_snapshot().startup_context_readings
+
+        assert len(builds) == 1
+        assert second == first
+
+    def test_resources_without_a_probe_give_no_readings(self) -> None:
+        """Injected resources with no selection give an empty list."""
+        manager = make_testable_process_manager()
+
+        assert manager._build_worker_state_snapshot().startup_context_readings == []
+
+    def test_two_cards_are_listed_by_device_index(self) -> None:
+        """Each card has its own reading, in device order."""
+        selections = select_context_readings(
+            [[_probe_reading(1, first_mb=470, marginal_mb=480), _probe_reading(0, first_mb=487, marginal_mb=488)]],
+        )
+        readings = startup_context_readings(selections, first_context_override_mb=None)
+
+        assert [reading.device_index for reading in readings] == [0, 1]

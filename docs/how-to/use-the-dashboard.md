@@ -436,6 +436,40 @@ because its headline figures already are the split.
 default, rotates at 5 MiB per file, and warns once retained files exceed 50 MiB. Compress or downsample
 them with `horde-stats` or the importable `stats_operations` helpers.
 
+#### Startup memory measurement
+
+Below the card earning section, the startup memory measurement section shows what the worker measured when it
+started. Each GPU process uses some of the card's memory before it loads a model. The worker measures this once per
+card, for a first process and for a second process, and the two figures should agree. It subtracts the figure from
+the card's capacity whenever it checks what work fits, and it keeps the figure until the worker restarts. A host
+without a card does not show the section.
+
+At Simple, a line explains the measurement, then one line per card states whether the two figures agreed and which
+figure the worker uses. A host with more than one card names each card.
+
+| Line | Meaning |
+|------|---------|
+| The two figures agreed. The worker uses 487 MB. | A clean measurement. Nothing to do. |
+| The two figures did not agree on any of the 3 tries. The worker uses 1000 MB, the middle figure of the tries. | Another program probably used or freed card memory while the worker started. The worker measured up to three times and kept the try with the middle first-process figure, or the larger of two. The [Insights](#insights) tab has a finding with what to do. |
+| The worker could not compare the two figures, so the reading was not checked. The worker uses 1161 MB. | A reading needed for the comparison was not taken. This happens on a card whose driver does not report its memory use, or when the second process did not start. The first figure stands unchecked. |
+| The worker uses 600 MB, set in vram_per_process_overhead_mb. | `vram_per_process_overhead_mb` is above 0. Its value replaces the measured first-process figure on every card, whatever the check said. Set it back to 0 to use the measurement. |
+
+At Advanced and above, the section is a table with one row per card.
+
+| Column | Meaning |
+|--------|---------|
+| First MB | The memory used by the first GPU process: after first less before. |
+| Further MB | The memory used by each further process: after second less after first. "not measured" when the second figure was not taken. |
+| Before MB, After first MB, After second MB | The card's used memory before any process, after the worker's first process and after a second process started. "not read" marks a reading the worker could not take. |
+| Check | agreed, did not agree, or not checked. |
+| Try used | Which try the figures come from, of how many tries read the card. A card that agreed on its first try reads "1 of 3" when another card needed more tries. |
+
+A card whose figures did not agree also gets an **Every try** table with each try's figures and readings, and marks
+the try in use. When `vram_per_process_overhead_mb` is above 0, a line under the tables states the value in use.
+The startup log has the same result (see [Logs](../reference/logs.md#startup-context-cost)), and
+[Startup context readings on the supervisor snapshot](../reference/stats.md#startup-context-readings-on-the-supervisor-snapshot)
+lists the fields.
+
 ### Live
 
 A **Scheduling** strip, a **Worker RAM by role** panel, then one panel per inference process.
@@ -537,7 +571,9 @@ panel shows that the worker looks healthy. The earning findings come from the [C
 figures: a model that earns below the rest of its card while the worker asked the horde only for it, a model
 that earns below the rest without such a claim, and a note that the figures started
 again after a settings change. A card's details update in place when only its figures move, so an open
-"Details" section stays open.
+"Details" section stays open. A card whose [startup memory figures](#startup-memory-measurement) did not agree on
+any try gets a finding that lists each try. It recommends a restart of the worker while no other program is using the card,
+or setting `vram_per_process_overhead_mb` to a figure you know.
 
 The **Model pool** panel is always present. With the pool off it reads `Model pool: off` and notes the
 throughput-versus-variety trade, and a finding appears only after measured `model_swap` churn.

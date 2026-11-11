@@ -32,6 +32,7 @@ from horde_worker_regen.tui.formatters import (
     shorten,
 )
 from horde_worker_regen.tui.widgets.earning import CardEarningView
+from horde_worker_regen.tui.widgets.startup_measurement import StartupMeasurementView
 
 
 class StatsView(Vertical):
@@ -72,6 +73,7 @@ class StatsView(Vertical):
         with VerticalScroll(id="stats-body"):
             yield Static(id="stats-headlines")
             yield CardEarningView()
+            yield StartupMeasurementView()
             yield Static(id="stats-governors")
             yield Static(id="stats-model-pool")
             yield Static(id="stats-export")
@@ -126,6 +128,12 @@ class StatsView(Vertical):
             earning_view.display = shows_earning
         if shows_earning:
             earning_view.update_earning(snapshot.card_earning, now=snapshot.timestamp)
+        measurement_view = self.query_one(StartupMeasurementView)
+        shows_measurement = bool(snapshot.startup_context_readings)
+        if measurement_view.display != shows_measurement:
+            measurement_view.display = shows_measurement
+        if shows_measurement:
+            measurement_view.update_readings(snapshot.startup_context_readings)
         governors_static = self.query_one("#stats-governors", Static)
         has_governors = bool(snapshot.pop_governors.governors)
         governors_static.display = has_governors

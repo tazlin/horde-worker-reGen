@@ -124,7 +124,7 @@ def test_probe_measures_overhead_and_marginal_on_real_device() -> None:
     unless a foreign tenant changed its allocation during every run. A card whose marginal could not be
     measured is not compared.
     """
-    accelerators = probe_session_accelerators()
+    accelerators = probe_session_accelerators().accelerators
     assert accelerators, "probe found no accelerators on a GPU box"
     primary = accelerators[0]
     assert primary.total_vram_mb > 0
@@ -579,7 +579,7 @@ class TestSessionProbeRetry:
                 [_context_reading(0, first_mb=480, marginal_mb=490)],
             ],
         )
-        (accelerator,) = probe_session_accelerators()
+        (accelerator,) = probe_session_accelerators().accelerators
         assert len(calls) == 2
         assert accelerator.runtime_overhead_mb == 472
 
@@ -599,7 +599,7 @@ class TestSessionProbeRetry:
                 [_context_reading(0, first_mb=1000, marginal_mb=200)],
             ],
         )
-        (accelerator,) = probe_session_accelerators()
+        (accelerator,) = probe_session_accelerators().accelerators
         assert MAX_CONTEXT_PROBE_RUNS == 3
         assert len(calls) == MAX_CONTEXT_PROBE_RUNS
         assert accelerator.runtime_overhead_mb == 1000
@@ -633,3 +633,75 @@ class TestSessionProbeRetry:
         resources = SystemResources.detect()
         assert resources.per_process_overhead_mb_by_device == {0: 472}
         assert resources.marginal_process_overhead_mb_by_device == {0: 506}
+        (selection,) = resources.context_readings
+        assert selection.verdict is ContextReadingVerdict.CONSISTENT
+        assert len(selection.readings) == 2
+
+
+class TestSessionProbeKeepsTheSelection:
+    """The session probe returns each card's verdict and every run's readings, so the dashboard can show them."""
+
+    def _install_runs(self, monkeypatch: pytest.MonkeyPatch, runs: list[list[ProbedAccelerator]]) -> None:
+        """Substitute the single probe run with canned runs, the last one repeated."""
+        calls: list[int] = []
+
+        def _next_run(**_kwargs: object) -> list[ProbedAccelerator]:
+            calls.append(len(calls))
+            return list(runs[min(len(calls) - 1, len(runs) - 1)])
+
+        monkeypatch.setattr(accelerator_probe_module, "probe_accelerators", _next_run)
+
+    def test_a_consistent_first_run_keeps_one_reading(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """One agreeing run gives a consistent verdict, a run count of one and that run's reading."""
+        first = _context_reading(0, first_mb=487, marginal_mb=488)
+        self._install_runs(monkeypatch, [[first]])
+
+        probe = probe_session_accelerators()
+
+        assert probe.run_count == 1
+        (selection,) = probe.selections
+        assert selection.verdict is ContextReadingVerdict.CONSISTENT
+        assert selection.readings == [first]
+        assert selection.accelerator == first
+        assert probe.accelerators == [first]
+
+    def test_a_replaced_run_keeps_both_readings(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A disagreeing first run replaced by an agreeing second keeps both readings and picks the second."""
+        inflated = _context_reading(0, first_mb=1161, marginal_mb=426)
+        clean = _context_reading(0, first_mb=472, marginal_mb=506)
+        self._install_runs(monkeypatch, [[inflated], [clean]])
+
+        probe = probe_session_accelerators()
+
+        assert probe.run_count == 2
+        (selection,) = probe.selections
+        assert selection.verdict is ContextReadingVerdict.CONSISTENT
+        assert selection.readings == [inflated, clean]
+        assert selection.accelerator == clean
+
+    def test_a_card_that_never_agrees_keeps_every_run(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Three disagreeing runs give an inconsistent verdict, all three readings and the median first figure."""
+        runs = [
+            [_context_reading(0, first_mb=1161, marginal_mb=426)],
+            [_context_reading(0, first_mb=900, marginal_mb=300)],
+            [_context_reading(0, first_mb=1000, marginal_mb=200)],
+        ]
+        self._install_runs(monkeypatch, runs)
+
+        probe = probe_session_accelerators()
+
+        assert probe.run_count == MAX_CONTEXT_PROBE_RUNS
+        (selection,) = probe.selections
+        assert selection.verdict is ContextReadingVerdict.INCONSISTENT
+        assert [reading.runtime_overhead_mb for reading in selection.readings] == [1161, 900, 1000]
+        assert selection.accelerator.runtime_overhead_mb == 1000
+
+    def test_no_accelerator_gives_an_empty_selection(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A host without a card gives no selections and one run."""
+        self._install_runs(monkeypatch, [[]])
+
+        probe = probe_session_accelerators()
+
+        assert probe.selections == []
+        assert probe.accelerators == []
+        assert probe.run_count == 1

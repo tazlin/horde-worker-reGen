@@ -21,6 +21,7 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     CardEarningSnapshot,
     CardEarningWindowRestart,
     ModelPoolSnapshot,
+    StartupContextReading,
     WorkerStateSnapshot,
 )
 from horde_worker_regen.process_management.scheduling.governance.whole_card import PopClaimValueVerdict
@@ -33,6 +34,8 @@ from horde_worker_regen.tui.widgets.earning import (
     share_text,
     verdict_phrase,
 )
+from horde_worker_regen.tui.widgets.startup_measurement import figure_in_use_sentence
+from horde_worker_regen.utils.accelerator_probe import ContextReadingVerdict
 
 _LOW_DUTY_CYCLE = 50.0
 _HIGH_VRAM_FRACTION = 0.92
@@ -71,6 +74,7 @@ def analyze(snapshot: WorkerStateSnapshot) -> list[Finding]:
     _check_idle(snapshot, findings)
     _check_model_pool(snapshot, findings)
     _check_card_earning(snapshot, findings)
+    _check_startup_measurement(snapshot, findings)
 
     if config.extra_slow_worker and config.max_batch > 1:
         findings.append(
@@ -395,6 +399,37 @@ def _check_earning_restart(snapshot: WorkerStateSnapshot, out: list[Finding]) ->
             headline=_restart_headline(restart),
         ),
     )
+
+
+def _check_startup_measurement(snapshot: WorkerStateSnapshot, out: list[Finding]) -> None:
+    """Flag each card whose startup memory figures did not agree on any probe run."""
+    readings = snapshot.startup_context_readings
+    several_cards = len(readings) > 1
+    for reading in readings:
+        if reading.verdict != ContextReadingVerdict.INCONSISTENT:
+            continue
+        card_words = f"card {reading.device_index}" if several_cards else "the card"
+        tries = "try" if reading.probe_runs == 1 else f"of {reading.probe_runs} tries"
+        out.append(
+            Finding(
+                kind=FindingKind.STARTUP_MEMORY_FIGURES_DISAGREE,
+                severity=Severity.WARNING,
+                headline=f"The two startup memory figures for {card_words} did not agree on any {tries}.",
+                evidence=_startup_measurement_evidence(reading),
+            ),
+        )
+
+
+def _startup_measurement_evidence(reading: StartupContextReading) -> list[str]:
+    """Return each try's two figures for a card whose figures did not agree, then the figure in use."""
+    lines = [
+        f"Try {position}: first process {run.first_context_mb} MB, second process {run.marginal_mb} MB."
+        for position, run in enumerate(reading.runs, start=1)
+    ]
+    lines.append(figure_in_use_sentence(reading))
+    if reading.first_context_override_mb is None:
+        lines.append(f"That figure is from try {reading.chosen_run}.")
+    return lines
 
 
 def _restart_headline(restart: CardEarningWindowRestart) -> str:

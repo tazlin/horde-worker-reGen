@@ -144,6 +144,7 @@ class FindingKind(enum.StrEnum):
     CLAIMED_MODEL_EARNS_BELOW_REST = "claimed_model_earns_below_rest"
     MODEL_EARNS_BELOW_REST = "model_earns_below_rest"
     CARD_EARNING_RESTARTED = "card_earning_restarted"
+    STARTUP_MEMORY_FIGURES_DISAGREE = "startup_memory_figures_disagree"
 
 
 @dataclass(frozen=True)
@@ -1170,6 +1171,25 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
             "The worker keeps a day of figures on what each model earns per second of card time. "
             "A change to a capacity or workload setting drops them, because figures measured under one set of "
             "settings do not describe another. No model has a verdict until enough of its new jobs finish."
+        ),
+        reference_page="docs/how-to/use-the-dashboard.md",
+    ),
+    FindingSpec(
+        kind=FindingKind.STARTUP_MEMORY_FIGURES_DISAGREE,
+        title="The startup memory figures did not agree",
+        action=(
+            "Restart the worker while no other program is using the card. "
+            "Or set `vram_per_process_overhead_mb` to the figure you know for this card. "
+            "A value above 0 replaces the measured first-process figure on every card."
+        ),
+        detail=(
+            "At startup the worker measures the memory a GPU process uses before it loads a model. "
+            "It measures this for a first and a second process, and the two figures should agree. "
+            "Another program using or freeing card memory during the measurement is the usual cause when they do not. "
+            "The worker keeps the figure for the whole session. "
+            "It subtracts the figure from the card's capacity when it checks what work fits. "
+            "A figure that is too high holds back work that would fit. "
+            "A figure that is too low lets work start that does not fit, and that work can fail or run slowly."
         ),
         reference_page="docs/how-to/use-the-dashboard.md",
     ),

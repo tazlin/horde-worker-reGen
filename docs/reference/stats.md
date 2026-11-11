@@ -333,6 +333,34 @@ order. The accumulator keeps the settings it last compared and names the fields 
 no figures. A restart found at load has `changed_settings` set to `None`, because the file holds only the
 previous fingerprint. The restart record is not persisted.
 
+### Startup context readings on the supervisor snapshot
+
+`WorkerStateSnapshot.startup_context_readings` holds one
+[`StartupContextReading`][horde_worker_regen.process_management.ipc.supervisor_channel.StartupContextReading] per
+card the worker drives, by device index. It is the startup probe's measurement of what a GPU process's context costs,
+the memory a process uses before it loads a model (see [Logs](logs.md#startup-context-cost)).
+`probe_session_accelerators` returns the selection as a `SessionAcceleratorProbe`, `SystemResources.context_readings`
+holds it, and `process_manager.startup_context_readings` turns it into these rows. The measurement is fixed for the
+session, so the worker builds the list once and reuses it. It builds the list again only when
+`vram_per_process_overhead_mb` changes in a reload. Resources supplied without a probe, as in tests and the
+dry-run harness, give an empty list.
+
+| Field | Meaning |
+| ----- | ------- |
+| `device_index` | The card. |
+| `chosen` | The run whose figures the worker uses: `first_context_mb`, `marginal_mb`, and the three device-wide readings `baseline_mb`, `after_context_mb` and `after_holder_mb`. A reading the probe did not take is `None`. |
+| `verdict` | `consistent`, `inconsistent` or `unchecked`, the string value of `ContextReadingVerdict`. |
+| `probe_runs` | How many probe runs read this card. A card that agreed on the first run reads above 1 when another card needed more runs. |
+| `chosen_run` | The position of `chosen` among this card's runs, from 1. |
+| `first_context_override_mb` | The `vram_per_process_overhead_mb` value when it is above 0, which replaces the measured first-context figure on every card. `None` when the setting is 0. |
+| `runs` | Every run's figures in run order, for an `inconsistent` card. Empty for any other verdict. |
+
+The dashboard shows the rows on the Stats tab (see
+[Startup memory measurement](../how-to/use-the-dashboard.md#startup-memory-measurement)). Its words for a verdict
+come from `tui/widgets/startup_measurement.py` `verdict_sentence` and `figure_in_use_sentence`, which the Insights
+finding `startup_memory_figures_disagree` reads too. The startup log line keeps its own wording in
+`utils/accelerator_probe.py`. An unknown verdict string is shown as it arrives.
+
 ## Stats tab: the Model pool section
 
 When the [fixed model pool](../explanation/model_pool.md) is enabled, the dashboard's **Stats** tab grows a

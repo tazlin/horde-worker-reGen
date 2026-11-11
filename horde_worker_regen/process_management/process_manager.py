@@ -145,6 +145,8 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     SamplerSummary,
     SchedulingGovernanceSnapshot,
     StandingPopClaimSample,
+    StartupContextReading,
+    StartupContextRun,
     StatsSample,
     SupervisedProcessSnapshotSource,
     SupervisorChannel,
@@ -358,6 +360,11 @@ from horde_worker_regen.text_backends.provision import (
     ensure_text_model_file,
     provision_executable,
 )
+from horde_worker_regen.utils.accelerator_probe import (
+    ContextReadingVerdict,
+    ProbedAccelerator,
+    SelectedContextReading,
+)
 from horde_worker_regen.utils.config_coercion import config_number
 from horde_worker_regen.utils.disk_monitor import DiskSpaceMonitor
 from horde_worker_regen.utils.gpu_monitor import GpuUtilizationSamplers, mean_across_cards
@@ -444,6 +451,9 @@ class SystemResources:
     marginal_process_overhead_mb_by_device: dict[int, int] = dataclasses.field(default_factory=dict)
     """Each card's own per-additional-context marginal (MB), keyed by device index. A card the probe could
     not measure is absent, and its forecasts fall back to the worker-wide figure above."""
+    context_readings: list[SelectedContextReading] = dataclasses.field(default_factory=list)
+    """Each card's chosen startup reading with its verdict and the readings of every probe run, for the
+    dashboard. Empty when the probe found no card or the resources were supplied without a probe."""
 
     @classmethod
     def detect(cls) -> SystemResources:
@@ -470,7 +480,8 @@ class SystemResources:
         # setdefault so a deliberate operator override still wins; the probe subprocess inherits it.
         os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
 
-        accelerators = probe_session_accelerators()
+        session_probe = probe_session_accelerators()
+        accelerators = session_probe.accelerators
 
         # Warn once if the declared compute backend (bin/backend) disagrees with what the hardware probe
         # actually found: a GPU install whose driver is broken (would run on CPU or fault), or a CPU
@@ -511,7 +522,47 @@ class SystemResources:
             marginal_process_overhead_mb=marginal_process_overhead_mb,
             per_process_overhead_mb_by_device=per_process_overhead_mb_by_device,
             marginal_process_overhead_mb_by_device=marginal_process_overhead_mb_by_device,
+            context_readings=session_probe.selections,
         )
+
+
+def _startup_context_run(reading: ProbedAccelerator) -> StartupContextRun:
+    """Return one probe run's reading of a card in the snapshot's form."""
+    return StartupContextRun(
+        first_context_mb=reading.runtime_overhead_mb,
+        marginal_mb=reading.marginal_overhead_mb,
+        baseline_mb=reading.device_baseline_mb,
+        after_context_mb=reading.context_device_used_mb,
+        after_holder_mb=reading.after_holder_device_used_mb,
+    )
+
+
+def startup_context_readings(
+    selections: list[SelectedContextReading],
+    *,
+    first_context_override_mb: int | None,
+) -> list[StartupContextReading]:
+    """Return each card's startup context measurement for the supervisor snapshot, by device index ascending.
+
+    Args:
+        selections: Each card's chosen probe reading, with its verdict and the readings of every run.
+        first_context_override_mb: The ``vram_per_process_overhead_mb`` value above 0, or None when it is 0.
+    """
+    readings: list[StartupContextReading] = []
+    for selection in sorted(selections, key=lambda card_selection: card_selection.accelerator.index):
+        is_inconsistent = selection.verdict is ContextReadingVerdict.INCONSISTENT
+        readings.append(
+            StartupContextReading(
+                device_index=selection.accelerator.index,
+                chosen=_startup_context_run(selection.accelerator),
+                verdict=selection.verdict.value,
+                probe_runs=len(selection.readings),
+                chosen_run=selection.readings.index(selection.accelerator) + 1,
+                first_context_override_mb=first_context_override_mb,
+                runs=[_startup_context_run(reading) for reading in selection.readings] if is_inconsistent else [],
+            ),
+        )
+    return readings
 
 
 def _select_driven_devices(
@@ -1437,6 +1488,16 @@ class HordeWorkerProcessManager:
             system_resources.device_map,
             self.bridge_data.gpu_device_indices,
         )
+        # The startup context measurement of each driven card, published on the snapshot. A card the worker
+        # does not drive is left out, because none of its work is checked against the figures.
+        driven_card_indices = set(self._device_map.root)
+        self._startup_context_selections: list[SelectedContextReading] = [
+            selection
+            for selection in system_resources.context_readings
+            if selection.accelerator.index in driven_card_indices
+        ]
+        self._startup_context_readings_cache: list[StartupContextReading] | None = None
+        self._startup_context_readings_override_mb: int | None = None
         if self._text_backend_is_managed():
             self._device_map = _exclude_text_backend_device(self._device_map, self.bridge_data.text_gpu_device_index)
         logger.debug(f"Driving device indices: {sorted(self._device_map.root)}")
@@ -1552,8 +1613,9 @@ class HordeWorkerProcessManager:
         # on-disk registry, neither of which belongs in CI. The registry itself is unit-tested directly.
         self._owned_registry: OwnedProcessRegistry | None = None
         if not os.environ.get("AI_HORDE_TESTING"):
-            self._owned_registry = OwnedProcessRegistry()
-            reaped = self._owned_registry.reap_orphans_from_previous_run()
+            owned_registry = OwnedProcessRegistry()
+            self._owned_registry = owned_registry
+            reaped = owned_registry.reap_orphans_from_previous_run()
             if reaped:
                 logger.warning(
                     f"Reaped {len(reaped)} orphaned child process(es) left by a previous run: {reaped}",
@@ -9114,6 +9176,7 @@ class HordeWorkerProcessManager:
             stats_baseline_rollups=self._run_metrics.baseline_rollups(),
             stats_form_rollups=self._run_metrics.form_rollups(),
             card_earning=self._current_card_earning_snapshot(),
+            startup_context_readings=self._current_startup_context_readings(bridge_data),
             stats_export=self._run_metrics.stats_export_state(),
             stats_history_backfill=self._run_metrics.stats_history_backfill(),
             downloads=self._model_availability.status,
@@ -9344,6 +9407,25 @@ class HordeWorkerProcessManager:
         self._card_earning_snapshot_cache = built
         self._card_earning_snapshot_built_at = now
         self._card_earning_snapshot_restart = last_restart
+        return built
+
+    def _current_startup_context_readings(self, bridge_data: reGenBridgeData) -> list[StartupContextReading]:
+        """Return the snapshot's startup context measurements, built again only when the override setting moved.
+
+        The measurements are fixed for the session. ``vram_per_process_overhead_mb`` reloads with the config, so
+        the cached list is rebuilt when its value changes.
+
+        Args:
+            bridge_data: The live config, which holds ``vram_per_process_overhead_mb``.
+        """
+        override_value = config_number(bridge_data.vram_per_process_overhead_mb)
+        override_mb = int(override_value) if override_value is not None and override_value > 0 else None
+        cached = self._startup_context_readings_cache
+        if cached is not None and override_mb == self._startup_context_readings_override_mb:
+            return cached
+        built = startup_context_readings(self._startup_context_selections, first_context_override_mb=override_mb)
+        self._startup_context_readings_cache = built
+        self._startup_context_readings_override_mb = override_mb
         return built
 
     @staticmethod

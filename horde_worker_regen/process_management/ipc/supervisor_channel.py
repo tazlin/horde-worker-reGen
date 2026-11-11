@@ -1104,6 +1104,45 @@ class CardEarningSnapshot(BaseModel):
     None from a worker that does not report it."""
 
 
+class StartupContextRun(BaseModel):
+    """Represents one startup probe run's reading of what a GPU process's context costs on one card.
+
+    The context is the memory a GPU process uses before it loads a model. The three readings are the card's
+    device-wide used memory, and the two figures are differences between them.
+    """
+
+    first_context_mb: int
+    """The first process's context cost: the reading after the probe's own context less the baseline."""
+    marginal_mb: int
+    """Each further process's context cost: the reading after the holder's context less the one before it."""
+    baseline_mb: int | None = None
+    """Used memory before the probe created any context. None when it was not read."""
+    after_context_mb: int
+    """Used memory after the probe created its own context."""
+    after_holder_mb: int | None = None
+    """Used memory after a second process started holding a context on the card. None when it was not read."""
+
+
+class StartupContextReading(BaseModel):
+    """Represents one card's startup context measurement, which the worker holds for the whole session."""
+
+    device_index: int
+    """The card, by device index."""
+    chosen: StartupContextRun
+    """The run whose figures the worker uses."""
+    verdict: str
+    """Whether the chosen run's two figures agreed (``consistent`` | ``inconsistent`` | ``unchecked``)."""
+    probe_runs: int
+    """How many probe runs read this card."""
+    chosen_run: int
+    """The position of the chosen run among this card's runs, from 1."""
+    first_context_override_mb: int | None = None
+    """The ``vram_per_process_overhead_mb`` value that replaces the measured first-context figure, or None when the
+    setting is 0 and the measured figure is used."""
+    runs: list[StartupContextRun] = Field(default_factory=list)
+    """Every run's reading, in run order, for an ``inconsistent`` card. Empty for any other verdict."""
+
+
 class StatsExportState(BaseModel):
     """Current worker-side JSONL export state."""
 
@@ -1918,6 +1957,9 @@ class WorkerStateSnapshot(BaseModel):
     card_earning: CardEarningSnapshot = Field(default_factory=CardEarningSnapshot)
     """What each model earns per card second over the trailing earning window, with each card's time and the
     window's status. Every figure is computed on the worker."""
+    startup_context_readings: list[StartupContextReading] = Field(default_factory=list)
+    """Each card's startup context measurement, by device index ascending. Empty when the probe found no card or
+    the device inventory was supplied without a probe."""
     stats_export: StatsExportState = Field(default_factory=StatsExportState)
     """Worker-side stats JSONL export state."""
     stats_history_backfill: StatsHistoryBackfill | None = None

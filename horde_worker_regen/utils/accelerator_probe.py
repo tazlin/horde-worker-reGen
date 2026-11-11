@@ -30,8 +30,9 @@ The two figures are:
 Both figures are the cost of one context, and a clean launch reads them within a few tens of MB of each other.
 All three readings are device-wide, so another program that allocates on the card between two of them is
 counted in the figure that spans that window. :func:`probe_session_accelerators` compares the two figures per
-card and repeats the probe while they disagree (see :func:`select_context_readings`), and logs the raw readings
-behind each card's figures once at startup.
+card and repeats the probe while they disagree (see :func:`select_context_readings`). It logs the raw readings
+behind each card's figures once at startup and returns the selection (:class:`SessionAcceleratorProbe`), which
+the worker publishes on the dashboard snapshot.
 
 The readings come from NVML, which is device-wide on every platform. Where NVML cannot read the card the
 probe falls back to torch's free-VRAM reading, which is per-process on Windows WDDM: there the marginal
@@ -385,6 +386,26 @@ class SelectedContextReading(BaseModel):
     """Whether the chosen reading's two figures agreed."""
 
 
+class SessionAcceleratorProbe(BaseModel):
+    """Represents the startup probe's outcome: each card's chosen reading and the readings it was chosen from.
+
+    The worker holds the chosen figures for the whole session, so the selection is kept for the dashboard to
+    show beside them.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    selections: list[SelectedContextReading]
+    """One entry per card of the first run, in that run's card order. Empty when it found no accelerators."""
+    run_count: int
+    """How many probe runs startup took for the whole host. A card missing from a later run has fewer readings."""
+
+    @property
+    def accelerators(self) -> list[ProbedAccelerator]:
+        """Each card with its chosen reading, in the first run's card order."""
+        return [selection.accelerator for selection in self.selections]
+
+
 def _first_context_overhead_mb(*, context_device_used_mb: int, device_baseline_mb: int | None) -> int:
     """Return the first/sole context's own VRAM cost (MB): the reading net of the device's prior baseline.
 
@@ -647,7 +668,7 @@ def probe_accelerators(*, timeout_seconds: float = 120.0) -> list[ProbedAccelera
     return []
 
 
-def probe_session_accelerators() -> list[ProbedAccelerator]:
+def probe_session_accelerators() -> SessionAcceleratorProbe:
     """Return the machine's accelerators with context figures checked for a foreign allocation.
 
     The figures are held for the whole session, so a reading inflated by another program allocating on the
@@ -659,8 +680,9 @@ def probe_session_accelerators() -> list[ProbedAccelerator]:
     whose figures never agreed.
 
     Returns:
-        list[ProbedAccelerator]: The first run's cards, each with its chosen reading. Empty when the first run
-            found no accelerators.
+        SessionAcceleratorProbe: The first run's cards, each with its chosen reading, its verdict and the readings
+            of every run, plus the host's run count. The selections are empty when the first run found no
+            accelerators.
     """
     runs: list[list[ProbedAccelerator]] = [probe_accelerators()]
     selections = select_context_readings(runs)
@@ -671,4 +693,4 @@ def probe_session_accelerators() -> list[ProbedAccelerator]:
         selections = select_context_readings(runs)
     for selection in selections:
         _log_context_selection(selection, run_count=len(runs))
-    return [selection.accelerator for selection in selections]
+    return SessionAcceleratorProbe(selections=selections, run_count=len(runs))
