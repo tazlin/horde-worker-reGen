@@ -2180,6 +2180,8 @@ class HordeWorkerProcessManager:
             whole_card_residency_active=self._inference_scheduler.is_whole_card_residency_active,
             whole_card_pop_claim=self._inference_scheduler.whole_card_pop_claim,
             whole_card_pop_outcome=self._inference_scheduler.note_whole_card_pop_outcome,
+            withheld_pop_claim_model=self._inference_scheduler.withheld_pop_claim_model,
+            pop_claim_pacing_exempt=self._inference_scheduler.pop_claim_pacing_exempt,
             admission_baseline_provider=self._inference_scheduler.serviceability_baseline_mb,
             whole_card_seat_provider=self._inference_scheduler.whole_card_seat,
             extended_controlnet_ready_provider=self._extended_controlnet_ready,
@@ -8230,8 +8232,13 @@ class HordeWorkerProcessManager:
         )
 
     def _whole_card_residency_status(self) -> WholeCardResidencyStatus:
-        """Project the scheduler's whole-card residency state onto the wire model (MB rounded to int)."""
+        """Project the scheduler's whole-card residency state onto the wire model (MB rounded to int).
+
+        The paced model comes from the job popper's large-model governor, which keeps it out of the offer.
+        """
         state = self._inference_scheduler.whole_card_residency_state()
+        paced = next(iter(self._job_popper.low_earning_pacing_status()), None)
+        now = time.time()
         return WholeCardResidencyStatus(
             possible=state.possible,
             enabled=state.enabled,
@@ -8255,6 +8262,11 @@ class HordeWorkerProcessManager:
             pop_claim_withheld_model=state.pop_claim_withheld_model,
             pop_claim_hold_reason=state.pop_claim_hold_reason,
             pop_claim_exemption=state.pop_claim_exemption,
+            paced_model=paced.model if paced is not None else None,
+            paced_model_left_seconds_ago=max(0.0, now - paced.left_at) if paced is not None else None,
+            paced_model_returns_in_seconds=(
+                max(0.0, paced.returns_at - now) if paced is not None and paced.returns_at is not None else None
+            ),
             weights_mb=self._to_int_mb(state.weights_mb),
             reserve_mb=self._to_int_mb(state.reserve_mb),
             free_now_mb=self._to_int_mb(state.free_now_mb),
@@ -8295,6 +8307,25 @@ class HordeWorkerProcessManager:
             self._pop_governor_registry.update(self._collect_pop_governor_readings(now), now=now)
         except Exception as e:  # never let observability bookkeeping break the control loop
             logger.debug(f"Pop-governor update skipped this tick: {type(e).__name__} {e}")
+
+    def _low_earning_return_reading(self, now: float) -> PopGovernorReading:
+        """Return the governor reading of the paced return, with the time left when the model's jobs are done."""
+        paced = self._job_popper.low_earning_pacing_status()
+        if not paced:
+            return PopGovernorReading(name="low_earning_return", label="Low-earning model paced", active=False)
+        return_seconds = self.bridge_data.whole_card_low_earning_return_seconds
+        models = ", ".join(status.model for status in paced)
+        remaining = [max(0.0, status.returns_at - now) for status in paced if status.returns_at is not None]
+        return PopGovernorReading(
+            name="low_earning_return",
+            label="Low-earning model paced",
+            active=True,
+            reason=(
+                f"not asking the horde for {models}, which earns below the rest of the card, until "
+                f"{return_seconds}s after its jobs finish"
+            ),
+            expected_remaining_seconds=min(remaining) if remaining else None,
+        )
 
     def _collect_pop_governor_readings(self, now: float) -> list[PopGovernorReading]:
         """Read every known pop/scheduling governor's current engagement into a list of readings.
@@ -8341,6 +8372,7 @@ class HordeWorkerProcessManager:
                 expected_remaining_seconds=large.reentry_remaining_seconds,
             ),
         )
+        readings.append(self._low_earning_return_reading(now))
 
         backlogged = self._job_popper.is_post_inference_backlogged()
         readings.append(

@@ -277,3 +277,286 @@ async def test_a_world_without_an_accumulator_keeps_its_claim() -> None:
     outcome = await _drive(world)
 
     _assert_the_claim_stood(world, outcome, "no accumulator")
+
+
+# -- The paced return of a below-rest model -----------------------------------------------------------------------
+
+_RETURN_SECONDS = 180.0
+"""The popper's ``whole_card_low_earning_return_seconds`` in these rows, its default."""
+
+_PACED_QUEUE_DEPTH = 4
+"""The configured queue size of the pacing rows, one above the opening Flux burst so foreign work is taken."""
+
+_STEADY_SUPPLY_TICKS = 30
+"""How many ticks the horde offers a Flux job and an SD 1.5 job in the steady-supply rows."""
+
+_DRAIN_TICKS = 12
+"""Ticks with no supply after the steady supply, so every accepted job can finish inside the run."""
+
+_FOREIGN_JOB_TTL_SECONDS = 300.0
+"""The longest an SD 1.5 job may wait from its pop to its dispatch. The horde gives a job a deadline and drops it
+from the worker past it. A foreign job taken while Flux holds the card waits for the Flux jobs ahead of it, which
+the per-model queue cap holds to three, and for the card to be given back."""
+
+
+async def _build_paced_world(
+    seed: _Seed | None,
+    *,
+    flux_jobs: int = 3,
+) -> tuple[_DispatchWorld, list[ImageGenerateJobPopResponse]]:
+    """Build the burst world with the popper's pacing modelled and pop ``flux_jobs`` Flux jobs.
+
+    The cooldown is the world's default of zero, so a drained grant is released and the card serves the mix.
+    """
+    world = _DispatchWorld(
+        card=_CARD_16GB,
+        lane_count=2,
+        max_threads=1,
+        queue_depth=_PACED_QUEUE_DEPTH,
+        card_earning=_seeded_accumulator(seed) if seed is not None else None,
+        low_earning_return_seconds=_RETURN_SECONDS,
+    )
+    jobs = [make_job_pop_response(_FLUX.name, width=512, height=512, ddim_steps=8) for _ in range(flux_jobs)]
+    for job in jobs:
+        await world.pop(job)
+    return world, jobs
+
+
+def _flux_in_hand(world: _DispatchWorld) -> bool:
+    """Return whether a Flux job is pending or in progress."""
+    return any(job.model == _FLUX.name for job in world.job_tracker.jobs_pending_inference)
+
+
+def _queue_full(world: _DispatchWorld) -> bool:
+    """Return whether the popper would hold the pop for a full queue."""
+    return len(world.job_tracker.jobs_pending_inference) >= _PACED_QUEUE_DEPTH
+
+
+@dataclass
+class _PacedOutcome:
+    """Represents what a pacing row observed over its run.
+
+    Attributes:
+        accepted: Every job the worker accepted during the run, for the drain assertion.
+        foreign_taken: The SD 1.5 jobs the worker accepted.
+        flux_taken: The Flux jobs the worker accepted.
+        flux_in_hand_by_tick: Per tick, whether a Flux job was pending or in progress after the tick.
+    """
+
+    accepted: list[ImageGenerateJobPopResponse] = field(default_factory=list)
+    foreign_taken: list[ImageGenerateJobPopResponse] = field(default_factory=list)
+    flux_taken: list[ImageGenerateJobPopResponse] = field(default_factory=list)
+    flux_in_hand_by_tick: dict[int, bool] = field(default_factory=dict)
+
+
+def _at_model_queue_cap(world: _DispatchWorld, model_name: str) -> bool:
+    """Return whether the popper's per-model queue cap leaves ``model_name`` out of the offer.
+
+    The cap is three pending jobs for a model loaded on a lane and two otherwise, as the popper's stage applies
+    it. The world does not model that stage, and without it one model fills the whole queue.
+    """
+    loaded = any(lane.loaded_horde_model_name == model_name for lane in world._process_map.values())
+    pending = sum(job.model == model_name for job in world.job_tracker.jobs_pending_inference)
+    return pending >= (3 if loaded else 2)
+
+
+async def _drive_steady_supply(world: _DispatchWorld) -> _PacedOutcome:
+    """Offer a Flux job and then an SD 1.5 job on every supply tick while the queue has room, then drain."""
+    outcome = _PacedOutcome()
+    for _ in range(_STEADY_SUPPLY_TICKS + _DRAIN_TICKS):
+        await world.step()
+        outcome.flux_in_hand_by_tick[world.tick] = _flux_in_hand(world)
+        if world.tick > _STEADY_SUPPLY_TICKS:
+            continue
+        for model in (_FLUX, _SD15):
+            if _queue_full(world):
+                break
+            if _at_model_queue_cap(world, model.name):
+                continue
+            job = make_job_pop_response(model.name, width=512, height=512, ddim_steps=8)
+            if not await world.offer_job(job):
+                continue
+            outcome.accepted.append(job)
+            (outcome.flux_taken if model is _FLUX else outcome.foreign_taken).append(job)
+    return outcome
+
+
+def _seconds_waited(world: _DispatchWorld, job: ImageGenerateJobPopResponse) -> float | None:
+    """Return the seconds from ``job``'s pop to its dispatch, or None when it never reached sampling."""
+    dispatched_tick = world.dispatch_tick(job)
+    if dispatched_tick is None:
+        return None
+    popped_at = world.popped_at[str(job.id_)]
+    return dispatched_tick * world.tick_seconds + _world_start(world) - popped_at
+
+
+def _world_start(world: _DispatchWorld) -> float:
+    """Return the world clock before its first tick."""
+    return world.now - world.tick * world.tick_seconds
+
+
+def _paced_ticks(world: _DispatchWorld) -> list[int]:
+    """Return the ticks on which the governor's pacing kept Flux out of the offer."""
+    return sorted(tick for tick, models in world.paced_withholds.items() if _FLUX.name in models)
+
+
+async def test_steady_supply_of_a_below_rest_model_does_not_starve_the_other_models() -> None:
+    """Steady demand for a below-rest whole-card model does not hold jobs for other models past their deadline.
+
+    Flux reads below the rest, so its grant does not claim the offer and the worker takes SD 1.5 jobs while Flux
+    holds the card. The horde offers a Flux job and an SD 1.5 job on every tick. Flux leaves the offer while its
+    claim is withheld, so its jobs in hand finish, the grant drains and the SD 1.5 jobs run.
+    """
+    world, jobs = await _build_paced_world(_BELOW_THE_REST)
+
+    outcome = await _drive_steady_supply(world)
+
+    assert outcome.foreign_taken, f"precondition: no SD 1.5 job was accepted. {world.state_dump()}"
+    for job in outcome.foreign_taken:
+        waited = _seconds_waited(world, job)
+        assert waited is not None, f"SD 1.5 job {job.id_} was accepted and never served. {world.state_dump()}"
+        assert waited <= _FOREIGN_JOB_TTL_SECONDS, (
+            f"SD 1.5 job {job.id_} waited {waited:.0f}s from its pop to its dispatch, past the "
+            f"{_FOREIGN_JOB_TTL_SECONDS:.0f}s deadline. {world.state_dump()}"
+        )
+    paced = _paced_ticks(world)
+    assert paced, f"Flux was never paced, so the row does not show the pacing acting. {world.state_dump()}"
+    for tick in paced:
+        assert _FLUX.name not in world.offers[tick], (
+            f"at tick {tick} Flux was paced but the worker asked the horde for it. {world.state_dump()}"
+        )
+    for job in jobs + outcome.accepted:
+        assert world.dispatch_tick(job) is not None, (
+            f"job {job.id_} for {job.model} was accepted and never served. {world.state_dump()}"
+        )
+
+
+async def test_a_paced_model_stays_out_for_the_interval_after_its_last_job_then_returns() -> None:
+    """A paced model is not asked for until the interval has passed since its last job finished.
+
+    The horde keeps offering both models, so the worker always has SD 1.5 work and the idle escape does not
+    apply, and it does not answer an offer with nothing, so the empty-answer escape does not apply either.
+    """
+    world, _jobs = await _build_paced_world(_BELOW_THE_REST)
+
+    outcome = await _drive_steady_supply(world)
+
+    paced = _paced_ticks(world)
+    assert paced, f"precondition: Flux was never paced. {world.state_dump()}"
+    first_paced = paced[0]
+    finished_tick = next(
+        (
+            tick
+            for tick in sorted(outcome.flux_in_hand_by_tick)
+            if tick >= first_paced and not outcome.flux_in_hand_by_tick[tick]
+        ),
+        None,
+    )
+    assert finished_tick is not None, f"precondition: Flux's jobs in hand never finished. {world.state_dump()}"
+    returns_after = finished_tick + _RETURN_SECONDS / world.tick_seconds
+    for tick in range(first_paced, int(returns_after)):
+        assert _FLUX.name not in world.offers[tick], (
+            f"at tick {tick} the worker asked the horde for Flux, before {_RETURN_SECONDS:.0f}s had passed since "
+            f"its last job finished at tick {finished_tick}. {world.state_dump()}"
+        )
+    returned = [
+        tick for tick in range(int(returns_after), _STEADY_SUPPLY_TICKS + 1) if _FLUX.name in world.offers[tick]
+    ]
+    assert returned, (
+        f"Flux was not asked for again after {_RETURN_SECONDS:.0f}s had passed since its last job finished at "
+        f"tick {finished_tick}. {world.state_dump()}"
+    )
+    assert returned[0] == int(returns_after) or returned[0] == int(returns_after) + 1, (
+        f"Flux returned at tick {returned[0]}, later than the interval allows. {world.state_dump()}"
+    )
+    assert any(
+        world.popped_at[str(job.id_)] > _world_start(world) + returned[0] * world.tick_seconds - 1.0
+        for job in outcome.flux_taken
+    ), f"no Flux job was taken after it returned to the offer. {world.state_dump()}"
+
+
+async def test_a_paced_model_that_is_the_only_supply_returns_after_an_empty_answer() -> None:
+    """When the horde has work only for the paced model, an empty answer returns it to the offer.
+
+    The horde offers only Flux jobs. While Flux is paced the worker asks for the other models and the horde
+    answers with nothing. Flux is then asked for again while a Flux job is still in hand, before the worker
+    runs out of work, and its jobs are served back to back.
+    """
+    world, jobs = await _build_paced_world(_BELOW_THE_REST)
+    accepted: list[ImageGenerateJobPopResponse] = []
+    empty_answer_ticks: list[int] = []
+    for _ in range(_STEADY_SUPPLY_TICKS):
+        await world.step()
+        if _queue_full(world):
+            continue
+        job = make_job_pop_response(_FLUX.name, width=512, height=512, ddim_steps=8)
+        if await world.offer_job(job):
+            accepted.append(job)
+            continue
+        empty_answer_ticks.append(world.tick)
+        world.report_pop_answered_empty()
+    for _ in range(_DRAIN_TICKS):
+        await world.step()
+
+    paced = _paced_ticks(world)
+    assert paced, f"precondition: Flux was never paced. {world.state_dump()}"
+    assert empty_answer_ticks, f"precondition: the horde never answered an offer with nothing. {world.state_dump()}"
+    first_empty = empty_answer_ticks[0]
+    assert len(empty_answer_ticks) == 1, (
+        f"the horde answered with nothing on ticks {empty_answer_ticks}, so Flux did not stay in the offer after "
+        f"the first empty answer. {world.state_dump()}"
+    )
+    for tick in range(first_empty + 1, _STEADY_SUPPLY_TICKS + 1):
+        assert _FLUX.name in world.offers[tick], (
+            f"at tick {tick}, after the empty answer at tick {first_empty}, the worker did not ask for Flux. "
+            f"{world.state_dump()}"
+        )
+    assert accepted, f"no Flux job was taken after the empty answer. {world.state_dump()}"
+    for job in jobs + accepted:
+        assert world.dispatch_tick(job) is not None, (
+            f"Flux job {job.id_} was accepted and never served. {world.state_dump()}"
+        )
+
+
+async def test_a_paced_model_is_offered_when_the_worker_has_no_work() -> None:
+    """The idle escape returns a paced model as soon as the worker holds no work, inside the interval."""
+    world, _jobs = await _build_paced_world(_BELOW_THE_REST)
+    idle_ticks: list[int] = []
+    for _ in range(_STEADY_SUPPLY_TICKS):
+        await world.step()
+        if world.job_tracker.num_jobs_total == 0:
+            idle_ticks.append(world.tick)
+
+    paced = _paced_ticks(world)
+    assert paced, f"precondition: Flux was never paced. {world.state_dump()}"
+    assert idle_ticks, f"precondition: the worker never ran out of work. {world.state_dump()}"
+    first_idle = idle_ticks[0]
+    assert (first_idle - paced[-1]) * world.tick_seconds < _RETURN_SECONDS, (
+        f"precondition: the worker ran out of work at tick {first_idle}, after the interval. {world.state_dump()}"
+    )
+    assert _FLUX.name in world.offers[first_idle], (
+        f"the worker held no work at tick {first_idle} and still did not ask the horde for Flux. {world.state_dump()}"
+    )
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["listed", "always", "pays", "unmeasured"],
+)
+async def test_a_model_whose_claim_is_not_withheld_is_not_paced(case: str) -> None:
+    """An exempt model, any model under policy ``always``, a paying model and an unmeasured model are not paced."""
+    from horde_worker_regen.process_management.scheduling.governance.whole_card import WholeCardClaimPolicy
+
+    seed = {"listed": _BELOW_THE_REST, "always": _BELOW_THE_REST, "pays": _PAYS, "unmeasured": _UNMEASURED}[case]
+    world, _jobs = await _build_paced_world(seed)
+    bridge_data = world.scheduler._runtime_config.bridge_data
+    if case == "listed":
+        bridge_data.whole_card_claim_always_models = [_FLUX.name]
+    if case == "always":
+        bridge_data.whole_card_claim_policy = WholeCardClaimPolicy.ALWAYS
+
+    outcome = await _drive_steady_supply(world)
+
+    assert world.claim_ticks, f"{case}: precondition: the grant never claimed the offer. {world.state_dump()}"
+    assert _paced_ticks(world) == [], f"{case}: Flux was paced on ticks {_paced_ticks(world)}. {world.state_dump()}"
+    assert outcome.flux_taken, f"{case}: no further Flux job was taken. {world.state_dump()}"

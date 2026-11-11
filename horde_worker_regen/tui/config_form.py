@@ -684,7 +684,8 @@ CONFIG_FIELDS: list[ConfigField] = [
         "While a very large model has the card to itself, the worker can ask the horde for that model only, so "
         "jobs for other models do not push it off the card. The worker measures what each model earns. With "
         "Only when it pays, the default, a model that earns clearly less than your other models does not get "
-        "this. The worker then keeps asking for every model while that model holds the card. With Always, the "
+        "this. The worker then asks for your other models while that model holds the card, and asks for it again "
+        "a set number of seconds after its jobs finish. With Always, the "
         "worker asks only for the model that holds the card, whatever it earns. Changing this restarts the "
         "earning figures on the Stats tab.",
         choices=WHOLE_CARD_CLAIM_POLICY_CHOICES,
@@ -698,6 +699,21 @@ CONFIG_FIELDS: list[ConfigField] = [
         "Workload policy",
         "Models, by name, that the worker asks for alone while they hold the card, whatever they earn. Use it "
         "for a model you serve on purpose even though it pays less than your other models.",
+    ),
+    ConfigField(
+        "whole_card_low_earning_return_seconds",
+        "Seconds a low-earning model stays out after its jobs finish",
+        FieldKind.INT,
+        "Workload policy",
+        "While a very large model that earns less than your other models holds the card, the worker stops asking "
+        "the horde for it. Its jobs already taken finish, and the worker asks for it again this many seconds "
+        "later. It is asked for sooner when the horde has no other work, or when the worker has none. A longer "
+        "wait gives more of the card to your better-paid models and serves fewer jobs for that model. A shorter "
+        "wait serves it more often, and jobs for other models can wait behind its jobs again each time.",
+        minimum=1,
+        unit="s",
+        explicit_default=180,
+        risk_level="advanced",
     ),
     # Model pool
     ConfigField(

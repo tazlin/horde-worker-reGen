@@ -1394,13 +1394,23 @@ class WholeCardResidencyStatus(BaseModel):
     (``unmeasured`` | ``pays`` | ``below_the_rest``), or None when a held grant does not claim the offer."""
     pop_claim_withheld_model: str | None = None
     """The model a held grant would claim the offer for, when the claim is withheld because the model earns below
-    the rest of its card. None otherwise. While it is set the worker keeps asking the horde for every model."""
+    the rest of its card. None otherwise. While it is set the worker asks the horde for the other models."""
     pop_claim_hold_reason: str | None = None
     """Whether the held grant's claim stands and why (``not_withheld`` | ``withheld_below_the_rest`` |
     ``kept_by_policy`` | ``kept_by_exemption``), or None when a held grant does not claim the offer."""
     pop_claim_exemption: str | None = None
     """The exemption that keeps the claim of a model that earns below the rest (``listed`` | ``pool_pin`` |
     ``constrained_lane``), or None."""
+    paced_model: str | None = None
+    """The model the worker does not ask the horde for because it earns below the rest of its card, or None.
+
+    It stays set after the grant ends, until the model is asked for again."""
+    paced_model_left_seconds_ago: float | None = None
+    """Seconds since ``paced_model`` stopped being asked for, or None without a paced model."""
+    paced_model_returns_in_seconds: float | None = None
+    """Seconds until ``paced_model`` is asked for again, or None while a job for it is pending or in progress, and
+    without a paced model. It can return sooner, when the horde has no work for the other models or the worker has
+    no work at all."""
 
     weights_mb: int | None = None
     """Resident weight footprint of the residency model (detail view)."""

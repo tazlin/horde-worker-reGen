@@ -667,12 +667,23 @@ GATE_REGISTRY: tuple[GateEntry, ...] = (
         surface=GateSurface.POP_GATE,
         kind=GateKind.HOLD,
         subsystem="process_management.jobs.job_popper",
-        engaged_by="the large-model switch throttle and re-entry cooldown between them emptied this cycle's offer",
-        released_by="the configured switch interval or re-entry cooldown elapsing",
+        engaged_by=(
+            "the large-model switch throttle, the re-entry cooldown and the paced return of a model that earns below "
+            "the rest of its card between them emptied this cycle's offer"
+        ),
+        released_by=(
+            "the configured switch interval, re-entry cooldown or whole_card_low_earning_return_seconds elapsing, or "
+            "the worker running out of work (the idle escape)"
+        ),
         bound_seconds=None,
-        bound_source="the configured large-model switch interval and re-entry cooldown",
+        bound_source=(
+            "the configured large-model switch interval, re-entry cooldown and whole_card_low_earning_return_seconds"
+        ),
         backstop=_POP_GATE_WEDGE_BACKSTOP,
-        observable_at="the large_model_switch and large_model_reentry governor spells, and the last_pop_gate stamp",
+        observable_at=(
+            "the large_model_switch, large_model_reentry and low_earning_return governor spells, and the "
+            "last_pop_gate stamp"
+        ),
     ),
     GateEntry(
         key="whole_card_pop_claim",

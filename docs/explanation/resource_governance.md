@@ -652,16 +652,26 @@ measures both
 (see [The whole-card pop claim](performance_and_backpressure.md#the-whole-card-pop-claim)). Under the default
 `whole_card_claim_policy` a grant whose model reads below the rest holds the card without a claim. The residency
 keeps its own clocks: its cooldown, its maximum hold and its retention end work as above. Only what the worker
-asks for changes. The worker keeps asking for every model, and a foreign job that arrives can wait for the
+asks for changes. The worker asks for the other models, and a foreign job that arrives can wait for the
 resident model's jobs to drain. A run's copy is spared only while a job for its model is queued. The operator keeps the
 claim for every model with `whole_card_claim_policy: always`, or for chosen models with
 `whole_card_claim_always_models`.
+
+The resident model itself leaves the offer while its claim is withheld. If it stayed, its own jobs would keep
+arriving, keep the grant held and pass the queued foreign jobs, and anti-starvation does not end a rung-2 grant.
+The large-model pop governor owns that paced return. The model's jobs in hand finish, and it stays out until
+`whole_card_low_earning_return_seconds` (180 s by default) have passed since the last one finished. It returns
+early when the horde answers an offer without it with no job, until a job for another model is popped, and when
+the worker has no work at all. The governor reads two things from the scheduler through the job popper: which
+model's claim is withheld now (`InferenceScheduler.withheld_pop_claim_model`) and whether the policy or an
+exemption holds the card for a paced model (`pop_claim_pacing_exempt`). It does not read the scheduler itself.
 
 The large-model re-entry cooldown sits beneath all of this, and it does not pace the return of the model that
 just held the card. It arms only once no card holds a grant and no very-large model is loaded or queued. A
 restore does not unload the resident model's weights, so after a release whose model stays on a lane the
 cooldown does not arm. The model's next job can then re-establish the residency as soon as it reaches the head,
-subject only to the establish-rate limiter, and a rung-1 run is not subject to that limiter either.
+subject only to the establish-rate limiter, and a rung-1 run is not subject to that limiter either. Only the paced
+return above paces such a model, and only when its claim is withheld.
 
 The rate limiter brakes how fast the card may be rotated; it is never a finding that the head cannot be
 served. The held head keeps asking every cycle and is never admitted co-resident. A model whose verdict is

@@ -1093,8 +1093,38 @@ def test_residency_panel_says_the_card_is_not_held_for_a_low_earning_model() -> 
 
     assert "Not holding the card for" in text
     assert "Qwen-Image" in text
-    assert "it earns below the rest, so the worker asks the horde for every model" in " ".join(text.split())
+    assert "it earns below the rest, so the worker asks the horde for the other models" in " ".join(text.split())
     assert "Offering only" not in text
+
+
+def test_residency_panel_shows_a_paced_model_and_the_time_left() -> None:
+    """A paced model is named with when it is asked for again and the setting that sets the wait."""
+    text = " ".join(
+        _render(
+            OverviewView._render_residency_panel(
+                _active_residency(
+                    active=False, model=None, paced_model="Qwen-Image", paced_model_returns_in_seconds=95.0
+                ),
+            ),
+        ).split()
+    )
+
+    assert "Not asking for" in text
+    assert "Qwen-Image" in text
+    assert "whole_card_low_earning_return_seconds" in text
+    assert "after its jobs finish" not in text
+
+
+def test_residency_panel_shows_a_paced_model_with_jobs_in_hand() -> None:
+    """While a job for the paced model is in hand, the return is after its jobs finish."""
+    text = " ".join(
+        _render(
+            OverviewView._render_residency_panel(_active_residency(paced_model="Qwen-Image")),
+        ).split()
+    )
+
+    assert "Not asking for" in text
+    assert "after its jobs finish" in text
 
 
 def test_residency_panel_says_why_a_low_earning_claim_is_kept() -> None:

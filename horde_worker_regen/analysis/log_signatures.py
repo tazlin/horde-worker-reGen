@@ -1151,10 +1151,10 @@ _SIGNATURE_LIST: list[LogSignature] = [
         emitter="process_management.scheduling.governance.whole_card:_withheld_line",
         sample=(
             "Not holding the card for Qwen-Image_fp8, since it earns below the rest of the card. On card 0 it earns "
-            "5.060 kudos per card second, and the rest of the card's work earns 10.700. The worker keeps asking the "
-            "horde for every model while Qwen-Image_fp8 holds the card. To ask the horde only for Qwen-Image_fp8 "
-            "while it holds the card, set whole_card_claim_policy to always, or add the model to "
-            "whole_card_claim_always_models."
+            "5.060 kudos per card second, and the rest of the card's work earns 10.700. The worker asks the horde for "
+            "the other models, and asks for Qwen-Image_fp8 again 180s after its jobs finish "
+            "(whole_card_low_earning_return_seconds). To ask the horde only for Qwen-Image_fp8 while it holds the "
+            "card, set whole_card_claim_policy to always, or add the model to whole_card_claim_always_models."
         ),
         dry_run_reason=_WHOLE_CARD_NOT_EXERCISED,
     ),

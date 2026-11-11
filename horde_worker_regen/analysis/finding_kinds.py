@@ -1134,17 +1134,18 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
         kind=FindingKind.CLAIMED_MODEL_EARNS_BELOW_REST,
         title="A model that earns less had the card to itself",
         action=(
-            "Remove the model from your model list, or add it to `models_to_skip`, to stop serving it. "
-            "Or set `whole_card_residency_max_hold_seconds` to 0 so the worker never asks the horde for one "
-            "model only. That also applies to models that earn well, and jobs for other models can then push "
-            "their loaded weights off the card."
+            "No action needed if you hold the card for this model on purpose. To stop, set "
+            "`whole_card_claim_policy` back to its default, and remove the model from "
+            "`whole_card_claim_always_models` and from the model pool's pinned seats. The worker then asks the "
+            "horde for your other models while it holds the card."
         ),
         detail=(
             "The worker compares what a model earns per second of card time with the rest of the card's work. "
             "The model's 95% band lies wholly under the rest's band, so the gap is larger than the readings vary. "
-            "While the worker asks the horde only for this model, the card does not take better-paid work for "
-            "other models. The worker keeps asking for one model only whatever the model earns. "
-            "The Stats tab shows the figures for every model."
+            "The worker asked the horde only for this model while it held the card, and the card did not take "
+            "better-paid work for other models then. A setting kept that hold. Either `whole_card_claim_policy` is "
+            "always, or the model is in `whole_card_claim_always_models` or pinned to a model pool seat. A model "
+            "the card fits only at a reduced size is also held. The Stats tab shows the figures for every model."
         ),
         reference_page="docs/how-to/use-the-dashboard.md",
     ),
@@ -1158,8 +1159,9 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
         detail=(
             "The worker compares what a model earns per second of card time with the rest of the card's work. "
             "The model's 95% band lies wholly under the rest's band, so the gap is larger than the readings vary. "
-            "The worker did not ask the horde for this model alone. "
-            "The horde sets what each job pays."
+            "The worker did not ask the horde for this model alone. On a host with one card, the worker stops "
+            "asking for it while it holds the card. It asks again once its jobs finish and "
+            "`whole_card_low_earning_return_seconds` have passed. The horde sets what each job pays."
         ),
         reference_page="docs/how-to/use-the-dashboard.md",
     ),

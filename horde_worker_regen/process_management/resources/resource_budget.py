@@ -772,7 +772,7 @@ class WholeCardResidencyState:
     held grant does not claim the offer."""
     pop_claim_withheld_model: str | None = None
     """The model a held grant would claim the offer for, when the claim is withheld because the model earns below
-    the rest of its card. None otherwise. While it is set the worker keeps asking the horde for every model."""
+    the rest of its card. None otherwise. While it is set the worker asks the horde for the other models."""
     pop_claim_hold_reason: str | None = None
     """Whether the held grant's claim stands and why (a :class:`PopClaimHoldReason` value), or None when a held
     grant does not claim the offer."""

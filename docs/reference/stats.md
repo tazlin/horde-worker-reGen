@@ -98,7 +98,10 @@ The entries come from the residency status (`WholeCardResidencyStatus.pop_claim_
 `pop_claim_verdict`), so the stream and the dashboard read the same claim. A claim withheld because its model
 earns below the rest does not stand, so it is not listed. The residency status names it in
 `pop_claim_withheld_model`, with `pop_claim_hold_reason` and `pop_claim_exemption` saying whether a claim stands
-and why. A standing entry's verdict is `below_the_rest` only when the policy or an exemption kept the claim. A
+and why. The residency status also names the model the worker does not ask the horde for while it is paced, in
+`paced_model`, with `paced_model_left_seconds_ago` and `paced_model_returns_in_seconds`. The last is None while a
+job for the model is pending or in progress. The paced model stays named after the grant ends, until the worker
+asks for it again. These three fields are not on `stats_sample`. A standing entry's verdict is `below_the_rest` only when the policy or an exemption kept the claim. A
 span inside a claim can be split from the rest of a session with this field instead of the engage and release
 lines. Samples written before the field existed omit it.
 

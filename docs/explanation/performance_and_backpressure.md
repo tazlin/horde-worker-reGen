@@ -1786,12 +1786,20 @@ exactly the set that would claim the card.
   resident model, so while its weights stay on a lane the cooldown does not open and does not pace that model's
   return (see [Resource governance](resource_governance.md)).
 
-Both yield to an idle escape: when the worker holds no local work at all (an empty queue, nothing in
+- **The paced return** (`whole_card_low_earning_return_seconds`, default 180): a model whose whole-card pop
+  claim is withheld, because it earns below the rest of its card, leaves the offer. It keys on the withheld
+  claim, not on the size tier. Its jobs already taken finish. It stays out while the claim is withheld and then
+  until the interval has passed since its last job finished. An answered pop that came back with no job for an
+  offer that left it out returns it early, until a job for another model is popped. See
+  [The whole-card pop claim](#the-whole-card-pop-claim) for why.
+
+All three yield to an idle escape: when the worker holds no local work at all (an empty queue, nothing in
 flight), nothing is withheld, so a limiter never leaves the worker idle when the only work it could take is
 a large model. The timing state lives in a pure, worker-wide
 [`LargeModelPopGovernor`][horde_worker_regen.process_management.jobs.large_model_pop_governor.LargeModelPopGovernor].
 The switch throttle is off by default. The re-entry cooldown is on by default, since its `-1` inherits the
-residency cooldown (45 s unless changed). Both are independent of `whole_card_exclusive_residency`.
+residency cooldown (45 s unless changed). Both are independent of `whole_card_exclusive_residency`. The paced
+return runs whatever the two durations are, and only on a host with one card, since only that host has a claim.
 
 ### The whole-card pop claim
 
@@ -1854,16 +1862,22 @@ rest is not ruled below on noise. The residency status and every stats sample re
 standing claim (see [Stats export](../reference/stats.md#standing-pop-claim-on-stats_sample)).
 
 A model that earns below the rest does not get the claim under the default `whole_card_claim_policy`
-(`when_it_pays`). The grant still holds the card for the model, and the worker keeps asking the horde for every
-model while it does. The cost is that a foreign job can arrive while the model holds the card. Such a job can
-wait until the model's jobs drain, or the model's weights leave the card for it. An unmeasured model keeps the claim, so a
+(`when_it_pays`). The grant still holds the card for the model, and the worker asks the horde for the other
+models while it does. A foreign job can then arrive while the model holds the card, and it waits until the
+model's jobs drain or the model's weights leave the card for it. If the model stayed in the offer, its own jobs
+would keep arriving, keep the grant held and pass the queued foreign jobs. So the large-model governor's paced
+return takes the model out of the offer as soon as its claim is withheld. Its jobs in hand finish, and it is
+asked for again `whole_card_low_earning_return_seconds` after the last one finishes. It returns sooner when the
+horde answers an offer without it with no job, or when the worker has no work. An unmeasured model keeps the claim, so a
 model's first readings are taken with the card held for it. Setting the policy to `always` keeps every claim.
 Listing a model in `whole_card_claim_always_models` keeps its claim alone. A model pinned to a seat of the enabled
 model pool, and a model the card fits only at a reduced size, keep it too. The second is offered on its own
 reduced-size pop, one in several, so without the claim its jobs rarely arrive while it holds the card. The
 scheduler reads the claim at one point (`InferenceScheduler._standing_pop_claim`), so the offer, the resident
 bypass and the retention of a run's copy drop a withheld claim together. The worker logs the decision once per
-model, and the Overview's residency panel names the model the card is not held for and why.
+model, and the Overview's residency panel names the model the card is not held for and why. The paced return
+logs when the model leaves the offer and when it returns, with the cause, and the residency panel shows the paced
+model with the time left.
 
 ### Governor observability
 

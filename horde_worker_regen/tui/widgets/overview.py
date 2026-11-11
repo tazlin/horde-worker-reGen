@@ -87,7 +87,7 @@ from horde_worker_regen.tui.trends import (
     trend_bounds,
 )
 from horde_worker_regen.tui.widgets.downloads import summarize_download_activity
-from horde_worker_regen.tui.widgets.earning import claim_earning_row, verdict_phrase
+from horde_worker_regen.tui.widgets.earning import claim_earning_row, setting_words, verdict_phrase
 from horde_worker_regen.tui.widgets.insights import POOL_LANE_TEXT
 from horde_worker_regen.tui.widgets.overview_layout import OVERVIEW_ELEMENTS
 from horde_worker_regen.update_check import UpdateInfo, current_version
@@ -1173,7 +1173,7 @@ class OverviewView(Vertical):
                 "Not holding the card for",
                 Text(residency.pop_claim_withheld_model, style="#f0beff"),
                 "Because",
-                Text(f"it earns {verdict_text}, so the worker asks the horde for every model"),
+                Text(f"it earns {verdict_text}, so the worker asks the horde for the other models"),
             )
         elif residency.pop_claim_release is not None:
             add_pair(
@@ -1181,6 +1181,21 @@ class OverviewView(Vertical):
                 Text("no longer", style="grey62"),
                 "Because",
                 Text(_POP_CLAIM_RELEASE_TEXT.get(residency.pop_claim_release, residency.pop_claim_release)),
+            )
+
+        # A paced model stays out of what the worker asks for after its grant ends, so it is shown on its own row.
+        if residency.paced_model is not None:
+            setting = setting_words("whole_card_low_earning_return_seconds").replace("`", "")
+            returns_in = (
+                f"in {human_duration(residency.paced_model_returns_in_seconds)}"
+                if residency.paced_model_returns_in_seconds is not None
+                else "after its jobs finish"
+            )
+            add_pair(
+                "Not asking for",
+                Text(residency.paced_model, style="#f0beff"),
+                "Asked for again",
+                Text(f"{returns_in} ({setting}), or sooner if the horde or the worker has no other work"),
             )
 
         border = "#f0beff" if residency.active else "grey37"

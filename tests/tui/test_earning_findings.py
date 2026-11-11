@@ -113,12 +113,12 @@ def test_a_claimed_model_below_the_rest_gets_a_card_with_its_figures() -> None:
         "it for 34% of the card's time."
     )
     assert finding.action == (
-        "Remove the model from your model list, or add it to `models_to_skip`, to stop serving it. "
-        "Or set `whole_card_residency_max_hold_seconds` to 0 so the worker never asks the horde for one model only. "
-        "That also applies to models that earn well, and jobs for other models can then push their loaded weights "
-        "off the card."
+        "No action needed if you hold the card for this model on purpose. To stop, set `whole_card_claim_policy` "
+        "back to its default, and remove the model from `whole_card_claim_always_models` and from the model pool's "
+        "pinned seats. The worker then asks the horde for your other models while it holds the card."
     )
-    assert "the card does not take better-paid work for other models" in finding.detail
+    assert "the card did not take better-paid work for other models then" in finding.detail
+    assert "`whole_card_claim_policy` is always" in finding.detail
     assert finding.evidence == [
         "It earns 0.42 kudos per second of card time. The rest of the card earns 0.61.",
         "It took 50% of the card's time.",

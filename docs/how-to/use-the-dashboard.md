@@ -264,7 +264,8 @@ claim stands, the worker asks the horde only for one model, so the card stays wi
 | **Ends in** | Time left before the claim's maximum hold ends it. |
 | **Claim value** | Whether that model earns as much per card second as the rest of the card's work, in the words of the Stats tab's [Card earning](#card-earning) section. It reads "not below the rest" until the Stats figures for the model reach the dashboard. |
 | **Held because** | Shown when the model earns below the rest and the worker still asks only for it: `whole_card_claim_policy` is always, the model is in `whole_card_claim_always_models`, it is pinned to a model pool seat, or the card fits it only at a reduced size. |
-| **Not holding the card for** and **Because** | A model holds the card, but it earns below the rest of the card's work, so the worker asks the horde for every model. To change this, set **Hold the card for low-earning models** to Always, or add the model to **Always hold the card for these models**, on the Config tab's Models page. |
+| **Not holding the card for** and **Because** | A model holds the card, but it earns below the rest of the card's work, so the worker asks the horde for the other models. To change this, set **Hold the card for low-earning models** to Always, or add the model to **Always hold the card for these models**, on the Config tab's Models page. |
+| **Not asking for** and **Asked for again** | The worker does not ask the horde for this low-earning model now. Its jobs already taken finish first. **Asked for again** gives the time left once they have finished, and reads "after its jobs finish" until then. It can come back sooner, when the horde has no other work or the worker has none. The row stays after the card is given back, until the model is asked for again. The wait is **Seconds a low-earning model stays out after its jobs finish** on the Config tab (Advanced). |
 | **Offering only: no longer** and **Because** | Shown for a while after a claim ends: the maximum hold elapsed, the horde had no further work for the model, or the residency ended. |
 
 #### Reading a work-ledger row
@@ -515,7 +516,9 @@ save.
 The **Models** page also holds **Hold the card for low-earning models** (Always or Only when it pays, the
 default) and **Always hold the card for these models**, at every experience level. They decide whether the
 worker asks the horde only for a very large model while it holds the card when that model earns less than your
-other models. See [Bridge Configuration](../explanation/bridge_config.md) for what each choice costs.
+other models. At Advanced the page also holds **Seconds a low-earning model stays out after its jobs finish**
+(180 by default): how long the worker waits, after such a model's jobs finish, before it asks the horde for it
+again. See [Bridge Configuration](../explanation/bridge_config.md) for what each choice costs.
 
 The tab also holds a models editor and a searchable model picker: search across name, description,
 tags, and triggers, filter by baseline, by SFW/NSFW/inpainting, and by on-disk status, sort by any
@@ -579,7 +582,9 @@ is the same card the Diagnostics tab uses: a badge saying what to do with it, a 
 panel shows that the worker looks healthy. The earning findings come from the [Card earning](#card-earning)
 figures: a model that earns below the rest of its card while the worker asked the horde only for it, a model
 that earns below the rest without such a claim, and a note that the figures started
-again after a settings change. A card's details update in place when only its figures move, so an open
+again after a settings change. Under the default **Hold the card for low-earning models** the first appears only
+when a setting kept the hold for that model: the policy is Always, or the model is listed, pinned to a pool seat
+or fits the card only at a reduced size. Its "Do this" line says how to stop the hold. A card's details update in place when only its figures move, so an open
 "Details" section stays open. A card whose [startup memory figures](#startup-memory-measurement) did not agree on
 any try gets a finding that lists each try. It recommends a restart of the worker while no other program is using the card,
 or setting `vram_per_process_overhead_mb` to a figure you know.

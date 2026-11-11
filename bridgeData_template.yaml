@@ -877,8 +877,9 @@ whole_card_residency_max_hold_seconds: 180
 
 # Whether the worker asks the horde only for a whole-card model that earns less than the rest of the card.
 # The worker measures what each model earns per second of the card's time. when_it_pays (the default) does
-# not ask for such a model alone. The worker keeps asking for every model while it holds the card, and this
-# is written to the log and shown on the dashboard. A model with too few jobs measured is asked for alone.
+# not ask for such a model alone. The worker asks for the other models while it holds the card, and asks for
+# it again whole_card_low_earning_return_seconds after its jobs finish. This is written to the log and shown on
+# the dashboard. A model with too few jobs measured is asked for alone.
 # always asks only for the model that holds the card, whatever it earns. Changing this restarts the
 # measured earning figures.
 whole_card_claim_policy: when_it_pays
@@ -889,6 +890,14 @@ whole_card_claim_policy: when_it_pays
 # listed.
 # whole_card_claim_always_models:
 #   - "Qwen-Image_fp8"
+
+# Seconds a whole-card model that earns less than the rest of the card is not asked for after its jobs finish.
+# While whole_card_claim_policy does not hold the card for such a model, the worker stops asking the horde for
+# it. The jobs for it already taken finish, and the worker asks for it again this many seconds after the last
+# one. It is asked for sooner when the horde has no work for the other models, or the worker has no work. A
+# longer value gives more of the card to the better-paid models and serves fewer jobs for that model. A shorter
+# value serves it more often, and jobs for other models can wait behind its jobs again. At least 1.
+whole_card_low_earning_return_seconds: 180
 
 # Minimum seconds between accepting jobs for *different* very-large models (Flux/Cascade/Qwen/Z-Image and
 # the named VRAM-heavy checkpoints). A queue that alternates distinct very-large models forces a fresh

@@ -1592,8 +1592,9 @@ class reGenBridgeData(CombinedHordeBridgeData):
     While a model holds the card to itself, the worker normally asks the horde only for that model, so jobs for
     other models do not push its weights off the card. The worker measures what each model earns per second of
     the card's time. With `when_it_pays` (the default), a model that earns clearly less than the rest of the
-    card's work does not get this. The worker keeps asking for every model while it holds the card, and this is
-    written to the log and shown on the dashboard. A model with too few jobs measured is asked for alone as usual.
+    card's work does not get this. The worker asks for the other models while it holds the card, and asks for it
+    again `whole_card_low_earning_return_seconds` after its jobs finish. This is written to the log and shown on the
+    dashboard. A model with too few jobs measured is asked for alone as usual.
     `always` asks only for the model that holds the card, whatever it earns.
 
     The cost of `when_it_pays` is that a job for another model can arrive while the low-earning model holds the
@@ -1609,6 +1610,18 @@ class reGenBridgeData(CombinedHordeBridgeData):
     Use it for a model you serve on purpose even though it pays less than your other models. It has the effect of
     `whole_card_claim_policy: always` for the listed models alone. A model pinned to a seat of the enabled model
     pool, and a model the card fits only at a reduced size, are treated as listed. Empty by default."""
+
+    whole_card_low_earning_return_seconds: int = Field(default=180, ge=1)
+    """Seconds a whole-card model that earns less than the rest of the card is not asked for after its jobs finish.
+
+    When `whole_card_claim_policy` does not hold the card for such a model, the worker stops asking the horde for
+    it while it holds the card. The jobs for it already taken finish, and the worker asks for it again this many
+    seconds after the last one finishes. It is asked for sooner when the horde has no work for the other models,
+    or when the worker has no work at all.
+
+    A longer value gives more of the card's time to the better-paid models, and serves fewer jobs for the
+    low-earning model. A shorter value serves that model more often, and each return can make jobs for other
+    models wait behind its jobs again. Only used on a host with one card."""
 
     large_model_switch_min_seconds: int = Field(default=0, ge=0, le=600)
     """Minimum seconds between accepting jobs for *different* very-large models (the switch throttle).

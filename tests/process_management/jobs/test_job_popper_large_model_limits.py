@@ -11,6 +11,8 @@ from __future__ import annotations
 from collections.abc import Callable
 from unittest.mock import Mock
 
+from loguru import logger
+
 from horde_worker_regen.process_management.config.worker_state import WorkerState
 from horde_worker_regen.process_management.ipc.messages import HordeProcessState
 from horde_worker_regen.process_management.jobs.job_popper import JobPopper
@@ -36,6 +38,8 @@ def _make_popper(
     job_tracker: JobTracker | None = None,
     bridge_data: Mock | None = None,
     whole_card_residency_active: Callable[[], bool] | None = None,
+    withheld_pop_claim_model: Callable[[], str | None] | None = None,
+    pop_claim_pacing_exempt: Callable[[str], bool] | None = None,
 ) -> JobPopper:
     """A JobPopper with mostly-mocked dependencies, for exercising the large-model offer filter."""
     return JobPopper(
@@ -48,7 +52,89 @@ def _make_popper(
         max_inference_processes=2,
         max_concurrent_inference_processes=1,
         whole_card_residency_active=whole_card_residency_active,
+        withheld_pop_claim_model=withheld_pop_claim_model,
+        pop_claim_pacing_exempt=pop_claim_pacing_exempt,
     )
+
+
+class TestLowEarningPacingFiltersOffer:
+    """A model whose claim the scheduler withholds leaves the offer, whatever the two large-model durations are."""
+
+    @staticmethod
+    def _messages() -> tuple[list[str], int]:
+        """Return a list that collects INFO loguru messages, and the sink id to remove."""
+        messages: list[str] = []
+        sink_id = logger.add(lambda message: messages.append(message.record["message"]), level="INFO")
+        return messages, sink_id
+
+    async def test_a_withheld_model_leaves_the_offer_and_the_start_is_logged(self) -> None:
+        """The withheld model leaves the offer and one line names it, the interval and the setting."""
+        job_tracker = JobTracker()
+        await track_popped_job_async(job_tracker, make_job_pop_response(_FLUX))
+        bridge_data = make_mock_bridge_data()
+        popper = _make_popper(job_tracker=job_tracker, bridge_data=bridge_data, withheld_pop_claim_model=lambda: _FLUX)
+        messages, sink_id = self._messages()
+        try:
+            first = popper._apply_large_model_pop_limits({_SMALL, _FLUX}, bridge_data)
+            second = popper._apply_large_model_pop_limits({_SMALL, _FLUX}, bridge_data)
+        finally:
+            logger.remove(sink_id)
+
+        assert first == {_SMALL}
+        assert second == {_SMALL}
+        assert messages == [
+            f"Not asking the horde for {_FLUX} for now, since it earns below the rest of the card. The jobs for it "
+            "already taken finish first. The worker asks for it again 180s after they finish "
+            "(whole_card_low_earning_return_seconds), or sooner when the horde has no work for the other models or "
+            "the worker has no work at all."
+        ]
+        (status,) = popper.low_earning_pacing_status()
+        assert status.model == _FLUX
+        assert status.returns_at is None
+
+    async def test_an_empty_answer_returns_the_model_and_says_why(self) -> None:
+        """An empty answer to the offer that left the model out returns it, with the cause on the line."""
+        job_tracker = JobTracker()
+        await track_popped_job_async(job_tracker, make_job_pop_response(_FLUX))
+        bridge_data = make_mock_bridge_data()
+        popper = _make_popper(job_tracker=job_tracker, bridge_data=bridge_data, withheld_pop_claim_model=lambda: _FLUX)
+        popper._apply_large_model_pop_limits({_SMALL, _FLUX}, bridge_data)
+        messages, sink_id = self._messages()
+        try:
+            popper._note_paced_pop_outcome(popped_model=None)
+        finally:
+            logger.remove(sink_id)
+
+        assert messages == [f"Asking the horde for {_FLUX} again, because the horde had no work for the other models."]
+        assert popper._apply_large_model_pop_limits({_SMALL, _FLUX}, bridge_data) == {_SMALL, _FLUX}
+
+    async def test_an_exempt_model_is_returned_at_once(self) -> None:
+        """A paced model that the policy or an exemption now holds the card for is offered again."""
+        job_tracker = JobTracker()
+        await track_popped_job_async(job_tracker, make_job_pop_response(_FLUX))
+        bridge_data = make_mock_bridge_data()
+        exempt = {"now": False}
+        popper = _make_popper(
+            job_tracker=job_tracker,
+            bridge_data=bridge_data,
+            withheld_pop_claim_model=lambda: None if exempt["now"] else _FLUX,
+            pop_claim_pacing_exempt=lambda _model: exempt["now"],
+        )
+        assert popper._apply_large_model_pop_limits({_SMALL, _FLUX}, bridge_data) == {_SMALL}
+
+        exempt["now"] = True
+
+        assert popper._apply_large_model_pop_limits({_SMALL, _FLUX}, bridge_data) == {_SMALL, _FLUX}
+
+    async def test_without_the_providers_nothing_is_paced(self) -> None:
+        """A popper wired without the scheduler's readings offers as before."""
+        job_tracker = JobTracker()
+        await track_popped_job_async(job_tracker, make_job_pop_response(_FLUX))
+        bridge_data = make_mock_bridge_data()
+        popper = _make_popper(job_tracker=job_tracker, bridge_data=bridge_data)
+
+        assert popper._apply_large_model_pop_limits({_SMALL, _FLUX}, bridge_data) == {_SMALL, _FLUX}
+        assert popper.low_earning_pacing_status() == ()
 
 
 def _process_map_with_loaded(model_name: str) -> ProcessMap:

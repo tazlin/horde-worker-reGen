@@ -44,6 +44,9 @@ from horde_worker_regen.process_management.jobs.job_tracker import JobFaultOrigi
 from horde_worker_regen.process_management.jobs.large_model_pop_governor import (
     LargeModelGovernorStatus,
     LargeModelPopGovernor,
+    PacedModelStatus,
+    PacedReturn,
+    PacedReturnCause,
 )
 from horde_worker_regen.process_management.jobs.pool_lanes import (
     LaneDecision,
@@ -473,6 +476,8 @@ class JobPopper:
     _safety_off_gpu_provider: Callable[[], bool]
     _deliberate_safety_rebuild_provider: Callable[[], bool]
     _vram_pressure_provider: Callable[[], bool]
+    _withheld_pop_claim_model: Callable[[], str | None]
+    _pop_claim_pacing_exempt: Callable[[str], bool]
 
     def __init__(
         self,
@@ -493,6 +498,8 @@ class JobPopper:
         whole_card_residency_active: Callable[[], bool] | None = None,
         whole_card_pop_claim: Callable[[], WholeCardPopClaim | None] | None = None,
         whole_card_pop_outcome: Callable[..., None] | None = None,
+        withheld_pop_claim_model: Callable[[], str | None] | None = None,
+        pop_claim_pacing_exempt: Callable[[str], bool] | None = None,
         admission_baseline_provider: Callable[[int | None], float | None] | None = None,
         whole_card_seat_provider: Callable[[str, int | None], WholeCardSeat | None] | None = None,
         post_processing_lane_commitments_provider: Callable[[], int] | None = None,
@@ -531,6 +538,12 @@ class JobPopper:
         attempt made under that claim was answered with work, which is the evidence that ends a claim whose
         model the horde has nothing for. Both default to inert, so a worker wired without them advertises
         exactly as it always has.
+
+        `withheld_pop_claim_model` returns the model whose claim a held grant would hold but is withheld because
+        the model earns below the rest of its card, and `pop_claim_pacing_exempt` returns whether the policy or
+        an exemption now holds the card for a model. The large-model governor reads both to keep such a model out
+        of the offer until ``whole_card_low_earning_return_seconds`` after its jobs finish. Both default to inert,
+        so a popper wired without them does not pace any model.
 
         `admission_baseline_provider` supplies the shared device baseline for model serviceability offer
         shaping. A missing provider or uncaptured baseline reads as zero and only defers the exclusion until
@@ -620,6 +633,12 @@ class JobPopper:
         )
         self._whole_card_pop_claim = whole_card_pop_claim if whole_card_pop_claim is not None else (lambda: None)
         self._whole_card_pop_outcome = whole_card_pop_outcome
+        self._withheld_pop_claim_model = (
+            withheld_pop_claim_model if withheld_pop_claim_model is not None else (lambda: None)
+        )
+        self._pop_claim_pacing_exempt = (
+            pop_claim_pacing_exempt if pop_claim_pacing_exempt is not None else (lambda _model: False)
+        )
         self._post_processing_lane_commitments_provider = (
             post_processing_lane_commitments_provider
             if post_processing_lane_commitments_provider is not None
@@ -1003,14 +1022,86 @@ class JobPopper:
             reentry = float(reentry_raw)
         return switch_min, reentry
 
+    def _models_with_work(self) -> frozenset[str]:
+        """Return the models with a job pending or in progress."""
+        return frozenset(job.model for job in self._job_tracker.jobs_pending_inference if job.model is not None)
+
+    def _low_earning_return_seconds(self, bridge_data: reGenBridgeData) -> float:
+        """Return ``whole_card_low_earning_return_seconds``, reading a non-numeric (mocked) value as disabled."""
+        return self._coerce_seconds(bridge_data.whole_card_low_earning_return_seconds, default=0.0)
+
+    def _note_paced_model_work(self) -> None:
+        """Stamp the finish time of each paced model whose last job finished, on every pop cycle."""
+        if not self._large_model_pop_governor.paced_models:
+            return
+        self._large_model_pop_governor.note_paced_model_work(
+            models_with_work=self._models_with_work(), now=time.time()
+        )
+
+    def _apply_low_earning_pacing(self, models: set[str], bridge_data: reGenBridgeData) -> set[str]:
+        """Withhold a model that earns below the rest of its card until its paced return.
+
+        See ``LargeModelPopGovernor.evaluate_pacing`` for the window's rule.
+        """
+        return_seconds = self._low_earning_return_seconds(bridge_data)
+        governor = self._large_model_pop_governor
+        decision = governor.evaluate_pacing(
+            withheld_claim_model=self._withheld_pop_claim_model(),
+            models_with_work=self._models_with_work(),
+            exempt_models=frozenset(model for model in governor.paced_models if self._pop_claim_pacing_exempt(model)),
+            now=time.time(),
+            return_seconds=return_seconds,
+            idle_escape=self._job_tracker.num_jobs_total == 0,
+        )
+        for model in decision.started:
+            logger.info(
+                f"Not asking the horde for {model} for now, since it earns below the rest of the card. The jobs for "
+                f"it already taken finish first. The worker asks for it again {return_seconds:.0f}s after they "
+                "finish (whole_card_low_earning_return_seconds), or sooner when the horde has no work for the other "
+                "models or the worker has no work at all.",
+            )
+        self._log_paced_returns(decision.returned, return_seconds=return_seconds)
+        if not decision.withheld:
+            return models
+        return models.difference(decision.withheld)
+
+    @staticmethod
+    def _log_paced_returns(returned: tuple[PacedReturn, ...], *, return_seconds: float) -> None:
+        """Log one line for each paced model that is asked for again, with the cause."""
+        for paced_return in returned:
+            causes = {
+                PacedReturnCause.INTERVAL_PASSED: f"{return_seconds:.0f}s have passed since its last job finished",
+                PacedReturnCause.HORDE_HAD_NO_OTHER_WORK: "the horde had no work for the other models",
+                PacedReturnCause.WORKER_IDLE: "the worker has no work at all",
+                PacedReturnCause.NO_LONGER_PACED: (
+                    "whole_card_claim_policy, whole_card_claim_always_models or an exemption now holds the card for it"
+                ),
+            }
+            logger.info(f"Asking the horde for {paced_return.model} again, because {causes[paced_return.cause]}.")
+
+    def _note_paced_pop_outcome(self, *, popped_model: str | None) -> None:
+        """Report what the horde answered this pop with to the pacing window, and log any model it returns.
+
+        Called at the same two sites as the claim's outcome. A maintenance refusal is not reported, unlike for the
+        claim, since a horde that refuses every pop does not show that it has no work for the other models.
+        """
+        returned = self._large_model_pop_governor.note_pop_outcome(popped_model=popped_model)
+        if returned:
+            self._log_paced_returns(
+                returned,
+                return_seconds=self._low_earning_return_seconds(self._runtime_config.bridge_data),
+            )
+
     def _apply_large_model_pop_limits(self, models: set[str], bridge_data: reGenBridgeData) -> set[str]:
         """Withhold very-large models from the offer per the switch throttle and re-entry cooldown.
 
         The switch throttle is off by default, and the re-entry cooldown inherits the residency cooldown by
         default. Both yield to an idle escape (the worker holds no work locally), so the worker does not sit idle
-        when a large model is the only work available. See
+        when a large model is the only work available. The paced return of a model that earns below the rest of
+        its card runs first, whatever the two durations are. See
         :class:`~horde_worker_regen.process_management.jobs.large_model_pop_governor.LargeModelPopGovernor`.
         """
+        models = self._apply_low_earning_pacing(models, bridge_data)
         switch_min, reentry = self._resolve_large_model_pop_durations(bridge_data)
         if switch_min <= 0 and reentry <= 0:
             return models
@@ -1369,6 +1460,12 @@ class JobPopper:
             now=now,
             switch_min_seconds=switch_min,
             reentry_cooldown_seconds=reentry,
+        )
+
+    def low_earning_pacing_status(self) -> tuple[PacedModelStatus, ...]:
+        """Return each model the paced return keeps out of the offer, for the governor registry and the status."""
+        return self._large_model_pop_governor.describe_pacing(
+            return_seconds=self._low_earning_return_seconds(self._runtime_config.bridge_data),
         )
 
     def is_post_inference_backlogged(self) -> bool:
@@ -2029,6 +2126,9 @@ class JobPopper:
                 all other preconditions (queue-full, free process, megapixelstep wait, error
                 backoff) are still enforced below.
         """
+        # Before any gate, so a paced model's interval runs from the cycle its last job finished even while the
+        # gates below end the cycles that follow.
+        self._note_paced_model_work()
         if self._state.workload_intake_paused:
             # Every workload flow shares this boundary (shutdown, operator/self pause, download-only hold, and
             # terminal-recovery park). Keep it centralized on WorkerState so a new flow cannot accidentally
@@ -2519,6 +2619,7 @@ class JobPopper:
 
         if job_pop_response.id_ is None:
             self._note_whole_card_pop_outcome(pop_claim, served=False)
+            self._note_paced_pop_outcome(popped_model=None)
             if self._residency_bias_pop_narrowed:
                 # A narrowed offer the horde had nothing for: the next pop opens the offer again.
                 self._residency_bias_last_narrowed_pop_empty = True
@@ -2548,6 +2649,7 @@ class JobPopper:
             return
 
         self._note_whole_card_pop_outcome(pop_claim, served=True)
+        self._note_paced_pop_outcome(popped_model=job_pop_response.model)
         if self._state.last_pop_maintenance_mode:
             logger.info("Clearing horde maintenance latch: a new job was popped successfully.")
             self._state.server_maintenance_cleared_by_job_pop = True

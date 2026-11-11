@@ -154,6 +154,19 @@ def test_whole_card_claim_policy_offers_every_policy_with_plain_labels() -> None
     assert _BY_KEY["whole_card_claim_always_models"].kind is FieldKind.STR_LIST
 
 
+def test_low_earning_return_seconds_is_an_advanced_number_with_the_worker_default() -> None:
+    """The paced return's interval is an Advanced number of seconds beside the card-holding choice."""
+    field = _BY_KEY["whole_card_low_earning_return_seconds"]
+    model_field = reGenBridgeData.model_fields["whole_card_low_earning_return_seconds"]
+
+    assert field.kind is FieldKind.INT
+    assert field.risk_level == "advanced"
+    assert field.section == "Workload policy"
+    assert field.label == "Seconds a low-earning model stays out after its jobs finish"
+    assert field.minimum == 1
+    assert field.default() == model_field.default
+
+
 def test_secret_fields_flagged() -> None:
     """Sensitive fields are marked secret so the editor masks them."""
     assert _BY_KEY["api_key"].secret

@@ -516,26 +516,31 @@ class TestWithheldDisclosure:
     """The withheld line is logged once per model, and a kept claim says why on its engage line."""
 
     def test_the_withheld_line_names_both_rates_and_the_settings(self, info_messages: list[str]) -> None:
-        """The line states the model, both rates, that every model is still asked for, and the settings."""
+        """The line states the model, both rates, that the other models are asked for, the return and the settings."""
         tracker = WholeCardPopClaimTracker()
 
-        tracker.disclose_edge(None, now=100.0, withheld=_below_hold())
-        tracker.disclose_edge(None, now=101.0, withheld=_below_hold())
+        tracker.disclose_edge(None, now=100.0, withheld=_below_hold(), low_earning_return_seconds=180.0)
+        tracker.disclose_edge(None, now=101.0, withheld=_below_hold(), low_earning_return_seconds=180.0)
 
         assert info_messages == [
             f"Not holding the card for {CLAIMED_MODEL}, since it earns below the rest of the card. On card 0 it "
-            f"earns 0.550 kudos per card second, and the rest of the card's work earns 2.100. The worker keeps "
-            f"asking the horde for every model while {CLAIMED_MODEL} holds the card. To ask the horde only for "
-            f"{CLAIMED_MODEL} while it holds the card, set whole_card_claim_policy to always, or add the model to "
-            "whole_card_claim_always_models."
+            f"earns 0.550 kudos per card second, and the rest of the card's work earns 2.100. The worker asks the "
+            f"horde for the other models, and asks for {CLAIMED_MODEL} again 180s after its jobs finish "
+            f"(whole_card_low_earning_return_seconds). To ask the horde only for {CLAIMED_MODEL} while it holds the "
+            "card, set whole_card_claim_policy to always, or add the model to whole_card_claim_always_models."
         ]
+
+    def test_the_withheld_line_needs_the_return_interval(self) -> None:
+        """A withheld claim disclosed without the return interval raises, so the line never states a wrong one."""
+        with pytest.raises(ValueError, match="low_earning_return_seconds"):
+            WholeCardPopClaimTracker().disclose_edge(None, now=100.0, withheld=_below_hold())
 
     def test_a_standing_claim_withheld_later_is_not_logged_as_released(self, info_messages: list[str]) -> None:
         """A claim that stood and is then withheld for the same model logs the withheld line and no release."""
         tracker = WholeCardPopClaimTracker()
         tracker.disclose_edge(_claim(None), now=100.0)
 
-        tracker.disclose_edge(None, now=150.0, withheld=_below_hold())
+        tracker.disclose_edge(None, now=150.0, withheld=_below_hold(), low_earning_return_seconds=180.0)
 
         assert not any("released" in message for message in info_messages)
         assert any(message.startswith("Not holding the card for") for message in info_messages)
@@ -589,6 +594,33 @@ class TestWithheldDisclosure:
 
         assert not any("Whole-card pop claim engaged" in message for message in info_messages)
         assert [message for message in info_messages if message.startswith("Not holding the card for")]
+
+
+class TestPacingInputs:
+    """The two readings the job popper's large-model governor takes from the scheduler to pace a model."""
+
+    def test_a_withheld_claim_names_its_model(self) -> None:
+        """A below-the-rest grant's withheld claim names the model to pace."""
+        scheduler = _scheduler(card_index=0, accumulator=_measured_accumulator(0))
+        _hold_the_card(scheduler)
+
+        assert scheduler.withheld_pop_claim_model() == CLAIMED_MODEL
+        assert scheduler.pop_claim_pacing_exempt(CLAIMED_MODEL) is False
+
+    def test_a_listed_model_and_the_always_policy_are_exempt(self) -> None:
+        """A listed model, and any model under policy ``always``, are not paced."""
+        scheduler = _scheduler(card_index=0, accumulator=_measured_accumulator(0))
+        _hold_the_card(scheduler)
+        bridge_data = scheduler._runtime_config.bridge_data
+
+        bridge_data.whole_card_claim_always_models = [CLAIMED_MODEL]
+        assert scheduler.pop_claim_pacing_exempt(CLAIMED_MODEL) is True
+        assert scheduler.withheld_pop_claim_model() is None
+
+        bridge_data.whole_card_claim_always_models = []
+        bridge_data.whole_card_claim_policy = WholeCardClaimPolicy.ALWAYS
+        assert scheduler.pop_claim_pacing_exempt(CLAIMED_MODEL) is True
+        assert scheduler.withheld_pop_claim_model() is None
 
 
 class TestValueReuse:

@@ -1,4 +1,4 @@
-"""Tests for the large-model pop limiters: the switch throttle and the re-entry cooldown.
+"""Tests for the large-model pop limiters: the switch throttle, the re-entry cooldown and the paced return.
 
 The governor is pure and time-injectable, so each scenario drives ``evaluate`` across a sequence of pop
 cycles with explicit timestamps and asserts which large models it withholds from the offer.
@@ -6,7 +6,12 @@ cycles with explicit timestamps and asserts which large models it withholds from
 
 from __future__ import annotations
 
-from horde_worker_regen.process_management.jobs.large_model_pop_governor import LargeModelPopGovernor
+from horde_worker_regen.process_management.jobs.large_model_pop_governor import (
+    LargeModelPopGovernor,
+    LowEarningPacingDecision,
+    PacedReturn,
+    PacedReturnCause,
+)
 
 _FLUX = "Flux.1-Schnell fp8 (Compact)"
 _ZIMAGE = "Z-Image-Turbo"
@@ -233,3 +238,140 @@ class TestIdleEscape:
             idle_escape=True,
         )
         assert withheld == frozenset()
+
+
+_RETURN_SECONDS = 180.0
+
+
+def _pace(
+    governor: LargeModelPopGovernor,
+    *,
+    now: float,
+    withheld: str | None = None,
+    with_work: set[str] | None = None,
+    exempt: set[str] | None = None,
+    return_seconds: float = _RETURN_SECONDS,
+    idle_escape: bool = False,
+) -> LowEarningPacingDecision:
+    """Drive one pacing evaluation and return the decision."""
+    return governor.evaluate_pacing(
+        withheld_claim_model=withheld,
+        models_with_work=frozenset(with_work or set()),
+        exempt_models=frozenset(exempt or set()),
+        now=now,
+        return_seconds=return_seconds,
+        idle_escape=idle_escape,
+    )
+
+
+class TestPacedReturn:
+    """The paced return of a model whose claim is withheld."""
+
+    def test_a_withheld_model_leaves_the_offer_while_its_jobs_finish(self) -> None:
+        """The model leaves when its claim is withheld, and stays out while a job for it is in hand."""
+        governor = LargeModelPopGovernor()
+        decision = _pace(governor, now=0.0, withheld=_FLUX, with_work={_FLUX})
+        assert decision.withheld == frozenset({_FLUX})
+        assert decision.started == (_FLUX,)
+        later = _pace(governor, now=1000.0, with_work={_FLUX})
+        assert later.withheld == frozenset({_FLUX})
+        assert later.started == ()
+
+    def test_the_model_returns_the_interval_after_its_last_job_finished(self) -> None:
+        """The interval is measured from the cycle in which the model's last job finished."""
+        governor = LargeModelPopGovernor()
+        _pace(governor, now=0.0, withheld=_FLUX, with_work={_FLUX})
+        governor.note_paced_model_work(models_with_work=frozenset(), now=50.0)
+        assert _pace(governor, now=50.0 + _RETURN_SECONDS - 1.0).withheld == frozenset({_FLUX})
+        decision = _pace(governor, now=50.0 + _RETURN_SECONDS)
+        assert decision.withheld == frozenset()
+        assert decision.returned == (PacedReturn(model=_FLUX, cause=PacedReturnCause.INTERVAL_PASSED),)
+        assert governor.paced_models == frozenset()
+
+    def test_the_model_stays_out_while_its_claim_is_still_withheld(self) -> None:
+        """A model whose claim is still withheld does not return when the interval has passed."""
+        governor = LargeModelPopGovernor()
+        _pace(governor, now=0.0, withheld=_FLUX)
+        assert _pace(governor, now=_RETURN_SECONDS + 10.0, withheld=_FLUX).withheld == frozenset({_FLUX})
+        assert _pace(governor, now=_RETURN_SECONDS + 20.0).withheld == frozenset()
+
+    def test_a_job_for_the_model_restarts_its_interval(self) -> None:
+        """A job for the paced model in hand clears its finish time, so the interval runs from its end."""
+        governor = LargeModelPopGovernor()
+        _pace(governor, now=0.0, withheld=_FLUX)
+        _pace(governor, now=100.0, with_work={_FLUX})
+        governor.note_paced_model_work(models_with_work=frozenset(), now=101.0)
+        assert _pace(governor, now=_RETURN_SECONDS + 1.0).withheld == frozenset({_FLUX})
+        assert _pace(governor, now=_RETURN_SECONDS + 100.0).withheld == frozenset({_FLUX})
+        assert _pace(governor, now=_RETURN_SECONDS + 101.0).withheld == frozenset()
+
+    def test_an_empty_answer_returns_the_model_until_another_model_is_popped(self) -> None:
+        """An empty answer to an offer that left the model out returns it, and only another model's pop ends that."""
+        governor = LargeModelPopGovernor()
+        _pace(governor, now=0.0, withheld=_FLUX, with_work={_FLUX})
+        returned = governor.note_pop_outcome(popped_model=None)
+        assert returned == (PacedReturn(model=_FLUX, cause=PacedReturnCause.HORDE_HAD_NO_OTHER_WORK),)
+        assert _pace(governor, now=10.0, withheld=_FLUX, with_work={_FLUX}).withheld == frozenset()
+        assert governor.note_pop_outcome(popped_model=_FLUX) == ()
+        assert _pace(governor, now=20.0, withheld=_FLUX, with_work={_FLUX}).withheld == frozenset()
+        governor.note_pop_outcome(popped_model=_ZIMAGE)
+        decision = _pace(governor, now=30.0, withheld=_FLUX, with_work={_FLUX})
+        assert decision.withheld == frozenset({_FLUX})
+        assert decision.started == (_FLUX,)
+
+    def test_an_empty_answer_to_an_offer_with_the_model_returns_nothing(self) -> None:
+        """An empty answer is evidence only for a model the last offer left out."""
+        governor = LargeModelPopGovernor()
+        _pace(governor, now=0.0)
+        assert governor.note_pop_outcome(popped_model=None) == ()
+
+    def test_the_idle_escape_returns_the_model_and_starts_no_window(self) -> None:
+        """A worker with no work asks for every paced model, and a withheld claim does not start a window then."""
+        governor = LargeModelPopGovernor()
+        _pace(governor, now=0.0, withheld=_FLUX, with_work={_FLUX})
+        decision = _pace(governor, now=10.0, withheld=_FLUX, idle_escape=True)
+        assert decision.withheld == frozenset()
+        assert decision.returned == (PacedReturn(model=_FLUX, cause=PacedReturnCause.WORKER_IDLE),)
+        assert _pace(governor, now=20.0, withheld=_FLUX, idle_escape=True).started == ()
+
+    def test_an_exemption_returns_the_model(self) -> None:
+        """A paced model that the policy or an exemption now holds the card for is asked for again at once."""
+        governor = LargeModelPopGovernor()
+        _pace(governor, now=0.0, withheld=_FLUX, with_work={_FLUX})
+        decision = _pace(governor, now=10.0, with_work={_FLUX}, exempt={_FLUX})
+        assert decision.withheld == frozenset()
+        assert decision.returned == (PacedReturn(model=_FLUX, cause=PacedReturnCause.NO_LONGER_PACED),)
+
+    def test_a_model_without_a_withheld_claim_is_not_paced(self) -> None:
+        """Without a withheld claim the window does not open, whatever the model's work."""
+        governor = LargeModelPopGovernor()
+        assert _pace(governor, now=0.0, with_work={_FLUX}).withheld == frozenset()
+        assert governor.paced_models == frozenset()
+
+    def test_pacing_leaves_the_switch_throttle_and_the_cooldown_unchanged(self) -> None:
+        """The paced window does not change what the switch throttle and re-entry cooldown withhold."""
+        paced = LargeModelPopGovernor()
+        plain = LargeModelPopGovernor()
+        _pace(paced, now=0.0, withheld=_FLUX, with_work={_FLUX})
+        for governor in (paced, plain):
+            _evaluate(governor, candidate={_FLUX}, incumbent={_FLUX}, now=0.0, switch=30.0, reentry=45.0)
+        for governor in (paced, plain):
+            assert _evaluate(
+                governor, candidate={_FLUX, _ZIMAGE}, incumbent={_FLUX}, now=10.0, switch=30.0, reentry=45.0
+            ) == frozenset({_ZIMAGE})
+            _evaluate(governor, candidate={_FLUX}, incumbent=set(), now=20.0, switch=30.0, reentry=45.0)
+            assert _evaluate(
+                governor, candidate={_FLUX}, incumbent=set(), now=30.0, switch=30.0, reentry=45.0
+            ) == frozenset({_FLUX})
+
+    def test_describe_reports_the_return_once_the_jobs_finish(self) -> None:
+        """The status has no return time while a job is in hand, and the interval after the last finish."""
+        governor = LargeModelPopGovernor()
+        _pace(governor, now=5.0, withheld=_FLUX, with_work={_FLUX})
+        (status,) = governor.describe_pacing(return_seconds=_RETURN_SECONDS)
+        assert status.model == _FLUX
+        assert status.left_at == 5.0
+        assert status.returns_at is None
+        governor.note_paced_model_work(models_with_work=frozenset(), now=40.0)
+        (status,) = governor.describe_pacing(return_seconds=_RETURN_SECONDS)
+        assert status.returns_at == 40.0 + _RETURN_SECONDS

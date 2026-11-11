@@ -437,7 +437,7 @@ class PopClaimHoldReason(StrEnum):
     NOT_WITHHELD = "not_withheld"
     """The model's verdict is not below the rest, so the claim stands."""
     WITHHELD_BELOW_THE_REST = "withheld_below_the_rest"
-    """The model earns below the rest of its card, so the worker keeps asking the horde for every model."""
+    """The model earns below the rest of its card, so the worker asks the horde for the other models."""
     KEPT_BY_POLICY = "kept_by_policy"
     """The model earns below the rest, and the policy is ``always``."""
     KEPT_BY_EXEMPTION = "kept_by_exemption"
@@ -1580,7 +1580,7 @@ def _kept_sentence(decision: PopClaimHoldDecision) -> str:
     return ""
 
 
-def _withheld_line(hold: PopClaimHold) -> str:
+def _withheld_line(hold: PopClaimHold, *, low_earning_return_seconds: float) -> str:
     """Return the line that states a claim is withheld, with both rates and the settings that change it."""
     model = hold.claim.model
     rate = hold.value.rate
@@ -1589,7 +1589,8 @@ def _withheld_line(hold: PopClaimHold) -> str:
     return (
         f"Not holding the card for {model}, since it earns below the rest of the card. On card "
         f"{hold.value.card_index} it earns {model_rate} kudos per card second, and the rest of the card's work "
-        f"earns {rest_rate}. The worker keeps asking the horde for every model while {model} holds the card. To "
+        f"earns {rest_rate}. The worker asks the horde for the other models, and asks for {model} again "
+        f"{low_earning_return_seconds:.0f}s after its jobs finish (whole_card_low_earning_return_seconds). To "
         f"ask the horde only for {model} while it holds the card, set whole_card_claim_policy to always, or add "
         "the model to whole_card_claim_always_models."
     )
@@ -1717,6 +1718,7 @@ class WholeCardPopClaimTracker:
         value_of: Callable[[WholeCardPopClaim], PopClaimValue] | None = None,
         decision_of: Callable[[WholeCardPopClaim], PopClaimHoldDecision] | None = None,
         withheld: PopClaimHold | None = None,
+        low_earning_return_seconds: float | None = None,
     ) -> None:
         """Log the engage, release or withheld line when the claim actually changes.
 
@@ -1731,8 +1733,15 @@ class WholeCardPopClaimTracker:
             withheld: The claim a held grant would hold, when it is withheld because its model earns below the
                 rest. The withheld line is logged once per model. A claim that was standing and is then
                 withheld for the same model is not also logged as released.
+            low_earning_return_seconds: The operator's ``whole_card_low_earning_return_seconds``, which the
+                withheld line states. It is required when ``withheld`` is given.
+
+        Raises:
+            ValueError: ``withheld`` is given without ``low_earning_return_seconds``.
         """
-        self._disclose_withheld(withheld)
+        if withheld is not None and low_earning_return_seconds is None:
+            raise ValueError("the withheld line states the return interval, so it needs low_earning_return_seconds")
+        self._disclose_withheld(withheld, low_earning_return_seconds=low_earning_return_seconds or 0.0)
         previous = self._disclosed
         if claim is not None:
             if previous is not None and previous.model == claim.model:
@@ -1769,7 +1778,7 @@ class WholeCardPopClaimTracker:
         self._release = (release, now)
         logger.info(f"Whole-card pop claim released for {previous.model}: {reason}; advertising the full pool again.")
 
-    def _disclose_withheld(self, withheld: PopClaimHold | None) -> None:
+    def _disclose_withheld(self, withheld: PopClaimHold | None, *, low_earning_return_seconds: float) -> None:
         """Log the withheld line when a claim is first withheld for a model, and forget it once none is."""
         if withheld is None:
             self._withheld_disclosed = None
@@ -1777,7 +1786,7 @@ class WholeCardPopClaimTracker:
         if self._withheld_disclosed == withheld.claim.model:
             return
         self._withheld_disclosed = withheld.claim.model
-        logger.info(_withheld_line(withheld))
+        logger.info(_withheld_line(withheld, low_earning_return_seconds=low_earning_return_seconds))
 
     def recent_release(self, now: float) -> WholeCardPopClaimRelease | None:
         """Why the last claim ended, while that still explains the widened offer; else None."""

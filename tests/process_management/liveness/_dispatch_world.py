@@ -941,6 +941,7 @@ class _DispatchWorld:
         load_seconds_per_gb: float = _LOAD_SECONDS_PER_GB,
         large_model_switch_min_seconds: float = 0.0,
         large_model_reentry_cooldown_seconds: float = 0.0,
+        low_earning_return_seconds: float | None = None,
     ) -> None:
         """Build the process pool, the model map, and the scheduler for one row.
 
@@ -1269,6 +1270,11 @@ class _DispatchWorld:
                 to).
                 Above zero, every very-large model leaves the offer for this long once the residency is up and no
                 very-large model is loaded or queued.
+            low_earning_return_seconds: The popper's ``whole_card_low_earning_return_seconds``. When set,
+                :meth:`advertised_models` paces a model whose pop claim the scheduler withholds through the same
+                governor, ahead of the switch throttle and the re-entry cooldown as the popper orders them. A row
+                reports an empty answer from the horde with :meth:`report_pop_answered_empty`. None, the default,
+                leaves pacing out, so every row written before it reads as it did.
         """
         self.card = card
         self.tick_seconds = tick_seconds
@@ -1338,6 +1344,9 @@ class _DispatchWorld:
         self._large_model_pop_governor = LargeModelPopGovernor()
         self.large_model_withholds: dict[int, LargeModelPopDecision] = {}
         """Per tick, the last offer the large-model governor narrowed, with the models it withheld and why."""
+        self.low_earning_return_seconds = low_earning_return_seconds
+        self.paced_withholds: dict[int, frozenset[str]] = {}
+        """Per tick, the models the governor's pacing last kept out of the offer."""
         self._empty_pop_reported_tick: int | None = None
         """The tick whose refused offer last reported an empty pop under the claim, so a tick reports one."""
         self._first_step_noted: set[str] = set()
@@ -2893,8 +2902,10 @@ class _DispatchWorld:
         """Return ``models`` less the very-large ones the popper's switch throttle and re-entry cooldown withhold.
 
         The governor is evaluated on the world clock, so its windows mean simulated seconds. A run that sets
-        neither duration never evaluates it, as the popper skips it at zero durations.
+        neither duration never evaluates the two limits, as the popper skips them at zero durations. The paced
+        return runs first when the row sets ``low_earning_return_seconds``, as the popper runs it first.
         """
+        models = self._apply_low_earning_pacing(models)
         if self.large_model_switch_min_seconds <= 0 and self.large_model_reentry_cooldown_seconds <= 0:
             return models
         decision = self._large_model_pop_governor.evaluate(
@@ -2909,6 +2920,32 @@ class _DispatchWorld:
         if not decision.withheld:
             return models
         self.large_model_withholds[self.tick] = decision
+        return models.difference(decision.withheld)
+
+    def _apply_low_earning_pacing(self, models: frozenset[str]) -> frozenset[str]:
+        """Return ``models`` less the ones the governor's paced return keeps out, over the popper's two inputs.
+
+        The withheld model and the exemption come from the scheduler, as the popper's providers read them, and the
+        models with work from the tracker. Without ``low_earning_return_seconds`` nothing is evaluated.
+        """
+        if self.low_earning_return_seconds is None:
+            return models
+        governor = self._large_model_pop_governor
+        decision = governor.evaluate_pacing(
+            withheld_claim_model=self._scheduler.withheld_pop_claim_model(),
+            models_with_work=frozenset(
+                job.model for job in self._job_tracker.jobs_pending_inference if job.model is not None
+            ),
+            exempt_models=frozenset(
+                model for model in governor.paced_models if self._scheduler.pop_claim_pacing_exempt(model)
+            ),
+            now=self.now,
+            return_seconds=self.low_earning_return_seconds,
+            idle_escape=self._job_tracker.num_jobs_total == 0,
+        )
+        if not decision.withheld:
+            return models
+        self.paced_withholds[self.tick] = decision.withheld
         return models.difference(decision.withheld)
 
     def pops_held_for_host_ram(self) -> bool:
@@ -2935,11 +2972,20 @@ class _DispatchWorld:
         await self.pop(job)
         if claim is not None:
             self._scheduler.note_whole_card_pop_outcome(served=True)
+        if self.low_earning_return_seconds is not None:
+            self._large_model_pop_governor.note_pop_outcome(popped_model=job.model)
         return True
 
     def report_empty_pop(self) -> None:
         """Report that a pop taken under the standing claim came back with no work."""
         self._scheduler.note_whole_card_pop_outcome(served=False)
+
+    def report_pop_answered_empty(self) -> None:
+        """Report that the horde answered the worker's pop with no job, as the popper reports an empty answer."""
+        if self._scheduler.whole_card_pop_claim() is not None:
+            self.report_empty_pop()
+        if self.low_earning_return_seconds is not None:
+            self._large_model_pop_governor.note_pop_outcome(popped_model=None)
 
     # -- child-side effects -------------------------------------------------------------------------------
 

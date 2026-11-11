@@ -296,6 +296,7 @@ def make_mock_bridge_data(**overrides: object) -> Mock:
     bd.whole_card_residency_max_hold_seconds = 180
     bd.whole_card_claim_policy = WholeCardClaimPolicy.WHEN_IT_PAYS
     bd.whole_card_claim_always_models = []
+    bd.whole_card_low_earning_return_seconds = 180
     bd.large_model_switch_min_seconds = 0
     bd.large_model_reentry_cooldown_seconds = -1
     bd.unservable_model_fault_threshold = 3

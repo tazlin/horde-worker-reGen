@@ -4268,6 +4268,31 @@ class InferenceScheduler:
             return None
         return hold.claim
 
+    def withheld_pop_claim_model(self) -> str | None:
+        """Return the model whose pop claim a held grant would hold but is withheld, or None.
+
+        The job popper's large-model governor reads it to keep that model out of the offer while it holds the
+        card, so jobs for other models taken meanwhile are not left waiting behind a stream of its jobs.
+        """
+        hold = self._pop_claim_hold()
+        if hold is None or not hold.decision.withheld:
+            return None
+        return hold.claim.model
+
+    def pop_claim_pacing_exempt(self, model: str) -> bool:
+        """Return whether the policy or an exemption holds the card for ``model`` whatever it earns.
+
+        The job popper's large-model governor reads it for each paced model, so a change of
+        ``whole_card_claim_policy`` or ``whole_card_claim_always_models`` returns a paced model at once.
+        """
+        if self._whole_card_claim_policy() is WholeCardClaimPolicy.ALWAYS:
+            return True
+        return self._pop_claim_exemption(model) is not None
+
+    def _low_earning_return_seconds(self) -> float:
+        """Return the operator's ``whole_card_low_earning_return_seconds``, for the withheld line."""
+        return float(self._runtime_config.bridge_data.whole_card_low_earning_return_seconds)
+
     def _held_grant_pop_claim(self) -> WholeCardPopClaim | None:
         """Return the claim a held grant has over the pop offer before the earning policy is applied."""
         if self._multi_gpu_routing_active:
@@ -4318,6 +4343,7 @@ class InferenceScheduler:
             value_of=self._pop_claim_value,
             decision_of=self._pop_claim_decision,
             withheld=hold if hold is not None and hold.decision.withheld else None,
+            low_earning_return_seconds=self._low_earning_return_seconds(),
         )
 
     def _whole_card_claim_policy(self) -> WholeCardClaimPolicy:
