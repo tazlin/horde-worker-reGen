@@ -605,6 +605,15 @@ would silently drop those keys from `bridgeData.yaml` the next time an unrelated
 setting was saved. The Config editor's Dashboard page is never withheld, so the
 control that changes level cannot be hidden by the level.
 
+The level reaches a widget through the stylesheet. `HordeWorkerTUI._apply_experience_level`
+sets one of `level-simple`, `level-advanced` or `level-developer` on the screen, and
+`horde.tcss` shows a widget classed `level-simple-only`, `level-operator-only` or
+`level-developer-only` under the matching screen class. A widget with two presentations
+mounts both and classes each one, so a level change does not rebuild anything. The Stats
+tab's card earning section is built this way. A test that mounts such a widget in a small
+host app loads `horde.tcss` and registers the dashboard's themes first, because the
+stylesheet reads theme variables.
+
 The seven destinations that keep their operator widget at every level are framed in
 Simple by a [`TabPrimer`][horde_worker_regen.tui.widgets.simple.TabPrimer]: one line
 on what the page is for, plus a collapsible callout saying what the live figures mean

@@ -253,6 +253,18 @@ A **Governance** panel consolidates the pop governors and the scheduler's RAM an
 its title says how many governors are actively holding work back. Multi-GPU workers also get a
 per-card strip (one row per GPU: VRAM bar, contexts, active jobs).
 
+#### The claim rows of the residency panel
+
+The **Whole-card residency** panel shows a whole-card pop claim whether or not a residency is held. While a
+claim stands, the worker asks the horde only for one model, so the card stays with it.
+
+| Row | Meaning |
+|-----|---------|
+| **Offering only** | The model the worker asks the horde for while the claim stands. |
+| **Ends in** | Time left before the claim's maximum hold ends it. |
+| **Claim value** | Whether that model earns as much per card second as the rest of the card's work, in the words of the Stats tab's [Card earning](#card-earning) section. It reads "not below the rest" until the Stats figures for the model reach the dashboard. The claim does not read this verdict. |
+| **Offering only: no longer** and **Because** | Shown for a while after a claim ends: the maximum hold elapsed, the horde had no further work for the model, or the residency ended. |
+
 #### Reading a work-ledger row
 
 Each row names the job's pop order, age, stage, model, the process and GPU it is dispatched to, and its
@@ -301,7 +313,8 @@ stabilizing, and so do the changes listed under
 [Capacity and workload settings](#capacity-and-workload-settings).
 
 **Kudos/hr** is an active rate: kudos earned in the window divided by the time the pipeline actually
-held work. It therefore reads steadily instead of sawtoothing on each submit, and it charges neither
+held work. It is not kudos per wall hour, so the dashboard writes "while working" beside it on the Trends
+row, in the hero line and on the Stats tab. It therefore reads steadily instead of sawtoothing on each submit, and it charges neither
 the cold start before your first job nor an idle or maintenance stretch. A pause still counts while it
 drains queued work, since kudos keep landing. The session figure in the hero line and the status bar is
 the same measure over the whole session. The held-work clock is worker-wide (`WorkerState.tick_eligible_seconds`),
@@ -349,9 +362,60 @@ the worker, alchemy, text, and residency panels spread three-up.
 
 ### Stats
 
-Session statistics the worker owns: submitted and faulted jobs, kudos/hr, GPU duty (each card's own
-figure beside it on a multi-GPU worker), recoveries, slowdowns, no-work time, pipeline depth, and
-alchemy totals when alchemy is on.
+Session statistics the worker owns: submitted and faulted jobs, kudos/hr while working, GPU duty (each
+card's own figure beside it on a multi-GPU worker), recoveries, slowdowns, no-work time, pipeline depth,
+and alchemy totals when alchemy is on.
+
+#### Card earning
+
+Under the session stats, the card earning section shows what each model earns per second of card time,
+where each card's time went, and how long the worker offered one model only. The figures cover the last
+day of work and survive a restart of the worker. The worker computes every figure and verdict, so the
+dashboard and the logs agree. A host with more than one card shows one block per card. A worker that does
+not serve image jobs shows the section only once it has figures.
+
+At Simple, each card's block has three parts.
+
+- **What each model earns on this card.** One line per model: a bar and a verdict in words. The best
+  earner on the card fills the bar, and every other bar is its rate as a share of the best earner's. A dot
+  in place of a bar is a model not measured yet. The bars are block characters (`#` on a terminal without
+  them), so they read without colour.
+- **Where the card's time went.** Each model's share of the card's wall clock, then the idle share, when
+  no job ran on the card and no model held it. A full bar is the whole wall. An **other models** line
+  appears when the section lists only the models with the most card time.
+- **Time spent offering one model only.** One sentence per model for which the worker held a whole-card
+  pop claim, with the claim's share of the card's wall and the model's verdict. Absent when no claim stood.
+
+The verdicts read as follows.
+
+| Phrase | Meaning |
+|--------|---------|
+| earning well | The model earns at least as much per card second as the rest of the card's work. |
+| about the same as the rest | The model reads lower than the rest, but by less than the readings vary, so the two are not shown to differ. |
+| below the rest | The model earns less per card second than the rest of the card's work, by more than the readings vary. |
+| not measured yet (6 of 20 jobs) | The worker has counted too few of the model's jobs on the card to judge. The worker sets the number of jobs it needs. Without the count, the jobs are there but a rate does not have readings over enough time yet. |
+
+The line under the blocks states how long the figures cover ("Measured over the last 9 hours"). The figures
+restart when a [capacity or workload setting](#capacity-and-workload-settings) changes, and the line names
+the settings that changed at the last restart. A restart found at startup says only that the settings
+differed from the last run's. "And 3 more models with less card time" counts the models the section left
+out. With nothing measured yet, the section says so and that it waits for finished jobs.
+
+At Advanced and above, the same three parts are tables with the figures behind them.
+
+| Column | Meaning |
+|--------|---------|
+| Kudos/s | The model's kudos per second of card time. |
+| 95% band | The range the model's true rate lies in with 95% confidence, judged from how much the readings vary. |
+| Rest kudos/s, Rest band | The same for the card's other work, over the card's time not spent on this model. |
+| Jobs | The model's finished jobs counted on the card, faulted jobs included. |
+| Readings | How many time slices each rate was read from, the model's then the rest's. |
+| Verdict | The phrase from the table above. |
+
+The time table adds each share's card time and the card's wall, and the claim table adds each claim's
+time. [Card earning on the supervisor snapshot](../reference/stats.md#card-earning-on-the-supervisor-snapshot)
+lists the fields, and [Card-time attribution](../explanation/duty-cycle.md#card-time-attribution-which-model-each-card-second-went-to)
+describes which model each card second goes to.
 
 The tables roll finalized image jobs up by model and by baseline, carrying jobs, MPxsteps
 (`width x height / 1,000,000 x steps x batch`), sampling time, end-to-end time, and how many jobs ran a

@@ -31,6 +31,7 @@ from horde_worker_regen.tui.formatters import (
     short_baseline,
     shorten,
 )
+from horde_worker_regen.tui.widgets.earning import CardEarningView
 
 
 class StatsView(Vertical):
@@ -70,6 +71,7 @@ class StatsView(Vertical):
         yield Button("Enable JSONL export", id="stats-export-button")
         with VerticalScroll(id="stats-body"):
             yield Static(id="stats-headlines")
+            yield CardEarningView()
             yield Static(id="stats-governors")
             yield Static(id="stats-model-pool")
             yield Static(id="stats-export")
@@ -116,6 +118,14 @@ class StatsView(Vertical):
         button = self.query_one("#stats-export-button", Button)
         button.label = "Disable JSONL export" if snapshot.stats_export.enabled else "Enable JSONL export"
         self.query_one("#stats-headlines", Static).update(self._render_headlines(snapshot))
+        # Card earning measures image jobs, so a worker that does not serve them shows the section only once
+        # it has figures. Assigning display restyles the subtree even when unchanged, so it is compared first.
+        earning_view = self.query_one(CardEarningView)
+        shows_earning = snapshot.config.dreamer or bool(snapshot.card_earning.rows)
+        if earning_view.display != shows_earning:
+            earning_view.display = shows_earning
+        if shows_earning:
+            earning_view.update_earning(snapshot.card_earning, now=snapshot.timestamp)
         governors_static = self.query_one("#stats-governors", Static)
         has_governors = bool(snapshot.pop_governors.governors)
         governors_static.display = has_governors
@@ -180,7 +190,10 @@ class StatsView(Vertical):
             gpu_duty = f"{gpu_duty} ({breakdown})"
         rows = [
             ("Jobs", f"{snapshot.num_jobs_submitted:,} submitted / {snapshot.num_jobs_faulted:,} faulted"),
-            ("Kudos/hr", "-" if snapshot.kudos_per_hour is None else f"{snapshot.kudos_per_hour:,.0f}"),
+            (
+                "Kudos/hr",
+                "-" if snapshot.kudos_per_hour is None else f"{snapshot.kudos_per_hour:,.0f} while working",
+            ),
             ("GPU duty", gpu_duty),
             ("Recoveries", f"{snapshot.num_process_recoveries:,}"),
             ("Lane start failures", f"{snapshot.num_lane_start_failures:,}"),

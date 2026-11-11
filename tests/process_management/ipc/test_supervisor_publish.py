@@ -34,6 +34,7 @@ from horde_worker_regen.process_management.scheduling.card_earning import (
 )
 from horde_worker_regen.process_management.scheduling.governance.preload_admission import AdmissionDecision
 from horde_worker_regen.process_management.scheduling.governance.whole_card import (
+    POP_CLAIM_VALUE_MIN_JOBS,
     PopClaimValueVerdict,
     two_sided_95_band_width,
 )
@@ -651,6 +652,7 @@ class TestCardEarningSnapshot:
         """Rows are ranked by attributed seconds, and the card row splits the wall."""
         earning = HordeWorkerProcessManager._card_earning_snapshot(_two_bucket_earning_window())
 
+        assert earning.verdict_min_jobs == POP_CLAIM_VALUE_MIN_JOBS
         assert [(row.device_index, row.model) for row in earning.rows] == [(0, "A"), (0, "B")]
         row_a = earning.rows[0]
         assert row_a.model_kudos_per_second == pytest.approx(1.75)

@@ -287,6 +287,7 @@ from horde_worker_regen.process_management.scheduling.clearance_lease import (
     format_tail_overlap_tally,
 )
 from horde_worker_regen.process_management.scheduling.governance.whole_card import (
+    POP_CLAIM_VALUE_MIN_JOBS,
     pop_claim_value_verdict,
     rate_95_band,
 )
@@ -9408,6 +9409,7 @@ class HordeWorkerProcessManager:
                 if last_restart is not None
                 else None
             ),
+            verdict_min_jobs=POP_CLAIM_VALUE_MIN_JOBS,
         )
 
     def _apply_reloaded_bridge_data(self, bridge_data: reGenBridgeData) -> None:

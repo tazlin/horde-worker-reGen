@@ -310,12 +310,19 @@ retained bucket and takes milliseconds to tens of milliseconds, so the worker re
 | `cards` | Per card: `wall_seconds`, `attributed_seconds` (to any model) and `unattributed_seconds` (the rest of the wall). |
 | `window_started_at` | The start of the oldest retained bucket, or `None` when the window is empty. |
 | `last_restart` | The last restart during this run or at load: `at` and `changed_settings`. `None` when there was none. |
+| `verdict_min_jobs` | How many of a model's jobs must be counted on a card before its verdict can be other than `unmeasured` (`whole_card.POP_CLAIM_VALUE_MIN_JOBS`). The dashboard reads it for "(6 of 20 jobs)". `None` from a worker that does not report it. |
 
 A row has the card, the model, `model_kudos_per_second` and `rest_kudos_per_second`, each with `_band_low` and
 `_band_high`, then `jobs`, `model_buckets`, `rest_buckets`, `attributed_card_seconds`, `claim_seconds` and
 `verdict`. A band end is the rate plus or minus `two_sided_95_band_width(buckets)` standard errors, from
 `whole_card.rate_95_band`, which the verdict reads too. A band end is `None` when the rate or its standard error
 is `None`. The verdict is `pop_claim_value_verdict` over the row's figures, as its string value.
+
+The dashboard shows the figures on the Stats tab (see
+[Card earning](../how-to/use-the-dashboard.md#card-earning)). Its words for a verdict come from
+`tui/widgets/earning.py` `verdict_phrase`, which the Overview's residency panel reads too. A `pays` verdict reads
+"earning well" when the model rate is at or above the rest rate and "about the same as the rest" when it is
+under. An unknown verdict string is shown as it arrives.
 
 A restart during a run names the changed settings by their `CapacityWorkloadSettings` field names, in declaration
 order. The accumulator keeps the settings it last compared and names the fields with

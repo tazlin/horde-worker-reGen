@@ -1094,6 +1094,9 @@ class CardEarningSnapshot(BaseModel):
     """The start of the oldest retained time bucket, or None when the window is empty."""
     last_restart: CardEarningWindowRestart | None = None
     """The last restart during this run or at load, or None when there was none."""
+    verdict_min_jobs: int | None = None
+    """How many of a model's jobs must be counted on a card before its verdict can be other than ``unmeasured``.
+    None from a worker that does not report it."""
 
 
 class StatsExportState(BaseModel):

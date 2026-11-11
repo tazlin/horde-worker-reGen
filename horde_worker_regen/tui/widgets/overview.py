@@ -18,6 +18,8 @@ from horde_worker_regen.app_state import OverviewTrendWindow, OverviewViewMode
 from horde_worker_regen.process_management.config.worker_state import PopGate
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
     RECENT_JOBS_IN_SNAPSHOT,
+    CardEarningRow,
+    CardEarningSnapshot,
     CardSnapshot,
     FeatureReadinessSummary,
     JobQueueEntry,
@@ -81,6 +83,7 @@ from horde_worker_regen.tui.trends import (
     trend_bounds,
 )
 from horde_worker_regen.tui.widgets.downloads import summarize_download_activity
+from horde_worker_regen.tui.widgets.earning import claim_earning_row, verdict_phrase
 from horde_worker_regen.tui.widgets.insights import POOL_LANE_TEXT
 from horde_worker_regen.tui.widgets.overview_layout import OVERVIEW_ELEMENTS
 from horde_worker_regen.update_check import UpdateInfo, current_version
@@ -122,13 +125,6 @@ _POP_CLAIM_RELEASE_TEXT: dict[str, str] = {
 }
 """How each ``WholeCardPopClaimRelease`` reads to an operator watching the offer widen back out. An unknown
 value is shown as it arrives, so a worker newer than the dashboard still says something true."""
-
-_POP_CLAIM_VERDICT_TEXT: dict[str, str] = {
-    "unmeasured": "not measured yet",
-    "pays": "not below the rest of the card",
-    "below_the_rest": "earns below the rest of the card",
-}
-"""How each ``PopClaimValueVerdict`` reads beside the standing claim. An unknown value is shown as it arrives."""
 
 
 def _join_styled(parts: list[tuple[str, str]], separator: str) -> list[tuple[str, str] | str]:
@@ -573,7 +569,7 @@ class OverviewView(Vertical):
             )
         if show["#overview-residency"] and residency is not None:
             self.query_one("#overview-residency", Static).update(
-                self._render_residency_panel(residency, compact=phone),
+                self._render_residency_panel(residency, compact=phone, earning=snapshot.card_earning),
             )
         if show["#overview-model-pool"] and model_pool is not None:
             self.query_one("#overview-model-pool", Static).update(
@@ -777,7 +773,7 @@ class OverviewView(Vertical):
                     (" faulted", "grey50"),
                 ),
             )
-            body.append(Text.assemble((kudos, "bold cyan"), (" kudos/hr", "grey50")))
+            body.append(Text.assemble((kudos, "bold cyan"), (" kudos/hr while working", "grey50")))
             body.append(
                 Text.assemble(
                     ("Active ", "grey50"),
@@ -840,7 +836,7 @@ class OverviewView(Vertical):
                 (" forms submitted", "grey50"),
                 ("   ·   ", "grey37"),
                 (kudos, "bold cyan"),
-                (" kudos/hr", "grey50"),
+                (" kudos/hr while working", "grey50"),
                 ("   ·   ", "grey37"),
                 (f"{snapshot.alchemy_total_faulted:,}", faulted_colour),
                 (" faulted", "grey50"),
@@ -851,7 +847,7 @@ class OverviewView(Vertical):
             (" jobs submitted", "grey50"),
             ("   ·   ", "grey37"),
             (kudos, "bold cyan"),
-            (" kudos/hr", "grey50"),
+            (" kudos/hr while working", "grey50"),
             ("   ·   ", "grey37"),
             (f"{snapshot.num_jobs_faulted:,}", faulted_colour),
             (" faulted", "grey50"),
@@ -1049,13 +1045,28 @@ class OverviewView(Vertical):
         return f"Whole-card residency: {' and '.join(clauses)} for {model} (intentional)"
 
     @staticmethod
-    def _render_residency_panel(residency: WholeCardResidencyStatus, *, compact: bool = False) -> Panel:
+    def _render_residency_panel(
+        residency: WholeCardResidencyStatus,
+        *,
+        compact: bool = False,
+        earning: CardEarningSnapshot | None = None,
+    ) -> Panel:
         """Render the whole-card residency posture and, when active, the live forecast numbers.
 
         A details-only panel: the operationally-relevant config, plus while a residency is held the hard
         VRAM figures behind the decision (weights, the per-step reserve, the free achievable alone) that
-        are a hair too technical for the normal view.
+        are a hair too technical for the normal view. The claim's value reads in the Stats tab's words when
+        ``earning`` has the claimed model's row.
         """
+        claim_row: CardEarningRow | None = None
+        claim_min_jobs: int | None = None
+        if earning is not None and residency.pop_claim_model is not None:
+            claim_row = claim_earning_row(
+                earning,
+                model=residency.pop_claim_model,
+                device_index=residency.pop_claim_card_index,
+            )
+            claim_min_jobs = earning.verdict_min_jobs
         grid = Table.grid(padding=(0, 1 if compact else 2))
         grid.add_column(justify="right", style="bold cyan", no_wrap=True)
         grid.add_column()
@@ -1131,7 +1142,7 @@ class OverviewView(Vertical):
                 else "-",
             )
             if residency.pop_claim_verdict is not None:
-                verdict_text = _POP_CLAIM_VERDICT_TEXT.get(residency.pop_claim_verdict, residency.pop_claim_verdict)
+                verdict_text = verdict_phrase(residency.pop_claim_verdict, row=claim_row, min_jobs=claim_min_jobs)
                 add_pair("Claim value", Text(verdict_text), "", "")
         elif residency.pop_claim_release is not None:
             add_pair(
@@ -2296,7 +2307,8 @@ class OverviewView(Vertical):
 
         kudos_now = "-" if kudos_rate is None else f"{kudos_rate:,.0f}"
         kudos_total = snapshot.kudos_this_session
-        kudos_tail = f"{kudos_total:,.0f} kudos" if kudos_total else ""
+        # The rate divides by the time the pipeline held work, which operators otherwise read as per wall hour.
+        kudos_tail = f"while working · {kudos_total:,.0f} kudos" if kudos_total else "while working"
         add_trend(
             "Kudos/hr",
             kudos_now,
