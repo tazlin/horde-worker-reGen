@@ -482,3 +482,97 @@ class TestConfigurationWindow:
         accumulator.restart_window_if_changed(OTHER_FINGERPRINT)
 
         assert not any("Card earning figures restart" in message for message in info_messages)
+
+
+SECOND_BUCKET_START = BUCKET_START + CARD_EARNING_BUCKET_SECONDS
+
+
+def _fill_bucket(
+    accumulator: CardEarningAccumulator,
+    *,
+    start: float,
+    elapsed: float,
+    in_flight_models: tuple[str, ...],
+    kudos_by_model: dict[str, float],
+) -> None:
+    """Add ``elapsed`` seconds shared by ``in_flight_models`` to the bucket at ``start``, then credit the kudos."""
+    accumulator.observe(start, {})
+    accumulator.observe(start + elapsed, {0: CardTick(in_flight_models=in_flight_models)})
+    for model, kudos in kudos_by_model.items():
+        accumulator.credit_finished_job(device_index=0, model=model, kudos=kudos)
+
+
+class TestStandardErrors:
+    """Each rate's standard error is read across the retained buckets."""
+
+    def test_two_buckets_give_the_hand_computed_errors(self) -> None:
+        """The worked example's errors match the ratio formula.
+
+        Bucket one: A and B share 20 s, so 10 s each, with A paid 10 and B paid 5. Bucket two: five lanes share
+        50 s, so A has 30 s and B 20 s, with A paid 60 and B paid 30. Model A's rate is 70 / 40 = 1.75, and its
+        residuals are 10 - 1.75 x 10 = -7.5 and 60 - 1.75 x 30 = 7.5, so its error is sqrt(2 x 112.5) / 40 =
+        0.375. The rest of the card has 10 s and 20 s paid 5 and 30, a rate of 35 / 30 = 7/6, residuals of
+        -20/3 and 20/3, and an error of sqrt(2 x 800/9) / 30 = 4/9.
+        """
+        accumulator = _accumulator()
+        _fill_bucket(
+            accumulator,
+            start=BUCKET_START,
+            elapsed=20.0,
+            in_flight_models=("A", "B"),
+            kudos_by_model={"A": 10.0, "B": 5.0},
+        )
+        _fill_bucket(
+            accumulator,
+            start=SECOND_BUCKET_START,
+            elapsed=50.0,
+            in_flight_models=("A", "A", "A", "B", "B"),
+            kudos_by_model={"A": 60.0, "B": 30.0},
+        )
+
+        rate = accumulator.rate(model="A", device_index=0)
+
+        assert rate.model_kudos_per_second == pytest.approx(1.75)
+        assert rate.model_standard_error == pytest.approx(0.375)
+        assert rate.rest_kudos_per_second == pytest.approx(7.0 / 6.0)
+        assert rate.rest_standard_error == pytest.approx(4.0 / 9.0)
+
+    def test_one_bucket_has_no_error(self) -> None:
+        """A single bucket does not give a spread, so both errors are None."""
+        accumulator = _accumulator()
+        _fill_bucket(
+            accumulator,
+            start=BUCKET_START,
+            elapsed=20.0,
+            in_flight_models=("A", "B"),
+            kudos_by_model={"A": 10.0, "B": 5.0},
+        )
+
+        rate = accumulator.rate(model="A", device_index=0)
+
+        assert rate.model_kudos_per_second == pytest.approx(1.0)
+        assert rate.model_standard_error is None
+        assert rate.rest_standard_error is None
+
+    def test_equal_bucket_rates_give_zero_error(self) -> None:
+        """Buckets of different sizes with the same rate do not spread the rate."""
+        accumulator = _accumulator()
+        _fill_bucket(
+            accumulator,
+            start=BUCKET_START,
+            elapsed=20.0,
+            in_flight_models=("A", "B"),
+            kudos_by_model={"A": 10.0, "B": 5.0},
+        )
+        _fill_bucket(
+            accumulator,
+            start=SECOND_BUCKET_START,
+            elapsed=60.0,
+            in_flight_models=("A", "B"),
+            kudos_by_model={"A": 30.0, "B": 15.0},
+        )
+
+        rate = accumulator.rate(model="A", device_index=0)
+
+        assert rate.model_standard_error == pytest.approx(0.0)
+        assert rate.rest_standard_error == pytest.approx(0.0)

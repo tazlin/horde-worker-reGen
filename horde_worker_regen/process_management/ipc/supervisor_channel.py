@@ -885,6 +885,18 @@ class WorkloadTotalsSnapshot(BaseModel):
     one reports nothing a mean could be taken of."""
 
 
+class StandingPopClaimSample(BaseModel):
+    """Represents a whole-card pop claim standing on one card when a stats sample is taken."""
+
+    device_index: int
+    """The claim's card, by the lane's device index (0 on a single-card host)."""
+    model: str
+    """The model the claim narrows the pop offer to."""
+    verdict: str
+    """Whether the model earns as much per card second as the rest of its card (``unmeasured`` | ``pays`` |
+    ``below_the_rest``)."""
+
+
 class StatsSample(BaseModel):
     """One lightweight, worker-owned statistics sample for trend history and JSONL export."""
 
@@ -956,6 +968,9 @@ class StatsSample(BaseModel):
     device_free_adapter_counter_mb: float | None = None
     """The card's total less the dedicated memory Windows counts on its adapter, or None off Windows.
     Recorded for comparison, not acted on."""
+    standing_pop_claims: list[StandingPopClaimSample] = Field(default_factory=list)
+    """The whole-card pop claim standing on each card at sample time, with its value verdict. Empty when no
+    claim stands."""
 
 
 class StatsRollupRow(BaseModel):
@@ -1222,6 +1237,12 @@ class WholeCardResidencyStatus(BaseModel):
     pop_claim_release: str | None = None
     """Why the last claim ended (``maximum_hold`` | ``no_further_work`` | ``residency_released``), while that
     is still recent; None otherwise."""
+    pop_claim_card_index: int | None = None
+    """The standing claim's card, by the lane's device index, or None when no claim stands."""
+    pop_claim_verdict: str | None = None
+    """Whether the claimed model earns as much per card second as the rest of its card (``unmeasured`` |
+    ``pays`` | ``below_the_rest``), or None when no claim stands. It is disclosed only, and the claim does not
+    read it."""
 
     weights_mb: int | None = None
     """Resident weight footprint of the residency model (detail view)."""

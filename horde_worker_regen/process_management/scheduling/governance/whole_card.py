@@ -48,18 +48,24 @@ from horde_worker_regen.process_management.resources.resource_budget import Stre
 from horde_worker_regen.process_management.scheduling.scheduler_budget import SchedulerBudget
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Callable, Iterable
 
     from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
+    from horde_worker_regen.process_management.scheduling.card_earning import CardEarningRate
 
 __all__ = [
     "HEAVY_HEAD_LOAD_GRACE_SECONDS",
     "POP_CLAIM_RELEASE_VISIBLE_SECONDS",
+    "POP_CLAIM_VALUE_MIN_BUCKETS",
+    "POP_CLAIM_VALUE_MIN_JOBS",
+    "POP_CLAIM_VALUE_STANDARD_ERRORS",
     "WHOLE_CARD_DRAIN_SETTLE_SECONDS",
     "WHOLE_CARD_ESTABLISH_GRACE_SECONDS",
     "WHOLE_CARD_RESTORE_GRACE_SECONDS",
     "DominanceRung",
     "GraceBudgetStatus",
+    "PopClaimValue",
+    "PopClaimValueVerdict",
     "WholeCardGovernor",
     "WholeCardGovernorHold",
     "WholeCardPopClaimTracker",
@@ -73,6 +79,7 @@ __all__ = [
     "convergence_blockers",
     "max_coresident_for_peak",
     "offer_under_pop_claim",
+    "pop_claim_value_verdict",
     "post_process_context_fits",
     "residency_has_holder",
 ]
@@ -171,6 +178,23 @@ Both rails are fixed rather than operator-configured: they describe how much evi
 reading, which is not a preference, and the operator-facing lever over how long a residency may own the
 intake is the maximum hold."""
 
+POP_CLAIM_VALUE_MIN_JOBS = 20
+"""Finished jobs of the claimed model on its card before the claim's value is judged.
+
+With fewer jobs a single unusual job can set the model's rate."""
+
+POP_CLAIM_VALUE_MIN_BUCKETS = 8
+"""Time buckets with readings that each rate needs before the claim's value is judged.
+
+A standard error estimated from a few buckets is itself uncertain, and a band of two of them is then too
+narrow. With eight readings the 95% band is about 2.4 standard errors, which is close to the two used below."""
+
+POP_CLAIM_VALUE_STANDARD_ERRORS = 2.0
+"""How many standard errors wide each rate's band is when the claim's value is judged.
+
+Two is the usual two-sided 95% band. A model whose rate is near the rest of the card's is then not ruled below
+it on noise."""
+
 
 class WholeCardGovernor(StrEnum):
     """The churn governors over a card taking on a *new* whole-card residency.
@@ -265,6 +289,38 @@ class WholeCardPopClaimRelease(StrEnum):
     TERMINAL_FAULT = "terminal_fault"
     """A job for the claimed model faulted terminally. Narrowing the offer to a model whose jobs fault feeds the
     card more of the same failure, so the claim lets go at the first one."""
+
+
+class PopClaimValueVerdict(StrEnum):
+    """Whether a standing pop claim's model earns as much per card second as the rest of its card's work.
+
+    The verdict is disclosed in the log and the stats stream. The claim, the offer, dispatch and retention do not
+    read it.
+    """
+
+    UNMEASURED = auto()
+    """Too few of the model's jobs or too few time buckets are counted, or a rate has no reading."""
+    PAYS = auto()
+    """The model's band reaches the rest of the card's band or lies above it, so the model is not shown to earn
+    below the rest."""
+    BELOW_THE_REST = auto()
+    """The top of the model's band is under the bottom of the rest of the card's band."""
+
+
+@dataclass(frozen=True)
+class PopClaimValue:
+    """Represents the measured value of a standing pop claim on its card.
+
+    Attributes:
+        card_index: The claim's card, by the lane's device index, as the card earning store keys it.
+        rate: The claimed model's earning figures on that card, or None when the worker does not measure
+            card earning.
+        verdict: The verdict on those figures.
+    """
+
+    card_index: int
+    rate: CardEarningRate | None
+    verdict: PopClaimValueVerdict
 
 
 class DominanceRung(StrEnum):
@@ -1265,6 +1321,62 @@ def offer_under_pop_claim(models: frozenset[str], *, claim: WholeCardPopClaim | 
     return models & {claim.model}
 
 
+def pop_claim_value_verdict(rate: CardEarningRate) -> PopClaimValueVerdict:
+    """Return whether the claimed model in ``rate`` earns as much per card second as the rest of its card.
+
+    Each rate gets a band of :data:`POP_CLAIM_VALUE_STANDARD_ERRORS` standard errors on each side. The model is
+    below the rest only when the top of its band is under the bottom of the rest's band.
+
+    Args:
+        rate: The claimed model's earning figures on the claim's card.
+    """
+    if rate.jobs < POP_CLAIM_VALUE_MIN_JOBS:
+        return PopClaimValueVerdict.UNMEASURED
+    model_rate = rate.model_kudos_per_second
+    rest_rate = rate.rest_kudos_per_second
+    model_error = rate.model_standard_error
+    rest_error = rate.rest_standard_error
+    if model_rate is None or rest_rate is None or model_error is None or rest_error is None:
+        return PopClaimValueVerdict.UNMEASURED
+    if min(rate.model_buckets, rate.rest_buckets) < POP_CLAIM_VALUE_MIN_BUCKETS:
+        return PopClaimValueVerdict.UNMEASURED
+    model_band_top = model_rate + POP_CLAIM_VALUE_STANDARD_ERRORS * model_error
+    rest_band_bottom = rest_rate - POP_CLAIM_VALUE_STANDARD_ERRORS * rest_error
+    if model_band_top < rest_band_bottom:
+        return PopClaimValueVerdict.BELOW_THE_REST
+    return PopClaimValueVerdict.PAYS
+
+
+def _format_kudos_rate(kudos_per_second: float | None) -> str:
+    return "unmeasured" if kudos_per_second is None else f"{kudos_per_second:.3f}"
+
+
+def _pop_claim_value_sentence(value: PopClaimValue) -> str:
+    """Return the engage line's statement of the claim's measured value."""
+    rate = value.rate
+    if rate is None:
+        return "Card earning is not measured on this worker. The claim's value is unmeasured."
+    jobs_noun = "job" if rate.jobs == 1 else "jobs"
+    figures = (
+        f"Earning on card {value.card_index}, in kudos per card second: "
+        f"{_format_kudos_rate(rate.model_kudos_per_second)} for the claimed model, "
+        f"{_format_kudos_rate(rate.rest_kudos_per_second)} for the rest of the card, "
+        f"over {rate.jobs} {jobs_noun} of the claimed model."
+    )
+    if value.verdict is PopClaimValueVerdict.PAYS:
+        return (
+            f"{figures} The claimed model is not below the rest of the card by more than the spread of the readings."
+        )
+    if value.verdict is PopClaimValueVerdict.BELOW_THE_REST:
+        return f"{figures} The claimed model earns below the rest of the card."
+    if rate.jobs < POP_CLAIM_VALUE_MIN_JOBS:
+        return f"{figures} The claim's value is unmeasured until {POP_CLAIM_VALUE_MIN_JOBS} jobs are counted."
+    return (
+        f"{figures} The claim's value is unmeasured until both rates have readings from "
+        f"{POP_CLAIM_VALUE_MIN_BUCKETS} time buckets."
+    )
+
+
 def _establishing(state: WholeCardResidency, *, now: float, establish_grace_seconds: float) -> bool:
     """Return whether a held rung-2 residency is still inside its establish grace.
 
@@ -1378,8 +1490,21 @@ class WholeCardPopClaimTracker:
             "is worker-wide and narrowing it to one card's model would starve the others.",
         )
 
-    def disclose_edge(self, claim: WholeCardPopClaim | None, *, now: float) -> None:
-        """Log the engage or release line when the standing claim actually changes."""
+    def disclose_edge(
+        self,
+        claim: WholeCardPopClaim | None,
+        *,
+        now: float,
+        value_of: Callable[[WholeCardPopClaim], PopClaimValue] | None = None,
+    ) -> None:
+        """Log the engage or release line when the standing claim actually changes.
+
+        Args:
+            claim: The standing claim, or None when the pool is unclaimed.
+            now: The scheduler's clock.
+            value_of: Reads a claim's measured value. It is called only at an engage edge, and the engage line
+                then states the value. None leaves the value out of the line.
+        """
         previous = self._disclosed
         if claim is not None:
             if previous is not None and previous.model == claim.model:
@@ -1387,9 +1512,10 @@ class WholeCardPopClaimTracker:
             self._disclosed = claim
             self._early_release_pending = None
             self._release = None
+            value_sentence = f" {_pop_claim_value_sentence(value_of(claim))}" if value_of is not None else ""
             logger.info(
                 f"Whole-card pop claim engaged for {claim.model}: advertising that model alone while it holds "
-                f"the card, for at most {claim.expires_at - claim.held_since:.0f}s.",
+                f"the card, for at most {claim.expires_at - claim.held_since:.0f}s.{value_sentence}",
             )
             return
         if previous is None:

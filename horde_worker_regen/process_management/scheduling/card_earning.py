@@ -17,7 +17,9 @@ The buckets hold figures for one capacity and workload configuration, named by i
 written under another fingerprint loads empty, and :meth:`CardEarningAccumulator.restart_window_if_changed`
 drops the buckets when the fingerprint changes during a run.
 
-The module only measures. It does not hold a threshold or a verdict, and scheduling does not read it.
+The module only measures. It does not hold a threshold or a verdict. The pop claim's value verdict in
+:mod:`~horde_worker_regen.process_management.scheduling.governance.whole_card` reads it for disclosure, and
+scheduling decisions do not read it.
 """
 
 from __future__ import annotations
@@ -94,6 +96,13 @@ class CardEarningRate:
         jobs: How many of the model's finished jobs were credited on the card, faulted jobs included.
         model_seconds: The card seconds attributed to the model, the model rate's denominator.
         card_wall_seconds: The card's wall seconds over the same window.
+        model_standard_error: The standard error of the model rate across the retained buckets. None when the
+            rate is None or fewer than two buckets have attributed seconds for the model.
+        rest_standard_error: The standard error of the rest rate across the retained buckets. None when the
+            rate is None or fewer than two buckets have seconds left for the rest of the card.
+        model_buckets: How many retained buckets have attributed seconds for the model. The model's standard
+            error is estimated from this many readings.
+        rest_buckets: How many retained buckets have seconds left for the rest of the card.
     """
 
     model_kudos_per_second: float | None
@@ -101,6 +110,40 @@ class CardEarningRate:
     jobs: int
     model_seconds: float
     card_wall_seconds: float
+    model_standard_error: float | None = None
+    rest_standard_error: float | None = None
+    model_buckets: int = 0
+    rest_buckets: int = 0
+
+
+@dataclass(frozen=True)
+class _BucketFigures:
+    """Represents one bucket's numerator and denominator of a rate."""
+
+    kudos: float
+    seconds: float
+
+
+def _counted_buckets(by_bucket: list[_BucketFigures]) -> list[_BucketFigures]:
+    """Return the buckets with seconds above zero, which are the ones a rate is read from."""
+    return [figures for figures in by_bucket if figures.seconds > _ZERO_SECONDS_TOLERANCE]
+
+
+def _ratio_standard_error(by_bucket: list[_BucketFigures], rate: float | None) -> float | None:
+    """Return the standard error of ``rate`` across ``by_bucket``, or None with fewer than two counted buckets.
+
+    A bucket counts when its seconds are above zero. Each residual is the bucket's kudos less the rate times its
+    seconds, which is the bucket's deviation from the rate weighted by its seconds.
+    """
+    if rate is None:
+        return None
+    counted = _counted_buckets(by_bucket)
+    count = len(counted)
+    if count < 2:
+        return None
+    total_seconds = sum(figures.seconds for figures in counted)
+    residual_sum = sum((figures.kudos - rate * figures.seconds) ** 2 for figures in counted)
+    return math.sqrt(count / (count - 1) * residual_sum) / total_seconds
 
 
 @dataclass
@@ -297,6 +340,10 @@ class CardEarningAccumulator:
     def rate(self, *, model: str, device_index: int) -> CardEarningRate:
         """Return the earning figures of ``model`` on ``device_index`` over the retained buckets.
 
+        A rate's standard error treats the rate as a ratio over the buckets. It is the square root of n/(n-1)
+        times the sum over buckets of (bucket kudos - rate x bucket seconds) squared, divided by the total
+        seconds, where n counts the buckets with seconds in the rate's denominator.
+
         Args:
             model: The model to read.
             device_index: The card to read, by the lane's device index.
@@ -306,25 +353,45 @@ class CardEarningAccumulator:
         model_seconds = 0.0
         model_kudos = 0.0
         model_jobs = 0
+        model_by_bucket: list[_BucketFigures] = []
+        rest_by_bucket: list[_BucketFigures] = []
         for bucket in self._buckets.values():
-            card_wall += bucket.wall_seconds_by_card.get(device_index, 0.0)
+            bucket_wall = bucket.wall_seconds_by_card.get(device_index, 0.0)
+            bucket_card_kudos = 0.0
+            bucket_model_seconds = 0.0
+            bucket_model_kudos = 0.0
             for (tally_card, tally_model), tally in bucket.tallies.items():
                 if tally_card != device_index:
                     continue
-                card_kudos += tally.kudos
+                bucket_card_kudos += tally.kudos
                 if tally_model == model:
-                    model_seconds += tally.seconds
-                    model_kudos += tally.kudos
+                    bucket_model_seconds += tally.seconds
+                    bucket_model_kudos += tally.kudos
                     model_jobs += tally.jobs
+            card_wall += bucket_wall
+            card_kudos += bucket_card_kudos
+            model_seconds += bucket_model_seconds
+            model_kudos += bucket_model_kudos
+            model_by_bucket.append(_BucketFigures(kudos=bucket_model_kudos, seconds=bucket_model_seconds))
+            rest_by_bucket.append(
+                _BucketFigures(
+                    kudos=bucket_card_kudos - bucket_model_kudos,
+                    seconds=bucket_wall - bucket_model_seconds,
+                ),
+            )
         rest_seconds = card_wall - model_seconds
+        model_rate = model_kudos / model_seconds if model_seconds > _ZERO_SECONDS_TOLERANCE else None
+        rest_rate = (card_kudos - model_kudos) / rest_seconds if rest_seconds > _ZERO_SECONDS_TOLERANCE else None
         return CardEarningRate(
-            model_kudos_per_second=(model_kudos / model_seconds if model_seconds > _ZERO_SECONDS_TOLERANCE else None),
-            rest_kudos_per_second=(
-                (card_kudos - model_kudos) / rest_seconds if rest_seconds > _ZERO_SECONDS_TOLERANCE else None
-            ),
+            model_kudos_per_second=model_rate,
+            rest_kudos_per_second=rest_rate,
             jobs=model_jobs,
             model_seconds=model_seconds,
             card_wall_seconds=card_wall,
+            model_standard_error=_ratio_standard_error(model_by_bucket, model_rate),
+            rest_standard_error=_ratio_standard_error(rest_by_bucket, rest_rate),
+            model_buckets=len(_counted_buckets(model_by_bucket)),
+            rest_buckets=len(_counted_buckets(rest_by_bucket)),
         )
 
     def session_seconds_by_model(self) -> dict[str, float]:

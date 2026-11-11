@@ -81,6 +81,24 @@ holds its job, and `child_preparing` while the child loads, encodes or uploads i
 before `child_preparing` existed book both to `clearance_hold`. The keys have no fixed list, and the duty report
 prints each key it finds, so an old file and a new file both read without a version check.
 
+### Standing pop claim on `stats_sample`
+
+`standing_pop_claims` lists the whole-card pop claim standing on each card at sample time. It is empty when no
+claim stands. The claim is skipped on a host with more than one card runtime, so the list holds at most one
+entry. Each entry is a
+[`StandingPopClaimSample`][horde_worker_regen.process_management.ipc.supervisor_channel.StandingPopClaimSample]:
+
+| Field | Meaning |
+| ----- | ------- |
+| `device_index` | The claim's card, by the lane's device index (0 on a single-card host). |
+| `model` | The model the claim narrows the offer to. |
+| `verdict` | `unmeasured`, `pays` or `below_the_rest`, read from the card earning figures as the engage line reads them (see [Logs](logs.md#lines-that-say-a-mechanism-acted)). |
+
+The entries come from the residency status (`WholeCardResidencyStatus.pop_claim_card_index` and
+`pop_claim_verdict`), so the stream and the dashboard read the same claim. The verdict is disclosed only, and the
+claim does not read it. A span inside a claim can be split from the rest of a session with this field instead of
+the engage and release lines. Samples written before the field existed omit it.
+
 ### Sampling window on `job_completed`
 
 A record for a job that reached its denoise loop has `sampling_window`, stamped by the child on the host's
@@ -261,7 +279,14 @@ retained buckets and adopts the new fingerprint. It does not touch the session t
 rollups. One INFO line reports each restart that drops figures. LoRA work suspended by a download or a full
 disk does not restart the window. The read is
 `CardEarningAccumulator.rate`: the model's kudos per attributed second, the card's other kudos per remaining wall
-second, the model's job count and both denominators. A rate is `None` when its denominator is zero.
+second, the model's job count, both denominators and each rate's standard error. A rate is `None` when its
+denominator is zero.
+
+A standard error treats its rate R as a ratio over the retained buckets. It is
+`sqrt(n / (n - 1) x sum((kudos_i - R x seconds_i)^2)) / sum(seconds_i)`, summed over the n buckets with seconds in
+the rate's denominator. Each bucket's deviation from the rate is therefore weighted by its seconds. A standard
+error is `None` when its rate is `None` or fewer than two buckets count. The read also returns how many buckets each rate was read from. The pop claim's value verdict reads both
+rates and both standard errors (see [Logs](logs.md#lines-that-say-a-mechanism-acted)).
 
 ## Stats tab: the Model pool section
 

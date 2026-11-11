@@ -244,8 +244,11 @@ from horde_worker_regen.process_management.scheduling.governance.whole_card impo
     WHOLE_CARD_RESTORE_GRACE_SECONDS,
     DominanceRung,
     DominantRunEndCause,
+    PopClaimValue,
+    PopClaimValueVerdict,
     WholeCardGrantKind,
     convergence_blockers,
+    pop_claim_value_verdict,
     post_process_context_fits,
     residency_has_holder,
 )
@@ -3294,7 +3297,11 @@ class InferenceScheduler:
         if not self._whole_card_ledger.note_terminal_fault(model, now=self._clock()):
             return
         self._pop_claim_tracker.note_terminal_fault_release()
-        self._pop_claim_tracker.disclose_edge(self.whole_card_pop_claim(), now=self._clock())
+        self._pop_claim_tracker.disclose_edge(
+            self.whole_card_pop_claim(),
+            now=self._clock(),
+            value_of=self._pop_claim_value,
+        )
 
     def _converge_whole_card_residency(self) -> None:
         """Collapse each held residency to sole VRAM residency once its model has a holder.
@@ -3862,7 +3869,11 @@ class InferenceScheduler:
                 model,
             )
         self._release_exclusive_admits_without_residency()
-        self._pop_claim_tracker.disclose_edge(self.whole_card_pop_claim(), now=self._clock())
+        self._pop_claim_tracker.disclose_edge(
+            self.whole_card_pop_claim(),
+            now=self._clock(),
+            value_of=self._pop_claim_value,
+        )
 
     def _release_exclusive_admits_without_residency(self) -> None:
         """Release the pending exclusive admits whose card does not hold a residency for the admit's model.
@@ -4237,6 +4248,19 @@ class InferenceScheduler:
                 return claim
         return None
 
+    def _pop_claim_value(self, claim: WholeCardPopClaim) -> PopClaimValue:
+        """Return the measured value of ``claim`` on its card, read from the card earning accumulator.
+
+        The whole-card ledger keys a single-card host by ``None``, and the earning store keys every card by the
+        lane's device index. A claim stands only on a host with at most one card runtime, so a ``None`` key is
+        that runtime's card.
+        """
+        card_index = claim.device_index if claim.device_index is not None else next(iter(self._card_runtimes), 0)
+        if self._card_earning is None:
+            return PopClaimValue(card_index=card_index, rate=None, verdict=PopClaimValueVerdict.UNMEASURED)
+        rate = self._card_earning.rate(model=claim.model, device_index=card_index)
+        return PopClaimValue(card_index=card_index, rate=rate, verdict=pop_claim_value_verdict(rate))
+
     def note_whole_card_pop_outcome(self, *, served: bool) -> None:
         """Record what a pop taken under the standing claim came back with (the empty-pop evidence).
 
@@ -4361,6 +4385,7 @@ class InferenceScheduler:
         # offer to it, and the offer is what an operator watching models come and go actually sees change.
         pop_claim = self.whole_card_pop_claim()
         pop_claim_release = self._pop_claim_tracker.recent_release(now) if pop_claim is None else None
+        pop_claim_value = self._pop_claim_value(pop_claim) if pop_claim is not None else None
 
         return WholeCardResidencyState(
             possible=possible,
@@ -4380,6 +4405,8 @@ class InferenceScheduler:
             pop_claim_model=pop_claim.model if pop_claim is not None else None,
             pop_claim_remaining_seconds=max(0.0, pop_claim.expires_at - now) if pop_claim is not None else None,
             pop_claim_release=pop_claim_release.value if pop_claim_release is not None else None,
+            pop_claim_card_index=pop_claim_value.card_index if pop_claim_value is not None else None,
+            pop_claim_verdict=pop_claim_value.verdict.value if pop_claim_value is not None else None,
             weights_mb=weights_mb,
             reserve_mb=reserve_mb,
             free_now_mb=free_now_mb,

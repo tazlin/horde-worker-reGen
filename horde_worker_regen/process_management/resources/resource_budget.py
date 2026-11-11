@@ -764,6 +764,12 @@ class WholeCardResidencyState:
     The three ends read differently to an operator watching the offer widen back out, and the reason is gone
     from every other surface by the time it is asked about; None once the release is old enough that it no
     longer explains what the worker is doing now."""
+    pop_claim_card_index: int | None = None
+    """The standing claim's card, by the lane's device index, or None when no claim stands."""
+    pop_claim_verdict: str | None = None
+    """The standing claim's value verdict (a :class:`PopClaimValueVerdict` value), or None when no claim stands.
+
+    It is disclosed only. The claim, the offer, dispatch and retention do not read it."""
 
     weights_mb: float | None = None
     """Resident weight footprint of the residency model (the establishing forecast), for the detail view."""

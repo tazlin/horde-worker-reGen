@@ -1841,6 +1841,16 @@ rollup of how long each claim held and how it ended, plus a warning-grade
 when claims repeatedly have to be ended by the maximum hold while another model's head sits parked, which is
 a mixed queue being squeezed rather than a burst that ran its course.
 
+A claim holds the whole offer to one model, so whether it pays depends on what that model earns per card second
+against the rest of the card's work. The engage line states both figures from the
+[card-time attribution](duty-cycle.md#card-time-attribution-which-model-each-card-second-went-to), the claimed
+model's job count and a verdict. The verdict is unmeasured until 20 of the model's jobs are counted on the card
+and both rates have readings from eight 15-minute buckets. After that, the claim earns below the rest when the two rates' bands of two
+standard errors do not overlap and the model's band is the lower one. Otherwise it pays, which means only that the model is not shown to earn below the rest. A model near the rest
+is not ruled below on noise. The residency status and every stats sample report the same verdict beside the
+standing claim (see [Stats export](../reference/stats.md#standing-pop-claim-on-stats_sample)). The verdict is
+disclosed only. The claim narrows the offer, and dispatch and retention read the claim, whatever the verdict is.
+
 ### Governor observability
 
 These limiters, whole-card residency, and the other conditions that hold back or reshape pops (post-inference

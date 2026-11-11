@@ -139,6 +139,7 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     RecentJobRecord,
     SamplerSummary,
     SchedulingGovernanceSnapshot,
+    StandingPopClaimSample,
     StatsSample,
     SupervisedProcessSnapshotSource,
     SupervisorChannel,
@@ -8165,12 +8166,34 @@ class HordeWorkerProcessManager:
             pop_claim_model=state.pop_claim_model,
             pop_claim_remaining_seconds=state.pop_claim_remaining_seconds,
             pop_claim_release=state.pop_claim_release,
+            pop_claim_card_index=state.pop_claim_card_index,
+            pop_claim_verdict=state.pop_claim_verdict,
             weights_mb=self._to_int_mb(state.weights_mb),
             reserve_mb=self._to_int_mb(state.reserve_mb),
             free_now_mb=self._to_int_mb(state.free_now_mb),
             free_if_alone_mb=self._to_int_mb(state.free_if_alone_mb),
             max_resident_processes=state.max_resident_processes,
         )
+
+    @staticmethod
+    def _standing_pop_claim_samples(residency: WholeCardResidencyStatus) -> list[StandingPopClaimSample]:
+        """Return the standing pop claim in ``residency`` as stats sample entries, or an empty list without one.
+
+        The claim stands only on a host with at most one card runtime, so the list holds at most one entry.
+        """
+        if (
+            residency.pop_claim_model is None
+            or residency.pop_claim_card_index is None
+            or residency.pop_claim_verdict is None
+        ):
+            return []
+        return [
+            StandingPopClaimSample(
+                device_index=residency.pop_claim_card_index,
+                model=residency.pop_claim_model,
+                verdict=residency.pop_claim_verdict,
+            ),
+        ]
 
     def _update_pop_governors(self) -> None:
         """Feed the governor registry this tick's readings, so spells advance and ENTER/EXIT lines log.
@@ -8890,6 +8913,7 @@ class HordeWorkerProcessManager:
         slot_duty_totals, slot_duty_capacity, dispatch_hold_bucket = self._inference_scheduler.slot_duty_snapshot()
         device_reading = self.latest_device_reading()
         reading_shadow = self.device_reading_shadow()
+        whole_card_residency = self._whole_card_residency_status()
 
         stats_sample = self._run_metrics.record_stats_sample(
             StatsSample(
@@ -8939,6 +8963,7 @@ class HordeWorkerProcessManager:
                 device_free_child_reported_mb=reading_shadow.child_reported_free_mb,
                 device_free_ledger_capped_mb=reading_shadow.ledger_capped_free_mb,
                 device_free_adapter_counter_mb=reading_shadow.adapter_counter_free_mb,
+                standing_pop_claims=self._standing_pop_claim_samples(whole_card_residency),
             ),
         )
         latest_stats_sample = stats_sample or self._run_metrics.latest_stats_sample()
@@ -9110,7 +9135,7 @@ class HordeWorkerProcessManager:
             orchestration_intent=orchestration_intent,
             work_ledger=self._build_work_ledger(recent_jobs),
             disagg_job_stages=self._build_disagg_job_stages(),
-            whole_card_residency=self._whole_card_residency_status(),
+            whole_card_residency=whole_card_residency,
             pop_governors=self._pop_governors_status(),
             scheduling_governance=self._scheduling_governance_status(),
             per_card=self._build_card_snapshots(),

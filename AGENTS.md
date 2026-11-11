@@ -122,8 +122,8 @@ built with `horde-log replay-fixture <bundle> --session N <out_dir>` (see `docs/
 **Comparing two sessions' kudos rates.** Kudos per hour is sampling seconds per wall hour times kudos per
 sampling second, and each model family's share of sampling seconds times its own kudos per sampling second
 makes up the second factor. Split each session's wall time by claim class (inside a whole-card pop claim, by
-model, and outside any claim) with the claim's engage and release lines, since the stats stream does not record
-them. Then compare the per-class rates and the class shares separately. The shares follow traffic and the claim,
+model, and outside any claim) with `standing_pop_claims` on each stats sample, or with the claim's engage and
+release lines for a session whose samples do not have that field. Then compare the per-class rates and the class shares separately. The shares follow traffic and the claim,
 and the rates follow the worker, so a change in kudos per hour does not show anything about the worker until it
 is split this way.
 

@@ -123,6 +123,13 @@ _POP_CLAIM_RELEASE_TEXT: dict[str, str] = {
 """How each ``WholeCardPopClaimRelease`` reads to an operator watching the offer widen back out. An unknown
 value is shown as it arrives, so a worker newer than the dashboard still says something true."""
 
+_POP_CLAIM_VERDICT_TEXT: dict[str, str] = {
+    "unmeasured": "not measured yet",
+    "pays": "not below the rest of the card",
+    "below_the_rest": "earns below the rest of the card",
+}
+"""How each ``PopClaimValueVerdict`` reads beside the standing claim. An unknown value is shown as it arrives."""
+
 
 def _join_styled(parts: list[tuple[str, str]], separator: str) -> list[tuple[str, str] | str]:
     """Return Rich Text.assemble fragments with a plain separator between styled parts."""
@@ -1123,6 +1130,9 @@ class OverviewView(Vertical):
                 if residency.pop_claim_remaining_seconds is not None
                 else "-",
             )
+            if residency.pop_claim_verdict is not None:
+                verdict_text = _POP_CLAIM_VERDICT_TEXT.get(residency.pop_claim_verdict, residency.pop_claim_verdict)
+                add_pair("Claim value", Text(verdict_text), "", "")
         elif residency.pop_claim_release is not None:
             add_pair(
                 "Offering only",

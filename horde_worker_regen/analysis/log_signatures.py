@@ -1126,7 +1126,10 @@ _SIGNATURE_LIST: list[LogSignature] = [
         r"Whole-card pop claim engaged for (?P<model>.+?): advertising that model alone",
         emitter="process_management.scheduling.governance.whole_card:disclose_edge",
         sample=(
-            "Whole-card pop claim engaged for Z-Image-Turbo: advertising that model alone while it holds the card."
+            "Whole-card pop claim engaged for Z-Image-Turbo: advertising that model alone while it holds the card, "
+            "for at most 180s. Earning on card 0, in kudos per card second: 0.512 for the claimed model, 0.430 for "
+            "the rest of the card, over 34 jobs of the claimed model. The claimed model is not below the rest of the "
+            "card by more than the spread of the readings."
         ),
         dry_run_reason=_WHOLE_CARD_NOT_EXERCISED,
     ),
