@@ -28,6 +28,7 @@ from unittest.mock import Mock
 import pytest
 from horde_model_reference import KNOWN_IMAGE_GENERATION_BASELINE
 from horde_sdk.ai_horde_api.apimodels import LorasPayloadEntry
+from loguru import logger
 
 from horde_worker_regen.process_management.ipc.messages import (
     HeldComponentSnapshot,
@@ -47,6 +48,7 @@ from horde_worker_regen.process_management.scheduling.governance.whole_card impo
     WholeCardPopClaim,
 )
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
+from horde_worker_regen.process_management.scheduling.ledgers.retention import RetentionDenialReason
 from tests.process_management.conftest import (
     make_job_pop_response,
     make_mock_bridge_data,
@@ -476,10 +478,18 @@ async def test_no_retain_while_wddm_paging_active() -> None:
     scheduler = _budget_on_scheduler(job_tracker)
     scheduler.note_wddm_paging({12345: 900.0}, active=True)
     process_info = scheduler._process_map[_PROCESS_ID]
+    messages: list[str] = []
+    handler_id = logger.add(lambda message: messages.append(message.record["message"]), level="DEBUG")
 
-    assert (
-        scheduler._should_keep_model_resident(dispatched, process_with_model=process_info, device_index=None) is False
-    )
+    try:
+        kept = scheduler._should_keep_model_resident(dispatched, process_with_model=process_info, device_index=None)
+    finally:
+        logger.remove(handler_id)
+
+    assert kept is False
+    # The denial writes the same per-dispatch verdict line as every other gate, so the denial shows in the log.
+    assert f"VRAM retention for {_MODEL} on process {_PROCESS_ID}: denied (WDDM paging verdict active)" in messages
+    assert scheduler.retention.grant_denials == {RetentionDenialReason.WDDM_PAGING: 1}
 
 
 async def test_wddm_paging_rising_edge_reclaims_idle_vram_once() -> None:

@@ -346,6 +346,7 @@ if TYPE_CHECKING:
     from horde_model_reference.component_identity import ComponentIdentitySidecar
 
     from horde_worker_regen.bridge_data.data_model import reGenBridgeData
+    from horde_worker_regen.utils.wddm_paging_monitor import WorkerPagingFigures
 
 
 _PRELOAD_ADMISSION_VERDICTS: dict[AdmissionDecision, DecisionVerdict] = {
@@ -1763,7 +1764,7 @@ class InferenceScheduler:
                 if disaggregated
                 else 0.0
             ),
-            admission_noise_mb=self._admission_margin_mb(
+            admission_noise_mb=self.card_admission_margin_mb(
                 device_index,
                 self._process_map.get_reported_total_vram_mb(device_index=device_index),
             ),
@@ -2246,7 +2247,7 @@ class InferenceScheduler:
             device_index=device_index,
             measured_free_mb=self._measured_free_vram_mb(device_index=device_index),
             marginal_need_mb=self._safety_placement_marginal_need_mb(device_index),
-            noise_buffer_mb=self._admission_margin_mb(device_index, total_vram_mb),
+            noise_buffer_mb=self.card_admission_margin_mb(device_index, total_vram_mb),
             governor_state=self.governor_state(device_index),
             safety_footprint_mb=self._safety_footprint_mb(),
             reclaimable_idle_mb=idle_resident_reclaimable_mb(self._process_map.values(), device_index),
@@ -6666,7 +6667,7 @@ class InferenceScheduler:
             per_process_reserved,
             target_process_ids=card_process_ids,
         )
-        noise_buffer_mb = self._admission_margin_mb(device_index, raw_total_mb)
+        noise_buffer_mb = self.card_admission_margin_mb(device_index, raw_total_mb)
         self._head_admission.note_admission_headroom(
             device_index,
             None if device_free_mb is None else device_free_mb - planned_mb - noise_buffer_mb,
@@ -6902,7 +6903,7 @@ class InferenceScheduler:
         total_vram_mb = self._process_map.get_reported_total_vram_mb(device_index=device_index)
         if total_vram_mb is None:
             return None
-        ceiling_mb = total_vram_mb - self._admission_margin_mb(device_index, total_vram_mb)
+        ceiling_mb = total_vram_mb - self.card_admission_margin_mb(device_index, total_vram_mb)
         if not include_foreign_floor:
             return ceiling_mb
         return ceiling_mb - (self.current_foreign_floor_mb(device_index) or 0.0)
@@ -7016,7 +7017,7 @@ class InferenceScheduler:
             total_vram_mb=float(total_vram_mb),
             first_context_mb=self._per_process_overhead_mb(device_index),
             marginal_context_mb=self._marginal_or_seed_mb(device_index),
-            admission_noise_mb=self._admission_margin_mb(device_index, total_vram_mb),
+            admission_noise_mb=self.card_admission_margin_mb(device_index, total_vram_mb),
             foreign_floor_bucket=diagnostic_mb_bucket(self.current_foreign_floor_mb(device_index)),
             sample_observation_counts=counts,
         )
@@ -7149,7 +7150,7 @@ class InferenceScheduler:
             )
             ceiling_mb = (
                 total_vram_mb
-                - self._admission_margin_mb(device_index, total_vram_mb)
+                - self.card_admission_margin_mb(device_index, total_vram_mb)
                 - max(learned_floor_mb or 0.0, footprint_mb)
             )
             ceiling_text = f"the most one load on device {device_key} can now be offered is {ceiling_mb:.0f} MB"
@@ -10038,8 +10039,11 @@ class InferenceScheduler:
                 return card.config
         return self._runtime_config.bridge_data
 
-    def _admission_margin_mb(self, device_index: int | None, total_vram_mb: float | None) -> float:
-        """The admission margin (MB) for ``device_index``: the card's operator override, else the platform default."""
+    def card_admission_margin_mb(self, device_index: int | None, total_vram_mb: float | None) -> float:
+        """Return the admission margin (MB) for ``device_index``: the card's override, else the platform default.
+
+        The parent also uses it for the paging verdict, as the free dedicated memory at or under which a card is short.
+        """
         override = self._card_bridge_data(device_index).vram_admission_noise_mb
         return admission_margin_mb(
             total_vram_mb,
@@ -12824,8 +12828,12 @@ class InferenceScheduler:
             self._retention.note_denial(RetentionDenialReason.BUDGET_INACTIVE)
             return False
         if self._retention.wddm_paging_active:
-            self._retention.note_denial(RetentionDenialReason.WDDM_PAGING)
-            return False
+            return self._deny_retention(
+                model,
+                process_with_model,
+                RetentionDenialReason.WDDM_PAGING,
+                "WDDM paging verdict active",
+            )
         governor_state = self.governor_state(device_index)
         rung_two_holder = self._rung_two_holder_has_next_job(
             model,
@@ -13082,7 +13090,7 @@ class InferenceScheduler:
         )
         return RetentionFit(
             predicted_mb=static_verdict.predicted_mb,
-            noise_mb=self._admission_margin_mb(device_index, total_vram_mb),
+            noise_mb=self.card_admission_margin_mb(device_index, total_vram_mb),
             total_vram_mb=total_vram_mb,
             static_charges_mb=static_charges_mb,
             retained_resident_mb=retained_resident_mb,
@@ -13991,15 +13999,24 @@ class InferenceScheduler:
         self._dispatch_holds.begin_pp_yield()
         return True
 
-    def note_wddm_paging(self, elevated_shared_mb_by_pid: dict[int, float], *, active: bool) -> None:
+    def note_wddm_paging(
+        self,
+        elevated_shared_mb_by_pid: dict[int, float],
+        *,
+        active: bool,
+        figures_by_pid: Mapping[int, WorkerPagingFigures] | None = None,
+    ) -> None:
         """Record the parent's WDDM demand-paging verdict and reclaim idle VRAM on its rising edge.
 
         ``elevated_shared_mb_by_pid`` names the worker child PIDs whose shared (system-backed) GPU usage
-        crossed the paging threshold: measured attribution that the *worker's own* allocations were
-        demoted out of dedicated VRAM. While active, retention is denied outright (holding weights in a
-        regime the driver is already paging can only deepen it). The rising edge additionally reclaims idle
-        resident VRAM, routed through the same LIFO reclaim policy the governor's ladder uses (newest idle
-        resident first).
+        crossed the paging threshold while their card's dedicated memory was short, or while the card did not have
+        a device-wide reading (``assess_worker_paging`` in ``utils/wddm_paging_monitor.py``). While active,
+        retention is denied outright, since holding weights while the driver is already paging can only deepen
+        it. The rising edge additionally reclaims idle resident VRAM through the same LIFO reclaim policy as the
+        governor's ladder (newest idle resident first).
+
+        ``figures_by_pid`` holds the sample's local usage and card reading for each process. They are used only
+        in the detection line, for each elevated process.
 
         The PDH-flagged process is deliberately NOT protected. The old sweep spared it on the assumption its
         model was the one in use, but under WDDM the driver demotes the least-recently-touched allocator, so
@@ -14012,12 +14029,14 @@ class InferenceScheduler:
         if not self._retention.note_wddm_paging(elevated_shared_mb_by_pid, active=active):
             return
 
-        detail = ", ".join(
-            f"pid {pid}: {shared_mb:.0f}MB shared" for pid, shared_mb in sorted(elevated_shared_mb_by_pid.items())
+        figures_by_pid = figures_by_pid or {}
+        detail = "; ".join(
+            figures_by_pid[pid].describe() if pid in figures_by_pid else f"pid {pid}: {shared_mb:.0f}MB shared"
+            for pid, shared_mb in sorted(elevated_shared_mb_by_pid.items())
         )
         logger.warning(
             "WDDM demand-paging detected on worker processes "
-            f"({detail}); the driver demoted their VRAM allocations to system memory. "
+            f"({detail}): shared GPU usage over the threshold while the card's dedicated memory is short or unread. "
             "Denying model retention and reclaiming idle resident VRAM (newest idle resident first).",
         )
 

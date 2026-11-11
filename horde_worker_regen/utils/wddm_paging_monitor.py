@@ -6,9 +6,11 @@ lies: ``mem_get_info`` keeps reporting generous free VRAM and core utilization r
 device mostly waits on the bus, so throughput halves with no visible error. The OS, however, tracks the
 demotion per process: the ``GPU Process Memory`` performance counters (the data behind Task Manager's
 "Shared GPU memory" column) expose each process's local (dedicated) and shared (system-backed) GPU bytes
-by PID. A worker child whose *shared* usage climbs while its job samples is being demand-paged, and the
-PID attribution distinguishes the worker's own over-commit from external VRAM pressure (a game or
-browser would show under its own PID instead).
+by PID. A worker child whose *shared* usage climbs while the card's dedicated memory is short is being
+demand-paged, and the PID attribution distinguishes the worker's own over-commit from external VRAM pressure
+(a game or browser would show under its own PID instead). The shared counter also includes host memory
+registered with the driver by a process, so shared usage while dedicated memory is free is not paging
+(:func:`assess_worker_paging`).
 
 The sampler reads those counters through PDH via ctypes on a background thread, mirroring
 :class:`~horde_worker_regen.utils.gpu_monitor.GpuUtilizationSampler`'s degradation contract: it runs in
@@ -23,10 +25,11 @@ import re
 import sys
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 
 from loguru import logger
+from strenum import StrEnum
 
 _SHARED_USAGE_COUNTER_PATH = r"\GPU Process Memory(*)\Shared Usage"
 _LOCAL_USAGE_COUNTER_PATH = r"\GPU Process Memory(*)\Local Usage"
@@ -133,24 +136,128 @@ def sum_by_adapter(mb_by_instance: dict[str, float]) -> dict[str, float]:
     return totals
 
 
+def _format_mb(megabytes: float | None) -> str:
+    return "unread" if megabytes is None else f"{megabytes:.0f}MB"
+
+
+@dataclass(frozen=True)
+class WorkerPagingFigures:
+    """Represents one worker process's GPU memory at a paging sample, beside its card's device reading.
+
+    The shared figure alone does not separate allocations demoted out of dedicated VRAM from host memory
+    registered with the driver by the process (ComfyUI pins offloaded weights with ``cudaHostRegister``), which
+    Windows may count in the same segment. A demotion needs the card's dedicated memory to be short, so the process's
+    local usage and the card's free and total are recorded with it.
+    """
+
+    pid: int
+    shared_mb: float
+    local_mb: float | None
+    """The process's dedicated GPU memory, from the ``Local Usage`` counter. None without a reading for it."""
+    adapter_dedicated_used_mb: float | None
+    """Dedicated memory in use on the process's adapter across every process. None without the adapter counters."""
+    device_index: int | None
+    device_free_mb: float | None
+    """Free memory in the parent's last device-wide reading for the process's card. None without one."""
+    device_total_mb: float | None
+    stale_device_reading_age_seconds: float | None = None
+    """The age of a device-wide reading left out for being older than the sample interval. None otherwise."""
+
+    def describe(self) -> str:
+        """Return the figures as the text of one process in a log line."""
+        stale = (
+            ""
+            if self.stale_device_reading_age_seconds is None
+            else f" (reading {self.stale_device_reading_age_seconds:.1f}s old)"
+        )
+        return (
+            f"pid {self.pid}: {self.shared_mb:.0f}MB shared, {_format_mb(self.local_mb)} local, "
+            f"card {self.device_index} free {_format_mb(self.device_free_mb)} of {_format_mb(self.device_total_mb)}"
+            f"{stale}, adapter dedicated {_format_mb(self.adapter_dedicated_used_mb)}"
+        )
+
+    def as_inputs(self) -> dict[str, int | float | None]:
+        """Return the figures as flat inputs for a stats row."""
+        return {
+            "pid": self.pid,
+            "shared_mb": round(self.shared_mb, 1),
+            "local_mb": None if self.local_mb is None else round(self.local_mb, 1),
+            "adapter_dedicated_used_mb": (
+                None if self.adapter_dedicated_used_mb is None else round(self.adapter_dedicated_used_mb, 1)
+            ),
+            "device_index": self.device_index,
+            "device_free_mb": None if self.device_free_mb is None else round(self.device_free_mb, 1),
+            "device_total_mb": None if self.device_total_mb is None else round(self.device_total_mb, 1),
+        }
+
+
+class SharedUsageVerdict(StrEnum):
+    """One paging sample's verdict on a worker process whose shared usage is over the threshold."""
+
+    COUNTED_DEDICATED_SHORT = "counted, dedicated memory short"
+    """The card's free dedicated memory is at or under its admission margin, so a demotion is possible."""
+    COUNTED_CARD_UNREAD = "counted, card unread"
+    """The process's card does not have a device-wide reading, so the shared usage counts alone."""
+    NOT_COUNTED_CARD_HAS_ROOM = "not counted, card has room"
+    """The card's free dedicated memory is above its admission margin, so the shared usage is not a demotion."""
+
+    @property
+    def counted(self) -> bool:
+        """Whether the process counts toward the paging verdict in this sample."""
+        return self is not SharedUsageVerdict.NOT_COUNTED_CARD_HAS_ROOM
+
+
+@dataclass(frozen=True)
+class WorkerPagingAssessment:
+    """Represents one paging sample's verdict on each worker process whose shared usage is over the threshold."""
+
+    verdict_by_pid: dict[int, SharedUsageVerdict]
+    shared_mb_by_pid: dict[int, float]
+    """The shared usage of each process in ``verdict_by_pid``."""
+
+    @property
+    def elevated_shared_mb_by_pid(self) -> dict[int, float]:
+        """Return the shared usage of each process counted toward the paging verdict."""
+        return {pid: self.shared_mb_by_pid[pid] for pid, verdict in self.verdict_by_pid.items() if verdict.counted}
+
+
 def assess_worker_paging(
-    sample: GpuProcessMemorySample,
-    worker_pids: set[int],
+    figures_by_pid: Mapping[int, WorkerPagingFigures],
     *,
     shared_threshold_mb: float,
-) -> dict[int, float]:
-    """Return the worker PIDs whose shared (system-backed) GPU usage exceeds the threshold.
+    margin_mb_by_device: Mapping[int, float],
+) -> WorkerPagingAssessment:
+    """Return the sample's verdict on each worker process whose shared GPU usage is over the threshold.
 
-    A small shared mapping (tens of MB) is normal runtime bookkeeping; hundreds of MB on a compute
-    process means its allocations were demoted out of dedicated VRAM: the demand-paging signature.
-    Restricting to ``worker_pids`` is the attribution: an elevated foreign PID is external VRAM
-    pressure, not the worker's own over-commit, and must not trip the worker-side verdict.
+    A small shared mapping (tens of MB) is normal runtime bookkeeping. More than the threshold is either
+    allocations demoted by the driver out of dedicated VRAM, or host memory registered with the driver by the
+    process (ComfyUI registers offloaded weights this way). The driver demotes only when dedicated memory runs
+    out, so a process counts only while its card's free memory is at or under the card's admission margin.
+    Without a device-wide reading for the card, or a margin for it, the two cannot be told apart, and the process
+    counts on its shared usage alone.
+
+    ``figures_by_pid`` holds only the worker's own processes, which is the attribution. A foreign process with
+    high shared usage is external VRAM pressure and does not count toward the worker's verdict.
+
+    Args:
+        figures_by_pid: The sample's figures for each worker process, keyed by OS pid.
+        shared_threshold_mb: The shared usage at or above which a process is judged.
+        margin_mb_by_device: The admission margin of each card with a device-wide reading, keyed by device index.
     """
-    return {
-        pid: shared_mb
-        for pid, shared_mb in sample.shared_mb_by_pid.items()
-        if pid in worker_pids and shared_mb >= shared_threshold_mb
-    }
+    verdict_by_pid: dict[int, SharedUsageVerdict] = {}
+    shared_mb_by_pid: dict[int, float] = {}
+    for pid, figures in figures_by_pid.items():
+        if figures.shared_mb < shared_threshold_mb:
+            continue
+        margin_mb = None if figures.device_index is None else margin_mb_by_device.get(figures.device_index)
+        if figures.device_free_mb is None or margin_mb is None:
+            verdict_by_pid[pid] = SharedUsageVerdict.COUNTED_CARD_UNREAD
+        elif figures.device_free_mb <= margin_mb:
+            verdict_by_pid[pid] = SharedUsageVerdict.COUNTED_DEDICATED_SHORT
+        else:
+            verdict_by_pid[pid] = SharedUsageVerdict.NOT_COUNTED_CARD_HAS_ROOM
+        shared_mb_by_pid[pid] = figures.shared_mb
+    return WorkerPagingAssessment(verdict_by_pid=verdict_by_pid, shared_mb_by_pid=shared_mb_by_pid)
 
 
 def _make_pdh_reader() -> Callable[[], GpuProcessMemorySample | None] | None:

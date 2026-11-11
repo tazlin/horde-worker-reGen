@@ -1026,14 +1026,20 @@ their form; every safety/form completion empties transient allocator blocks befo
 On roomy cards the quota still grows to a bounded ceiling so those active evaluations can transiently allocate
 above CLIP without faulting. A faulted safety evaluation still recycles the process.
 
-On Windows the worker also watches the one signal the driver cannot fake: the per-process
-`GPU Process Memory` counters (the data behind Task Manager's "Shared GPU memory" column). When a worker
-child's *shared* (system-backed) GPU usage climbs past a threshold for consecutive samples, its
-allocations were demoted out of dedicated VRAM: measured, PID-attributed demand-paging by the worker
-itself, as opposed to external VRAM pressure from another application's process. That verdict denies
-retention outright while active and triggers one under-pressure sweep of idle resident models on its
-rising edge. The telemetry is WDDM-level and vendor-neutral; on Linux, or any host where the counters
-are unavailable, the monitor simply collects nothing and the verdict stays off.
+On Windows the worker also watches the per-process `GPU Process Memory` counters (the data behind Task
+Manager's "Shared GPU memory" column) for demand-paging of its children. A worker child's *shared*
+(system-backed) GPU usage over a threshold is not proof of a demotion. A process can register
+host memory with the driver, as ComfyUI does for offloaded weights. That memory counts in the same counter
+while the card has gigabytes of dedicated memory free. The driver demotes only when dedicated memory runs
+out, so a child counts toward the verdict only while the card's device-wide free reading is at or under the
+card's admission margin. Without a device-wide reading for the card (from NVML or an adapter counter), the
+two cannot be told apart, so the shared usage counts alone. Two consecutive counted samples set the
+verdict. It is measured, PID-attributed demand-paging by the worker itself, as opposed to external VRAM
+pressure from another application's process. That verdict denies retention outright while active and
+triggers one under-pressure sweep of idle resident models on its rising edge. The telemetry is WDDM-level
+and vendor-neutral. On Linux, or any host where the counters are unavailable, the monitor does not collect
+anything and the verdict stays off. Each sample is logged with the process's local usage and the card's free
+and total beside the shared figure ([WDDM paging figures](../reference/logs.md#wddm-paging-figures)).
 
 ### The truthful signal hierarchy and the device-free governor
 

@@ -255,6 +255,7 @@ from horde_worker_regen.process_management.resources.resource_budget import (
 from horde_worker_regen.process_management.resources.run_metrics import (
     DecisionKind,
     DecisionVerdict,
+    FlatScalarMap,
     ResourceStateKind,
     RunMetricsSnapshot,
     WorkerRunMetrics,
@@ -374,7 +375,10 @@ from horde_worker_regen.utils.image_utils import UPLOAD_IMAGE_ENCODING
 from horde_worker_regen.utils.kudos_calculator import KudosCalculator
 from horde_worker_regen.utils.kudos_utils import generate_kudos_info_string as _generate_kudos_info_string
 from horde_worker_regen.utils.wddm_paging_monitor import (
+    GpuProcessMemorySample,
     WddmPagingMonitor,
+    WorkerPagingAssessment,
+    WorkerPagingFigures,
     adapter_dedicated_used_mb,
     assess_worker_paging,
 )
@@ -3794,14 +3798,18 @@ class HordeWorkerProcessManager:
     """The epoch time of the last status message."""
 
     _WDDM_PAGING_SHARED_THRESHOLD_MB = 256.0
-    """Per-process shared (system-backed) GPU usage above which a worker child counts as demand-paged.
+    """Per-process shared (system-backed) GPU usage at or above which a worker child is judged for paging.
 
-    A compute process normally maps only tens of MB of the shared segment (runtime bookkeeping); crossing
-    a quarter GB means real allocations were demoted out of dedicated VRAM."""
+    A compute process normally maps only tens of MB of the shared segment (runtime bookkeeping). More than a
+    quarter GB is either allocations demoted out of dedicated VRAM or host memory registered with the driver by the
+    process. :func:`assess_worker_paging` separates the two by the card's free dedicated memory."""
 
     _WDDM_PAGING_CONSECUTIVE_SAMPLES = 2
     """Fresh elevated readings required before the paging verdict fires, so a single transient demotion
     spike (e.g. during a model load) does not trigger reclaim."""
+
+    _WDDM_PAGING_SAMPLE_LOG_INTERVAL_SECONDS = 30.0
+    """The least time between two ``DEBUG`` sample lines while every worker process is under the shared threshold."""
 
     def _evaluate_wddm_paging(self) -> None:
         """Judge the latest per-process GPU shared-usage reading and feed the verdict to the scheduler.
@@ -3810,38 +3818,126 @@ class HordeWorkerProcessManager:
         browser claiming VRAM shows up as external pressure (unchanged budget behavior) rather than
         tripping worker-side reclaim. A no-op on hosts without the telemetry (non-Windows, PDH failure):
         ``latest()`` stays None there.
+
+        A process over the shared threshold counts only while its card's free dedicated memory is at or under the
+        card's admission margin (:func:`assess_worker_paging`). The card's figure is the device-wide reading
+        taken on the previous control loop tick.
+
+        Each sample is logged in one line with every worker process's shared and local usage and its card's free
+        and total. A sample with a process over the threshold logs at DEBUG, and the line states whether that
+        process counted. Other samples are time-boxed.
         """
         sample = self._wddm_paging_monitor.latest()
         if sample is None or sample.timestamp <= self._last_wddm_sample_timestamp:
             return
         self._last_wddm_sample_timestamp = sample.timestamp
 
-        worker_pids = {
-            process_info.os_pid for process_info in self._process_map.values() if process_info.os_pid is not None
-        }
-        elevated = assess_worker_paging(
-            sample,
-            worker_pids,
+        figures_by_pid = self._worker_paging_figures(sample)
+        assessment = assess_worker_paging(
+            figures_by_pid,
             shared_threshold_mb=self._WDDM_PAGING_SHARED_THRESHOLD_MB,
+            margin_mb_by_device={
+                figures.device_index: self._inference_scheduler.card_admission_margin_mb(
+                    figures.device_index,
+                    figures.device_total_mb,
+                )
+                for figures in figures_by_pid.values()
+                if figures.device_index is not None and figures.device_total_mb is not None
+            },
         )
+        elevated = assessment.elevated_shared_mb_by_pid
         if elevated:
             self._wddm_elevated_streak += 1
         else:
             self._wddm_elevated_streak = 0
 
+        if figures_by_pid:
+            self._log_wddm_paging_sample(sample, figures_by_pid, assessment)
+
         active = self._wddm_elevated_streak >= self._WDDM_PAGING_CONSECUTIVE_SAMPLES
-        self._inference_scheduler.note_wddm_paging(elevated, active=active)
+        self._inference_scheduler.note_wddm_paging(elevated, active=active, figures_by_pid=figures_by_pid)
 
         # Edge-triggered: record only when the debounced paging verdict flips, so this is naturally low
         # frequency rather than one record per monitor sample.
         if active != self._wddm_paging_active:
             self._wddm_paging_active = active
+            inputs: FlatScalarMap = {"elevated_streak": self._wddm_elevated_streak, "elevated_pids": len(elevated)}
+            if figures_by_pid:
+                # A flat row holds one process's figures. The process with the most shared usage is over the
+                # threshold on the rising edge, and the clearing sample shows its fall.
+                most_shared = max(figures_by_pid.values(), key=lambda figures: figures.shared_mb)
+                inputs.update(most_shared.as_inputs())
             self._run_metrics.record_resource_state(
                 state_kind=ResourceStateKind.WDDM_PAGING,
                 state="active" if active else "cleared",
                 reason="wddm_shared_segment_paging",
-                inputs={"elevated_streak": self._wddm_elevated_streak},
+                inputs=inputs,
             )
+
+    def _log_wddm_paging_sample(
+        self,
+        sample: GpuProcessMemorySample,
+        figures_by_pid: Mapping[int, WorkerPagingFigures],
+        assessment: WorkerPagingAssessment,
+    ) -> None:
+        """Log one paging sample's figures in one line, with the verdict on each process over the threshold.
+
+        A sample with a process over the threshold always logs at DEBUG, so a bundle keeps every sample that could
+        move the verdict. The line marks each such process as counted or not counted, with the reason.
+        """
+        level = (
+            "DEBUG"
+            if assessment.verdict_by_pid
+            else throttled_log_level(
+                "process_manager.wddm_paging_sample", self._WDDM_PAGING_SAMPLE_LOG_INTERVAL_SECONDS
+            )
+        )
+        described: list[str] = []
+        for pid, figures in sorted(figures_by_pid.items()):
+            verdict = assessment.verdict_by_pid.get(pid)
+            described.append(figures.describe() if verdict is None else f"{figures.describe()} ({verdict.value})")
+        logger.log(
+            level,
+            f"WDDM paging sample (age {time.time() - sample.timestamp:.2f}s, elevated streak "
+            f"{self._wddm_elevated_streak}): " + "; ".join(described),
+        )
+
+    def _worker_paging_figures(self, sample: GpuProcessMemorySample) -> dict[int, WorkerPagingFigures]:
+        """Return each worker process's figures in ``sample``, keyed by OS pid, beside its card's last reading.
+
+        The card's free and total come from the device-free governor's reading on the previous control loop tick,
+        so the paging sample does not add a device read. Only a device-wide reading is used. A process report
+        counts a sibling's memory as free, and a host-memory reading is system RAM, so these readings cannot show
+        that the card's dedicated memory is short.
+
+        A reading older than the monitor's sample interval is left out too, and its age is recorded. A missed
+        NVML read leaves the previous reading in place. A reading that stopped updating must not suppress the
+        verdict, since a suppressed verdict looks the same as a healthy card.
+        """
+        now = time.monotonic()
+        figures_by_pid: dict[int, WorkerPagingFigures] = {}
+        for process_info in self._process_map.values():
+            pid = process_info.os_pid
+            if pid is None or (pid not in sample.shared_mb_by_pid and pid not in sample.local_mb_by_pid):
+                continue
+            reading = self._last_device_reading_by_device.get(process_info.device_index)
+            if reading is not None and not reading.is_device_wide:
+                reading = None
+            stale_age_seconds: float | None = None
+            if reading is not None and now - reading.measured_at > self._wddm_paging_monitor.interval:
+                stale_age_seconds = now - reading.measured_at
+                reading = None
+            figures_by_pid[pid] = WorkerPagingFigures(
+                pid=pid,
+                shared_mb=sample.shared_mb_by_pid.get(pid, 0.0),
+                local_mb=sample.local_mb_by_pid.get(pid),
+                adapter_dedicated_used_mb=adapter_dedicated_used_mb(sample, {pid}),
+                device_index=process_info.device_index,
+                device_free_mb=None if reading is None else reading.free_mb,
+                device_total_mb=None if reading is None else reading.total_mb,
+                stale_device_reading_age_seconds=stale_age_seconds,
+            )
+        return figures_by_pid
 
     def _read_device_memory(self, device_index: int) -> DeviceMemoryReading | None:
         """Return device ``index``'s memory reading, torch-free, or None when nothing has reported.

@@ -355,10 +355,11 @@ _LOW_FREE_VRAM_MB_THRESHOLD = 4096
 # now off until restart), so a session carrying it is escalated and the remediation points at the restart +
 # downgrade. The phrase is the worker's verbatim breaker-trip line (process_manager).
 _POST_PROCESSING_BREAKER_RE = pattern_for("post_processing_breaker_tripped")
-# The parent's measured WDDM demand-paging verdict: worker child allocations demoted to system memory. This is
-# the direct proof that co-resident work drove the device past its real headroom, so it corroborates a
-# post-processing/inference overlap as a genuine stall rather than admitted co-residency. The phrase is the
-# inference scheduler's verbatim rising-edge line (note_wddm_paging).
+# The parent's measured WDDM demand-paging verdict. It fires when a worker child's shared GPU usage is over the
+# threshold while the card's dedicated memory is at or under its admission margin, or while the card does not
+# have a fresh device-wide reading. It shows that co-resident work drove the device past its real headroom, so it
+# corroborates a post-processing/inference overlap as a genuine stall rather than admitted co-residency. The
+# phrase is the inference scheduler's verbatim rising-edge line (note_wddm_paging).
 _WDDM_PAGING_RE = pattern_for("wddm_paging")
 # The pop offer's edge lines. A current worker logs every change of the wire value with the reason it went off.
 # A worker up to 18.8.1 logged only its free-VRAM headroom gate, which is the one reason it had.

@@ -54,6 +54,44 @@ The deadlock diagnostics include two free-VRAM figures and they are not intercha
 
 A snapshot carrying only the first figure is from a worker with no device-level reading wired in.
 
+## WDDM paging figures
+
+On Windows the parent reads each worker process's GPU memory counters every 2 seconds (every half second
+while a card without NVML is priced from them) and logs each reading as one line:
+
+```text
+WDDM paging sample (age 0.04s, elevated streak 0): pid 19588: 4762MB shared, 11281MB local, card 0 free 3130MB of 16376MB, adapter dedicated 12952MB (not counted, card has room); pid 30548: ...
+```
+
+`shared` and `local` are the process's `Shared Usage` and `Local Usage` counters. `card <d> free <f> of <t>` is
+the parent's last device-wide reading for the process's card, from NVML where NVML is available, taken on the
+previous control loop tick. `adapter dedicated` is the dedicated memory in use on the process's adapter across
+every process, as counted by Windows. `unread` marks a figure missing from the sample or from the parent's
+readings. A process report is not device-wide on Windows, so a card read only from its processes' reports
+shows `unread` here. A reading older than the sample interval also shows `unread`, followed by
+`(reading <n>s old)`, and the sample counts on shared usage alone. A reading that stopped updating must not
+suppress the verdict.
+
+The shared counter alone does not show that the driver demoted VRAM. Host memory registered with the driver
+by a process counts in it too, and ComfyUI registers offloaded weights this way. A process at or above the
+256 MB threshold is therefore marked with whether it counted, and why:
+
+| Mark | Meaning |
+|---|---|
+| `counted, dedicated memory short` | The card's free figure is at or under its admission margin. The sample counts toward the verdict. |
+| `counted, card unread` | The card does not have a device-wide reading, so the shared usage counts alone. |
+| `not counted, card has room` | The card's free figure is above its admission margin. The shared usage is host memory, and the sample does not count. |
+
+`elevated streak` counts the consecutive samples with a counted process, and the verdict fires at 2. A sample
+with a process at or above the threshold always logs at `DEBUG`, so a bundle keeps every sample that could move
+the verdict. Other samples are time-boxed as described above.
+
+The paging verdict's WARNING, `WDDM demand-paging detected on worker processes (...): shared GPU usage over the
+threshold while the card's dedicated memory is short or unread.`, prints the same figures for each counted
+process. The `wddm_paging` `resource_state` rows include them as `inputs` for the process with the most shared
+usage (see [stats.md](stats.md)). While the verdict is active, each dispatch's retention verdict line reads
+`denied (WDDM paging verdict active)`.
+
 ## Rotation and retention
 
 The supervisor logs (`bridge_tui.log` / `bridge_host.log`) and the benchmark run logs rotate at a **25 MB**

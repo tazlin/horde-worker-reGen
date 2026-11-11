@@ -34,8 +34,12 @@ layer (the device-free governor) reads the one figure that stays honest.
   to system memory: WDDM demotes the *least-recently-touched* allocator, so the process that goes slow (the
   active sampler) and the process whose shared memory grows (the idle newcomer) are usually **different**
   process ids, and the per-PID magnitude read for a given process varies run to run for one physical state.
-  The arbiter therefore never prices against a per-process free figure; it prices against the committed
-  *ledger* (what the worker itself placed on the card) plus its own planned overlay.
+  The shared counter also includes host memory registered with the driver by a process, so a process's
+  shared usage can rise by gigabytes while the card's dedicated memory is free. The paging verdict therefore
+  counts a process only while the card's device-wide free reading is at or under its admission margin
+  ([WDDM paging](performance_and_backpressure.md#keeping-a-model-resident-between-same-model-jobs)). The
+  arbiter never prices against a per-process free figure. It prices against the committed *ledger* (what the
+  worker itself placed on the card) plus its planned overlay.
 - **The NVML device-level total is truthful.** Read from the torch-free parent, outside any CUDA workload,
   the device used/free total does not lie. Throughput does not degrade gradually as it falls; it falls off a
   hard cliff the instant device-free reaches roughly zero, then plateaus, so the whole defense is to keep
@@ -1461,7 +1465,9 @@ a disaggregated sampler) has them inside that reservation. The entries' reported
 estimate, about a whole checkpoint per seated monolithic lane, and stands in only until the lane's first memory
 report. A lane that also holds a retained resident is left to the retained-resident term, since its reservation
 contains those same weights. Under WDDM the reservation can understate demand-paged allocations. The paging
-denial and the governor gate run ahead of the static fit and refuse the grant in that regime.
+denial and the governor gate run ahead of the static fit and refuse the grant in that regime. A paging denial
+writes the same per-dispatch verdict line as the other gates,
+`VRAM retention for <model> on process <id>: denied (WDDM paging verdict active)`.
 
 A grant is settled into the slot's retained-resident record only when its job **succeeds**. A fault is
 evidence about the job and none at all about the device: a job that failed part-way through may have left

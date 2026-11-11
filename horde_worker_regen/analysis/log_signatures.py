@@ -1560,7 +1560,12 @@ _SIGNATURE_LIST: list[LogSignature] = [
         "wddm_paging",
         r"WDDM demand-paging detected on worker processes",
         emitter="process_management.scheduling.inference_scheduler:note_wddm_paging",
-        sample="WDDM demand-paging detected on worker processes (elevated shared GPU memory on 2 process(es)).",
+        sample=(
+            "WDDM demand-paging detected on worker processes (pid 23320: 4470MB shared, 15890MB local, card 0 free "
+            "212MB of 16375MB, adapter dedicated 16163MB): shared GPU usage over the threshold while the card's "
+            "dedicated memory is short or unread. Denying model retention and reclaiming idle resident VRAM "
+            "(newest idle resident first)."
+        ),
         dry_run_reason="WDDM demand-paging is a Windows driver signal the dry-run harness never produces",
     ),
     _signature(
