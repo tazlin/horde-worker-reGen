@@ -624,6 +624,14 @@ These fail as interactions, not as units, so component tests stay green through 
 
 ## Working conventions
 
+- **The docs are read before the code is searched.** Before searching the code for where a decision lives,
+  what a figure measures or how a mechanism behaves, read the page that owns the topic. Find it through
+  [docs/index.md](docs/index.md), the responsibility maps and a grep of `docs/` for the terms. A discovery
+  brief names those pages and tells the delegate to read them first. Search the code for what the page does
+  not state, or to check a statement the work depends on. A question that the docs should have covered and
+  did not is a documentation defect. Write the answer into the owning page in the next change that touches
+  the area, or list it in the change description when that is not possible. A search that fills a gap
+  without closing it is repeated by the next reader at the same cost.
 - **Do not run tests or builds during a soak or live run in the same checkout.** The CPU contention ruins
   the measurement. (Tests no longer share the live run's `.abort` sentinel or `logs/`: each test has its
   own run root. A live worker launched in the checkout still watches the checkout's `.abort`, so never

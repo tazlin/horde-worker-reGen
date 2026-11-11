@@ -122,13 +122,17 @@ without NVML.
 The sentence after the figures is the check's result:
 
 - `The two figures agree` means the line's run was accepted. A count above one means an earlier run on some
-  card disagreed and the probe ran again.
+  card disagreed and the probe ran again. The count is the number of probe runs for the whole host, so it also
+  reads above one on a card that agreed on its first run. The line shows the accepted run only. The readings
+  of an earlier run that disagreed are not logged, and the count is the only sign of them.
 - `The two figures disagree on every run` means no run agreed within the tolerance (a quarter of the smaller
   figure, at least 64 MB) after three runs. The figures are from the run with the median first-context
   figure, and a WARNING beginning `Accelerator N first-context and marginal figures disagree on every probe
   run` lists every run's readings. Another program allocating or releasing memory on the card while the worker
   starts is the usual cause, and the baseline readings show whether the card was already busy.
-- `Not checked` means the marginal was not measured as an NVML delta. The figures are the first run's.
+- `Not checked` means the first run's two figures could not be compared, because the card had no baseline
+  reading or the marginal was not measured as an NVML delta. The figures are the first run's, and the card is
+  not measured again.
 
 `vram_per_process_overhead_mb` in the config, when above 0, replaces the first-context figure regardless of
 this line. The
