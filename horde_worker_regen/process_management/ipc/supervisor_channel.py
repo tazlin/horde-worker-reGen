@@ -1052,6 +1052,11 @@ class CardEarningRow(BaseModel):
     """The card seconds attributed to the model, the model rate's denominator."""
     claim_seconds: float = 0.0
     """The card seconds during which a whole-card pop claim for the model stood on the card."""
+    kudos_gap_to_rest: float | None = None
+    """The kudos the model's card seconds would have earned at the rest of the card's rate, less what the
+    model earned in them. None unless both rates have readings. Negative when the model earns more than the
+    rest. It is an estimate, because the rest's rate holds only while the horde has other work for the
+    card."""
     verdict: str
     """Whether the model earns as much per card second as the rest of its card (``unmeasured`` | ``pays`` |
     ``below_the_rest``)."""

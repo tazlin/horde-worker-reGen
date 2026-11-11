@@ -9381,6 +9381,11 @@ class HordeWorkerProcessManager:
                     rest_buckets=rate.rest_buckets,
                     attributed_card_seconds=rate.model_seconds,
                     claim_seconds=rate.claim_seconds,
+                    kudos_gap_to_rest=(
+                        (rate.rest_kudos_per_second - rate.model_kudos_per_second) * rate.model_seconds
+                        if rate.rest_kudos_per_second is not None and rate.model_kudos_per_second is not None
+                        else None
+                    ),
                     verdict=pop_claim_value_verdict(rate).value,
                 ),
             )

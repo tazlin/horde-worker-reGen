@@ -40,6 +40,7 @@ def _row(model: str, *, device_index: int = 0, **overrides: object) -> CardEarni
         "rest_buckets": 34,
         "attributed_card_seconds": 18000.0,
         "claim_seconds": 12240.0,
+        "kudos_gap_to_rest": 3420.0,
         "verdict": "below_the_rest",
     }
     base.update(overrides)
@@ -121,6 +122,8 @@ def test_a_claimed_model_below_the_rest_gets_a_card_with_its_figures() -> None:
     assert finding.evidence == [
         "It earns 0.42 kudos per second of card time. The rest of the card earns 0.61.",
         "It took 50% of the card's time.",
+        "At the rest of the card's rate, that card time would have earned about 3,420 more kudos. This assumes "
+        "the horde had other work for the card.",
         "Its 95% band is 0.36 to 0.48. The rest's band is 0.55 to 0.67.",
         "Counted from 412 of its jobs on the card.",
         "Measured over the last 9 hours.",
@@ -154,19 +157,33 @@ def test_two_claimed_models_below_the_rest_give_two_cards_most_claim_time_first(
     assert [finding.headline.split('"')[1] for finding in findings] == ["Longer claim", "Shorter claim"]
 
 
-def test_an_unclaimed_model_below_the_rest_is_a_note_only_past_half_the_card() -> None:
-    """Without claim time, a below-the-rest model is a note when it took more than half of its card's wall."""
+def test_unclaimed_models_below_the_rest_are_notes_ordered_by_the_kudos_given_up() -> None:
+    """Without claim time, each below-the-rest model is a note, whatever its share, the largest estimate first."""
     cards = [_card(0), _card(1)]
-    over_half = _row("Over half", device_index=1, claim_seconds=0.0, attributed_card_seconds=20000.0)
-    exactly_half = _row("Exactly half", device_index=0, claim_seconds=0.0, attributed_card_seconds=18000.0)
+    small_share = _row(
+        "Small share",
+        device_index=0,
+        claim_seconds=0.0,
+        attributed_card_seconds=3600.0,
+        kudos_gap_to_rest=684.0,
+    )
+    larger_gap = _row(
+        "Larger gap",
+        device_index=1,
+        claim_seconds=0.0,
+        attributed_card_seconds=20000.0,
+        kudos_gap_to_rest=3800.0,
+    )
 
-    findings = _earning_findings(_snapshot(_earning([over_half, exactly_half], cards=cards)))
+    findings = _earning_findings(_snapshot(_earning([small_share, larger_gap], cards=cards)))
     print(*(_describe(finding) for finding in findings), sep="\n\n")
 
-    assert [finding.kind for finding in findings] == [FindingKind.MODEL_EARNS_BELOW_REST]
+    assert [finding.kind for finding in findings] == [FindingKind.MODEL_EARNS_BELOW_REST] * 2
+    assert [finding.headline.split('"')[1] for finding in findings] == ["Larger gap", "Small share"]
+    assert findings[1].headline == '"Small share" earns below the rest of card 0 and took 10% of the card\'s time.'
     finding = findings[0]
     assert finding.severity is Severity.INFO
-    assert finding.headline == '"Over half" earns below the rest of card 1 and took 56% of the card\'s time.'
+    assert finding.headline == '"Larger gap" earns below the rest of card 1 and took 56% of the card\'s time.'
     assert finding.action == (
         "No action needed if you serve this model on purpose. Otherwise remove it from your model list, or add it "
         "to `models_to_skip`, to stop serving it."
@@ -174,6 +191,8 @@ def test_an_unclaimed_model_below_the_rest_is_a_note_only_past_half_the_card() -
     assert "did not ask the horde for this model alone" in finding.detail
     assert finding.evidence == [
         "It earns 0.42 kudos per second of card time. The rest of the card earns 0.61.",
+        "At the rest of the card's rate, that card time would have earned about 3,800 more kudos. This assumes "
+        "the horde had other work for the card.",
         "Its 95% band is 0.36 to 0.48. The rest's band is 0.55 to 0.67.",
         "Counted from 412 of its jobs on the card.",
         "Measured over the last 9 hours.",

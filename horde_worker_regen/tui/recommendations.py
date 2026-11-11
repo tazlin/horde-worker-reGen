@@ -263,9 +263,9 @@ def _note_pool_resident_matches(pool: ModelPoolSnapshot, out: list[Finding]) -> 
 def _check_card_earning(snapshot: WorkerStateSnapshot, out: list[Finding]) -> None:
     """Flag each model that earns below the rest of its card, then note a restart of the earning window.
 
-    A model with claim time gets a card whatever its share, because the worker asked the horde only for it during
-    that time. A model without a claim gets one only when it took more than half of the card's wall. That is more
-    seconds than the rest's rate is read over, which is the wall less the model's seconds.
+    A model with claim time gets a suggestion, because the worker asked the horde only for it during that time.
+    A model without a claim gets a note. The verdict is the only bar for either: it needs the two 95% bands to
+    lie apart, so few models reach it. Notes are ordered by the worker's estimate of the kudos given up.
     """
     earning = snapshot.card_earning
     walls = {card.device_index: card.wall_seconds for card in earning.cards}
@@ -290,13 +290,8 @@ def _check_card_earning(snapshot: WorkerStateSnapshot, out: list[Finding]) -> No
             ),
         )
     unclaimed = sorted(
-        (
-            row
-            for row in below_rest
-            if row.claim_seconds <= 0
-            and row.attributed_card_seconds > walls[row.device_index] - row.attributed_card_seconds
-        ),
-        key=lambda row: (-row.attributed_card_seconds, row.device_index),
+        (row for row in below_rest if row.claim_seconds <= 0),
+        key=lambda row: (-(row.kudos_gap_to_rest or 0.0), row.device_index, row.model),
     )
     for row in unclaimed:
         out.append(
@@ -354,11 +349,19 @@ def _below_rest_finding(
 
 
 def _earning_evidence(earning: CardEarningSnapshot, row: CardEarningRow, *, now: float) -> list[str]:
-    """Return the figures behind a below-the-rest finding: the two rates, their bands, the jobs and the window."""
+    """Return the figures behind a below-the-rest finding.
+
+    The lines are the two rates, the worker's estimate of the kudos given up, the bands, the jobs and the window.
+    """
     lines = [
         f"It earns {rate_text(row.model_kudos_per_second)} kudos per second of card time. The rest of the card "
         f"earns {rate_text(row.rest_kudos_per_second)}.",
     ]
+    if row.kudos_gap_to_rest is not None and row.kudos_gap_to_rest > 0:
+        lines.append(
+            f"At the rest of the card's rate, that card time would have earned about "
+            f"{round(row.kudos_gap_to_rest):,} more kudos. This assumes the horde had other work for the card.",
+        )
     bands = (row.model_band_low, row.model_band_high, row.rest_band_low, row.rest_band_high)
     if all(band is not None for band in bands):
         lines.append(

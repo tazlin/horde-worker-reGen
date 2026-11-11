@@ -535,7 +535,7 @@ is the same card the Diagnostics tab uses: a badge saying what to do with it, a 
 [Findings](../reference/log_findings.md#live-dashboard) lists them. When nothing is worth saying the
 panel shows that the worker looks healthy. The earning findings come from the [Card earning](#card-earning)
 figures: a model that earns below the rest of its card while the worker asked the horde only for it, a model
-that earns below the rest and took more than half of its card's time, and a note that the figures started
+that earns below the rest without such a claim, and a note that the figures started
 again after a settings change. A card's details update in place when only its figures move, so an open
 "Details" section stays open.
 

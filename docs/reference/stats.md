@@ -317,6 +317,9 @@ A row has the card, the model, `model_kudos_per_second` and `rest_kudos_per_seco
 `verdict`. A band end is the rate plus or minus `two_sided_95_band_width(buckets)` standard errors, from
 `whole_card.rate_95_band`, which the verdict reads too. A band end is `None` when the rate or its standard error
 is `None`. The verdict is `pop_claim_value_verdict` over the row's figures, as its string value.
+`kudos_gap_to_rest` is the rest's rate less the model's rate, times the model's attributed card seconds. It
+estimates the kudos given up by serving the model, and it is `None` when either rate is `None`. The estimate
+holds only while the horde has other work for the card. The Insights earning findings state it and order by it.
 
 The dashboard shows the figures on the Stats tab (see
 [Card earning](../how-to/use-the-dashboard.md#card-earning)). Its words for a verdict come from

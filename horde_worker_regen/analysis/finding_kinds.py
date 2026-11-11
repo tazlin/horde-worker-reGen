@@ -1149,7 +1149,7 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
     ),
     FindingSpec(
         kind=FindingKind.MODEL_EARNS_BELOW_REST,
-        title="A model that earns less took most of the card's time",
+        title="A model earns less than the rest of its card",
         action=(
             "No action needed if you serve this model on purpose. Otherwise remove it from your model list, or "
             "add it to `models_to_skip`, to stop serving it."
@@ -1157,7 +1157,6 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
         detail=(
             "The worker compares what a model earns per second of card time with the rest of the card's work. "
             "The model's 95% band lies wholly under the rest's band, so the gap is larger than the readings vary. "
-            "This note appears only when the model took more than half of the card's time, idle time included. "
             "The worker did not ask the horde for this model alone. "
             "The horde sets what each job pays."
         ),

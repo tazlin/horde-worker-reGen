@@ -662,6 +662,7 @@ class TestCardEarningSnapshot:
         assert row_a.rest_buckets == 2
         assert row_a.attributed_card_seconds == pytest.approx(40.0)
         assert row_a.claim_seconds == pytest.approx(50.0)
+        assert row_a.kudos_gap_to_rest == pytest.approx(-35.0)
         assert row_a.verdict == PopClaimValueVerdict.UNMEASURED.value
         assert earning.rows[1].claim_seconds == 0.0
         assert len(earning.cards) == 1
