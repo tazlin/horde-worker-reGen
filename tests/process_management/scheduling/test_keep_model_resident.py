@@ -26,6 +26,8 @@ from __future__ import annotations
 from unittest.mock import Mock
 
 import pytest
+from horde_model_reference import KNOWN_IMAGE_GENERATION_BASELINE
+from horde_sdk.ai_horde_api.apimodels import LorasPayloadEntry
 
 from horde_worker_regen.process_management.ipc.messages import (
     HeldComponentSnapshot,
@@ -40,12 +42,17 @@ from horde_worker_regen.process_management.lifecycle.process_map import ProcessM
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.resources.device_free_governor import GovernorState
 from horde_worker_regen.process_management.scheduling import inference_scheduler as inference_scheduler_module
-from horde_worker_regen.process_management.scheduling.governance.whole_card import DominanceRung
+from horde_worker_regen.process_management.scheduling.governance.whole_card import (
+    DominanceRung,
+    WholeCardPopClaim,
+)
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from tests.process_management.conftest import (
     make_job_pop_response,
     make_mock_bridge_data,
+    make_mock_model_reference_record,
     make_mock_process_info,
+    make_test_model_metadata,
     track_popped_job_async,
 )
 from tests.process_management.scheduling.test_inference_scheduling import _make_inference_scheduler
@@ -224,13 +231,15 @@ async def test_the_first_job_of_a_run_keeps_its_weights_under_pressure_when_anot
     )
 
 
-async def test_a_teardown_residency_under_pressure_still_denies() -> None:
-    """Outside a run the governor gate stands, a rung-2 residency included."""
+async def test_a_teardown_residency_under_pressure_keeps_its_weights_only_with_a_job_of_its_own_pending() -> None:
+    """A rung-2 holder passes the governor gate while a job of its own is pending, and not otherwise.
+
+    The holder is alone on the card, so the pressure comes from its own copy. Without a standing claim or a pending
+    job of its own, its next job is unknown and the governor gate stands.
+    """
     job_tracker = JobTracker()
     dispatched = make_job_pop_response(model=_MODEL)
-    successor = make_job_pop_response(model=_MODEL)
     await track_popped_job_async(job_tracker, dispatched)
-    await track_popped_job_async(job_tracker, successor)
 
     scheduler = _budget_on_scheduler(job_tracker)
     scheduler.set_governor_state(0, GovernorState.PRESSURE)
@@ -239,6 +248,16 @@ async def test_a_teardown_residency_under_pressure_still_denies() -> None:
 
     assert (
         scheduler._should_keep_model_resident(dispatched, process_with_model=process_info, device_index=None) is False
+    ), "the governor gate stands while the holder does not have a pending job"
+
+    await track_popped_job_async(job_tracker, make_job_pop_response(model=_OTHER_MODEL))
+    assert (
+        scheduler._should_keep_model_resident(dispatched, process_with_model=process_info, device_index=None) is False
+    ), "another model's pending job does not keep the holder's copy"
+
+    await track_popped_job_async(job_tracker, make_job_pop_response(model=_MODEL))
+    assert (
+        scheduler._should_keep_model_resident(dispatched, process_with_model=process_info, device_index=None) is True
     )
 
 
@@ -1313,4 +1332,152 @@ async def test_retains_the_model_a_held_whole_card_residency_advertises() -> Non
 
     assert (
         scheduler._should_keep_model_resident(dispatched, process_with_model=process_info, device_index=None) is True
+    )
+
+
+_HOLDER_MODEL = "Krea2-Turbo_fp8"
+"""An extra-large checkpoint whose static sampling peak at the holder shape exceeds a 16 GB card."""
+_HOLDER_SHAPE = (768, 1344)
+
+
+def _holder_scheduler(job_tracker: JobTracker) -> InferenceScheduler:
+    """A budget-on scheduler on a 16 GB card whose reference resolves the extra-large class, its slot seeded."""
+    bridge_data = make_mock_bridge_data(enable_vram_budget=True, vram_reserve_mb=2048, ram_reserve_mb=4096)
+    process_info = make_mock_process_info(_PROCESS_ID, model_name=_HOLDER_MODEL)
+    process_info.total_vram_mb = _TOTAL_VRAM_MB
+    scheduler = _make_inference_scheduler(
+        job_tracker=job_tracker,
+        bridge_data=bridge_data,
+        process_map=ProcessMap({_PROCESS_ID: process_info}),
+        model_metadata=make_test_model_metadata(
+            {
+                _HOLDER_MODEL: make_mock_model_reference_record(
+                    _HOLDER_MODEL,
+                    baseline=KNOWN_IMAGE_GENERATION_BASELINE.krea2_turbo,
+                ),
+            },
+        ),
+    )
+    _seed_repeat_evidence(scheduler, _PROCESS_ID, _HOLDER_MODEL)
+    return scheduler
+
+
+def _holder_job(*, lora: bool = False):  # noqa: ANN202
+    """A job of the extra-large class at the holder shape, with a LoRA when asked."""
+    width, height = _HOLDER_SHAPE
+    loras = [LorasPayloadEntry(name="some_lora", model=1.0, clip=1.0)] if lora else None
+    return make_job_pop_response(_HOLDER_MODEL, width=width, height=height, loras=loras)
+
+
+async def _holder_verdict(
+    *,
+    rung: DominanceRung | None,
+    governor: GovernorState = GovernorState.HEALTHY,
+    lora: bool = False,
+    successor_model: str | None = _HOLDER_MODEL,
+    standing_claim: bool = False,
+) -> tuple[bool, list[str]]:
+    """Judge one extra-large dispatch and return the verdict and the logged reasons.
+
+    ``rung`` is the rung of the card's residency for the model, or None without a residency. ``successor_model`` is
+    the model of the one other pending job, or None when there is not one. ``standing_claim`` makes the residency's
+    claim stand over the pop offer for the model. A withheld claim is treated as absent.
+    """
+    job_tracker = JobTracker()
+    dispatched = _holder_job(lora=lora)
+    await track_popped_job_async(job_tracker, dispatched)
+    if successor_model is not None:
+        await track_popped_job_async(job_tracker, make_job_pop_response(successor_model))
+    scheduler = _holder_scheduler(job_tracker)
+    scheduler.set_governor_state(0, governor)
+    if rung is not None:
+        scheduler._whole_card_ledger.record_grant(
+            None, model=_HOLDER_MODEL, forecast=None, cooldown_until=0.0, now=0.0, rung=rung
+        )
+    if standing_claim:
+        claim = WholeCardPopClaim(model=_HOLDER_MODEL, device_index=None, held_since=0.0, expires_at=3600.0)
+        scheduler._standing_pop_claim = lambda: claim  # type: ignore[method-assign]
+    reasons = _record_retention_reasons(scheduler)
+    granted = scheduler._should_keep_model_resident(
+        dispatched,
+        process_with_model=scheduler._process_map[_PROCESS_ID],
+        device_index=None,
+    )
+    return granted, reasons
+
+
+async def test_a_rung_two_holder_keeps_its_weights_at_its_partial_load_seat() -> None:
+    """A holder's job that fails the static fit is granted at its seat under pressure, on a ``seat:`` line."""
+    granted, reasons = await _holder_verdict(rung=DominanceRung.CANNOT_CO_RESIDE, governor=GovernorState.PRESSURE)
+
+    assert granted is True, reasons
+    assert len(reasons) == 1 and reasons[0].startswith("seat: "), reasons
+    assert "static: peak" in reasons[0], "the line also includes the static fit replaced by the seat"
+
+
+async def test_a_rung_two_holders_lora_job_is_still_denied_on_the_static_fit() -> None:
+    """A LoRA job does not have a partial-load seat, so the static fit decides and denies it."""
+    granted, reasons = await _holder_verdict(rung=DominanceRung.CANNOT_CO_RESIDE, lora=True)
+
+    assert granted is False, reasons
+    assert len(reasons) == 1 and reasons[0].startswith("static: "), reasons
+
+
+@pytest.mark.parametrize(
+    "rung",
+    [DominanceRung.CANNOT_CO_SAMPLE, None],
+    ids=["rung_one_run", "no_residency"],
+)
+async def test_a_model_that_is_not_the_rung_two_holder_keeps_the_static_verdict(rung: DominanceRung | None) -> None:
+    """A rung-1 run and a model without a residency are judged on the static fit alone, which denies the class."""
+    granted, reasons = await _holder_verdict(rung=rung)
+
+    assert granted is False, reasons
+    assert len(reasons) == 1 and reasons[0].startswith("static: "), reasons
+
+
+@pytest.mark.parametrize("successor_model", [None, _OTHER_MODEL], ids=["nothing_pending", "other_model_pending"])
+async def test_a_rung_two_holder_without_a_job_of_its_own_or_a_standing_claim_is_denied(
+    successor_model: str | None,
+) -> None:
+    """Without a pending job of its own or a standing claim, the static fit decides the holder's verdict."""
+    granted, reasons = await _holder_verdict(rung=DominanceRung.CANNOT_CO_RESIDE, successor_model=successor_model)
+
+    assert granted is False, reasons
+    assert len(reasons) == 1 and reasons[0].startswith("static: "), reasons
+
+
+@pytest.mark.parametrize("successor_model", [None, _OTHER_MODEL], ids=["nothing_pending", "other_model_pending"])
+async def test_a_rung_two_holder_with_a_standing_claim_is_granted_at_its_seat(successor_model: str | None) -> None:
+    """While the claim stands the next pop is the holder's, so a queued job of another model does not deny it.
+
+    That job waits for the residency to end whether or not the copy is kept.
+    """
+    granted, reasons = await _holder_verdict(
+        rung=DominanceRung.CANNOT_CO_RESIDE,
+        governor=GovernorState.PRESSURE,
+        successor_model=successor_model,
+        standing_claim=True,
+    )
+
+    assert granted is True, reasons
+    assert len(reasons) == 1 and reasons[0].startswith("seat: "), reasons
+
+
+async def test_the_holders_grant_stops_when_its_residency_ends() -> None:
+    """Once the residency is cleared, the holder's next dispatch is judged on the static fit again."""
+    job_tracker = JobTracker()
+    dispatched = _holder_job()
+    await track_popped_job_async(job_tracker, dispatched)
+    await track_popped_job_async(job_tracker, _holder_job())
+    scheduler = _holder_scheduler(job_tracker)
+    scheduler._whole_card_ledger.record_grant(None, model=_HOLDER_MODEL, forecast=None, cooldown_until=0.0, now=0.0)
+    process_info = scheduler._process_map[_PROCESS_ID]
+    assert (
+        scheduler._should_keep_model_resident(dispatched, process_with_model=process_info, device_index=None) is True
+    ), "precondition: the holder is granted while its residency stands"
+
+    scheduler._whole_card_ledger.record_restore(None, now=0.0)
+    assert (
+        scheduler._should_keep_model_resident(dispatched, process_with_model=process_info, device_index=None) is False
     )

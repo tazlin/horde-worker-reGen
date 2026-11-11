@@ -1311,6 +1311,18 @@ def copy_belongs_to_dominant_run(
     holder = snapshot.dominant_runs[model]
     if holder is not None and device_index is not None and holder != device_index:
         return False
+    return model_has_next_job(snapshot, model, besides_job_id=besides_job_id)
+
+
+def model_has_next_job(snapshot: SchedulingSnapshot, model: str, *, besides_job_id: str | None = None) -> bool:
+    """Whether the card's next job is one of ``model``'s, for a model that holds the card.
+
+    The next job is a pending job for the model that is not held without release by a dispatch gate or, when the
+    model does not have a pending job, the next pop under the standing claim for the model. A claim withheld from the
+    offer is not standing (``snapshot.pop_claim_model`` is None then). While every pending job for the model is held
+    without release the claim does not count, since a further pop queues behind the same hold. ``besides_job_id``
+    leaves out a job being dispatched now, which would otherwise count as its own successor.
+    """
     successors = queued_jobs_naming(snapshot, model, besides_job_id=besides_job_id)
     if any(not _dispatch_held_without_release(snapshot, job_id) for job_id in successors):
         return True

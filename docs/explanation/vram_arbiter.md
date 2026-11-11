@@ -1415,8 +1415,12 @@ to the card. It is instead a governed live gate that grants only when:
   evicting idle residents elsewhere, and dropping the run's weights would only make its next job reload them.
   The first job of a run counts too when another job for its model is queued, since its run is granted at its
   first step, after this verdict. The exception lasts only as long as the run, which ends when the run's work
-  drains or when a different-model head has waited past the anti-starvation bound. Outside a run the gate
-  applies as written.
+  drains or when a different-model head has waited past the anti-starvation bound. A model that holds the
+  card's rung-2 residency is exempt on the same terms (`_rung_two_holder_has_next_job`). It is alone on the
+  card, so the pressure comes from its own copy and the card does not hold anything else that can be
+  reclaimed. Its next job is decided by the same rule that keeps a run's copy (`pricing.model_has_next_job`).
+  That job is a pending job for the model or, when there is not one, the standing pop claim for it. Elsewhere
+  the gate applies as written.
 - **The slot's own recent traffic repeats this model.** The dispatched model must appear among the slot's
   previous `RETENTION_REPEAT_EVIDENCE_DISPATCHES` (3, in `scheduling/ledgers/retention.py`) dispatches. See
   [Retention is granted on repeat evidence](#retention-is-granted-on-repeat-evidence).
@@ -1434,6 +1438,22 @@ to the card. It is instead a governed live gate that grants only when:
   same accessor as the achievable ceiling. Retention cannot page that memory out, and a fit priced from the
   card's total would otherwise see none of it. The verdict's log line states the floor as its own figure
   when it is nonzero.
+- **A rung-2 holder is priced at its partial-load seat.** When an extra-large checkpoint is too large for the
+  card to hold whole, its whole sampling peak never fits. It samples in a partial-load seat instead, which is
+  a share of its weights plus its activation. When such a model holds the card's rung-2 residency and its next
+  job is its own, a job that fails the static fit is priced again at that seat (`pricing.partial_seat_mb` at
+  the fallback weight share) against the same room. The kept copy is part of that seat. A LoRA job does not
+  have a seat, and a job does not have one while the driver pages. Those jobs keep the static verdict and
+  unload. The log line starts with `seat:` when the seat decided and `static:` when the static fit did.
+
+  The standing claim counts as the holder's next job because, while it stands, the worker asks the horde
+  for that model alone. A queued job of another model waits for the residency to end whether or not the
+  copy is kept. The grant is wrong only when the horde does not have further work for the model, and the cost
+  then is one eviction when the other model's job loads.
+
+  A kept copy does not stay whole between jobs. The next job's encode requests room for its text encoder,
+  and ComfyUI pages part of the copy out to make that room. That job's load moves back only the paged part,
+  which is less than the job's whole upload when the copy is not kept.
 
 An idle lane holding a component cache is charged its measured allocator reservation. A cache entry may sit in
 host RAM, where it costs the card nothing. A lane that holds components on the device (a component or VAE lane,
@@ -1502,7 +1522,9 @@ gate is not waived when a popped job names the model, the static fit prices the 
 and not the successor's staged clearance price, and the reclaim victim choice (the dispatch-hold eviction and
 the pressure sweep) does not take a copy a popped job names last. Beyond the sweep's ready-seat and lookahead
 rules (`pricing.sweep_spares_idle_copy`), a queued job naming a model keeps the copy only as the next job of a
-rung-1 run (`pricing.queued_jobs_naming`, read by `pricing.copy_belongs_to_dominant_run`).
+rung-1 run or of a rung-2 holder (`pricing.model_has_next_job`, read by `pricing.copy_belongs_to_dominant_run` and
+by the retention gate's `_rung_two_holder_has_next_job`). In both cases another model's job does not share the
+card.
 
 The rule rests on two premises about a card that seats one whole-job peak of the offered mix at a time. The
 successor is usually popped after the predecessor ends, so at the decision instant no job names the model. And

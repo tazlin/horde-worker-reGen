@@ -201,7 +201,8 @@ Start from the mechanism, not the file. Each line states the owner of one questi
   `process_map.committed_vram_mb` (context constant plus reservation per committed process). A reading at or
   below zero comes from the worker's own stale or over-charged footprint, never from the card.
 - **Whether a lane keeps its weights between jobs:** the scheduler's `_should_keep_model_resident`
-  (governor gate, repeat evidence, static fit through `_retention_fit`) and `ledgers/retention.py`
+  (governor gate, repeat evidence, static fit through `_retention_fit` and, for a rung-2 holder whose next
+  job is its own, the partial-load seat through `_holder_seat_retention`) and `ledgers/retention.py`
   (`RetentionFit`, `slot_has_repeat_evidence`); the child honours the verdict as `defer_vram_unload`.
 - **Whether a model takes the whole card:** `scheduling/governance/whole_card.py` (`WholeCardResidencyMachine`,
   `WholeCardResidencyLedger`, `teardown_complete`, the pop claim and `WholeCardPopClaimRelease`), the scheduler's
@@ -468,9 +469,17 @@ uv run pytest -m chaos_sweep        # generated wedge-liveness sweep (pre-releas
   lanes each had a path that wedged or crashed the row before they were modelled; and a replay that reads far from
   live is a simulator finding before it is a scheduling one.
 - **The world starts the child's job at dispatch.** It calls `begin_job` and enters the wait in the dispatch tick,
-  so a grant never precedes the job start and a clear never precedes the encode, and a run's per-job encoder
-  reload does not page the kept weights out. A clearance-transport or run-duty claim needs a row that drives that
-  order, or a live measurement.
+  so a grant never precedes the job start and a clear never precedes the encode. A clearance-transport or run-duty
+  claim needs a row that drives that order, or a live measurement. Under `partial_loads` the child relieves the
+  encode charge at dispatch through its shortfall relief, which pages part of a kept copy out. The next load moves
+  that part back. Without `partial_loads` the encode does not touch a kept copy. The world does not charge any
+  time for the encode itself or for a job-end unload.
+- **The world's governor does not return to HEALTHY between back-to-back jobs.** A job's completion, one
+  governor sample, the successor's dispatch and the successor's load all land in one tick. The card reads as
+  free for that one sample. The governor needs two agreeing samples to change state, so a card in PRESSURE
+  while each job samples stays in PRESSURE for the whole streak. On a live worker the freed card reads as free
+  for several samples first. For a row whose outcome depends on the governor gate at a successor's dispatch,
+  the gate is stricter than on a live worker.
 - **On one card the preload pass ends at its first stop of any kind, except `EXCLUSIVE_IN_PROGRESS`.**
   `stop_is_card_scoped` in `admission/preload.py` matters only with multi-GPU routing active; on a single card,
   whatever decision a parked head records decides whether anything behind it preloads. After an

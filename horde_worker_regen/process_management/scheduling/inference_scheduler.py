@@ -12802,7 +12802,13 @@ class InferenceScheduler:
         governor gate does not apply. The pressure the
         governor reads is often the run's own retained copy beside a sibling's job, and the reclaim ladder
         answers pressure by evicting idle residents elsewhere, so dropping the run's weights would only make the
-        next job reload them.
+        next job reload them. The same holds for a model that holds the card's rung-2 residency and whose next job is
+        its own (:meth:`_rung_two_holder_has_next_job`). It is alone on the card, so the pressure comes from its own
+        copy and the card does not hold anything else that can be reclaimed.
+
+        Such a holder's job that fails the static fit is priced again at its partial-load seat
+        (:meth:`_holder_seat_retention`). A checkpoint too large for the card to hold whole samples in that seat,
+        and the kept copy is part of the seat.
         """
         model = dispatched_job.model
         if model is None:
@@ -12821,10 +12827,19 @@ class InferenceScheduler:
             self._retention.note_denial(RetentionDenialReason.WDDM_PAGING)
             return False
         governor_state = self.governor_state(device_index)
-        if governor_state is not GovernorState.HEALTHY and not self._weights_belong_to_dominant_run(
+        rung_two_holder = self._rung_two_holder_has_next_job(
             model,
             device_index=device_index,
             dispatched_job=dispatched_job,
+        )
+        if (
+            governor_state is not GovernorState.HEALTHY
+            and not rung_two_holder
+            and not self._weights_belong_to_dominant_run(
+                model,
+                device_index=device_index,
+                dispatched_job=dispatched_job,
+            )
         ):
             return self._deny_retention(
                 model,
@@ -12833,11 +12848,10 @@ class InferenceScheduler:
                 f"governor: card {governor_state.value} (the reclaim ladder holds priority over new residents)",
             )
         residency_names_model = self._whole_card_ledger.holds_model_on_card(model, device_index)
-        # A held residency advertises this model alone, so the slot's next job is this model by construction:
-        # that is the repeat evidence, from the first job. The static fit still applies, since a checkpoint
-        # whose encoders and weights together exceed the card is not helped by keeping its weights: the
-        # encoder then runs offloaded and the backend evicts part of the retained copy to seat it, which costs
-        # more than the re-upload the grant would save.
+        # A held residency advertises this model alone, so the slot's next job is this model by construction.
+        # That is the repeat evidence, from the first job. The next job's encode still pages part of a kept copy out
+        # to seat the encoder. That job's load moves back only the paged part, which is less than its whole upload
+        # when the copy is not kept.
         pending_models = self._pending_models_besides(dispatched_job)
         displacing = self._displacing_pending_models(pending_models, besides=process_with_model)
         if not residency_names_model and not self._retention.slot_has_repeat_evidence(
@@ -12869,14 +12883,76 @@ class InferenceScheduler:
                 self._retention.note_denial(fit.reason)
                 return False
             return self._deny_retention(model, process_with_model, fit.reason, fit.detail)
+        granted = fit.granted
+        reason = fit.describe()
+        if not granted and rung_two_holder:
+            seat = self._holder_seat_retention(dispatched_job, fit, device_index=device_index)
+            if seat is not None:
+                granted, reason = seat
         self._log_retention_decision(
             model,
             process_with_model,
-            granted=fit.granted,
-            reason=fit.describe(),
-            denial_reason=None if fit.granted else RetentionDenialReason.STATIC_FIT,
+            granted=granted,
+            reason=reason,
+            denial_reason=None if granted else RetentionDenialReason.STATIC_FIT,
         )
-        return fit.granted
+        return granted
+
+    def _rung_two_holder_has_next_job(
+        self,
+        model: str,
+        *,
+        device_index: int | None,
+        dispatched_job: ImageGenerateJobPopResponse,
+    ) -> bool:
+        """Whether ``model`` holds the card's rung-2 residency and the card's next job is its own.
+
+        ``device_index`` is the routing key (None on a single card), which is also the whole-card ledger's key. The
+        next job is read through :func:`pricing.model_has_next_job`, the same rule that keeps a rung-1 run's copy.
+        The job being dispatched now is left out. The standing claim counts because, while it stands, the worker
+        asks for this model alone. A queued job of another model waits for the residency to end whether or not the
+        copy is kept. A grant is wrong only when another job for the model does not arrive, and that costs one
+        eviction.
+        """
+        if not any(
+            index == device_index and state.model == model for index, state in self._whole_card_ledger.teardown_held()
+        ):
+            return False
+        return pricing.model_has_next_job(self.snapshot(), model, besides_job_id=str(dispatched_job.id_))
+
+    def _holder_seat_retention(
+        self,
+        dispatched_job: ImageGenerateJobPopResponse,
+        fit: RetentionFit,
+        *,
+        device_index: int | None,
+    ) -> tuple[bool, str] | None:
+        """The grant verdict and its log reason for a rung-2 holder's job priced at its partial-load seat.
+
+        The seat is :func:`pricing.partial_seat_mb` at the fallback weight share, as :meth:`_residency_head_need_mb`
+        prices a residency head, against the static fit's room and noise. None when the job does not have a seat (a
+        LoRA job, or any job on a card whose driver is paging), so the static verdict stands.
+        """
+        model = dispatched_job.model
+        if model is None or fit.predicted_mb is None:
+            return None
+        baseline = self._model_metadata.get_baseline(model)
+        seat_mb = pricing.partial_seat_mb(
+            self.snapshot(),
+            dispatched_job,
+            str(baseline) if baseline is not None else None,
+            device_index=device_index,
+            weight_fraction=pricing.PARTIAL_SEAT_FALLBACK_WEIGHT_FRACTION,
+        )
+        if seat_mb is None:
+            return None
+        available_mb = fit.effective_available_mb
+        granted = seat_mb + fit.noise_mb <= available_mb
+        reason = (
+            f"seat: rung-2 holder's partial-load seat {seat_mb:.0f} + noise {fit.noise_mb:.0f} "
+            f"vs {available_mb:.0f}MB (static peak {fit.predicted_mb} did not fit, {fit.describe()})"
+        )
+        return granted, reason
 
     def _pending_models_besides(self, dispatched_job: ImageGenerateJobPopResponse) -> tuple[str, ...]:
         """The models of the popped jobs still awaiting dispatch, with ``dispatched_job`` itself left out.
