@@ -37,6 +37,14 @@ applies valid changes through the process manager. The apply step updates
 need the current values; no locks, no notifications. The hot-reload is best-effort; there is no atomicity guarantee
 across multiple reads.
 
+The `max_threads` on the dashboard snapshot is the live concurrent-inference cap
+(`RuntimeConfig.effective_max_threads`). It can differ from the file's value. A reload re-derives it from the
+file, within the session's ceiling. The supervisor's concurrency and capacity commands move it between reloads.
+A reload or one of those commands that changes a
+[capacity or workload setting](../how-to/use-the-dashboard.md#capacity-and-workload-settings) marks the
+dashboard trends as stabilizing and restarts the
+[persisted card earning](../reference/stats.md#persisted-card-earning) window.
+
 A file reload is applied live, including the download subsystem: the pause /
 bandwidth / parallelism controls, the queue order (`download_priority_policy`,
 also switchable from the Downloads tab), the download-gating flags

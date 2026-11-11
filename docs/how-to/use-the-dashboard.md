@@ -296,8 +296,9 @@ arriving and nothing a token count can honestly be derived from.
 `T` cycles the trend window across 5m, 15m, 30m, 60m, 120m, and All; `R` resets the buffers without
 touching session totals. Changing the window filters retained history rather than resetting it, and
 each finite window draws fixed buckets from `now - window` to `now`, so a warming-up worker shows empty
-early buckets instead of a graph that only covers the samples it has. Config changes and explicit
-resets mark the trends as stabilizing.
+early buckets instead of a graph that only covers the samples it has. Explicit resets mark the trends as
+stabilizing, and so do the changes listed under
+[Capacity and workload settings](#capacity-and-workload-settings).
 
 **Kudos/hr** is an active rate: kudos earned in the window divided by the time the pipeline actually
 held work. It therefore reads steadily instead of sawtoothing on each submit, and it charges neither
@@ -310,6 +311,28 @@ so the rate does not split by card or model. The per-model figure is described i
 If the GPU is near-idle while a job is in flight, the Trends border and its GPU-duty row turn orange
 with a `(!)`. On a multi-GPU worker the row states each card's own duty and the alert names the card it
 means, because the headline figure is a mean across the driven cards.
+
+##### Capacity and workload settings
+
+A change to any of these settings marks the trends as stabilizing:
+
+- `max_threads`, read as the live concurrent-inference cap. A config reload moves it, and so do the
+  supervisor's concurrency and capacity commands.
+- The number of offered image models, `max_power`, `queue_size` and `max_batch`.
+- `safety_on_gpu`, `allow_img2img`, `allow_lora`, `allow_controlnet`, `allow_sdxl_controlnet` and
+  `allow_post_processing`.
+- `high_performance_mode`, `moderate_performance_mode` and `extra_slow_worker`.
+- `alchemist`, `alchemy_allow_concurrent`, `alchemy_max_concurrency`, `alchemy_vram_headroom_mb` and the
+  configured alchemy forms, in their configured order.
+
+The worker reduces these settings to one fingerprint (`WorkerConfigSummary.config_fingerprint`, built by
+`capacity_workload_fingerprint`). The same fingerprint restarts the
+[persisted card earning](../reference/stats.md#persisted-card-earning) window, so figures measured under one
+set of settings are not read under another.
+
+The trends are also marked as stabilizing when LoRA work is suspended or resumed without a settings change.
+A background model download or a full LoRA disk suspends it. This suspension is not part of the fingerprint,
+and it does not restart the earning window.
 
 #### Layout and customization
 

@@ -691,7 +691,7 @@ class HordeWorkerTUI(App[None]):
         # so a restart returns to the operator's curated layout.
         self._reveal_hidden_elements = False
         self._show_recent_work_ledger_jobs = True
-        self._last_trend_config_fingerprint: tuple[object, ...] | None = None
+        self._last_trend_config_state: tuple[str, bool | None] | None = None
         self._last_main_tab = "tab-overview"
         self._allow_tab_switch_to: str | None = None
         self._config_leave_warning_suppressed = False
@@ -1490,45 +1490,22 @@ class HordeWorkerTUI(App[None]):
             return "local"
         return ""
 
-    @staticmethod
-    def _trend_config_fingerprint(snapshot: WorkerStateSnapshot | None) -> tuple[object, ...] | None:
-        """Return the capacity/workload config fields that affect trend interpretation."""
-        if snapshot is None:
-            return None
-        config = snapshot.config
-        return (
-            config.num_models,
-            config.max_power,
-            config.max_threads,
-            config.queue_size,
-            config.max_batch,
-            config.safety_on_gpu,
-            config.allow_img2img,
-            config.allow_lora,
-            config.effective_allow_lora,
-            config.allow_controlnet,
-            config.allow_sdxl_controlnet,
-            config.allow_post_processing,
-            config.high_performance_mode,
-            config.moderate_performance_mode,
-            config.extra_slow_worker,
-            config.alchemist,
-            config.alchemy_concurrent,
-            config.alchemy_max_concurrency,
-            config.alchemy_vram_headroom_mb,
-            tuple(config.alchemy_forms),
-        )
-
     def _maybe_mark_trend_config_change(self, overview: OverviewView, snapshot: WorkerStateSnapshot | None) -> None:
-        """Show a trend stabilization disclaimer when relevant worker config changes."""
-        fingerprint = self._trend_config_fingerprint(snapshot)
-        if fingerprint is None:
+        """Show a trend stabilization disclaimer when the worker's capacity or workload changes."""
+        if snapshot is None:
             return
-        if self._last_trend_config_fingerprint is None:
-            self._last_trend_config_fingerprint = fingerprint
+        config = snapshot.config
+        fingerprint = config.config_fingerprint
+        effective_allow_lora = config.effective_allow_lora
+        previous = self._last_trend_config_state
+        self._last_trend_config_state = (fingerprint, effective_allow_lora)
+        if previous is None:
             return
-        if fingerprint != self._last_trend_config_fingerprint:
-            self._last_trend_config_fingerprint = fingerprint
+        previous_fingerprint, previous_effective_allow_lora = previous
+        settings_changed = fingerprint != previous_fingerprint
+        # Downloads or a full disk suspend LoRA work without a settings change, and that shifts the trend.
+        lora_work_suspension_changed = effective_allow_lora != previous_effective_allow_lora
+        if settings_changed or lora_work_suspension_changed:
             overview.note_config_changed()
 
     # Status-bar segments are laid out most-important-first and shed from the end on a narrow terminal.

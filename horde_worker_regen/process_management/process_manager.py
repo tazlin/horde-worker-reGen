@@ -117,6 +117,7 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     RECENT_JOBS_IN_SNAPSHOT,
     WORK_LEDGER_ENTRIES_IN_SNAPSHOT,
     CapacityChangeResult,
+    CapacityWorkloadSettings,
     CardSnapshot,
     DisaggStageRow,
     FeatureInfoRow,
@@ -153,6 +154,7 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     WorkLedgerProgressUnit,
     WorkLedgerStage,
     WorkloadTotalsSnapshot,
+    capacity_workload_fingerprint,
 )
 from horde_worker_regen.process_management.jobs.alchemy_popper import (
     AlchemyCoordinator,
@@ -1605,6 +1607,7 @@ class HordeWorkerProcessManager:
         # the performance model. Under test it stays in memory, as the performance model does.
         self._card_earning = CardEarningAccumulator(
             max_tick_seconds=self._ELIGIBLE_MAX_TICK_DT_SECONDS,
+            config_fingerprint=self._capacity_workload_fingerprint(),
             path=None if os.environ.get("AI_HORDE_TESTING") else default_app_state_dir() / CARD_EARNING_FILENAME,
         )
 
@@ -4930,6 +4933,9 @@ class HordeWorkerProcessManager:
             has_pipeline_work=self._has_pipeline_work(),
             max_dt=self._ELIGIBLE_MAX_TICK_DT_SECONDS,
         )
+        # Read each tick because a reload and the supervisor's concurrency and capacity commands all move the
+        # settings, and one read here covers every path.
+        self._card_earning.restart_window_if_changed(self._capacity_workload_fingerprint())
         self._publish_supervisor_snapshot()
 
         await self._sleep(self._loop_interval / 2)
@@ -8937,41 +8943,43 @@ class HordeWorkerProcessManager:
         )
         latest_stats_sample = stats_sample or self._run_metrics.latest_stats_sample()
 
+        capacity_settings = self._capacity_workload_settings()
         config = WorkerConfigSummary(
             dreamer_name=bridge_data.dreamer_worker_name,
             dreamer=bridge_data.dreamer,
             alchemist_name=bridge_data.alchemist_name,
             worker_version=horde_worker_regen.__version__,
             horde_username=self.user_info.username if self.user_info is not None else None,
-            num_models=len(bridge_data.image_models_to_load),
+            num_models=capacity_settings.num_models,
             custom_models=bool(bridge_data.custom_models),
             custom_models_ready=len(bridge_data.custom_model_ready_names),
             custom_models_configured=bridge_data.custom_model_configured_count,
             custom_model_issues=bridge_data.custom_model_issue_summaries,
-            max_power=bridge_data.max_power,
-            max_threads=self.max_concurrent_inference_processes,
-            queue_size=bridge_data.queue_size,
-            max_batch=bridge_data.max_batch,
-            safety_on_gpu=bridge_data.safety_on_gpu,
-            allow_img2img=bridge_data.allow_img2img,
-            allow_lora=bridge_data.allow_lora,
+            max_power=capacity_settings.max_power,
+            max_threads=capacity_settings.max_threads,
+            queue_size=capacity_settings.queue_size,
+            max_batch=capacity_settings.max_batch,
+            safety_on_gpu=capacity_settings.safety_on_gpu,
+            allow_img2img=capacity_settings.allow_img2img,
+            allow_lora=capacity_settings.allow_lora,
             effective_allow_lora=(
-                bridge_data.allow_lora
+                capacity_settings.allow_lora
                 and not self._model_availability.background_download_active
                 and not self._state.lora_disk_exhausted
             ),
-            allow_controlnet=bridge_data.allow_controlnet,
-            allow_sdxl_controlnet=bridge_data.allow_sdxl_controlnet,
-            allow_post_processing=bridge_data.allow_post_processing,
-            high_performance_mode=bridge_data.high_performance_mode,
-            moderate_performance_mode=bridge_data.moderate_performance_mode,
-            extra_slow_worker=bridge_data.extra_slow_worker,
-            alchemist=bridge_data.alchemist,
-            alchemy_concurrent=bridge_data.alchemy_allow_concurrent,
-            alchemy_max_concurrency=bridge_data.alchemy_max_concurrency,
-            alchemy_vram_headroom_mb=bridge_data.alchemy_vram_headroom_mb,
+            allow_controlnet=capacity_settings.allow_controlnet,
+            allow_sdxl_controlnet=capacity_settings.allow_sdxl_controlnet,
+            allow_post_processing=capacity_settings.allow_post_processing,
+            high_performance_mode=capacity_settings.high_performance_mode,
+            moderate_performance_mode=capacity_settings.moderate_performance_mode,
+            extra_slow_worker=capacity_settings.extra_slow_worker,
+            alchemist=capacity_settings.alchemist,
+            alchemy_concurrent=capacity_settings.alchemy_concurrent,
+            alchemy_max_concurrency=capacity_settings.alchemy_max_concurrency,
+            alchemy_vram_headroom_mb=capacity_settings.alchemy_vram_headroom_mb,
             alchemy_caption_enabled=bridge_data.alchemy_caption_enabled,
-            alchemy_forms=list(bridge_data.forms) if bridge_data.forms else list(DEFAULT_ALCHEMY_FORMS),
+            alchemy_forms=list(capacity_settings.alchemy_forms),
+            config_fingerprint=capacity_workload_fingerprint(capacity_settings),
             scribe=bridge_data.scribe,
             scribe_name=bridge_data.scribe_name if bridge_data.scribe else None,
             text_stall_seconds=bridge_data.text_stall_seconds,
@@ -9231,6 +9239,40 @@ class HordeWorkerProcessManager:
                 and self._recovery_disposition is RecoveryDisposition.CONTINUE_IN_PROCESS
             ),
         )
+
+    def _capacity_workload_settings(self) -> CapacityWorkloadSettings:
+        """Return the live capacity and workload settings.
+
+        The snapshot's config summary and the fingerprint are both built from this one reading, so the two do
+        not drift apart. ``max_threads`` is the live cap, so the supervisor's concurrency and capacity commands
+        change it as a reload does.
+        """
+        bridge_data = self.bridge_data
+        return CapacityWorkloadSettings(
+            num_models=len(bridge_data.image_models_to_load),
+            max_power=bridge_data.max_power,
+            max_threads=self.max_concurrent_inference_processes,
+            queue_size=bridge_data.queue_size,
+            max_batch=bridge_data.max_batch,
+            safety_on_gpu=bridge_data.safety_on_gpu,
+            allow_img2img=bridge_data.allow_img2img,
+            allow_lora=bridge_data.allow_lora,
+            allow_controlnet=bridge_data.allow_controlnet,
+            allow_sdxl_controlnet=bridge_data.allow_sdxl_controlnet,
+            allow_post_processing=bridge_data.allow_post_processing,
+            high_performance_mode=bridge_data.high_performance_mode,
+            moderate_performance_mode=bridge_data.moderate_performance_mode,
+            extra_slow_worker=bridge_data.extra_slow_worker,
+            alchemist=bridge_data.alchemist,
+            alchemy_concurrent=bridge_data.alchemy_allow_concurrent,
+            alchemy_max_concurrency=bridge_data.alchemy_max_concurrency,
+            alchemy_vram_headroom_mb=bridge_data.alchemy_vram_headroom_mb,
+            alchemy_forms=tuple(bridge_data.forms) if bridge_data.forms else tuple(DEFAULT_ALCHEMY_FORMS),
+        )
+
+    def _capacity_workload_fingerprint(self) -> str:
+        """Return the fingerprint of the live capacity and workload settings."""
+        return capacity_workload_fingerprint(self._capacity_workload_settings())
 
     def _apply_reloaded_bridge_data(self, bridge_data: reGenBridgeData) -> None:
         """Swap in freshly-loaded bridge data and re-derive dependent state."""

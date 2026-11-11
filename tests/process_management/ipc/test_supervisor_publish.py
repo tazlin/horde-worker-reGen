@@ -25,6 +25,7 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
 )
 from horde_worker_regen.process_management.jobs.pool_lanes import LaneDecision, PoolLaneState
 from horde_worker_regen.process_management.jobs.text_generation_coordinator import TextJobInFlight
+from horde_worker_regen.process_management.process_manager import HordeWorkerProcessManager
 from horde_worker_regen.process_management.scheduling.governance.preload_admission import AdmissionDecision
 from horde_worker_regen.process_management.scheduling.model_demand_poller import DemandSnapshot
 from horde_worker_regen.process_management.scheduling.model_pool import (
@@ -526,3 +527,61 @@ def test_no_published_preload_decision_when_the_head_was_not_decided() -> None:
     )
 
     assert manager._build_worker_state_snapshot().scheduling_governance.preload == PreloadAdmissionSnapshot()
+
+
+def _snapshot_fingerprint(manager: HordeWorkerProcessManager) -> str:
+    return manager._build_worker_state_snapshot().config.config_fingerprint
+
+
+def test_the_snapshot_fingerprint_is_the_live_settings_fingerprint() -> None:
+    """The dashboard and the earning store read one value."""
+    manager = make_testable_process_manager()
+
+    fingerprint = _snapshot_fingerprint(manager)
+
+    assert fingerprint
+    assert fingerprint == manager._capacity_workload_fingerprint()
+
+
+def test_a_concurrency_change_changes_the_fingerprint() -> None:
+    """A supervisor concurrency command moves the live cap between reloads, and that counts as a change."""
+    manager = make_testable_process_manager(max_threads=2)
+    before = _snapshot_fingerprint(manager)
+
+    manager._apply_set_concurrency(target_threads=1, target_processes=None)
+
+    assert manager.max_concurrent_inference_processes == 1
+    assert _snapshot_fingerprint(manager) != before
+
+
+def test_a_workload_setting_changes_the_fingerprint() -> None:
+    """A listed workload flag is part of the fingerprint."""
+    manager = make_testable_process_manager()
+    before = _snapshot_fingerprint(manager)
+
+    manager._runtime_config.bridge_data.allow_controlnet = not manager.bridge_data.allow_controlnet
+
+    assert _snapshot_fingerprint(manager) != before
+
+
+def test_a_setting_outside_the_list_does_not_change_the_fingerprint() -> None:
+    """The NSFW flag is not a capacity or workload setting."""
+    manager = make_testable_process_manager()
+    before = _snapshot_fingerprint(manager)
+
+    manager._runtime_config.bridge_data.nsfw = not manager.bridge_data.nsfw
+
+    assert _snapshot_fingerprint(manager) == before
+
+
+def test_suspended_lora_work_does_not_change_the_fingerprint() -> None:
+    """A full LoRA disk turns off LoRA advertising without a settings change, so the earning window stays."""
+    manager = make_testable_process_manager(allow_lora=True)
+    before = manager._build_worker_state_snapshot().config
+
+    manager._state.lora_disk_exhausted = True
+
+    after = manager._build_worker_state_snapshot().config
+    assert before.effective_allow_lora is True
+    assert after.effective_allow_lora is False
+    assert after.config_fingerprint == before.config_fingerprint

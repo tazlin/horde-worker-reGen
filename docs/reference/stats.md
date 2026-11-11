@@ -249,7 +249,17 @@ The same figures, kept per card and per model in trailing 15-minute buckets, per
 `.horde_worker_regen/card_earning.json` beside `perf_model.json`. The file is written after every tenth finished
 job and at shutdown, by an atomic replace. A bucket counts for 24 hours after it closes. Load discards a file of
 another schema version or bucket width, and drops each entry that is malformed, non-finite, negative or
-older than the retention. Under test the figures stay in memory. The read is
+older than the retention. Under test the figures stay in memory.
+
+The file records the fingerprint of the capacity and workload settings that the figures were measured under.
+The settings are the dashboard's list in
+[Capacity and workload settings](../how-to/use-the-dashboard.md#capacity-and-workload-settings), reduced to one
+value by `capacity_workload_fingerprint`. Load discards the buckets of a file written under another fingerprint,
+and a file without one counts as another. The control loop compares the fingerprint once per tick, so a config
+reload and the supervisor's concurrency and capacity commands all restart the window. A restart drops the
+retained buckets and adopts the new fingerprint. It does not touch the session totals behind the per-model
+rollups. One INFO line reports each restart that drops figures. LoRA work suspended by a download or a full
+disk does not restart the window. The read is
 `CardEarningAccumulator.rate`: the model's kudos per attributed second, the card's other kudos per remaining wall
 second, the model's job count and both denominators. A rate is `None` when its denominator is zero.
 

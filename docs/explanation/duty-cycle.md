@@ -309,8 +309,9 @@ per wall second. Attributed card seconds are a split of one card's wall, so a ca
 exceed its wall, and kudos over them is a card rate. Kudos are credited per card and model when a finished
 job's record is folded into the rollups. The model rate is the model's kudos over its seconds, and the rest rate
 is the card's other kudos over its wall less the model's seconds. Both are read over a trailing day kept beside
-`perf_model.json` (see [Stats export](../reference/stats.md#per-model-rollups)). Scheduling and the pop offer do
-not read them.
+`perf_model.json` (see [Stats export](../reference/stats.md#per-model-rollups)). The day restarts when a capacity
+or workload setting changes (see [Persisted card earning](../reference/stats.md#persisted-card-earning)).
+Scheduling and the pop offer do not read them.
 
 ### The dashboard
 

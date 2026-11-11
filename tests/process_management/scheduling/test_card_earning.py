@@ -2,15 +2,18 @@
 
 The accumulator's figures rest on two properties pinned here. A card's attributed seconds never exceed its
 wall, however many lanes share it, so kudos over attributed seconds is a card rate. And the persisted window
-loads back only the entries that could have been written by a healthy worker inside the retention.
+loads back only the entries that could have been written by a healthy worker inside the retention, under the
+same capacity and workload settings.
 """
 
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+from loguru import logger
 
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
@@ -35,11 +38,42 @@ BUCKET_START = 1000.0 * CARD_EARNING_BUCKET_SECONDS
 GENEROUS_TICK_SECONDS = 1000.0
 """A tick clamp above every step the worked examples take, so only the clamp test is clamped."""
 
+FINGERPRINT = "settings-a"
+OTHER_FINGERPRINT = "settings-b"
+
+
+@pytest.fixture
+def info_messages() -> Iterator[list[str]]:
+    """Collect the INFO-and-above loguru messages written during the test."""
+    messages: list[str] = []
+    sink_id = logger.add(lambda message: messages.append(message.record["message"]), level="INFO")
+    try:
+        yield messages
+    finally:
+        logger.remove(sink_id)
+
 
 def _accumulator(
-    *, max_tick_seconds: float = GENEROUS_TICK_SECONDS, path: Path | None = None
+    *,
+    max_tick_seconds: float = GENEROUS_TICK_SECONDS,
+    path: Path | None = None,
+    config_fingerprint: str = FINGERPRINT,
 ) -> CardEarningAccumulator:
-    return CardEarningAccumulator(max_tick_seconds=max_tick_seconds, path=path, clock=lambda: BUCKET_START)
+    return CardEarningAccumulator(
+        max_tick_seconds=max_tick_seconds,
+        config_fingerprint=config_fingerprint,
+        path=path,
+        clock=lambda: BUCKET_START,
+    )
+
+
+def _accumulator_with_one_job(*, path: Path | None = None) -> CardEarningAccumulator:
+    """An accumulator whose window holds 30 seconds and 12 kudos of model A on card 0."""
+    accumulator = _accumulator(path=path)
+    accumulator.observe(BUCKET_START, {0: CardTick()})
+    accumulator.observe(BUCKET_START + 30.0, {0: CardTick(in_flight_models=("A",))})
+    accumulator.credit_finished_job(device_index=0, model="A", kudos=12.0)
+    return accumulator
 
 
 class _Clock:
@@ -292,6 +326,7 @@ class TestPersistence:
         payload = {
             "schema_version": CARD_EARNING_SCHEMA_VERSION,
             "bucket_seconds": CARD_EARNING_BUCKET_SECONDS,
+            "config_fingerprint": FINGERPRINT,
             "buckets": [
                 {
                     "start": BUCKET_START,
@@ -352,3 +387,98 @@ class TestPersistence:
         accumulator.credit_finished_job(device_index=0, model="A", kudos=1.0)
 
         assert _accumulator(path=path).rate(model="A", device_index=0).jobs == 10
+
+
+class TestConfigurationWindow:
+    """Figures measured under one capacity and workload configuration are not read under another."""
+
+    def test_a_file_loads_intact_under_its_own_fingerprint(self, tmp_path: Path) -> None:
+        """The saved fingerprint matches, so the window loads back whole."""
+        path = tmp_path / "card_earning.json"
+        _accumulator_with_one_job(path=path).save()
+
+        rate = _accumulator(path=path).rate(model="A", device_index=0)
+
+        assert rate.model_seconds == pytest.approx(30.0)
+        assert rate.model_kudos_per_second == pytest.approx(12.0 / 30.0)
+        assert rate.jobs == 1
+
+    def test_a_file_loads_empty_under_another_fingerprint(self, tmp_path: Path, info_messages: list[str]) -> None:
+        """A file written under other settings is discarded, and the restart is logged."""
+        path = tmp_path / "card_earning.json"
+        _accumulator_with_one_job(path=path).save()
+
+        rate = _accumulator(path=path, config_fingerprint=OTHER_FINGERPRINT).rate(model="A", device_index=0)
+
+        assert rate.model_seconds == 0.0
+        assert rate.card_wall_seconds == 0.0
+        assert rate.jobs == 0
+        assert any("Card earning figures restart" in message for message in info_messages)
+
+    def test_a_file_without_a_fingerprint_loads_empty(self, tmp_path: Path) -> None:
+        """A file that does not record its settings counts as written under other settings."""
+        path = tmp_path / "card_earning.json"
+        _accumulator_with_one_job(path=path).save()
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        del payload["config_fingerprint"]
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        assert _accumulator(path=path).rate(model="A", device_index=0).card_wall_seconds == 0.0
+
+    def test_a_restart_during_a_run_drops_the_window_and_keeps_the_session_totals(
+        self, info_messages: list[str]
+    ) -> None:
+        """The rates read no seconds and no kudos, and the rollups' session totals are kept."""
+        accumulator = _accumulator_with_one_job()
+
+        accumulator.restart_window_if_changed(OTHER_FINGERPRINT)
+
+        rate = accumulator.rate(model="A", device_index=0)
+        assert rate.model_seconds == 0.0
+        assert rate.card_wall_seconds == 0.0
+        assert rate.model_kudos_per_second is None
+        assert rate.jobs == 0
+        assert accumulator.session_seconds_by_model() == {"A": pytest.approx(30.0)}
+        assert any("Card earning figures restart" in message for message in info_messages)
+
+    def test_ticks_after_a_restart_accrue_normally(self) -> None:
+        """The clock anchor survives the restart, so the next tick's seconds land in the new window."""
+        accumulator = _accumulator_with_one_job()
+        accumulator.restart_window_if_changed(OTHER_FINGERPRINT)
+
+        accumulator.observe(BUCKET_START + 40.0, {0: CardTick(in_flight_models=("A",))})
+        accumulator.credit_finished_job(device_index=0, model="A", kudos=5.0)
+
+        rate = accumulator.rate(model="A", device_index=0)
+        assert rate.model_seconds == pytest.approx(10.0)
+        assert rate.model_kudos_per_second == pytest.approx(0.5)
+        assert accumulator.session_seconds_by_model() == {"A": pytest.approx(40.0)}
+
+    def test_a_restart_adopts_the_new_fingerprint_in_the_file(self, tmp_path: Path) -> None:
+        """After a restart the saved window belongs to the new settings."""
+        path = tmp_path / "card_earning.json"
+        accumulator = _accumulator_with_one_job(path=path)
+        accumulator.restart_window_if_changed(OTHER_FINGERPRINT)
+        accumulator.observe(BUCKET_START + 40.0, {0: CardTick(in_flight_models=("A",))})
+        accumulator.save()
+
+        reloaded = _accumulator(path=path, config_fingerprint=OTHER_FINGERPRINT)
+
+        assert reloaded.rate(model="A", device_index=0).model_seconds == pytest.approx(10.0)
+
+    def test_the_same_fingerprint_does_not_restart_the_window(self, info_messages: list[str]) -> None:
+        """An unchanged fingerprint keeps the window and does not log."""
+        accumulator = _accumulator_with_one_job()
+
+        accumulator.restart_window_if_changed(FINGERPRINT)
+
+        assert accumulator.rate(model="A", device_index=0).model_seconds == pytest.approx(30.0)
+        assert not any("Card earning figures restart" in message for message in info_messages)
+
+    def test_a_change_with_an_empty_window_does_not_log(self, info_messages: list[str]) -> None:
+        """No figures are dropped, so no restart line is written."""
+        accumulator = _accumulator()
+
+        accumulator.restart_window_if_changed(OTHER_FINGERPRINT)
+
+        assert not any("Card earning figures restart" in message for message in info_messages)

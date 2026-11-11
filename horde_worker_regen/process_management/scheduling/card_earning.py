@@ -12,6 +12,11 @@ lanes that have a job in flight and the card's whole-card grant. The run metrics
 finished image record is folded into the rollups (:meth:`CardEarningAccumulator.credit_finished_job`). The
 process manager owns the instance, persists it beside ``perf_model.json`` and saves it at shutdown.
 
+The buckets hold figures for one capacity and workload configuration, named by its fingerprint
+(:func:`~horde_worker_regen.process_management.ipc.supervisor_channel.capacity_workload_fingerprint`). A file
+written under another fingerprint loads empty, and :meth:`CardEarningAccumulator.restart_window_if_changed`
+drops the buckets when the fingerprint changes during a run.
+
 The module only measures. It does not hold a threshold or a verdict, and scheduling does not read it.
 """
 
@@ -169,6 +174,7 @@ class CardEarningAccumulator:
         self,
         *,
         max_tick_seconds: float,
+        config_fingerprint: str = "",
         path: Path | None = None,
         clock: Callable[[], float] | None = None,
     ) -> None:
@@ -177,11 +183,14 @@ class CardEarningAccumulator:
         Args:
             max_tick_seconds: The most one tick may add. A larger gap means the control loop stalled, and the
                 stalled time is not evidence of what the card was doing.
+            config_fingerprint: The fingerprint of the capacity and workload settings the figures are measured
+                under. A persisted file written under another fingerprint loads empty.
             path: Where the buckets persist. None keeps them in memory only.
             clock: Wall-clock source, read to age the persisted buckets at load and to place a kudos credit
                 that arrives before the first tick. Defaults to ``time.time``.
         """
         self._max_tick_seconds = max_tick_seconds
+        self._config_fingerprint = config_fingerprint
         self._path = path
         self._clock: Callable[[], float] = clock if clock is not None else time.time
         self._buckets: dict[float, _EarningBucket] = {}
@@ -240,6 +249,26 @@ class CardEarningAccumulator:
         self._jobs_since_save += 1
         if self._jobs_since_save >= _PERSIST_EVERY_N_OBSERVATIONS:
             self.save()
+
+    def restart_window_if_changed(self, config_fingerprint: str) -> None:
+        """Mutate the window to start over when ``config_fingerprint`` differs from the current one.
+
+        The retained buckets are dropped and the new fingerprint is adopted. The session totals behind
+        :meth:`session_seconds_by_model` are kept, since the rollups read them as session figures. The clock
+        anchor is kept too, so the next tick accrues into the new window as usual.
+
+        Args:
+            config_fingerprint: The fingerprint of the current capacity and workload settings.
+        """
+        if config_fingerprint == self._config_fingerprint:
+            return
+        self._config_fingerprint = config_fingerprint
+        if not self._buckets:
+            return
+        self._buckets.clear()
+        _log_window_restart()
+        # Written at once so the file does not keep figures of the old settings until the next save.
+        self.save()
 
     def _credit_seconds(self, bucket: _EarningBucket, device_index: int, model: str, seconds: float) -> None:
         bucket.tally(device_index, model).seconds += seconds
@@ -344,6 +373,7 @@ class CardEarningAccumulator:
         return {
             "schema_version": CARD_EARNING_SCHEMA_VERSION,
             "bucket_seconds": CARD_EARNING_BUCKET_SECONDS,
+            "config_fingerprint": self._config_fingerprint,
             "buckets": buckets,
         }
 
@@ -351,7 +381,8 @@ class CardEarningAccumulator:
         """Load the persisted buckets, dropping each entry that is malformed, non-finite, negative or expired.
 
         A file of another schema version or bucket width is discarded whole, since its buckets cannot be merged
-        into this width.
+        into this width. A file written under another configuration fingerprint is discarded whole too, and a
+        file without a fingerprint counts as another one.
         """
         if self._path is None or not self._path.exists():
             return
@@ -368,6 +399,10 @@ class CardEarningAccumulator:
             return
         persisted_buckets = raw.get("buckets")
         if not isinstance(persisted_buckets, list):
+            return
+        if raw.get("config_fingerprint") != self._config_fingerprint:
+            if persisted_buckets:
+                _log_window_restart()
             return
         now = self._clock()
         dropped = 0
@@ -412,3 +447,7 @@ class CardEarningAccumulator:
         return dropped
 
     # endregion
+
+
+def _log_window_restart() -> None:
+    logger.info("Card earning figures restart because capacity or workload settings changed.")

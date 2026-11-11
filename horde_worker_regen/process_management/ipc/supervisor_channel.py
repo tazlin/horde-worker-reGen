@@ -14,6 +14,7 @@ fallback the launcher can swap to without touching any screen code.
 from __future__ import annotations
 
 import enum
+import hashlib
 import threading
 import time
 from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
@@ -244,6 +245,57 @@ class OrchestrationIntentSnapshot(BaseModel):
     updated_at: float = Field(default_factory=time.time)
 
 
+class CapacityWorkloadSettings(BaseModel):
+    """Represents the capacity and workload settings that the measured figures depend on.
+
+    These fields are the one list of settings that count as a capacity or workload change. The dashboard marks
+    its trends as stabilizing when they change, and the card earning store restarts its window. Figures
+    measured under one set of these values do not describe another.
+
+    ``max_threads`` is the live concurrent-inference cap. Supervisor concurrency and capacity commands move it
+    between config reloads, and those moves count as changes.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    num_models: int
+    max_power: int
+    max_threads: int
+    queue_size: int
+    max_batch: int
+    safety_on_gpu: bool
+    allow_img2img: bool
+    allow_lora: bool
+    allow_controlnet: bool
+    allow_sdxl_controlnet: bool
+    allow_post_processing: bool
+    high_performance_mode: bool
+    moderate_performance_mode: bool
+    extra_slow_worker: bool
+    alchemist: bool
+    alchemy_concurrent: bool
+    alchemy_max_concurrency: int
+    alchemy_vram_headroom_mb: int
+    alchemy_forms: tuple[str, ...]
+
+
+_CAPACITY_WORKLOAD_FINGERPRINT_HEX_DIGITS = 16
+"""Sixteen hex digits make an accidental match between two configurations negligible and keep the file short."""
+
+
+def capacity_workload_fingerprint(settings: CapacityWorkloadSettings) -> str:
+    """Return a short fingerprint of ``settings`` that is stable across processes and restarts.
+
+    The digest is persisted with the card earning store, so it is a content hash rather than ``hash()``, whose
+    value changes per process.
+
+    Args:
+        settings: The capacity and workload settings to fingerprint.
+    """
+    digest = hashlib.sha256(settings.model_dump_json().encode("utf-8")).hexdigest()
+    return digest[:_CAPACITY_WORKLOAD_FINGERPRINT_HEX_DIGITS]
+
+
 class WorkerConfigSummary(BaseModel):
     """The operationally-relevant bridge-data fields the overview/worker panels display.
 
@@ -288,6 +340,8 @@ class WorkerConfigSummary(BaseModel):
     alchemy_vram_headroom_mb: int = 2000
     alchemy_caption_enabled: bool = False
     alchemy_forms: list[str] = Field(default_factory=list)
+    config_fingerprint: str = ""
+    """The worker's :func:`capacity_workload_fingerprint`. Empty when the worker did not compute one."""
 
     scribe: bool = False
     """Whether the operator selected the text-generation role."""

@@ -17,6 +17,7 @@ from horde_worker_regen.process_management.ipc.messages import HeldComponentSnap
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
     SUPERVISOR_PROTOCOL_VERSION,
     TEXT_BACKEND_PROCESS_ID,
+    CapacityWorkloadSettings,
     DisaggStageRow,
     ModelPoolBenchRow,
     ModelPoolSeatReadiness,
@@ -36,6 +37,7 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     WorkerConfigSummary,
     WorkerLivenessFrame,
     WorkerStateSnapshot,
+    capacity_workload_fingerprint,
 )
 from horde_worker_regen.process_management.scheduling.workload_flow import WorkloadKind
 
@@ -953,3 +955,61 @@ def test_a_map_derived_row_is_never_external() -> None:
     assert inference.text_backend is None
     assert inference.display_state is None
     assert inference.os_pid is None
+
+
+def _capacity_workload_settings() -> CapacityWorkloadSettings:
+    return CapacityWorkloadSettings(
+        num_models=3,
+        max_power=8,
+        max_threads=2,
+        queue_size=1,
+        max_batch=1,
+        safety_on_gpu=False,
+        allow_img2img=True,
+        allow_lora=False,
+        allow_controlnet=False,
+        allow_sdxl_controlnet=False,
+        allow_post_processing=True,
+        high_performance_mode=False,
+        moderate_performance_mode=False,
+        extra_slow_worker=False,
+        alchemist=False,
+        alchemy_concurrent=True,
+        alchemy_max_concurrency=1,
+        alchemy_vram_headroom_mb=2000,
+        alchemy_forms=("caption",),
+    )
+
+
+def _changed_value(current: object) -> object:
+    if isinstance(current, bool):
+        return not current
+    if isinstance(current, int):
+        return current + 1
+    if isinstance(current, tuple):
+        return (*current, "strip_background")
+    raise AssertionError(f"no change rule for {current!r}")
+
+
+def test_equal_settings_have_equal_fingerprints() -> None:
+    """Two separately built equal settings give one fingerprint, so a persisted value matches on reload."""
+    assert capacity_workload_fingerprint(_capacity_workload_settings()) == capacity_workload_fingerprint(
+        _capacity_workload_settings()
+    )
+
+
+@pytest.mark.parametrize("field_name", list(CapacityWorkloadSettings.model_fields))
+def test_changing_any_listed_setting_changes_the_fingerprint(field_name: str) -> None:
+    """Every listed integer, flag and form list is part of the fingerprint."""
+    settings = _capacity_workload_settings()
+    changed = settings.model_copy(update={field_name: _changed_value(getattr(settings, field_name))})
+
+    assert capacity_workload_fingerprint(changed) != capacity_workload_fingerprint(settings)
+
+
+def test_the_form_order_is_part_of_the_fingerprint() -> None:
+    """The forms are fingerprinted as configured, so reordering them counts as a change."""
+    settings = _capacity_workload_settings().model_copy(update={"alchemy_forms": ("caption", "nsfw")})
+    reordered = settings.model_copy(update={"alchemy_forms": ("nsfw", "caption")})
+
+    assert capacity_workload_fingerprint(reordered) != capacity_workload_fingerprint(settings)
