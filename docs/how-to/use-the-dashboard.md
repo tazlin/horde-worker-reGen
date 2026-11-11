@@ -303,7 +303,9 @@ resets mark the trends as stabilizing.
 held work. It therefore reads steadily instead of sawtoothing on each submit, and it charges neither
 the cold start before your first job nor an idle or maintenance stretch. A pause still counts while it
 drains queued work, since kudos keep landing. The session figure in the hero line and the status bar is
-the same measure over the whole session. An alchemist worker gets a **Forms/hr** row beside Jobs/hr.
+the same measure over the whole session. The held-work clock is worker-wide (`WorkerState.tick_eligible_seconds`),
+so the rate does not split by card or model. The per-model figure is described in
+[Stats export](../reference/stats.md#per-model-rollups). An alchemist worker gets a **Forms/hr** row beside Jobs/hr.
 
 If the GPU is near-idle while a job is in flight, the Trends border and its GPU-duty row turn orange
 with a `(!)`. On a multi-GPU worker the row states each card's own duty and the alert names the card it

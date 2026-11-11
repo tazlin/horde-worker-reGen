@@ -50,6 +50,7 @@ from horde_worker_regen.telemetry_spans import (
 if TYPE_CHECKING:
     from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
     from horde_worker_regen.process_management.jobs.job_tracker import TrackedJob
+    from horde_worker_regen.process_management.scheduling.card_earning import CardEarningAccumulator
 
 ChurnKind = Literal[
     "model_swap",
@@ -799,8 +800,24 @@ class WorkerRunMetrics:
     the process lifecycle manager records crash events.
     """
 
-    def __init__(self, *, baseline_resolver: Callable[[str], str | None] | None = None) -> None:
-        """Initialize empty aggregation state."""
+    def __init__(
+        self,
+        *,
+        baseline_resolver: Callable[[str], str | None] | None = None,
+        card_earning: CardEarningAccumulator | None = None,
+    ) -> None:
+        """Initialize empty aggregation state.
+
+        Args:
+            baseline_resolver: Resolves a model name to its baseline for the rollups.
+            card_earning: The per-card earning accumulator the manager owns. A folded image record credits its
+                kudos to it, and the per-model rollups read their attributed card seconds from it. ``None``
+                leaves both at zero.
+        """
+        self._card_earning = card_earning
+        self._card_seconds_anchor: dict[str, float] = (
+            card_earning.session_seconds_by_model() if card_earning is not None else {}
+        )
         self._jobs: list[JobMetricsRecord] = []
         self._events: deque[WorkerEvent] = deque(maxlen=RECENT_EVENTS_IN_SNAPSHOT)
         self._next_event_sequence = 1
@@ -862,6 +879,10 @@ class WorkerRunMetrics:
         self._model_rollups.clear()
         self._baseline_rollups.clear()
         self._form_rollups.clear()
+        # The accumulator keeps its trailing window across a reset, so the rollups restart their card seconds
+        # from its totals at this moment.
+        if self._card_earning is not None:
+            self._card_seconds_anchor = self._card_earning.session_seconds_by_model()
         self._decision_states.clear()
         for times in self._churn_event_times.values():
             times.clear()
@@ -1503,12 +1524,35 @@ class WorkerRunMetrics:
         )
 
     def model_rollups(self) -> list[StatsRollupRow]:
-        """Return finalized image-job rollups by model."""
-        return sorted(self._model_rollups.values(), key=lambda row: row.jobs, reverse=True)
+        """Return finalized image-job rollups by model, with each model's attributed card seconds."""
+        session_seconds = self._session_card_seconds_by_model()
+        rows = [
+            row.model_copy(update={"attributed_card_seconds": session_seconds.get(row.model or "", 0.0)})
+            for row in self._model_rollups.values()
+        ]
+        return sorted(rows, key=lambda row: row.jobs, reverse=True)
 
     def baseline_rollups(self) -> list[StatsRollupRow]:
-        """Return finalized image-job rollups by baseline."""
-        return sorted(self._baseline_rollups.values(), key=lambda row: row.jobs, reverse=True)
+        """Return finalized image-job rollups by baseline, with the card seconds of the baseline's models."""
+        session_seconds = self._session_card_seconds_by_model()
+        seconds_by_baseline: dict[str | None, float] = {}
+        for model, baseline in self._model_rollups:
+            seconds_by_baseline[baseline] = seconds_by_baseline.get(baseline, 0.0) + session_seconds.get(
+                model or "",
+                0.0,
+            )
+        rows = [
+            row.model_copy(update={"attributed_card_seconds": seconds_by_baseline.get(baseline, 0.0)})
+            for baseline, row in self._baseline_rollups.items()
+        ]
+        return sorted(rows, key=lambda row: row.jobs, reverse=True)
+
+    def _session_card_seconds_by_model(self) -> dict[str, float]:
+        """Return each model's attributed card seconds since construction or the last reset."""
+        if self._card_earning is None:
+            return {}
+        totals = self._card_earning.session_seconds_by_model()
+        return {model: seconds - self._card_seconds_anchor.get(model, 0.0) for model, seconds in totals.items()}
 
     def form_rollups(self) -> list[StatsRollupRow]:
         """Return finalized alchemy-form rollups by form (``model`` includes the form name)."""
@@ -1566,6 +1610,14 @@ class WorkerRunMetrics:
         baseline_row = self._baseline_rollups.setdefault(baseline, StatsRollupRow(baseline=baseline))
         self._add_to_rollup(baseline_row, record)
 
+        # The record's device index is the lane's, and the accumulator files card time under the lane's index too.
+        if self._card_earning is not None and record.device_index is not None and record.model_name is not None:
+            self._card_earning.credit_finished_job(
+                device_index=record.device_index,
+                model=record.model_name,
+                kudos=None if record.faulted else record.kudos_reward,
+            )
+
     def _fold_form_rollup(self, record: JobMetricsRecord) -> None:
         """Fold a finished alchemy form into the by-form rollup (keyed by form name).
 
@@ -1583,6 +1635,7 @@ class WorkerRunMetrics:
         row.megapixelsteps += record.megapixelsteps
         row.sampling_seconds += record.sampling_seconds or 0.0
         row.e2e_seconds += record.e2e_seconds or 0.0
+        row.kudos += record.kudos_reward or 0.0
         if record.batch_count > 1:
             row.batch_gt_one_jobs += 1
         if record.faulted:

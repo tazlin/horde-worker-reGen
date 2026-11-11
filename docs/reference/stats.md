@@ -42,6 +42,13 @@ deletion; a foreign file, a leftover `.tmp`, or a nested folder is never touched
 | `decision`       | On an admission/dispatch/reclaim verdict (coalesced) | `decision_kind`, `subject`, `verdict`, `reason`, and a flat `inputs` map of the quantities the arbiter decided from. |
 | `resource_state` | On a device/overflow transition (edge-triggered) | `state_kind` (governor / WDDM paging / saturation-unresolved / dispatch hold), `state`, `device_index`, and flat `inputs`. A `dispatch_hold` record is written when a head's dispatch is first held by the residency gate (`standing`), when it is admitted (`released`, with `reason` `measured_attempt`, `reclaim` or `natural_free`), or when the job leaves the queue unadmitted (`abandoned`). Its inputs include the measured room breakdown described below plus `hold_seconds`. |
 
+The `kudos_per_hour` on a `stats_sample` is the session's kudos over its productive seconds,
+`eligible_seconds_total`, times 3600. The productive clock (`WorkerState.tick_eligible_seconds`) starts at the
+first submit and runs only while the pipeline holds a job anywhere, clamped per control tick. It is worker-wide
+and does not split by card or model. A window's rate is the difference of two samples' `kudos_this_session` over
+the difference of their `eligible_seconds_total`. The per-card, per-model figure is in
+[Per-model rollups](#per-model-rollups).
+
 A `stats_sample` carries card 0's free memory from the reading admission prices against (`device_free_mb`,
 with `device_free_provenance`) and three figures recorded for comparison that nothing acts on:
 `device_free_child_reported_mb` (what the card's processes report), `device_free_ledger_capped_mb` (that
@@ -206,6 +213,45 @@ safety footprint and `safety_off_gpu` is omitted from the room's rung fields ent
 cannot offer, not a currently forbidden action an operator setting could unlock. A job held because the safety
 backlog temporarily excludes its only eligible card is classified under the `safety_backlog_exclusion`
 dispatch-stall bucket until the backlog drains.
+
+## Per-model rollups
+
+The worker folds every finished job into session rollups, which reach the dashboard on the supervisor snapshot
+(`WorkerStateSnapshot.stats_model_rollups`, `stats_baseline_rollups` and `stats_form_rollups`). The JSONL export
+does not write them. A row is a
+[`StatsRollupRow`][horde_worker_regen.process_management.ipc.supervisor_channel.StatsRollupRow]:
+
+| Rollup | Key | Folded from |
+| ------ | --- | ----------- |
+| By model | `model` and `baseline` | Each finished image job. |
+| By baseline | `baseline` | Each finished image job. |
+| By form | `model`, which holds the alchemy form's name | Each finished alchemy form. |
+
+| Field | Meaning |
+| ----- | ------- |
+| `jobs`, `faulted_jobs` | Jobs (or forms) folded, and how many of them faulted. |
+| `megapixelsteps` | `width x height / 1,000,000 x steps x batch`, summed. |
+| `sampling_seconds` | The children's sampling seconds, summed. Two lanes sampling at once each add theirs. |
+| `e2e_seconds` | Pop to the end of submit, summed. |
+| `batch_gt_one_jobs` | Jobs with a batch above one. |
+| `vram_high_water_mb` | The highest VRAM high-water a child reported for a folded job. |
+| `kudos` | The horde's paid kudos, summed. A faulted job or one without a figure adds 0. |
+| `attributed_card_seconds` | The card seconds attributed to the model this session, summed over cards, by the rules in [Card-time attribution](../explanation/duty-cycle.md#card-time-attribution-which-model-each-card-second-went-to). A baseline row sums its models' rows. A form row reads 0. |
+
+`kudos` over `attributed_card_seconds` is the model's kudos per card second. Unlike `sampling_seconds`, a card's
+attributed seconds never exceed its wall, so the figure is a rate of the card. The attributed seconds include the
+time of jobs that have not finalized yet. A benchmark level's reset restarts the rollups, and with them the
+attributed seconds.
+
+### Persisted card earning
+
+The same figures, kept per card and per model in trailing 15-minute buckets, persist to
+`.horde_worker_regen/card_earning.json` beside `perf_model.json`. The file is written after every tenth finished
+job and at shutdown, by an atomic replace. A bucket counts for 24 hours after it closes. Load discards a file of
+another schema version or bucket width, and drops each entry that is malformed, non-finite, negative or
+older than the retention. Under test the figures stay in memory. The read is
+`CardEarningAccumulator.rate`: the model's kudos per attributed second, the card's other kudos per remaining wall
+second, the model's job count and both denominators. A rate is `None` when its denominator is zero.
 
 ## Stats tab: the Model pool section
 

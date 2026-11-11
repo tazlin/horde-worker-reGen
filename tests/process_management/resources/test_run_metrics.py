@@ -30,6 +30,7 @@ from horde_worker_regen.process_management.resources.run_metrics import (
     ResourceStateKind,
     WorkerRunMetrics,
 )
+from horde_worker_regen.process_management.scheduling.card_earning import CardEarningAccumulator, CardTick
 from horde_worker_regen.process_management.scheduling.workload_flow import WorkloadKind
 from horde_worker_regen.process_management.simulation._dummy_jobs import dummy_job_factory
 
@@ -761,6 +762,35 @@ def _finalize_job_from(metrics: WorkerRunMetrics, job: object) -> None:
     )
 
 
+def _finalize_on_card(
+    metrics: WorkerRunMetrics,
+    *,
+    device_index: int,
+    kudos_reward: float | None,
+    faulted: bool = False,
+) -> None:
+    """Finalize a job whose sampling metrics arrived from a lane on ``device_index``."""
+    job = dummy_job_factory("Deliberate")
+    assert job.id_ is not None
+    metrics.on_job_metrics(_job_metrics_message(str(job.id_)), device_index=device_index)
+    tracked = TrackedJob(
+        job_id=job.id_,
+        sdk_api_job_info=job,
+        stage=JobStage.PENDING_SUBMIT,
+        time_popped=100.0,
+        kudos_reward=kudos_reward,
+        stage_timestamps={"FINALIZED": 112.0},
+    )
+    metrics.on_job_finalized(
+        tracked,
+        HordeJobInfo(
+            sdk_api_job_info=job,
+            state=GENERATION_STATE.faulted if faulted else GENERATION_STATE.ok,
+            time_popped=100.0,
+        ),
+    )
+
+
 class TestAggregates:
     """Aggregation of downloads, high-water marks, crash events, and counters."""
 
@@ -897,6 +927,55 @@ class TestStatsRollupsAndExport:
         assert metrics.model_rollups() == []
         assert metrics.baseline_rollups() == []
         assert [row.model for row in metrics.form_rollups()] == ["caption"]
+
+    def test_rollups_total_kudos_and_a_fault_adds_none(self) -> None:
+        """Model and baseline rows sum the paid kudos of their jobs, and a faulted job adds nothing."""
+        metrics = WorkerRunMetrics(baseline_resolver=lambda _model: "stable_diffusion_1")
+        _finalize_job(metrics, kudos_reward=4.0)
+        _finalize_job(metrics, kudos_reward=6.5)
+        _finalize_job(metrics, faulted=True, fault_reason="boom")
+
+        assert metrics.model_rollups()[0].kudos == 10.5
+        assert metrics.baseline_rollups()[0].kudos == 10.5
+
+    def test_folded_records_credit_the_card_earning_accumulator(self) -> None:
+        """A folded record credits its card and model, and the rollups read the model's attributed card seconds."""
+        accumulator = CardEarningAccumulator(max_tick_seconds=1000.0)
+        metrics = WorkerRunMetrics(baseline_resolver=lambda _model: "stable_diffusion_1", card_earning=accumulator)
+        accumulator.observe(9000.0, {1: CardTick()})
+        accumulator.observe(9008.0, {1: CardTick(in_flight_models=("Deliberate",))})
+
+        _finalize_on_card(metrics, device_index=1, kudos_reward=16.0)
+        _finalize_on_card(metrics, device_index=1, kudos_reward=None, faulted=True)
+
+        rate = accumulator.rate(model="Deliberate", device_index=1)
+        assert rate.jobs == 2
+        assert rate.model_kudos_per_second == 2.0
+        assert metrics.model_rollups()[0].attributed_card_seconds == 8.0
+        assert metrics.baseline_rollups()[0].attributed_card_seconds == 8.0
+
+    def test_a_record_without_a_card_does_not_credit_the_accumulator(self) -> None:
+        """A job that never reported a sampling card has no card to credit."""
+        accumulator = CardEarningAccumulator(max_tick_seconds=1000.0)
+        metrics = WorkerRunMetrics(card_earning=accumulator)
+
+        _finalize_job(metrics, kudos_reward=4.0)
+
+        assert accumulator.rate(model="Deliberate", device_index=0).jobs == 0
+
+    def test_reset_restarts_the_rollup_card_seconds(self) -> None:
+        """After a reset the rollups count card seconds from the reset, while the accumulator keeps its window."""
+        accumulator = CardEarningAccumulator(max_tick_seconds=1000.0)
+        accumulator.observe(9000.0, {0: CardTick()})
+        accumulator.observe(9008.0, {0: CardTick(in_flight_models=("Deliberate",))})
+        metrics = WorkerRunMetrics(card_earning=accumulator)
+        metrics.reset()
+        accumulator.observe(9011.0, {0: CardTick(in_flight_models=("Deliberate",))})
+
+        _finalize_on_card(metrics, device_index=0, kudos_reward=3.0)
+
+        assert metrics.model_rollups()[0].attributed_card_seconds == 3.0
+        assert accumulator.rate(model="Deliberate", device_index=0).model_seconds == 11.0
 
     def test_jsonl_export_writes_sample_and_job_events(self, tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
         """Export writes typed stats_sample and job_completed events under the session stats directory."""

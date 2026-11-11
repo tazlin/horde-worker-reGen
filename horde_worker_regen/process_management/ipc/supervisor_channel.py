@@ -918,6 +918,15 @@ class StatsRollupRow(BaseModel):
     """How many of the folded jobs/forms faulted (the by-form table surfaces this per form)."""
     vram_high_water_mb: int = 0
     """Peak VRAM high-water observed across the folded jobs/forms, when a child reported it (0 otherwise)."""
+    kudos: float = 0.0
+    """Kudos the horde paid for the folded jobs/forms. A faulted job or one without a reported figure adds 0."""
+    attributed_card_seconds: float = 0.0
+    """Card seconds attributed to the row's model this session, summed over cards (by-model and by-baseline rows
+    only, 0 on a by-form row).
+
+    A second of a card belongs to its lanes with a job in flight, split equally, or to the model of the card's
+    whole-card grant while no job is in flight. Unlike ``sampling_seconds``, the shares on one card sum to at most
+    the card's wall, so ``kudos`` over this figure is a card rate. It includes time of jobs not yet finalized."""
 
 
 class StatsExportState(BaseModel):

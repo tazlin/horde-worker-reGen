@@ -168,7 +168,7 @@ launches the headless worker as a child. Other console scripts: `download_models
 `horde-worker-host`, `horde-benchmark`. Full flag/env reference: [CLI](docs/reference/cli.md).
 
 **Durable state** lives in `.horde_worker_regen/` in the working directory (state.json,
-owned_pids.json, action_ledger.jsonl, perf_model.json, vram_footprints.json), alongside `bridgeData.yaml`, `logs/`, and
+owned_pids.json, action_ledger.jsonl, perf_model.json, vram_footprints.json, card_earning.json), alongside `bridgeData.yaml`, `logs/`, and
 `benchmark_results/`.
 
 ### Scheduling and admission, by mechanism
@@ -383,6 +383,12 @@ uv run pytest -m chaos_sweep        # generated wedge-liveness sweep (pre-releas
   `hordelib.utils.torch_memory`). (2) Device queries (`enumerate_accelerators`, `get_torch_*_vram_mb`)
   load torch when called; run them out-of-process via `utils/accelerator_probe.py::probe_accelerators`.
   `tests/process_management/manager/test_orchestrator_torch_free.py` is the tripwire.
+- **A single-card host has two keys for its one card.** A lane's `HordeProcessInfo.device_index` is always a
+  real index, 0 on a single-card host. The scheduler, the job tracker and the whole-card ledger key per-card
+  facts by `None` there and by the device index only on a multi-card host. Convert with
+  `InferenceScheduler._routing_device_index`, or with `device_index if self._multi_gpu_routing_active else None`
+  where only an index is in hand. A read that passes 0 to a `None`-keyed store returns nothing and does not
+  raise.
 - **Subprocesses must never download model references.** The parent owns reference downloading; use
   `reference_helper` for an offline reference manager in a child. On-disk layout facts live in
   `horde_model_reference.on_disk_layout`. Beta (pending-queue) records reach children the same way. The parent

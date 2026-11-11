@@ -290,6 +290,28 @@ so `horde-log duty` reports the same breakdown per session offline, alongside a 
 occupancy** line (share of wall at each in-flight count) computed from the samples' `jobs_in_progress`,
 which works even on stats files predating the slot-duty fields.
 
+### Card-time attribution: which model each card second went to
+
+Slot duty counts anonymous slots across the worker. It does not record which model a card's time went to, so a
+model's kudos per card second cannot be read from it. The same tick also feeds
+[`CardEarningAccumulator`][horde_worker_regen.process_management.scheduling.card_earning.CardEarningAccumulator],
+which splits each card's elapsed time by three rules:
+
+1. The card's lanes with a job in flight share the time equally, and each share goes to that job's model. A lane
+   counts from dispatch to its result, so a job's load, encode and decode are charged to its model.
+2. With no job in flight and a whole-card grant of either rung on the card, the time goes to the held model. The
+   establishment, the release and a held card's idle time are then charged to the model that caused them.
+3. Otherwise the time counts in the card's wall only.
+
+The card's wall grows by the whole elapsed time in all three cases. The two figures differ in what they can
+exceed. Slot-seconds are elapsed time times busy slots, so a card with two sampling lanes books two slot-seconds
+per wall second. Attributed card seconds are a split of one card's wall, so a card's attributed seconds never
+exceed its wall, and kudos over them is a card rate. Kudos are credited per card and model when a finished
+job's record is folded into the rollups. The model rate is the model's kudos over its seconds, and the rest rate
+is the card's other kudos over its wall less the model's seconds. Both are read over a trailing day kept beside
+`perf_model.json` (see [Stats export](../reference/stats.md#per-model-rollups)). Scheduling and the pop offer do
+not read them.
+
 ### The dashboard
 
 The [TUI dashboard](../how-to/use-the-dashboard.md) shows the same sampled figure live: the health

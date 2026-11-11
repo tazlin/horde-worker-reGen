@@ -45,6 +45,7 @@ these files, read [Architecture](../explanation/architecture.md) first.
 | VRAM/RAM budgeting and metrics         | `process_management/resources/`, especially `vram_arbiter.py` and `resource_budget.py` |
 | Host-resource governance               | `process_management/scheduling/governance/` (`ResourceGovernor`)   |
 | Concurrent-overlap headway rule        | `process_management/scheduling/concurrent_overlap.py` (`concurrent_overlap_permitted`) |
+| What a model earns per card second (attributed card seconds and kudos per card and model, trailing and persisted) | `process_management/scheduling/card_earning.py` (`CardEarningAccumulator`, `CardTick`, `CardEarningRate`); fed by `InferenceScheduler._observe_card_earning` and `WorkerRunMetrics._fold_rollup` |
 | Control-loop log coalescing            | `process_management/scheduling/diagnostic_throttle.py` (`DiagnosticThrottle`) |
 | VRAM retention state and arithmetic    | `process_management/scheduling/ledgers/retention.py` (`RetentionLedger`, `RetentionFit`) |
 | Runtime safety placement evidence      | `process_management/scheduling/ledgers/safety_placement.py` (`SafetyPlacementInputs`, `SafetyPlacementLedger`) |

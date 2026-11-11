@@ -267,6 +267,10 @@ from horde_worker_regen.process_management.resources.vram_footprints import (
     card_total_gb,
 )
 from horde_worker_regen.process_management.scheduling import pool_ranker
+from horde_worker_regen.process_management.scheduling.card_earning import (
+    CARD_EARNING_FILENAME,
+    CardEarningAccumulator,
+)
 from horde_worker_regen.process_management.scheduling.clearance_lease import (
     ClearanceController,
     ClearanceLeaseProxy,
@@ -1596,9 +1600,20 @@ class HordeWorkerProcessManager:
             ),
         )
 
+        # What each model earns per card second. The manager owns it and saves it at shutdown. The scheduler
+        # feeds its card time each tick and the run metrics credit its kudos as records fold. It persists beside
+        # the performance model. Under test it stays in memory, as the performance model does.
+        self._card_earning = CardEarningAccumulator(
+            max_tick_seconds=self._ELIGIBLE_MAX_TICK_DT_SECONDS,
+            path=None if os.environ.get("AI_HORDE_TESTING") else default_app_state_dir() / CARD_EARNING_FILENAME,
+        )
+
         # Built before the collaborators that record on its event ring, and before the stats-export and
         # session-start calls below that need the rest of the manager's configuration.
-        self._run_metrics = WorkerRunMetrics(baseline_resolver=self._safe_model_baseline)
+        self._run_metrics = WorkerRunMetrics(
+            baseline_resolver=self._safe_model_baseline,
+            card_earning=self._card_earning,
+        )
 
         self._download_coordinator = ModelDownloadCoordinator(
             state=self._state,
@@ -1862,6 +1877,7 @@ class HordeWorkerProcessManager:
             max_inference_processes=self.max_inference_processes,
             lru=self._lru,
             performance_model=self._performance_model,
+            card_earning=self._card_earning,
             reserve_ledger=self._reserve_ledger,
             post_processing_lane_commitments_provider=lambda: getattr(
                 getattr(self, "_alchemy_coordinator", None),
@@ -9695,6 +9711,7 @@ class HordeWorkerProcessManager:
         self._note_session_end_reason("graceful_shutdown")
         self._performance_model.save()
         self._learned_footprint_store.save()
+        self._card_earning.save()
         self._shutdown_manager.shutdown()
 
     def _abort(self) -> None:

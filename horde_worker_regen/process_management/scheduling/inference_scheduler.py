@@ -191,6 +191,7 @@ from horde_worker_regen.process_management.scheduling.admission.snapshot import 
     build_scheduling_snapshot,
     snapshot_ledgers,
 )
+from horde_worker_regen.process_management.scheduling.card_earning import CardEarningAccumulator, CardTick
 from horde_worker_regen.process_management.scheduling.clearance_lease import (
     CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS,
     TAIL_OVERLAP_MIN_PROGRESS_FOR_ESTIMATE,
@@ -614,6 +615,7 @@ class InferenceScheduler:
     _max_inference_processes: int
     _lru: LRUCache
     _performance_model: PerformanceModel | None
+    _card_earning: CardEarningAccumulator | None
 
     _preload_delay_notified: bool
     _pending_line_skip: NextJobAndProcess | None
@@ -648,6 +650,7 @@ class InferenceScheduler:
         max_inference_processes: int,
         lru: LRUCache,
         performance_model: PerformanceModel | None = None,
+        card_earning: CardEarningAccumulator | None = None,
         reserve_ledger: CommittedReserveLedger | None = None,
         post_processing_lane_commitments_provider: Callable[[], int] | None = None,
         pool_protected_models_provider: Callable[[], frozenset[str]] | None = None,
@@ -685,6 +688,9 @@ class InferenceScheduler:
             lru (LRUCache): The worker's LRU cache, used to track recently used models for unloading decisions.
             performance_model (PerformanceModel | None): Supplies an expected sampling time per dispatched
                 job for the audit ledger (and, in a later phase, slow-job remediation). May be ``None``.
+            card_earning (CardEarningAccumulator | None): The per-card earning accumulator the manager owns. The
+                scheduler gives it each card's lanes and whole-card grant once per tick. ``None`` (unit tests
+                driving the scheduler alone) does not record card time.
             reserve_ledger (CommittedReserveLedger | None): The shared committed-VRAM/RAM ledger every
                 workload flow contributes to, so image generation and alchemy cannot independently admit
                 against the same free VRAM. When ``None`` (unit tests driving the scheduler alone) a private
@@ -759,6 +765,7 @@ class InferenceScheduler:
         self._max_inference_processes = max_inference_processes
         self._lru = lru
         self._performance_model = performance_model
+        self._card_earning = card_earning
         # Optional sink for between-jobs reload/respawn events, set by the manager to
         # WorkerRunMetrics.record_churn. None in unit tests that drive the scheduler directly.
         self._churn_observer: Callable[[ChurnKind], None] | None = None
@@ -5169,7 +5176,11 @@ class InferenceScheduler:
         child loads, encodes or uploads before its first step. When one of several primed lanes is held the tick
         books ``CLEARANCE_HOLD``, since the accumulator takes one bucket for all empty slots. Without the lease
         dispatch is the sampling moment, so busy is the in-progress count.
+
+        The same tick also gives the card earning accumulator each card's lanes and whole-card grant
+        (:meth:`_observe_card_earning`).
         """
+        self._observe_card_earning()
         # The slots priced here are every sampling slot the worker owns, and the in-progress count compared
         # against them is worker-wide, so the capacity is the sum over driven cards (one card's figure on a
         # single-GPU host).
@@ -5235,6 +5246,33 @@ class InferenceScheduler:
             waiting_jobs=max(waiting, 0),
             hold=hold,
         )
+
+    def _observe_card_earning(self) -> None:
+        """Give the card earning accumulator each card's in-flight models and whole-card grant for this tick.
+
+        A lane counts while it owns a dispatched job, from dispatch to the job's result, whatever state it
+        reports, so a job's load, encode and decode are charged to its model. The accumulator keys cards by the
+        lane's device index, while the whole-card ledger keys a single-card host by ``None``. The ledger read uses
+        the scheduler's card-to-key mapping (``device_index if self._multi_gpu_routing_active else None``).
+        """
+        if self._card_earning is None:
+            return
+        in_flight_by_card: dict[int, list[str]] = {device_index: [] for device_index in self._card_runtimes}
+        for process_info in self._process_map.values():
+            if process_info.process_type != HordeProcessType.INFERENCE:
+                continue
+            lane_models = in_flight_by_card.setdefault(process_info.device_index, [])
+            job = process_info.current_inference_job()
+            if job is not None and job.model is not None:
+                lane_models.append(str(job.model))
+        cards: dict[int, CardTick] = {}
+        for device_index, models in in_flight_by_card.items():
+            held = self._whole_card_ledger.get(device_index if self._multi_gpu_routing_active else None)
+            cards[device_index] = CardTick(
+                in_flight_models=tuple(models),
+                held_model=held.model if held is not None else None,
+            )
+        self._card_earning.observe(self._clock(), cards)
 
     def _clearance_gate_holds_lane(self, process_info: HordeProcessInfo) -> bool:
         """Whether the clearance gate is holding the job of a lane whose child has entered its clearance wait.
