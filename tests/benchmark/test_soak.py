@@ -7,18 +7,29 @@ from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopRequest, LorasPa
 
 from horde_worker_regen.benchmark.capabilities.result import SuggestedBridgeData
 from horde_worker_regen.benchmark.enums import BenchTier
+from horde_worker_regen.benchmark.pricing_corpus import _HEAVY_ANCHORS, KREA2_A
 from horde_worker_regen.benchmark.scenarios import CannedAlchemyFormSpec, CannedImageJobSpec, Scenario
 from horde_worker_regen.benchmark.soak import (
     PRODUCTION_REPLAY_FLUX_MODELS,
     PRODUCTION_REPLAY_SD15_MODELS,
     PRODUCTION_REPLAY_SDXL_MODELS,
+    WHOLE_CARD_STREAK_BREAK_LENGTHS,
+    WHOLE_CARD_STREAK_DEFAULT_BREAK_MODEL,
+    WHOLE_CARD_STREAK_DEFAULT_MODEL,
+    WHOLE_CARD_STREAK_LENGTHS,
+    WHOLE_CARD_STREAK_MIN_SHARED_LORAS,
+    WHOLE_CARD_STREAK_SIZES,
     build_lora_storm_soak_scenario,
     build_production_replay_soak_scenario,
     build_soak_scenario,
+    build_whole_card_streak_soak_scenario,
 )
+from horde_worker_regen.harness import HarnessConfig
 from horde_worker_regen.process_management.simulation._canned_scenarios import (
     GeneratingAlchemySource,
     GeneratingJobSource,
+    SequencedJobSource,
+    SoakDrawOrder,
     SoakImageTemplate,
 )
 
@@ -454,3 +465,178 @@ class TestProductionReplayMix:
         for _ in range(5):
             response = source.next_pop_response()
             assert list(response.payload.post_processing or []) == pp_spec.post_processing
+
+
+def _pop_request_for(models: list[str]) -> ImageGenerateJobPopRequest:
+    """Build a permissive pop request that offers only ``models``."""
+    return ImageGenerateJobPopRequest(  # type: ignore[call-arg]
+        apikey="0000000000",
+        name="test-worker",
+        models=models,
+        max_pixels=2048 * 2048,
+        allow_lora=True,
+    )
+
+
+class TestSequencedJobSource:
+    """The sequenced source serves templates in listed order and waits for a withheld model."""
+
+    def test_serves_each_template_its_weight_in_a_row_then_repeats(self) -> None:
+        """A template's weight is a run length, and the sequence starts over after the last template."""
+        source = SequencedJobSource(
+            [SoakImageTemplate(model="A", weight=2.0), SoakImageTemplate(model="B", weight=3.0)],
+        )
+
+        models = [source.next_pop_response().model for _ in range(12)]
+
+        assert models == ["A", "A", "B", "B", "B", "A", "A", "B", "B", "B", "A", "A"]
+
+    def test_withheld_model_yields_no_job_and_keeps_the_position(self) -> None:
+        """While the next job's model is not offered, a job is not served and the sequence does not advance."""
+        source = SequencedJobSource(
+            [SoakImageTemplate(model="A", weight=1.0), SoakImageTemplate(model="B", weight=1.0)],
+        )
+        assert source.next_pop_response(_pop_request_for(["A", "B"])).model == "A"
+        position = source.position
+
+        for _ in range(3):
+            assert source.next_pop_response(_pop_request_for(["A"])).id_ is None
+            assert source.position == position
+
+        assert source.next_pop_response(_pop_request_for(["A", "B"])).model == "B"
+        assert source.next_pop_response(_pop_request_for(["A", "B"])).model == "A"
+
+    def test_minted_jobs_get_fresh_ids(self) -> None:
+        """Repeating the sequence mints new generation ids rather than re-serving old jobs."""
+        source = SequencedJobSource([SoakImageTemplate(model="A", weight=1.0)])
+
+        ids = {source.next_pop_response().id_ for _ in range(10)}
+
+        assert len(ids) == 10
+
+    def test_stop_ends_generation(self) -> None:
+        """A stopped source reports exhausted and does not serve a job."""
+        source = SequencedJobSource([SoakImageTemplate(model="A", weight=1.0)])
+        source.stop()
+
+        assert source.exhausted is True
+        assert source.next_pop_response().id_ is None
+
+    @pytest.mark.parametrize("weight", [0.0, 1.5])
+    def test_weight_must_be_a_whole_run_length(self, weight: float) -> None:
+        """A weight that is not a whole number of at least 1 cannot be a run length."""
+        with pytest.raises(ValueError, match="whole-number weight"):
+            SequencedJobSource([SoakImageTemplate(model="A", weight=weight)])
+
+
+def _streak_runs(specs: list[CannedImageJobSpec]) -> list[tuple[str, int]]:
+    """Collapse the listed specs into ``(model, consecutive jobs)`` runs in serving order."""
+    runs: list[tuple[str, int]] = []
+    for spec in specs:
+        if runs and runs[-1][0] == spec.model:
+            runs[-1] = (spec.model, runs[-1][1] + spec.count)
+        else:
+            runs.append((spec.model, spec.count))
+    return runs
+
+
+class TestWholeCardStreakMix:
+    """The `whole_card_streak` mix serves streaks of one whole-card model broken by short runs of a smaller one."""
+
+    def test_is_a_sequenced_soak(self) -> None:
+        """The mix is served in listed order, and the harness gets that order from the scenario."""
+        scenario = build_whole_card_streak_soak_scenario(soak_seconds=60.0)
+        config = HarnessConfig.from_scenario(scenario, process_mode="fake", timeout_seconds=120.0)
+
+        assert scenario.name == "whole_card_streak"
+        assert scenario.soak_order is SoakDrawOrder.SEQUENCE
+        assert config.soak_order is SoakDrawOrder.SEQUENCE
+
+    def test_streak_and_break_lengths(self) -> None:
+        """Streaks of 8 to 12 whole-card jobs alternate with breaks of 3 to 4 smaller-model jobs."""
+        runs = _streak_runs(build_whole_card_streak_soak_scenario(soak_seconds=60.0).image_jobs)
+
+        expected: list[tuple[str, int]] = []
+        for streak_length, break_length in zip(
+            WHOLE_CARD_STREAK_LENGTHS, WHOLE_CARD_STREAK_BREAK_LENGTHS, strict=True
+        ):
+            expected.append((WHOLE_CARD_STREAK_DEFAULT_MODEL, streak_length))
+            expected.append((WHOLE_CARD_STREAK_DEFAULT_BREAK_MODEL, break_length))
+        assert runs == expected
+        assert all(8 <= length <= 12 for length in WHOLE_CARD_STREAK_LENGTHS)
+        assert all(3 <= length <= 4 for length in WHOLE_CARD_STREAK_BREAK_LENGTHS)
+
+    def test_minted_order_is_deterministic(self) -> None:
+        """Two sources built from the mix mint the same models, sizes and LoRAs in the same order."""
+
+        def _minted() -> list[tuple[str | None, int | None, int | None, list[str]]]:
+            templates, _ = build_whole_card_streak_soak_scenario(soak_seconds=60.0).to_soak_templates()
+            source = SequencedJobSource(templates)
+            responses = [source.next_pop_response() for _ in range(150)]
+            return [
+                (
+                    response.model,
+                    response.payload.width,
+                    response.payload.height,
+                    [entry.name for entry in response.payload.loras or []],
+                )
+                for response in responses
+            ]
+
+        first = _minted()
+        assert _minted() == first
+        cycle_length = sum(WHOLE_CARD_STREAK_LENGTHS) + sum(WHOLE_CARD_STREAK_BREAK_LENGTHS)
+        assert first[cycle_length : 2 * cycle_length] == first[:cycle_length]
+
+    def test_whole_card_jobs_take_the_anchor_shape(self) -> None:
+        """Whole-card jobs use the pricing corpus's Krea2 anchor settings at the measured sizes, batch 1."""
+        anchor = _HEAVY_ANCHORS[KREA2_A]
+        specs = build_whole_card_streak_soak_scenario(soak_seconds=60.0).image_jobs
+        whole_card = [spec for spec in specs if spec.model == KREA2_A]
+
+        assert {(spec.width, spec.height) for spec in whole_card} == set(WHOLE_CARD_STREAK_SIZES)
+        for spec in whole_card:
+            assert spec.steps == anchor.steps == 8
+            assert spec.cfg_scale == anchor.cfg_scale
+            assert spec.sampler_name == anchor.sampler_name
+            assert spec.scheduler == anchor.scheduler
+            assert spec.n_iter == 1
+            assert spec.post_processing == []
+
+    def test_break_jobs_are_plain(self) -> None:
+        """Break jobs do not have a LoRA or post-processing."""
+        specs = build_whole_card_streak_soak_scenario(soak_seconds=60.0).image_jobs
+        breaks = [spec for spec in specs if spec.model == WHOLE_CARD_STREAK_DEFAULT_BREAK_MODEL]
+
+        assert breaks
+        assert all(not spec.lora_names and not spec.post_processing for spec in breaks)
+
+    def test_lora_pattern(self) -> None:
+        """Half the whole-card jobs have one shared-pool LoRA, with every transition between neighbours."""
+        shared = ["s0", "s1", "s2"]
+        specs = build_whole_card_streak_soak_scenario(soak_seconds=60.0, shared_lora_references=shared).image_jobs
+        loras = [tuple(spec.lora_names) for spec in specs if spec.model == KREA2_A]
+
+        assert all(len(names) <= 1 for names in loras)
+        assert {name for names in loras for name in names} == set(shared)
+        with_lora = sum(1 for names in loras if names)
+        assert abs(with_lora - len(loras) / 2) <= 1
+        neighbours = list(zip(loras, loras[1:], strict=False))
+        assert any(previous and not current for previous, current in neighbours)
+        assert any(not previous and current for previous, current in neighbours)
+        assert any(previous and current and previous == current for previous, current in neighbours)
+        assert any(previous and current and previous != current for previous, current in neighbours)
+
+    def test_model_is_a_parameter(self) -> None:
+        """The whole-card model is a builder parameter, and a model without a heavy anchor is refused."""
+        anchored = next(model for model in _HEAVY_ANCHORS if model != KREA2_A)
+        specs = build_whole_card_streak_soak_scenario(soak_seconds=60.0, whole_card_model=anchored).image_jobs
+        assert anchored in {spec.model for spec in specs}
+
+        with pytest.raises(ValueError, match="does not have a heavy anchor"):
+            build_whole_card_streak_soak_scenario(soak_seconds=60.0, whole_card_model="Deliberate")
+
+    def test_undersized_shared_pool_is_rejected(self) -> None:
+        """A shared pool too small for the pattern fails fast."""
+        with pytest.raises(ValueError, match=f"at least {WHOLE_CARD_STREAK_MIN_SHARED_LORAS} shared"):
+            build_whole_card_streak_soak_scenario(soak_seconds=60.0, shared_lora_references=["only", "two"])

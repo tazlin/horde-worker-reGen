@@ -16,14 +16,15 @@ from horde_worker_regen.benchmark.soak import (
     operator_throughput_overrides,
     strip_auxiliary_references,
 )
+from horde_worker_regen.process_management.simulation._canned_scenarios import SoakDrawOrder
 
 
 class TestSoakMixSelection:
     """`--mix` picks a named mix and `--no-loras` strips its auxiliary references."""
 
-    def test_both_mixes_are_offered(self) -> None:
+    def test_every_mix_is_offered(self) -> None:
         """The CLI choices are the mixes the builders implement, production cadence first."""
-        assert SOAK_MIXES == ("production_replay", "lora_storm")
+        assert SOAK_MIXES == ("production_replay", "lora_storm", "whole_card_streak")
 
     @pytest.mark.parametrize("mix", SOAK_MIXES)
     def test_scenario_is_a_soak_named_after_its_mix(self, mix: str) -> None:
@@ -76,6 +77,34 @@ class TestSoakMixSelection:
         """A partial pool fails fast rather than building a mix that measures the failure path."""
         with pytest.raises(ValueError, match="at least 3 shared and 8 unique"):
             build_soak_mix_scenario("lora_storm", soak_seconds=42.0, shared_lora_references=["only-one"])
+
+    def test_whole_card_streak_reads_the_shared_pool_only(self) -> None:
+        """The streak mix takes its LoRAs from the shared pool and ignores a supplied unique pool."""
+        shared = [f"real-shared-{index}" for index in range(3)]
+
+        scenario = build_soak_mix_scenario(
+            "whole_card_streak",
+            soak_seconds=42.0,
+            shared_lora_references=shared,
+            unique_lora_references=["real-unique-0"],
+        )
+
+        referenced = {name for spec in scenario.image_jobs for name in spec.lora_names}
+        assert referenced == set(shared)
+
+    def test_lora_is_version_marks_every_lora_spec(self) -> None:
+        """`lora_is_version` marks each LoRA-bearing spec, and LoRA-free specs keep the default."""
+        scenario = build_soak_mix_scenario(
+            "whole_card_streak",
+            soak_seconds=42.0,
+            shared_lora_references=["101", "102", "103"],
+            lora_is_version=True,
+        )
+
+        assert all(spec.lora_is_version for spec in scenario.image_jobs if spec.lora_names)
+        assert not any(spec.lora_is_version for spec in scenario.image_jobs if not spec.lora_names)
+        templates, _ = scenario.to_soak_templates()
+        assert all(entry.is_version for template in templates for entry in template.loras)
 
     def test_stripping_is_idempotent(self) -> None:
         """Stripping an already-stripped scenario is a no-op, so a doubled pass cannot lose templates."""
@@ -254,6 +283,50 @@ class TestSoakSubcommandPlumbing:
 
         assert rc == 0
         assert captured["config"].bridge_data_overrides == {}
+
+    def test_whole_card_streak_mix_is_accepted(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """`--mix whole_card_streak` runs the sequenced mix with version-id LoRAs from the shared pool."""
+        captured = self._capture_harness_call(monkeypatch)
+        out_dir = tmp_path / "out"
+
+        rc = main(
+            [
+                "soak",
+                "--mix",
+                "whole_card_streak",
+                "--minutes",
+                "0.5",
+                "--process-mode",
+                "fake",
+                "--ignore-bridge-data",
+                "--shared-lora",
+                "101",
+                "--shared-lora",
+                "102",
+                "--shared-lora",
+                "103",
+                "--lora-is-version",
+                "--out",
+                str(out_dir),
+            ],
+        )
+        capsys.readouterr()
+
+        assert rc == 0
+        config = captured["config"]
+        assert config.scenario_id == "whole_card_streak"
+        assert config.soak_order is SoakDrawOrder.SEQUENCE
+        loras = [entry for template in config.soak_image_templates for entry in template.loras]
+        assert {entry.name for entry in loras} == {"101", "102", "103"}
+        assert all(entry.is_version for entry in loras)
+        manifest = json.loads((out_dir / "soak.json").read_text(encoding="utf-8"))
+        assert manifest["mix"] == "whole_card_streak"
+        assert manifest["lora_is_version"] is True
 
     def test_malformed_override_is_rejected_before_any_worker_starts(
         self,

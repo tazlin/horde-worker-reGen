@@ -674,11 +674,33 @@ worker faster", which needs two runs that differ only in the setting under test.
 that (the model mix and job sizes vary between any two hours), so the mix is generated locally from the
 same templates the `run` soak uses.
 
-Two mixes are available. `production_replay` (the default) reproduces the shape of a measured production
+Three mixes are available. `production_replay` (the default) reproduces the shape of a measured production
 pop stream: SDXL-family dominant with an SD1.5 and a rare Flux minority, batch sizes and job magnitudes
 matching the observed distribution, LoRAs on a realistic minority of pops, post-processing on about a
 third. `lora_storm` is the adversarial download-pressure mix (roughly two thirds of pops carry LoRAs).
-Both are described under [LoRA backpressure](../explanation/performance_and_backpressure.md).
+`whole_card_streak` serves streaks of 8 to 12 jobs for `Krea2-Turbo_fp8`, a model that takes the whole of a
+16 GB card, each followed by 3 or 4 jobs of `WAI-NSFW-illustrious-SDXL`. It measures how the worker keeps a
+whole-card model's weights between that model's jobs and what it pays to take the card back after a break.
+All three are described under [LoRA backpressure](../explanation/performance_and_backpressure.md).
+
+**How each pop is chosen.** `production_replay` and `lora_storm` draw each job at random, weighted by
+template, with a fixed seed. Before each draw the pop request filters the candidates: a template whose
+model is not offered, whose size is above the advertised `max_pixels`, or whose feature is withheld is
+left out. So two arms see the same jobs only while the worker offers the same thing on every pop. A
+setting that changes the offer (a pop claim, a large-model limiter) changes the traffic too.
+`whole_card_streak` serves its jobs in a fixed, repeating order instead. When the next job's model is not
+offered, the pop does not get a job and the order does not move on. Both arms therefore see the same
+sequence, and a withheld model costs its waiting time, as it would on the horde.
+
+The streak mix's whole-card jobs take the `anchor.krea2` cell of the pricing corpus (8 steps, guidance 1,
+`er_sde` with the `simple` schedule), batch 1, no post-processing, cycling through 1024x1024, 832x1216,
+896x1152, 576x1024 and 1024x576. Its SDXL jobs are 1024x1024 at 25 steps, without a LoRA or
+post-processing. Half its whole-card jobs have one LoRA from the shared pool, in a fixed pattern. The pattern
+places a LoRA job after a LoRA-free job and the reverse, and two LoRA jobs in a row with the same LoRA and
+with different ones. It reads the first three `--shared-lora` references and ignores `--unique-lora`. As
+with a withheld model, the next LoRA job is not served while the pop does not advertise LoRA support. One
+cause is the concurrent-LoRA cap (`JobPopper._lora_queue_cap_reached`), so two LoRA jobs in a row are not
+both queued on a worker with one or two inference processes.
 
 The run measures the **operator's own configuration**: the throughput-shaping fields of `bridgeData.yaml`
 (`max_threads`, `queue_size`, `high_performance_mode`, `moderate_performance_mode`, `safety_on_gpu`,
@@ -692,17 +714,26 @@ the templates' own features. `--override key=value` layers on top, and is the A/
 
 | Flag | Default | Meaning |
 |------|---------|---------|
-| `--mix {production_replay,lora_storm}` | `production_replay` | Which traffic mix to sustain. |
+| `--mix {production_replay,lora_storm,whole_card_streak}` | `production_replay` | Which traffic mix to sustain. |
 | `--minutes N` | `20` | How long to sustain it. Short runs are noisy; prefer 20 minutes or more per arm. |
 | `--process-mode {fake,dry_run,real}` | `real` | Only `real` measures anything; `fake`/`dry_run` exercise the plumbing and export no stats. |
 | `--out DIR` | `benchmark_results/<ts>` | Run directory for `controller.log` and the `soak.json` manifest. |
 | `--label TEXT` | — | A label for this run, such as `baseline` or `unload-on`. It appears in the manifest and the closing summary. |
 | `--bridge-data PATH` | `bridgeData.yaml` | Worker config to copy the throughput settings from. |
 | `--ignore-bridge-data` | off | Copy nothing from the worker config. The run uses the benchmark defaults plus any `--override`. |
-| `--override KEY=VALUE` | — | Set one config value for this run, over the worker config. Repeatable. |
+| `--override KEY=VALUE` | — | Set one config value for this run, over the worker config. Repeatable. Any `bridgeData.yaml` field is accepted, including ones outside the copied list. The value is read as a bool, `none`, an int, a float or a string, and the config model validates it. An unknown key is kept without effect and without a warning, so check the spelling. |
 | `--no-loras` | off | Remove every LoRA and textual-inversion reference from the mix. |
 | `--shared-lora REFERENCE` | synthetic pool | A downloadable LoRA reference for the pool the mix reuses across jobs (the cache-hit pool). Repeatable. Give at least 3. |
-| `--unique-lora REFERENCE` | synthetic pool | A downloadable LoRA reference for the pool the mix uses once each (the download-pressure pool). Repeatable. Give at least 8. |
+| `--unique-lora REFERENCE` | synthetic pool | A downloadable LoRA reference for the pool the mix uses once each (the download-pressure pool). Repeatable. Give at least 8. `whole_card_streak` does not use it. |
+| `--lora-is-version` | off | Read every LoRA reference as a CivitAI version id. |
+
+**LoRA reference forms.** A reference takes one of three forms, resolved by hordelib's
+`fetch_adhoc_lora_with_reason`. Without `--lora-is-version`, a numeric reference is a CivitAI model id,
+and the job uses that model's latest version at the time it resolves. Any other text is a name, which goes
+through CivitAI's search. With `--lora-is-version`, every reference must be a numeric CivitAI version id,
+and the job uses exactly that file. Use version ids when two arms are compared, so a LoRA that gains a new
+version between them does not change the weights or add a download. Each form needs a CivitAI metadata
+request the first time a reference resolves.
 
 ```bash
 # Arm A: the worker as configured today.
@@ -714,12 +745,29 @@ horde-benchmark soak --minutes 20 --label unload-on --no-loras --override legacy
 # The adversarial download mix, with real LoRA references so the prefetch path is exercised:
 horde-benchmark soak --mix lora_storm --minutes 30 \
   --shared-lora GlowingRunesAI --shared-lora ... --unique-lora ...
+
+# Whole-card streaks, without LoRAs and then with three pinned LoRA versions that fit the model:
+horde-benchmark soak --mix whole_card_streak --minutes 20 --label streak-a --no-loras
+horde-benchmark soak --mix whole_card_streak --minutes 20 --label streak-a-loras \
+  --lora-is-version --shared-lora <version id> --shared-lora <version id> --shared-lora <version id>
 ```
 
-**The LoRA caveat.** Both mixes ship *synthetic* default LoRA and textual-inversion reference names, which
+A run writes these files:
+
+- The stats export, `.horde_worker_regen/stats/stats-v*.jsonl` under the run root, in real mode only. Its
+  `job_completed` rows have the per-job `phase_metrics`, and `soak.json` lists the files and the session id.
+- The parent log, `logs/bridge_harness.log` under the run root.
+- Each child process's log, `logs/bridge_<id>.log` under the run root, with a child's startup crash in
+  `logs/bridge_<role>_startup.log`.
+- The controller log, `controller.log`, and the manifest, `soak.json`, in the `--out` directory.
+
+The run root is the working directory, unless `HORDE_WORKER_RUN_ROOT` sets another one.
+
+**The LoRA caveat.** Every mix ships *synthetic* default LoRA and textual-inversion reference names, which
 exist only so a fake-mode run has something to mint. In a real-mode run they cannot resolve, so every
 LoRA-bearing job would measure the prefetch failure path instead of production cadence. Either supply
-resolvable references (`--shared-lora` / `--unique-lora`, at least 3 and 8 respectively) or pass
+resolvable references (`--shared-lora` / `--unique-lora`, at least 3 and 8 respectively, or at least 3
+`--shared-lora` for `whole_card_streak`) or pass
 `--no-loras`, which strips LoRA *and* textual-inversion references from every template while leaving the
 model, resolution, batch and post-processing shape untouched. `--no-loras` makes the mix slightly cheaper
 than production (no LoRA load, no download pressure); that is a fair comparison between two arms run the

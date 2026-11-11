@@ -82,7 +82,9 @@ from horde_worker_regen.process_management.simulation._canned_scenarios import (
     CannedTextSource,
     GeneratingAlchemySource,
     GeneratingJobSource,
+    SequencedJobSource,
     SoakAlchemyForm,
+    SoakDrawOrder,
     SoakImageTemplate,
     TimedJobSource,
     image_template_to_feature_flags,
@@ -386,6 +388,10 @@ class HarnessConfig:
     soak_image_templates: list[SoakImageTemplate] = field(default_factory=list)
     """Weighted job templates the soak generates image jobs from (required when soaking)."""
 
+    soak_order: SoakDrawOrder = SoakDrawOrder.WEIGHTED
+    """How the soak picks each job's template: a random draw by weight, or the listed order (see
+    :class:`~horde_worker_regen.process_management.simulation._canned_scenarios.SequencedJobSource`)."""
+
     soak_alchemy_templates: Sequence[SoakAlchemyForm] = field(default_factory=list)
     """Weighted ``(form, weight)`` or ``(form, weight, control_type)`` entries the soak generates alchemy
     forms from (optional). The control type has an ``annotation`` form's detector identity."""
@@ -428,6 +434,7 @@ class HarnessConfig:
             return cls(
                 soak_seconds=scenario.soak_seconds,
                 soak_image_templates=image_templates,
+                soak_order=scenario.soak_order,
                 soak_alchemy_templates=alchemy_templates,
                 process_mode=process_mode,
                 skip_api=True,
@@ -1258,7 +1265,9 @@ def build_harness_process_manager(
 
     canned_job_source: CannedJobSource | None = None
     if config.skip_api:
-        if config.soak_seconds is not None:
+        if config.soak_seconds is not None and config.soak_order is SoakDrawOrder.SEQUENCE:
+            canned_job_source = SequencedJobSource(config.soak_image_templates)
+        elif config.soak_seconds is not None:
             canned_job_source = GeneratingJobSource(config.soak_image_templates)
         elif config.arrival is not None:
             canned_job_source = TimedJobSource(scenario, config.arrival)

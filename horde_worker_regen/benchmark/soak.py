@@ -31,12 +31,14 @@ from horde_worker_regen.benchmark.ladder import (
     BENCH_TIER_MODELS,
     tier_canned_job_overrides,
 )
+from horde_worker_regen.benchmark.pricing_corpus import _HEAVY_ANCHORS, KREA2_A
 from horde_worker_regen.benchmark.report import SuggestedBridgeData
 from horde_worker_regen.benchmark.scenarios import (
     CannedAlchemyFormSpec,
     CannedImageJobSpec,
     Scenario,
 )
+from horde_worker_regen.process_management.simulation._canned_scenarios import SoakDrawOrder
 
 _SOAK_POST_PROCESSING = [KNOWN_UPSCALERS.RealESRGAN_x4plus.value, KNOWN_FACEFIXERS.GFPGAN.value]
 """A representative upscaler + face-fixer pair for the soak's post-processing profile."""
@@ -400,11 +402,142 @@ def build_production_replay_soak_scenario(
     return Scenario(name="production_replay", image_jobs=image_jobs, soak_seconds=soak_seconds)
 
 
-SoakMix = Literal["production_replay", "lora_storm"]
+WHOLE_CARD_STREAK_DEFAULT_MODEL = KREA2_A
+"""The default model of the ``whole_card_streak`` mix's streaks.
+
+It is an extra-large model that takes the whole of a 16 GB card as a partial load, so each streak starts a
+whole-card residency and each break ends it."""
+
+WHOLE_CARD_STREAK_DEFAULT_BREAK_MODEL = PRODUCTION_REPLAY_SDXL_MODELS[0]
+"""The smaller model whose short runs break up the streaks: the dominant SDXL checkpoint of ``production_replay``."""
+
+WHOLE_CARD_STREAK_LENGTHS: tuple[int, ...] = (10, 8, 12, 9, 11)
+"""The number of consecutive whole-card jobs in each streak, in serving order, before the cycle repeats."""
+
+WHOLE_CARD_STREAK_BREAK_LENGTHS: tuple[int, ...] = (3, 4, 4, 3, 3)
+"""The number of consecutive break-model jobs after each streak, paired with :data:`WHOLE_CARD_STREAK_LENGTHS`."""
+
+WHOLE_CARD_STREAK_SIZES: tuple[tuple[int, int], ...] = (
+    (1024, 1024),
+    (832, 1216),
+    (896, 1152),
+    (576, 1024),
+    (1024, 576),
+)
+"""The ``(width, height)`` of each whole-card job in turn, taken from measured traffic for Krea2."""
+
+WHOLE_CARD_STREAK_LORA_PATTERN: tuple[int | None, ...] = (0, 0, None, None, 1, 2, None, None)
+"""For each whole-card job in turn, the index into the shared LoRA pool, or None for a job without a LoRA.
+
+Half the jobs have a LoRA. The pattern includes a LoRA job after a LoRA-free job and the reverse, and two LoRA
+jobs in a row with the same LoRA and with different ones."""
+
+WHOLE_CARD_STREAK_MIN_SHARED_LORAS = 1 + max(index for index in WHOLE_CARD_STREAK_LORA_PATTERN if index is not None)
+"""The smallest shared LoRA pool that covers every index in :data:`WHOLE_CARD_STREAK_LORA_PATTERN`."""
+
+_WHOLE_CARD_STREAK_BREAK_STEPS = 25
+"""Steps for a break-model job, the same as ``production_replay``'s plain template for that model."""
+
+_WHOLE_CARD_STREAK_SHARED_REFERENCES: tuple[str, ...] = tuple(
+    f"whole_card_streak_shared_{index:02d}" for index in range(WHOLE_CARD_STREAK_MIN_SHARED_LORAS)
+)
+"""Synthetic shared LoRA pool for the ``whole_card_streak`` mix, meaningful only in a fake-mode run."""
+
+
+def build_whole_card_streak_soak_scenario(
+    *,
+    soak_seconds: float,
+    shared_lora_references: Sequence[str] = _WHOLE_CARD_STREAK_SHARED_REFERENCES,
+    whole_card_model: str = WHOLE_CARD_STREAK_DEFAULT_MODEL,
+    break_model: str = WHOLE_CARD_STREAK_DEFAULT_BREAK_MODEL,
+) -> Scenario:
+    """Build the ``whole_card_streak`` soak: streaks of one whole-card model broken by short runs of a smaller one.
+
+    The jobs are served in a fixed, repeating order (:attr:`Scenario.soak_order` is ``sequence``), so two runs
+    that differ in one setting see the same jobs in the same order. Each streak takes the card for the
+    whole-card model and each break releases it, so a run measures how the worker keeps that model's weights
+    between its own jobs and what it pays to take the card back.
+
+    - **Streaks** of :data:`WHOLE_CARD_STREAK_LENGTHS` whole-card jobs, each followed by
+      :data:`WHOLE_CARD_STREAK_BREAK_LENGTHS` break-model jobs, then the cycle repeats.
+    - **Whole-card jobs** take the step count, guidance, sampler and schedule of the model's heavy anchor in the
+      pricing corpus, batch 1, no post-processing, cycling through :data:`WHOLE_CARD_STREAK_SIZES`.
+    - **Break jobs** are 1024x1024 at 25 steps with the canned default sampler, no LoRA and no post-processing.
+    - **LoRAs** follow :data:`WHOLE_CARD_STREAK_LORA_PATTERN` over the whole-card jobs and are drawn from the
+      shared pool only. The break jobs do not have a LoRA, since a pool chosen for the whole-card model need
+      not fit the break model.
+
+    Args:
+        soak_seconds: How long to sustain the mix.
+        shared_lora_references: The LoRA pool the pattern draws from. At least
+            :data:`WHOLE_CARD_STREAK_MIN_SHARED_LORAS`. The defaults are synthetic and do not resolve in a
+            real-mode run.
+        whole_card_model: The model served by the streaks. It needs a heavy anchor in the pricing corpus, which is
+            where its job shape comes from.
+        break_model: The smaller model whose runs break the streaks.
+
+    Raises:
+        ValueError: If the shared pool is too small, or the whole-card model does not have a heavy anchor.
+    """
+    if len(shared_lora_references) < WHOLE_CARD_STREAK_MIN_SHARED_LORAS:
+        raise ValueError(
+            f"the whole_card_streak mix needs at least {WHOLE_CARD_STREAK_MIN_SHARED_LORAS} shared LoRA "
+            f"references (got {len(shared_lora_references)})",
+        )
+    anchor = _HEAVY_ANCHORS.get(whole_card_model)
+    if anchor is None:
+        raise ValueError(
+            f"{whole_card_model} does not have a heavy anchor in the pricing corpus to take its job shape from",
+        )
+
+    shared = tuple(shared_lora_references)
+    image_jobs: list[CannedImageJobSpec] = []
+    whole_card_job_index = 0
+    for streak_length, break_length in zip(WHOLE_CARD_STREAK_LENGTHS, WHOLE_CARD_STREAK_BREAK_LENGTHS, strict=True):
+        for _ in range(streak_length):
+            width, height = WHOLE_CARD_STREAK_SIZES[whole_card_job_index % len(WHOLE_CARD_STREAK_SIZES)]
+            lora_index = WHOLE_CARD_STREAK_LORA_PATTERN[whole_card_job_index % len(WHOLE_CARD_STREAK_LORA_PATTERN)]
+            image_jobs.append(
+                CannedImageJobSpec(
+                    model=whole_card_model,
+                    width=width,
+                    height=height,
+                    steps=anchor.steps,
+                    cfg_scale=anchor.cfg_scale,
+                    n_iter=1,
+                    sampler_name=anchor.sampler_name,
+                    scheduler=anchor.scheduler,
+                    lora_names=[shared[lora_index]] if lora_index is not None else [],
+                    count=1,
+                ),
+            )
+            whole_card_job_index += 1
+        image_jobs.append(
+            CannedImageJobSpec(
+                model=break_model,
+                width=1024,
+                height=1024,
+                steps=_WHOLE_CARD_STREAK_BREAK_STEPS,
+                count=break_length,
+            ),
+        )
+
+    return Scenario(
+        name="whole_card_streak",
+        image_jobs=image_jobs,
+        soak_seconds=soak_seconds,
+        soak_order=SoakDrawOrder.SEQUENCE,
+    )
+
+
+SoakMix = Literal["production_replay", "lora_storm", "whole_card_streak"]
 """The named sustained-traffic mixes a standalone soak can run."""
 
-SOAK_MIXES: tuple[SoakMix, ...] = ("production_replay", "lora_storm")
+SOAK_MIXES: tuple[SoakMix, ...] = ("production_replay", "lora_storm", "whole_card_streak")
 """``SoakMix`` values in CLI choice order; the first is the default (production cadence)."""
+
+SHARED_LORA_POOL_ONLY_MIXES: frozenset[SoakMix] = frozenset({"whole_card_streak"})
+"""Mixes that draw LoRAs from the shared pool alone and ignore ``--unique-lora``."""
 
 OPERATOR_THROUGHPUT_BRIDGE_FIELDS: tuple[str, ...] = (
     "max_threads",
@@ -468,6 +601,7 @@ def build_soak_mix_scenario(
     shared_lora_references: Sequence[str] | None = None,
     unique_lora_references: Sequence[str] | None = None,
     include_auxiliary_references: bool = True,
+    lora_is_version: bool = False,
 ) -> Scenario:
     """Build one named soak mix, optionally with its LoRA/TI references stripped.
 
@@ -477,23 +611,38 @@ def build_soak_mix_scenario(
     the builders' synthetic default names would measure the resolution-failure path in a real-mode run.
     The result is a slightly cheaper mix than production (no LoRA load, no download pressure), which is
     the caveat a before/after comparison run this way has to carry.
+
+    ``lora_is_version=True`` marks every LoRA reference as a CivitAI version id. A version id identifies one
+    file, so two runs use the same weights even when the LoRA gains a newer version between them. A model id
+    resolves to the latest version at the time of the job. Textual-inversion references are not affected.
+
+    A mix in :data:`SHARED_LORA_POOL_ONLY_MIXES` does not read ``unique_lora_references``.
     """
-    shared = shared_lora_references if shared_lora_references is not None else None
-    unique = unique_lora_references if unique_lora_references is not None else None
     kwargs: dict[str, Any] = {"soak_seconds": soak_seconds}
-    if shared is not None:
-        kwargs["shared_lora_references"] = shared
-    if unique is not None:
-        kwargs["unique_lora_references"] = unique
+    if shared_lora_references is not None:
+        kwargs["shared_lora_references"] = shared_lora_references
+    if unique_lora_references is not None and mix not in SHARED_LORA_POOL_ONLY_MIXES:
+        kwargs["unique_lora_references"] = unique_lora_references
 
     if mix == "lora_storm":
         scenario = build_lora_storm_soak_scenario(**kwargs)
+    elif mix == "whole_card_streak":
+        scenario = build_whole_card_streak_soak_scenario(**kwargs)
     else:
         scenario = build_production_replay_soak_scenario(**kwargs)
 
-    if include_auxiliary_references:
-        return scenario
-    return strip_auxiliary_references(scenario)
+    if not include_auxiliary_references:
+        return strip_auxiliary_references(scenario)
+    if lora_is_version:
+        return scenario.model_copy(
+            update={
+                "image_jobs": [
+                    spec.model_copy(update={"lora_is_version": True}) if spec.lora_names else spec
+                    for spec in scenario.image_jobs
+                ],
+            },
+        )
+    return scenario
 
 
 def strip_auxiliary_references(scenario: Scenario) -> Scenario:
@@ -507,12 +656,21 @@ def strip_auxiliary_references(scenario: Scenario) -> Scenario:
 
 __all__ = [
     "OPERATOR_THROUGHPUT_BRIDGE_FIELDS",
+    "SHARED_LORA_POOL_ONLY_MIXES",
     "SOAK_MIXES",
+    "WHOLE_CARD_STREAK_BREAK_LENGTHS",
+    "WHOLE_CARD_STREAK_DEFAULT_BREAK_MODEL",
+    "WHOLE_CARD_STREAK_DEFAULT_MODEL",
+    "WHOLE_CARD_STREAK_LENGTHS",
+    "WHOLE_CARD_STREAK_LORA_PATTERN",
+    "WHOLE_CARD_STREAK_MIN_SHARED_LORAS",
+    "WHOLE_CARD_STREAK_SIZES",
     "SoakMix",
     "build_lora_storm_soak_scenario",
     "build_production_replay_soak_scenario",
     "build_soak_mix_scenario",
     "build_soak_scenario",
+    "build_whole_card_streak_soak_scenario",
     "operator_throughput_overrides",
     "strip_auxiliary_references",
 ]

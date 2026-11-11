@@ -21,6 +21,7 @@ from horde_worker_regen.process_management.simulation._canned_scenarios import (
     ArrivalSchedule,
     CannedAlchemySource,
     CannedJobSource,
+    SoakDrawOrder,
     SoakImageTemplate,
     TimedJobSource,
     make_alchemy_scenario,
@@ -110,6 +111,12 @@ class Scenario(BaseModel):
     """When set, this is a sustained-load soak: jobs/forms are *generated* continuously from
     the specs (their `count` becomes a relative weight) for this many seconds rather than the
     specs being expanded into a fixed list. See `to_soak_templates`."""
+    soak_order: SoakDrawOrder = SoakDrawOrder.WEIGHTED
+    """How a soak picks each job's spec.
+
+    ``weighted`` draws at random by `count` among the specs accepted by the pop request. ``sequence`` serves
+    the specs in listed order, each `count` times in a row, and waits while the pop request does not accept the next
+    job. A mix whose effect depends on runs of one model needs ``sequence``."""
 
     @property
     def total_image_jobs(self) -> int:

@@ -179,7 +179,14 @@ def _add_soak_parser(subparsers: argparse._SubParsersAction) -> None:
         default=[],
         metavar="REFERENCE",
         help="A downloadable LoRA reference for the pool the mix uses once each, so each use is a "
-        "download. Repeatable. Give at least 8.",
+        "download. Repeatable. Give at least 8. The whole_card_streak mix does not use this pool.",
+    )
+    soak.add_argument(
+        "--lora-is-version",
+        action="store_true",
+        help="Treat every --shared-lora and --unique-lora reference as a CivitAI version id. A version id "
+        "identifies one file, so two runs use the same weights. Without this flag a numeric reference is a "
+        "CivitAI model id and resolves to its latest version.",
     )
 
 
@@ -1374,7 +1381,11 @@ def _print_soak_summary(report: SessionDutyReport, *, label: str, stats_paths: l
 def _run_soak(args: argparse.Namespace) -> int:
     """Run one sustained-traffic soak mix and score it from the stats export it wrote."""
     from horde_worker_regen.benchmark.gate_driver import _parse_overrides
-    from horde_worker_regen.benchmark.soak import build_soak_mix_scenario, operator_throughput_overrides
+    from horde_worker_regen.benchmark.soak import (
+        SHARED_LORA_POOL_ONLY_MIXES,
+        build_soak_mix_scenario,
+        operator_throughput_overrides,
+    )
     from horde_worker_regen.benchmark.worker_env import ensure_worker_env
     from horde_worker_regen.harness import HarnessConfig, run_harness
     from horde_worker_regen.reference_helper import ensure_model_reference_manager_initialized
@@ -1388,6 +1399,7 @@ def _run_soak(args: argparse.Namespace) -> int:
             shared_lora_references=args.shared_lora or None,
             unique_lora_references=args.unique_lora or None,
             include_auxiliary_references=not args.no_loras,
+            lora_is_version=args.lora_is_version,
         )
     except (argparse.ArgumentTypeError, ValueError) as error:
         logger.error(str(error))
@@ -1406,11 +1418,16 @@ def _run_soak(args: argparse.Namespace) -> int:
             )
     bridge_overrides.update(cli_overrides)
 
-    if args.process_mode == "real" and not args.no_loras and not (args.shared_lora and args.unique_lora):
+    uses_unique_pool = args.mix not in SHARED_LORA_POOL_ONLY_MIXES
+    if not uses_unique_pool and args.unique_lora:
+        logger.warning(f"The {args.mix} mix uses the shared LoRA pool only, so --unique-lora is ignored.")
+    pools_supplied = bool(args.shared_lora) and (bool(args.unique_lora) or not uses_unique_pool)
+    if args.process_mode == "real" and not args.no_loras and not pools_supplied:
+        pool_flags = "--shared-lora/--unique-lora" if uses_unique_pool else "--shared-lora"
         logger.warning(
             f"The {args.mix} mix includes LoRA references, but they were not supplied, so its LoRA-bearing "
             "templates use synthetic names that cannot resolve: those jobs would measure the prefetch "
-            "failure path. Pass --shared-lora/--unique-lora with resolvable references, or --no-loras.",
+            f"failure path. Pass {pool_flags} with resolvable references, or --no-loras.",
         )
 
     ensure_worker_env(args.process_mode)
@@ -1458,6 +1475,7 @@ def _run_soak(args: argparse.Namespace) -> int:
         "minutes": args.minutes,
         "process_mode": args.process_mode,
         "loras_included": not args.no_loras,
+        "lora_is_version": args.lora_is_version,
         "bridge_overrides": bridge_overrides,
         "jobs_completed": result.num_jobs_completed,
         "jobs_faulted": result.num_jobs_faulted,

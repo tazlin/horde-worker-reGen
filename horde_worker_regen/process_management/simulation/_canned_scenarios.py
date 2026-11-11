@@ -10,6 +10,7 @@ import uuid
 import zlib
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from enum import StrEnum
 
 from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
 from horde_sdk.ai_horde_api.apimodels import (
@@ -756,6 +757,66 @@ class GeneratingJobSource(CannedJobSource):
         if not templates:
             return make_empty_pop_response()
         template = self._rng.choices(templates, weights=weights, k=1)[0]
+        return make_job_from_template(template)
+
+
+class SoakDrawOrder(StrEnum):
+    """How a soak source picks the template for each pop."""
+
+    WEIGHTED = "weighted"
+    """A seeded random draw by weight over the templates accepted by the pop request."""
+    SEQUENCE = "sequence"
+    """The templates in their listed order, each served as many times in a row as its weight, then repeated."""
+
+
+class SequencedJobSource(GeneratingJobSource):
+    """A never-exhausting job source that mints fresh jobs from templates in a fixed, repeating order.
+
+    Each template's weight is the number of consecutive jobs it mints before the next template takes over, so
+    a mix can state runs of one model. The order does not depend on the pop requests, so two runs that differ
+    only in a worker setting see the same sequence of jobs.
+
+    When the pop request does not accept the next job (its model is not offered, it is too large, or a feature
+    is withheld), the source returns an empty pop and keeps its position. A worker that withholds a model then
+    waits for that model's job, as it would on a horde that does not have other work for it.
+    """
+
+    def __init__(self, templates: list[SoakImageTemplate]) -> None:
+        """Initialise with the templates in serving order.
+
+        Raises:
+            ValueError: If a template's weight is not a whole number of at least 1.
+        """
+        super().__init__(templates)
+        sequence: list[int] = []
+        for template_index, template in enumerate(templates):
+            if template.weight < 1 or template.weight != int(template.weight):
+                raise ValueError(
+                    f"a sequenced soak template needs a whole-number weight of at least 1 (got {template.weight} "
+                    f"for {template.model})",
+                )
+            sequence.extend([template_index] * int(template.weight))
+        self._sequence = sequence
+        self._position = 0
+
+    @property
+    def position(self) -> int:
+        """The index in the repeating sequence of the next job to serve."""
+        return self._position
+
+    def next_pop_response(self, pop_request: ImageGenerateJobPopRequest | None = None) -> ImageGenerateJobPopResponse:
+        """Mint the next job in the sequence, or return an empty pop while the pop request does not accept it."""
+        if self._held() or self._stopped:
+            return make_empty_pop_response()
+        template_index = self._sequence[self._position]
+        template = self._templates[template_index]
+        if pop_request is not None and not self._template_matches_pop_request(
+            template,
+            self._template_features[template_index],
+            pop_request,
+        ):
+            return make_empty_pop_response()
+        self._position = (self._position + 1) % len(self._sequence)
         return make_job_from_template(template)
 
 

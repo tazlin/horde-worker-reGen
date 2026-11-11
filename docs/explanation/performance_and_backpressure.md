@@ -2073,7 +2073,24 @@ about a third), so a worker is soaked under the traffic it will actually meet ra
 storm answers "does the download path degrade gracefully under a flood"; the replay answers "does the
 configuration hold up under production's real mix".
 
-Either mix runs standalone through `horde-benchmark soak`, which is the before/after vehicle for a change
+Both mixes draw each job at random by template weight, from a fixed seed, among the templates accepted by the
+pop request. A template is left out of that draw when the worker does not offer its model or withholds its size
+or feature. The same seed therefore gives the same jobs only while the worker's offers match. A setting that
+changes the worker's offer also changes the traffic under which the worker is measured.
+
+A third mix, **`whole_card_streak`**, is for changes to how a whole-card model keeps its weights between its
+jobs. It serves streaks of 8 to 12 jobs for a model that takes the whole card, each followed by 3 or 4
+jobs of an SDXL checkpoint, so a 20 minute run takes and releases the whole-card residency several times.
+Its jobs come in a fixed, repeating order rather than a weighted draw
+(`SequencedJobSource` in `process_management/simulation/_canned_scenarios.py`). When the next job's model
+is not offered, the pop does not get a job and the order does not advance, so both arms get the same
+sequence. The empty pop counts toward the standing pop claim's release, as an empty pop from the horde does.
+The large-model limiters' idle escape opens once the local queue is empty, so the wait ends. Half the
+whole-card jobs have one LoRA from a small shared pool. The pattern places a LoRA job after a LoRA-free job
+and the reverse, and two LoRA jobs in a row with the same LoRA and with different ones. The SDXL jobs do not
+have a LoRA.
+
+Any of the three runs standalone through `horde-benchmark soak`, which is the before/after vehicle for a change
 like these: it sustains one mix for a fixed period against the operator's own throughput settings, exports
 stats, and prints the duty attribution for the session it just wrote. It never talks to the horde, so two
 arms differ only in the setting under test rather than in the traffic they happened to be offered. See
