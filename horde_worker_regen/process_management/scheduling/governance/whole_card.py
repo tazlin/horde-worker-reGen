@@ -56,9 +56,7 @@ if TYPE_CHECKING:
 __all__ = [
     "HEAVY_HEAD_LOAD_GRACE_SECONDS",
     "POP_CLAIM_RELEASE_VISIBLE_SECONDS",
-    "POP_CLAIM_VALUE_MIN_BUCKETS",
     "POP_CLAIM_VALUE_MIN_JOBS",
-    "POP_CLAIM_VALUE_STANDARD_ERRORS",
     "WHOLE_CARD_DRAIN_SETTLE_SECONDS",
     "WHOLE_CARD_ESTABLISH_GRACE_SECONDS",
     "WHOLE_CARD_RESTORE_GRACE_SECONDS",
@@ -80,6 +78,7 @@ __all__ = [
     "max_coresident_for_peak",
     "offer_under_pop_claim",
     "pop_claim_value_verdict",
+    "two_sided_95_band_width",
     "post_process_context_fits",
     "residency_has_holder",
 ]
@@ -183,17 +182,68 @@ POP_CLAIM_VALUE_MIN_JOBS = 20
 
 With fewer jobs a single unusual job can set the model's rate."""
 
-POP_CLAIM_VALUE_MIN_BUCKETS = 8
-"""Time buckets with readings that each rate needs before the claim's value is judged.
+_TWO_SIDED_95_T_BY_DEGREES_OF_FREEDOM: tuple[float, ...] = (
+    12.706,
+    4.303,
+    3.182,
+    2.776,
+    2.571,
+    2.447,
+    2.365,
+    2.306,
+    2.262,
+    2.228,
+    2.201,
+    2.179,
+    2.160,
+    2.145,
+    2.131,
+    2.120,
+    2.110,
+    2.101,
+    2.093,
+    2.086,
+    2.080,
+    2.074,
+    2.069,
+    2.064,
+    2.060,
+    2.056,
+    2.052,
+    2.048,
+    2.045,
+    2.042,
+)
+"""The two-sided 95% critical values of Student's t distribution for 1 to 30 degrees of freedom.
 
-A standard error estimated from a few buckets is itself uncertain, and a band of two of them is then too
-narrow. With eight readings the 95% band is about 2.4 standard errors, which is close to the two used below."""
+These are the standard published values. The parent process does not load a statistics library, so the values
+it needs are listed here."""
 
-POP_CLAIM_VALUE_STANDARD_ERRORS = 2.0
-"""How many standard errors wide each rate's band is when the claim's value is judged.
+_TWO_SIDED_95_NORMAL = 1.960
+"""The two-sided 95% critical value of the normal distribution, which Student's t approaches as readings grow."""
 
-Two is the usual two-sided 95% band. A model whose rate is near the rest of the card's is then not ruled below
-it on noise."""
+
+def two_sided_95_band_width(readings: int) -> float:
+    """Return how many standard errors wide a 95% band is when the standard error comes from ``readings``.
+
+    A standard error estimated from a few readings is itself uncertain, so the band has to be wider. The width
+    is Student's t critical value for ``readings - 1`` degrees of freedom. Two readings give 12.7 standard errors
+    and thirty-one give 2.04. Past the listed values the width is the normal value plus the first correction
+    term of its expansion in the degrees of freedom, which agrees with the published values to within 0.003.
+
+    Args:
+        readings: How many readings the standard error was estimated from. At least two.
+
+    Raises:
+        ValueError: When ``readings`` is under two, where a standard error does not exist.
+    """
+    if readings < 2:
+        raise ValueError("a standard error needs at least two readings")
+    degrees_of_freedom = readings - 1
+    if degrees_of_freedom <= len(_TWO_SIDED_95_T_BY_DEGREES_OF_FREEDOM):
+        return _TWO_SIDED_95_T_BY_DEGREES_OF_FREEDOM[degrees_of_freedom - 1]
+    correction = (_TWO_SIDED_95_NORMAL**3 + _TWO_SIDED_95_NORMAL) / (4 * degrees_of_freedom)
+    return _TWO_SIDED_95_NORMAL + correction
 
 
 class WholeCardGovernor(StrEnum):
@@ -299,7 +349,7 @@ class PopClaimValueVerdict(StrEnum):
     """
 
     UNMEASURED = auto()
-    """Too few of the model's jobs or too few time buckets are counted, or a rate has no reading."""
+    """Too few of the model's jobs are counted, or a rate or its standard error has no reading."""
     PAYS = auto()
     """The model's band reaches the rest of the card's band or lies above it, so the model is not shown to earn
     below the rest."""
@@ -1324,7 +1374,9 @@ def offer_under_pop_claim(models: frozenset[str], *, claim: WholeCardPopClaim | 
 def pop_claim_value_verdict(rate: CardEarningRate) -> PopClaimValueVerdict:
     """Return whether the claimed model in ``rate`` earns as much per card second as the rest of its card.
 
-    Each rate gets a band of :data:`POP_CLAIM_VALUE_STANDARD_ERRORS` standard errors on each side. The model is
+    Each rate gets a 95% band on each side, as wide as the number of time buckets behind its standard error
+    allows (:func:`two_sided_95_band_width`). A rate read from few buckets has a wide band, so a verdict of
+    below the rest needs either a large gap or many readings. The model is
     below the rest only when the top of its band is under the bottom of the rest's band.
 
     Args:
@@ -1338,10 +1390,10 @@ def pop_claim_value_verdict(rate: CardEarningRate) -> PopClaimValueVerdict:
     rest_error = rate.rest_standard_error
     if model_rate is None or rest_rate is None or model_error is None or rest_error is None:
         return PopClaimValueVerdict.UNMEASURED
-    if min(rate.model_buckets, rate.rest_buckets) < POP_CLAIM_VALUE_MIN_BUCKETS:
+    if min(rate.model_buckets, rate.rest_buckets) < 2:
         return PopClaimValueVerdict.UNMEASURED
-    model_band_top = model_rate + POP_CLAIM_VALUE_STANDARD_ERRORS * model_error
-    rest_band_bottom = rest_rate - POP_CLAIM_VALUE_STANDARD_ERRORS * rest_error
+    model_band_top = model_rate + two_sided_95_band_width(rate.model_buckets) * model_error
+    rest_band_bottom = rest_rate - two_sided_95_band_width(rate.rest_buckets) * rest_error
     if model_band_top < rest_band_bottom:
         return PopClaimValueVerdict.BELOW_THE_REST
     return PopClaimValueVerdict.PAYS
@@ -1371,10 +1423,7 @@ def _pop_claim_value_sentence(value: PopClaimValue) -> str:
         return f"{figures} The claimed model earns below the rest of the card."
     if rate.jobs < POP_CLAIM_VALUE_MIN_JOBS:
         return f"{figures} The claim's value is unmeasured until {POP_CLAIM_VALUE_MIN_JOBS} jobs are counted."
-    return (
-        f"{figures} The claim's value is unmeasured until both rates have readings from "
-        f"{POP_CLAIM_VALUE_MIN_BUCKETS} time buckets."
-    )
+    return f"{figures} The claim's value is unmeasured until both rates have readings from two time buckets."
 
 
 def _establishing(state: WholeCardResidency, *, now: float, establish_grace_seconds: float) -> bool:

@@ -1845,9 +1845,12 @@ A claim holds the whole offer to one model, so whether it pays depends on what t
 against the rest of the card's work. The engage line states both figures from the
 [card-time attribution](duty-cycle.md#card-time-attribution-which-model-each-card-second-went-to), the claimed
 model's job count and a verdict. The verdict is unmeasured until 20 of the model's jobs are counted on the card
-and both rates have readings from eight 15-minute buckets. After that, the claim earns below the rest when the two rates' bands of two
-standard errors do not overlap and the model's band is the lower one. Otherwise it pays, which means only that the model is not shown to earn below the rest. A model near the rest
-is not ruled below on noise. The residency status and every stats sample report the same verdict beside the
+and both rates have readings from two 15-minute buckets. Each rate has a 95% band whose width follows the
+number of buckets behind it. The band is 12.7 standard errors at two buckets, 3.2 at four, 2.4 at eight and
+close to 2 from thirty. A wide gap is therefore ruled after a few buckets, and a narrow one only after many.
+The claim earns below the rest when the two bands do not overlap and the model's band is the lower one.
+Otherwise it pays, which means only that the model is not shown to earn below the rest. A model near the
+rest is not ruled below on noise. The residency status and every stats sample report the same verdict beside the
 standing claim (see [Stats export](../reference/stats.md#standing-pop-claim-on-stats_sample)). The verdict is
 disclosed only. The claim narrows the offer, and dispatch and retention read the claim, whatever the verdict is.
 

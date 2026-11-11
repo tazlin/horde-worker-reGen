@@ -257,7 +257,7 @@ inferring it from throughput. All are registered in `analysis/log_signatures.py`
 | `Reclaim ladder: restoring the <lane> lane while job <id> still waits, since the job waits on that lane.` | DEBUG | A lane pause booked for a job is restored although the job still waits, because the job waits on the paused lane itself. In practice the post-processing lane. |
 | `Alchemy form <id> was already submitted on the horde. Recorded as delivered with no reward. Horde response: <message>` | WARNING | The horde refused an alchemy submit because it already holds a result for the form. The form counts as submitted. No reward is recorded, because the response does not show whether an earlier attempt or the horde settled the form. |
 
-The engage line ends with one of these verdict sentences. Each rate has a band of two standard errors on each
+The engage line ends with one of these verdict sentences. Each rate has a 95% band on each
 side (see [Persisted card earning](stats.md#persisted-card-earning)).
 
 | Sentence | Meaning |
@@ -265,7 +265,7 @@ side (see [Persisted card earning](stats.md#persisted-card-earning)).
 | `The claimed model is not below the rest of the card by more than the spread of the readings.` | The model's band reaches the rest's band or lies above it. The model may still read lower than the rest. The difference is then within the noise in both rates. The stats stream and the dashboard report this verdict as `pays`. |
 | `The claimed model earns below the rest of the card.` | The top of the model's band is under the bottom of the rest's band. |
 | `The claim's value is unmeasured until 20 jobs are counted.` | Fewer than 20 of the model's jobs are counted on the card, so one unusual job could set its rate. |
-| `The claim's value is unmeasured until both rates have readings from 8 time buckets.` | A rate has no reading, or its figures fall in fewer than eight 15-minute buckets. A standard error estimated from fewer readings is too uncertain for a band of two of them. |
+| `The claim's value is unmeasured until both rates have readings from two time buckets.` | A rate has no reading, or its figures fall in fewer than two 15-minute buckets, so it has no standard error. |
 | `Card earning is not measured on this worker. The claim's value is unmeasured.` | The scheduler has no earning accumulator. The line then has no figures. |
 
 The verdict is disclosed only. The claim narrows the offer whatever the verdict is.

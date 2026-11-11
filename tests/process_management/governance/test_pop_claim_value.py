@@ -1,7 +1,7 @@
 """The pop claim's value verdict and its disclosure in the engage line and the stats stream.
 
 The verdict compares the claimed model's kudos per card second with the rest of its card's, each with a band of
-two standard errors. It is disclosed only, so these tests pin what is read and what is reported.
+its 95% band. It is disclosed only, so these tests pin what is read and what is reported.
 """
 
 from __future__ import annotations
@@ -23,12 +23,12 @@ from horde_worker_regen.process_management.scheduling.card_earning import (
     CardTick,
 )
 from horde_worker_regen.process_management.scheduling.governance.whole_card import (
-    POP_CLAIM_VALUE_MIN_BUCKETS,
     POP_CLAIM_VALUE_MIN_JOBS,
     PopClaimValueVerdict,
     WholeCardPopClaim,
     WholeCardPopClaimTracker,
     pop_claim_value_verdict,
+    two_sided_95_band_width,
 )
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from tests.process_management.conftest import make_test_card_runtimes
@@ -40,6 +40,12 @@ BUCKET_START = 1000.0 * CARD_EARNING_BUCKET_SECONDS
 CLAIMED_MODEL = "Flux.1-Schnell fp8 (Compact)"
 OTHER_MODEL = "AlbedoBase XL (SDXL)"
 
+_MANY_BUCKETS = 31
+"""Thirty degrees of freedom, where the band is 2.042 standard errors wide."""
+
+_MEASURED_BUCKETS = 8
+"""How many time buckets the measured accumulator fills."""
+
 
 def _rate(
     *,
@@ -48,7 +54,7 @@ def _rate(
     rest_rate: float | None = 1.0,
     rest_error: float | None = 0.1,
     jobs: int = POP_CLAIM_VALUE_MIN_JOBS,
-    buckets: int = POP_CLAIM_VALUE_MIN_BUCKETS,
+    buckets: int = _MANY_BUCKETS,
 ) -> CardEarningRate:
     return CardEarningRate(
         model_kudos_per_second=model_rate,
@@ -63,6 +69,28 @@ def _rate(
     )
 
 
+class TestBandWidth:
+    """The band is wide when the standard error comes from few readings and narrows toward the normal value."""
+
+    @pytest.mark.parametrize(
+        ("readings", "width"),
+        [(2, 12.706), (4, 3.182), (8, 2.365), (31, 2.042), (61, 2.000), (96, 1.985)],
+    )
+    def test_matches_the_published_values(self, readings: int, width: float) -> None:
+        """The listed values and the expansion past them agree with the published table."""
+        assert two_sided_95_band_width(readings) == pytest.approx(width, abs=0.003)
+
+    def test_narrows_as_readings_grow(self) -> None:
+        """More readings do not widen the band, across the change from listed values to the expansion."""
+        widths = [two_sided_95_band_width(readings) for readings in range(2, 120)]
+        assert widths == sorted(widths, reverse=True)
+
+    def test_one_reading_is_refused(self) -> None:
+        """One reading does not have a standard error."""
+        with pytest.raises(ValueError, match="at least two readings"):
+            two_sided_95_band_width(1)
+
+
 class TestVerdict:
     """The verdict reads the job floor, the two rates and their bands."""
 
@@ -71,10 +99,17 @@ class TestVerdict:
         rate = _rate(model_rate=0.1, rest_rate=5.0, jobs=POP_CLAIM_VALUE_MIN_JOBS - 1)
         assert pop_claim_value_verdict(rate) is PopClaimValueVerdict.UNMEASURED
 
-    def test_under_the_bucket_floor_is_unmeasured(self) -> None:
-        """A spread read from too few time buckets is unmeasured even when the bands are far apart."""
-        rate = _rate(model_rate=0.1, model_error=0.01, rest_rate=5.0, buckets=POP_CLAIM_VALUE_MIN_BUCKETS - 1)
+    def test_one_bucket_is_unmeasured(self) -> None:
+        """A rate read from one time bucket does not have a spread, however far apart the rates are."""
+        rate = _rate(model_rate=0.1, model_error=0.01, rest_rate=5.0, buckets=1)
         assert pop_claim_value_verdict(rate) is PopClaimValueVerdict.UNMEASURED
+
+    def test_the_same_gap_needs_more_buckets_to_rule_below(self) -> None:
+        """With two buckets the band is 12.7 standard errors wide and the bands overlap. With many they do not."""
+        few = _rate(model_rate=1.0, model_error=0.1, rest_rate=2.0, rest_error=0.2, buckets=2)
+        many = _rate(model_rate=1.0, model_error=0.1, rest_rate=2.0, rest_error=0.2, buckets=_MANY_BUCKETS)
+        assert pop_claim_value_verdict(few) is PopClaimValueVerdict.PAYS
+        assert pop_claim_value_verdict(many) is PopClaimValueVerdict.BELOW_THE_REST
 
     @pytest.mark.parametrize(
         ("model_rate", "model_error", "rest_rate", "rest_error"),
@@ -97,12 +132,12 @@ class TestVerdict:
         assert pop_claim_value_verdict(rate) is PopClaimValueVerdict.UNMEASURED
 
     def test_bands_apart_rule_below_the_rest(self) -> None:
-        """The model's band top 1.0 + 2 x 0.1 = 1.2 is under the rest's band bottom 2.0 - 2 x 0.2 = 1.6."""
+        """The model's band top 1.0 + 2.042 x 0.1 is 1.204, under the rest's band bottom 2.0 - 2.042 x 0.2 at 1.592."""
         rate = _rate(model_rate=1.0, model_error=0.1, rest_rate=2.0, rest_error=0.2)
         assert pop_claim_value_verdict(rate) is PopClaimValueVerdict.BELOW_THE_REST
 
     def test_overlapping_bands_pay(self) -> None:
-        """The model's band top 1.0 + 2 x 0.3 = 1.6 reaches the rest's band bottom 2.0 - 2 x 0.2 = 1.6."""
+        """The model's band top 1.0 + 2.042 x 0.3 is 1.613, over the rest's band bottom 2.0 - 2.042 x 0.2 at 1.592."""
         rate = _rate(model_rate=1.0, model_error=0.3, rest_rate=2.0, rest_error=0.2)
         assert pop_claim_value_verdict(rate) is PopClaimValueVerdict.PAYS
 
@@ -124,13 +159,13 @@ def info_messages() -> Iterator[list[str]]:
 
 
 def _measured_accumulator(device_index: int) -> CardEarningAccumulator:
-    """An accumulator with eight buckets on ``device_index``, the claimed model earning below the other model.
+    """An accumulator with eight time buckets on ``device_index``, the claimed model earning below the other model.
 
     Each bucket has 20 jobs of the claimed model over 100 s and one job of the other model over 100 s. The
     claimed model earns 0.5 and 0.6 kudos per second in alternate buckets, and the other model 2.0 and 2.2.
     """
     accumulator = CardEarningAccumulator(max_tick_seconds=1000.0, clock=lambda: BUCKET_START)
-    for bucket_number in range(POP_CLAIM_VALUE_MIN_BUCKETS):
+    for bucket_number in range(_MEASURED_BUCKETS):
         start = BUCKET_START + 900.0 * bucket_number
         claimed_kudos, other_kudos = (50.0, 200.0) if bucket_number % 2 == 0 else (60.0, 220.0)
         accumulator.observe(start, {})
@@ -175,7 +210,7 @@ class TestEngageLine:
 
         assert f"Earning on card {card_index}, in kudos per card second: 0.550 for the claimed model" in line
         assert "2.100 for the rest of the card" in line
-        assert f"over {POP_CLAIM_VALUE_MIN_BUCKETS * POP_CLAIM_VALUE_MIN_JOBS} jobs of the claimed model" in line
+        assert f"over {_MEASURED_BUCKETS * POP_CLAIM_VALUE_MIN_JOBS} jobs of the claimed model" in line
         assert line.endswith("The claimed model earns below the rest of the card.")
 
     def test_a_claim_keyed_by_a_card_reads_that_card(self, info_messages: list[str]) -> None:
