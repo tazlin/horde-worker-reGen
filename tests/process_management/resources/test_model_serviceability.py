@@ -501,10 +501,9 @@ class TestModelServiceabilityVerdicts:
         ("seat", "expected"),
         [
             (WholeCardSeat(seat_mb=4173.0, ceiling_mb=7676.0), ModelServiceabilityTier.SERVICEABLE),
-            (WholeCardSeat(seat_mb=None, ceiling_mb=7676.0), ModelServiceabilityTier.UNSERVICEABLE),
             (None, ModelServiceabilityTier.UNSERVICEABLE),
         ],
-        ids=["seat_supplied", "seat_unpriced", "no_seat"],
+        ids=["seat_supplied", "no_seat"],
     )
     def test_a_fitting_seat_serves_a_card_below_the_recommended_minimum(
         self,

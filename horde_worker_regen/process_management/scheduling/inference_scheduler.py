@@ -6953,34 +6953,19 @@ class InferenceScheduler:
     ) -> WholeCardSeat | None:
         """Return the partial-load seat a rung-2 or pinned model needs on a card and the card's achievable ceiling.
 
-        None when the model is neither (a model outside the extra-large tier does not have a seat) or when the card
-        is not yet sized, so the serviceability verdict keeps its other rules. A rung-2 or pinned model whose seat
-        cannot be priced (a paging card) is returned unpriced, so the offer withholds it and the gate passes it.
-        The model that holds the card's whole-card grant is the exception. Its seat is taken, so it is returned
-        as None and stays in the offer under the other rules.
+        None when the model is not rung-2 and not pinned, when it does not have a seat (a model outside the
+        extra-large tier, or one whose seat cannot be priced from the store's figures yet) or when the card is not
+        yet sized. The serviceability verdict then keeps its other rules. The seat is priced without the WDDM
+        paging state. Paging describes the card at this instant, and a whole-card model's dispatch takes the card
+        before its load, so paging is a dispatch-time input only (:func:`pricing.partial_seat_mb`).
         The offer reads this with the foreign floor in the ceiling. The preload gate reads it without the floor
         (:meth:`_preload_gate_whole_card_seat`), so a job accepted before the floor rose is never faulted by it.
         """
         dominance = self.card_dominance(device_index)
-        if dominance is None or model not in dominance.seats_mb:
+        if dominance is None:
             return None
-        seat_mb = dominance.seats_mb[model]
-        # A None seat means either that the seat cannot be priced while the card pages, or that the model has
-        # no partial-load seat at all (below the extra-large tier, or a LoRA job), in which case the verdict's
-        # other rules apply. Only an extra-large model's seat under paging is an unpriced seat, which withholds
-        # the model from the offer and lets the preload gate recognise a job popped before paging began.
-        if seat_mb is None and not (
-            self._retention.wddm_paging_active and self._model_size_tier(model) >= ModelSizeTier.EXTRA_LARGE
-        ):
-            return None
-        # The model that holds the card's whole-card grant already has its seat. A partial load of an extra-large
-        # checkpoint leaves some of its allocations in shared memory, so the paging reading is in part that
-        # model's own load. Withholding it would leave the card held for a model that is not in the offer. A job
-        # for it is priced at dispatch, at its activation above the seated weights.
-        if seat_mb is None and self._whole_card_ledger.holds_model_on_card(
-            model,
-            device_index if self._multi_gpu_routing_active else None,
-        ):
+        seat_mb = dominance.seats_mb.get(model)
+        if seat_mb is None:
             return None
         ceiling_mb = self.achievable_ceiling_mb(device_index, include_foreign_floor=include_foreign_floor)
         if ceiling_mb is None:
@@ -7109,7 +7094,6 @@ class InferenceScheduler:
             baseline_id,
             store=self._footprint_store,
             total_vram_mb=total_vram_mb,
-            wddm_paging_active=self._retention.wddm_paging_active,
             model_tier=self._model_size_tier(model),
             weight_fraction=weight_fraction,
             platform=self._platform,
@@ -11892,11 +11876,9 @@ class InferenceScheduler:
         keep). A job the offer admits passes here. A rung-2 or pinned model is checked by the same partial-load
         seat the offer reads, against the card's total net of the admission margin only. The offer's ceiling also
         subtracts the learned foreign floor, which moves, and a job accepted before the floor rose is owed its one
-        real load instead of a fault. A rung-2 or pinned whole-card model whose seat cannot be priced (a card under
-        WDDM demand paging) passes instead of falling to the recommended-minimum rule, since the offer may have priced
-        the seat before paging began and the popped job is owed its load. Core weights over the card's weight
-        budget fault in every case, and a model below the extra-large tier does not have a seat and keeps the
-        resident rule.
+        real load instead of a fault. The offer and the gate do not read the WDDM paging state. Core weights over
+        the card's weight budget fault in every case, and a model below the extra-large tier does not have a seat
+        and keeps the resident rule.
         """
         if job.model is None or not self._card_runtimes:
             return None
@@ -11909,10 +11891,6 @@ class InferenceScheduler:
             whole_card_seat_provider=self._preload_gate_whole_card_seat,
         )
         if not verdicts or any(verdict.serviceable for _, verdict in verdicts):
-            return None
-        if any(
-            verdict.whole_card_seat is not None and not verdict.whole_card_seat.priced for _card, verdict in verdicts
-        ):
             return None
         return f"model minimum footprint cannot fit any serving card; {serviceability_arithmetic(verdicts)}"
 

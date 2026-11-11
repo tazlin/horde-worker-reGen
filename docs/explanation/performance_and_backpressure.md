@@ -325,15 +325,16 @@ ceiling instead, since after the teardown that seat is how the card serves it (s
 card says, so a card below that recommendation still serves a model whose seat fits. For the offer the ceiling
 includes the learned foreign floor, so such a model leaves the offer while a tenant does not leave room for the seat,
 and returns when the tenant goes. The preload gate checks the same seat against the total net of the admission
-margin only, so a job accepted before the floor rose is not faulted for it. Where an extra-large model's seat cannot
-be priced (a card under WDDM demand paging), the offer withholds the model, since it advertises only what it can
-price, and the preload gate lets a job already popped through, since the offer priced the seat before paging began
-and the popped job is owed its load. The model that holds the card's whole-card grant is not withheld this way.
-Its seat is already taken, and a partial load of an extra-large checkpoint leaves some allocations in shared
-memory, so the paging reading is in part that model's own load. It stays in the offer under the
-recommended-minimum rule, and a job for it is priced at dispatch. Without this the card would be held for a
-model that is not in the offer, and the pop claim for it would leave nothing to ask the horde for. Core
-weights over the card's weight budget still fault at the gate in every case.
+margin only, so a job accepted before the floor rose is not faulted for it. The offer and the preload gate do not
+read the WDDM paging verdict. Paging describes what is on the card at this instant, and an offer is a promise
+about a later dispatch. A whole-card model's dispatch takes the card before its load, so the allocations paging
+now are gone by then. The seat is therefore priced as a property of the model and the card, and a model whose
+seat fits stays in the offer while the card pages. Paging stays an input at dispatch. Clearance does not seat a
+job partially on a paging card (`pricing.partial_seat_mb`), so the job is priced at its whole weights. A staged
+waiter that is still refused past its attempt deadline while the paging verdict is active is faulted for
+reissue, and its lane is replaced (`InferenceScheduler._terminal_refusal_evidence`). Its unpriced sample at the
+lease-acquire timeout would crash natively. Core weights over the card's weight budget still fault at the gate
+in every case.
 
 ### Dominance verdict
 
@@ -349,14 +350,9 @@ offer narrowings above treat as large. The verdict decides the teardown and whic
 
 The verdict is cached per card and recomputed only when one of its inputs changes: the offered set and pins,
 the total, the context constants, the admission margin, the foreign floor's bucket and the observation counts of
-the offered baselines' sampling keys. WDDM demand paging is not one of them, though the partial-load seats are
-priced with the paging state current at compute time, and seats are not priced on a paging card. A verdict computed during
-a paging episode therefore keeps a rung-2 model's seat unpriced after paging clears, and one computed outside an
-episode keeps the seat priced through the next, until another input moves. For that span the offer holds the
-model back or advertises it on a stale reading. The preload gate does not fault a job the offer advertised in
-either state, since an unpriced seat passes it and a priced one is checked without the floor, so the cost is
-limited to offer accuracy. Keying the verdict on paging would recompute it on each paging edge, which on a small
-card follows most jobs.
+the offered baselines' sampling keys. WDDM demand paging is not one of them, and the partial-load seats stored on
+the verdict are priced without it, so a paging edge does not change a verdict or a seat. Keying the verdict on
+paging would recompute it on each paging edge, which on a small card follows most jobs.
 
 The horde's pop carries one `max_pixels` for every model in it, so a constrained model cannot share a pop
 with the others without capping them all. The popper lanes it instead

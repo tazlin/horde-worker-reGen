@@ -651,12 +651,13 @@ def partial_seat_mb(
     its patch temporaries crash a child natively in this regime, and neither does any job on a card whose driver
     is paging the worker's allocations.
     """
+    if snapshot.ledgers.retention.wddm_paging_active:
+        return None
     return partial_seat_on_card_mb(
         job,
         baseline,
         store=snapshot.services.footprint_store,
         total_vram_mb=snapshot.card(device_index).total_vram_mb,
-        wddm_paging_active=snapshot.ledgers.retention.wddm_paging_active,
         model_tier=size_tier(snapshot, job.model),
         weight_fraction=weight_fraction,
     )
@@ -668,14 +669,15 @@ def partial_seat_on_card_mb(
     *,
     store: LearnedFootprintStore | None,
     total_vram_mb: float | None,
-    wddm_paging_active: bool,
     model_tier: ModelSizeTier,
     weight_fraction: float,
     platform: str = sys.platform,
 ) -> float | None:
-    """Return :func:`partial_seat_mb` from explicit figures, for a caller that prices a seat outside a snapshot."""
-    if wddm_paging_active:
-        return None
+    """Return a job's partial-load seat (MB) on a card of ``total_vram_mb``, or None when the job does not qualify.
+
+    The seat is priced from the job, the learned figures and the card's size. The paging state is not an input.
+    :func:`partial_seat_mb` adds the paging rule for dispatch.
+    """
     if model_tier < ModelSizeTier.EXTRA_LARGE:
         return None
     from hordelib.feature_impact import FEATURE_KIND

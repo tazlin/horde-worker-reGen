@@ -1316,8 +1316,9 @@ seat = f x weights + max(activation, ComfyUI inference reserve)
   the seat fits the card's achievable ceiling (total net of the admission margin and the learned foreign floor,
   `InferenceScheduler.whole_card_seat`). The ceiling follows the floor, so a floor that rises takes such a model
   out of the offer and a floor that falls brings it back. A job accepted before the floor rose is never faulted
-  for it, since the preload gate keeps the recommended-minimum rule and the job gets its one real load through
-  the ceiling attempt.
+  for it, since the preload gate checks the same seat against the total net of the admission margin only. The
+  offer's seat is priced without the WDDM paging verdict, which is an input at clearance only, so such a model
+  stays in the offer while the card pages.
 
 ## Doomed model prevention
 

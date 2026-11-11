@@ -39,9 +39,8 @@ against the card's achievable ceiling instead, whatever its recommended minimum 
 seat is how the card serves it, so a seat the ceiling cannot hold is a model the card cannot serve. For the offer
 the ceiling is the total net of the admission margin and the learned foreign floor. The preload gate uses the
 same seat against the total net of the admission margin only, so a job accepted before the floor rose still gets
-its load. A rung-2 or pinned whole-card model whose seat cannot be priced (a card under WDDM demand paging) is withheld
-from the offer, since the offer advertises only what it can price, and passes the preload gate, since a job popped
-before paging began is owed its load.
+its load. The seat is a property of the model and the card, so the offer and the preload gate do not read the
+WDDM paging state. That state describes the card at this instant and is read at dispatch.
 
 A ``CONSTRAINED`` model is not allowed to lower every other model's ``max_power``: the horde's pop carries one
 ``max_pixels`` for the whole offer, so the constrained models are advertised on a pop of their own, one in a
@@ -256,19 +255,13 @@ class WholeCardSeat:
     foreign floor.
     """
 
-    seat_mb: float | None
-    """The seat's price, or None while it cannot be priced (a card under WDDM demand paging)."""
+    seat_mb: float
     ceiling_mb: float
 
     @property
-    def priced(self) -> bool:
-        """Whether the seat has a price, which a rung-2 or pinned model's seat lacks while the card pages."""
-        return self.seat_mb is not None
-
-    @property
     def fits(self) -> bool:
-        """Whether the seat fits the achievable ceiling, which is false for an unpriced seat."""
-        return self.seat_mb is not None and self.seat_mb <= self.ceiling_mb
+        """Whether the seat fits the achievable ceiling."""
+        return self.seat_mb <= self.ceiling_mb
 
 
 @dataclass(frozen=True)
@@ -336,11 +329,6 @@ class ModelServiceabilityVerdict:
         minimum = self.figures.minimum_footprint_mb
         if self.whole_card_seat is not None:
             seat = self.whole_card_seat
-            if seat.seat_mb is None:
-                return (
-                    "whole-card model whose partial-load seat cannot be priced while the card pages, so it is "
-                    f"withheld from the offer (achievable ceiling {seat.ceiling_mb:.0f} MB)"
-                )
             fits = "fits" if seat.fits else "does NOT fit"
             return (
                 f"whole-card model's partial-load seat {seat.seat_mb:.0f} MB checked against the "
@@ -400,9 +388,7 @@ def assess_model_serviceability(
 
     A ``whole_card_seat`` (a rung-2 or pinned model's partial-load seat and the card's achievable ceiling) decides
     the tier once the weight budget passes. The tier is ``SERVICEABLE`` when the seat fits the ceiling and
-    ``UNSERVICEABLE`` otherwise, whatever the recommended minimum card says. An unpriced seat (the card is
-    paging) is ``UNSERVICEABLE`` here, which withholds the model from the offer. The preload gate reads the
-    unpriced seat on the verdict and lets a job already popped through instead.
+    ``UNSERVICEABLE`` otherwise, whatever the recommended minimum card says.
 
     Unknown capacity or unknown footprint figures abstain as serviceable: the worker must not de-list a model
     on missing metadata. When both sides are known, core weights over the card's weight budget

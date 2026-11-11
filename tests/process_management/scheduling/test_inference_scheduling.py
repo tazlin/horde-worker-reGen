@@ -333,30 +333,42 @@ class TestPreloadGateChecksTheSeatWithoutTheFloor:
         assert reason is not None
         assert "partial-load seat" in reason
 
-    def test_an_unpriceable_seat_passes(self) -> None:
-        """Under WDDM paging the seat cannot be priced, so the offer withholds the model and the popped job passes."""
+    def test_a_seat_under_paging_is_priced_and_the_popped_job_passes(self) -> None:
+        """The paging verdict does not unprice the seat, so a seat that fits passes the preload gate."""
         scheduler = _small_card_scheduler({_MOSS: KNOWN_IMAGE_GENERATION_BASELINE.moss_image})
         scheduler.note_wddm_paging({100001: 512.0}, active=True)
 
         seat = scheduler.whole_card_seat(_MOSS, 0)
         assert seat is not None
-        assert seat.priced is False
-        assert seat.fits is False
+        assert seat.fits is True
         assert scheduler._unserviceable_job_reason(make_job_pop_response(_MOSS)) is None
 
-    def test_the_model_that_holds_the_card_stays_in_the_offer_under_paging(self) -> None:
-        """A partial load pages a little by itself, so the model that holds the card is not withheld for it.
+    def test_a_model_that_does_not_hold_the_card_stays_in_the_offer_under_paging(self) -> None:
+        """Paging describes the card now, and a whole-card dispatch takes the card before its load.
 
-        Before the grant the model's seat cannot be priced on a paging card, and the offer leaves the model out.
-        Once the model holds the card its seat is taken. The offer then keeps it under the other rules, so the
-        card is not held for a model that is not in the offer.
+        A rung-2 model whose seat fits the ceiling, and which does not hold the card's whole-card grant, stays in
+        the offer while the paging verdict is active. The pop claim is not withheld for it.
         """
         scheduler = _small_card_scheduler({_MOSS: KNOWN_IMAGE_GENERATION_BASELINE.moss_image})
         scheduler.note_wddm_paging({100001: 512.0}, active=True)
-        unpriced = scheduler.whole_card_seat(_MOSS, 0)
-        assert unpriced is not None and unpriced.priced is False
-        assert scheduler._claimed_model_held_back_from_offer(_MOSS) is True
+        assert not scheduler._whole_card_ledger.holds_model_on_card(_MOSS, None)
 
+        held_back = _serviceability_held_back_models(
+            {_MOSS},
+            card_runtimes=scheduler._card_runtimes,
+            model_metadata=scheduler._model_metadata,
+            admission_baseline_provider=scheduler.serviceability_baseline_mb,
+            serviceability_logged=None,
+            whole_card_seat_provider=scheduler.whole_card_seat,
+        )
+
+        assert held_back == set()
+        assert scheduler._claimed_model_held_back_from_offer(_MOSS) is False
+
+    def test_the_model_that_holds_the_card_keeps_its_seat_under_paging(self) -> None:
+        """The model that holds the card is checked by the same seat under paging as without it."""
+        scheduler = _small_card_scheduler({_MOSS: KNOWN_IMAGE_GENERATION_BASELINE.moss_image})
+        scheduler.note_wddm_paging({100001: 512.0}, active=True)
         scheduler._whole_card_ledger.record_grant(
             None,
             model=_MOSS,
@@ -365,7 +377,8 @@ class TestPreloadGateChecksTheSeatWithoutTheFloor:
             now=scheduler._clock(),
         )
 
-        assert scheduler.whole_card_seat(_MOSS, 0) is None
+        seat = scheduler.whole_card_seat(_MOSS, 0)
+        assert seat is not None and seat.fits is True
         assert scheduler._claimed_model_held_back_from_offer(_MOSS) is False
 
     def test_a_whole_card_model_off_rung_two_faults_by_the_recommended_minimum_card(self) -> None:
@@ -417,11 +430,9 @@ class TestPreloadGateChecksTheSeatWithoutTheFloor:
         advertised = set(models) - held_back
 
         assert advertised
-        if card_state == "zero_floor":
+        if card_state in ("zero_floor", "paging"):
+            # The seat is priced without the paging state, so the rung-2 model stays in the offer while the card pages.
             assert "moss_image_model" in advertised
-        elif card_state == "paging":
-            # The seat cannot be priced while the card pages, so the offer withholds the rung-2 model.
-            assert "moss_image_model" not in advertised
         faulted = {
             model: reason
             for model in sorted(advertised)
