@@ -468,6 +468,19 @@ class _WholeCardDemandOutcome(enum.Enum):
     asking, and the card is free for other work meanwhile."""
 
 
+class _DispatchWholeCardDemand(enum.Enum):
+    """Whether a job dispatched as the head would be given the whole card."""
+
+    NOT_DEMANDED = enum.auto()
+    """The forecast does not show a need for the whole card."""
+    DISAGGREGATION_CLASS = enum.auto()
+    """A disaggregation-class job does not claim the card."""
+    NOT_WARRANTED = enum.auto()
+    """The demand rests on an unmeasured figure, so the card is not reserved for it."""
+    DEMANDED = enum.auto()
+    """The job is given the card."""
+
+
 @dataclass(frozen=True)
 class _ReusedPopClaimValue:
     """Represents a claim's measured value with when it was read and the earning window it was read from.
@@ -3485,12 +3498,8 @@ class InferenceScheduler:
         live_inference_processes = self._process_map.num_loaded_inference_processes(
             device_index=target_device_index,
         )
-        if not self._whole_card_ledger.residency_demanded(
-            forecast,
-            enabled=self._whole_card_residency_enabled(),
-            is_head_blocker=True,
-            live_inference_process_count=live_inference_processes,
-        ):
+        demand = self._dispatch_whole_card_demand(job, forecast, live_inference_processes)
+        if demand is _DispatchWholeCardDemand.NOT_DEMANDED:
             if forecast.needs_process_count_reduction:
                 self._log_whole_card_reduction_suppressed(
                     job,
@@ -3504,10 +3513,10 @@ class InferenceScheduler:
         # because the job has already been dispatched disaggregated: the teardown would stop the very lanes
         # its own encode and decode run on. Decided on class-eligibility, not liveness, so the contract holds
         # while a lane is transiently paused.
-        if self._is_disaggregation_class_eligible(job):
+        if demand is _DispatchWholeCardDemand.DISAGGREGATION_CLASS:
             self._log_stream_forecast(job, forecast)
             return True
-        if not self._whole_card_warranted(forecast):
+        if demand is _DispatchWholeCardDemand.NOT_WARRANTED:
             self._log_whole_card_declined(job, forecast)
             return True
         if self._dispatch_hold_has_no_remedy(job):
@@ -3552,6 +3561,59 @@ class InferenceScheduler:
             device_index=target_device_index,
         )
         return self._whole_card_teardown_exhausted(forecast, device_index=target_device_index)
+
+    def _dispatch_whole_card_demand(
+        self,
+        job: ImageGenerateJobPopResponse,
+        forecast: StreamForecast,
+        live_inference_processes: int,
+    ) -> _DispatchWholeCardDemand:
+        """Return whether a job dispatched as the head would be given the whole card, and why not otherwise.
+
+        It is the one sequence of the dispatch-time demand's conditions. :meth:`_resident_whole_card_head_ready`
+        establishes on it, and the placement reorder reads it through :meth:`_dispatch_would_take_the_card`.
+        """
+        if not self._whole_card_ledger.residency_demanded(
+            forecast,
+            enabled=self._whole_card_residency_enabled(),
+            is_head_blocker=True,
+            live_inference_process_count=live_inference_processes,
+        ):
+            return _DispatchWholeCardDemand.NOT_DEMANDED
+        if self._is_disaggregation_class_eligible(job):
+            return _DispatchWholeCardDemand.DISAGGREGATION_CLASS
+        if not self._whole_card_warranted(forecast):
+            return _DispatchWholeCardDemand.NOT_WARRANTED
+        return _DispatchWholeCardDemand.DEMANDED
+
+    def _dispatch_would_take_the_card(
+        self,
+        job: ImageGenerateJobPopResponse,
+        process_with_model: HordeProcessInfo,
+    ) -> bool:
+        """Return whether dispatching ``job`` on its lane would establish a teardown that the card does not hold.
+
+        Only the head may take the card, since a teardown stops the lanes that serve the head. A job seated ahead
+        of the head by the placement order reaches the dispatch-time demand as if it were the head. The reorder
+        reads this first, so such a job is promoted only while it can sample without a new teardown. A teardown
+        already held for the job's model is not new, and the head could not load under it anyway.
+        """
+        if job.model is None or not self._budget_active() or not self._whole_card_residency_enabled():
+            return False
+        device_index = self._routing_device_index(process_with_model)
+        if any(
+            held_device_index == device_index and residency.model == job.model
+            for held_device_index, residency in self._whole_card_ledger.teardown_held()
+        ):
+            return False
+        forecast = self._forecast_streaming(
+            job,
+            self._model_metadata.get_baseline(job.model),
+            device_index=device_index,
+        )
+        live_inference_processes = self._process_map.num_loaded_inference_processes(device_index=device_index)
+        demand = self._dispatch_whole_card_demand(job, forecast, live_inference_processes)
+        return demand is _DispatchWholeCardDemand.DEMANDED
 
     def _whole_card_teardown_exhausted(self, forecast: StreamForecast, *, device_index: int | None = None) -> bool:
         """Whether a whole-card residency has done all it can and the head can now load best-effort.
@@ -11190,6 +11252,11 @@ class InferenceScheduler:
         preparation, degraded-retry isolation, or in-progress status is never a candidate, so a reorder can only
         promote a job that was already eligible to be placed.
 
+        A job whose dispatch would establish a whole-card teardown that the card does not hold is not a candidate
+        on either ground (:meth:`_dispatch_would_take_the_card`). Only the head may take the card. A promoted job
+        that took it would stop the lane where the head is loading. The head could not load under the residency,
+        and head protection would hold the promoted job for the head.
+
         A job for the model a held whole-card residency is for is a candidate on any free slot holding that model,
         retained or only staged in RAM (:meth:`_residency_reorder_resident`). Serving the head there first unloads
         the residency's model between two of its own jobs, so the next one pays a full reload and a second
@@ -11239,6 +11306,9 @@ class InferenceScheduler:
                 continue
             residency_resident = self._residency_reorder_resident(job)
             if residency_resident is not None:
+                if self._dispatch_would_take_the_card(job, residency_resident):
+                    rejections.append(f"{job.model}: only the head may take the card, and its dispatch would")
+                    continue
                 expected_seconds = self._expected_sampling_seconds(job, self._model_metadata.get_baseline(job.model))
                 if expected_seconds is None:
                     rejections.append(f"{job.model}: residency reorder has no expected sampling time")
@@ -11262,6 +11332,9 @@ class InferenceScheduler:
             # conditioning, which is precisely the window its retained weights are most exposed in.
             if not resident.can_accept_job():
                 rejections.append(f"{job.model}: retainer-busy ({resident.last_process_state.name})")
+                continue
+            if self._dispatch_would_take_the_card(job, resident):
+                rejections.append(f"{job.model}: only the head may take the card, and its dispatch would")
                 continue
             if not self._reorder_is_pareto_admissible(head_job, resident):
                 rejections.append(f"{job.model}: pareto (head has no other load target)")
