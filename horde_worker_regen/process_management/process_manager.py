@@ -112,12 +112,17 @@ from horde_worker_regen.process_management.ipc.messages import (
 )
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
     ADHOC_PREFETCH_FEATURES,
+    EARNING_ROWS_IN_SNAPSHOT,
     FEATURE_SAFETY,
     PENDING_JOBS_IN_SNAPSHOT,
     RECENT_JOBS_IN_SNAPSHOT,
     WORK_LEDGER_ENTRIES_IN_SNAPSHOT,
     CapacityChangeResult,
     CapacityWorkloadSettings,
+    CardEarningCardRow,
+    CardEarningRow,
+    CardEarningSnapshot,
+    CardEarningWindowRestart,
     CardSnapshot,
     DisaggStageRow,
     FeatureInfoRow,
@@ -273,12 +278,17 @@ from horde_worker_regen.process_management.scheduling import pool_ranker
 from horde_worker_regen.process_management.scheduling.card_earning import (
     CARD_EARNING_FILENAME,
     CardEarningAccumulator,
+    CardEarningRestart,
 )
 from horde_worker_regen.process_management.scheduling.clearance_lease import (
     ClearanceController,
     ClearanceLeaseProxy,
     TailOverlapDenialReason,
     format_tail_overlap_tally,
+)
+from horde_worker_regen.process_management.scheduling.governance.whole_card import (
+    pop_claim_value_verdict,
+    rate_95_band,
 )
 from horde_worker_regen.process_management.scheduling.inference_scheduler import (
     InferenceScheduler,
@@ -1239,6 +1249,14 @@ class HordeWorkerProcessManager:
     primed, cleared). The interval is the floor on that hop latency; the loop's own work is small beside it.
     """
 
+    _CARD_EARNING_SNAPSHOT_REFRESH_SECONDS: float = 10.0
+    """How long the snapshot's card earning figures are reused before they are read again.
+
+    The read walks every retained bucket for every card and model, which takes several milliseconds on a full
+    day of figures and tens of milliseconds on a worker that served many models on several cards. A snapshot is
+    built up to twice a second while a job samples. The figures are sums over a day in 15-minute buckets, so a
+    display that is ten seconds old shows the same picture. A window restart is shown at the next snapshot."""
+
     _ELIGIBLE_MAX_TICK_DT_SECONDS: float = 5.0
     """Upper bound on the wall-time a single control tick may credit to the eligible-seconds clock.
 
@@ -1608,9 +1626,12 @@ class HordeWorkerProcessManager:
         # the performance model. Under test it stays in memory, as the performance model does.
         self._card_earning = CardEarningAccumulator(
             max_tick_seconds=self._ELIGIBLE_MAX_TICK_DT_SECONDS,
-            config_fingerprint=self._capacity_workload_fingerprint(),
+            settings=self._capacity_workload_settings(),
             path=None if os.environ.get("AI_HORDE_TESTING") else default_app_state_dir() / CARD_EARNING_FILENAME,
         )
+        self._card_earning_snapshot_cache: CardEarningSnapshot | None = None
+        self._card_earning_snapshot_built_at: float = 0.0
+        self._card_earning_snapshot_restart: CardEarningRestart | None = None
 
         # Built before the collaborators that record on its event ring, and before the stats-export and
         # session-start calls below that need the rest of the manager's configuration.
@@ -4934,9 +4955,7 @@ class HordeWorkerProcessManager:
             has_pipeline_work=self._has_pipeline_work(),
             max_dt=self._ELIGIBLE_MAX_TICK_DT_SECONDS,
         )
-        # Read each tick because a reload and the supervisor's concurrency and capacity commands all move the
-        # settings, and one read here covers every path.
-        self._card_earning.restart_window_if_changed(self._capacity_workload_fingerprint())
+        self._restart_card_earning_window_if_changed()
         self._publish_supervisor_snapshot()
 
         await self._sleep(self._loop_interval / 2)
@@ -9093,6 +9112,7 @@ class HordeWorkerProcessManager:
             stats_model_rollups=self._run_metrics.model_rollups(),
             stats_baseline_rollups=self._run_metrics.baseline_rollups(),
             stats_form_rollups=self._run_metrics.form_rollups(),
+            card_earning=self._current_card_earning_snapshot(),
             stats_export=self._run_metrics.stats_export_state(),
             stats_history_backfill=self._run_metrics.stats_history_backfill(),
             downloads=self._model_availability.status,
@@ -9298,6 +9318,97 @@ class HordeWorkerProcessManager:
     def _capacity_workload_fingerprint(self) -> str:
         """Return the fingerprint of the live capacity and workload settings."""
         return capacity_workload_fingerprint(self._capacity_workload_settings())
+
+    def _restart_card_earning_window_if_changed(self) -> None:
+        """Mutate the card earning window to start over when the live capacity or workload settings changed.
+
+        Called once per control tick, because a reload and the supervisor's concurrency and capacity commands
+        all move the settings, and one read here covers every path.
+        """
+        self._card_earning.restart_window_if_changed(self._capacity_workload_settings())
+
+    def _current_card_earning_snapshot(self) -> CardEarningSnapshot:
+        """Return the snapshot's card earning figures, read again when they are stale or the window restarted.
+
+        The figures are reused for :attr:`_CARD_EARNING_SNAPSHOT_REFRESH_SECONDS`, because the read is too slow to
+        repeat at the snapshot's rate.
+        """
+        now = time.time()
+        last_restart = self._card_earning.last_restart
+        cached = self._card_earning_snapshot_cache
+        fresh = now - self._card_earning_snapshot_built_at < self._CARD_EARNING_SNAPSHOT_REFRESH_SECONDS
+        if cached is not None and fresh and last_restart is self._card_earning_snapshot_restart:
+            return cached
+        built = self._card_earning_snapshot(self._card_earning)
+        self._card_earning_snapshot_cache = built
+        self._card_earning_snapshot_built_at = now
+        self._card_earning_snapshot_restart = last_restart
+        return built
+
+    @staticmethod
+    def _card_earning_snapshot(card_earning: CardEarningAccumulator) -> CardEarningSnapshot:
+        """Return the earning window's figures for the supervisor snapshot, bands and verdicts computed here.
+
+        The rows are ranked by attributed card seconds and cut at :data:`EARNING_ROWS_IN_SNAPSHOT`, so a worker
+        that served many models keeps the rows with the most card time.
+        """
+        window = card_earning.read_window()
+        rows: list[CardEarningRow] = []
+        for (device_index, model), rate in window.rates.items():
+            model_band = rate_95_band(
+                rate=rate.model_kudos_per_second,
+                standard_error=rate.model_standard_error,
+                readings=rate.model_buckets,
+            )
+            rest_band = rate_95_band(
+                rate=rate.rest_kudos_per_second,
+                standard_error=rate.rest_standard_error,
+                readings=rate.rest_buckets,
+            )
+            rows.append(
+                CardEarningRow(
+                    device_index=device_index,
+                    model=model,
+                    model_kudos_per_second=rate.model_kudos_per_second,
+                    model_band_low=model_band.low if model_band is not None else None,
+                    model_band_high=model_band.high if model_band is not None else None,
+                    rest_kudos_per_second=rate.rest_kudos_per_second,
+                    rest_band_low=rest_band.low if rest_band is not None else None,
+                    rest_band_high=rest_band.high if rest_band is not None else None,
+                    jobs=rate.jobs,
+                    model_buckets=rate.model_buckets,
+                    rest_buckets=rate.rest_buckets,
+                    attributed_card_seconds=rate.model_seconds,
+                    claim_seconds=rate.claim_seconds,
+                    verdict=pop_claim_value_verdict(rate).value,
+                ),
+            )
+        rows.sort(key=lambda row: (-row.attributed_card_seconds, row.device_index, row.model))
+        last_restart = window.last_restart
+        return CardEarningSnapshot(
+            rows=rows[:EARNING_ROWS_IN_SNAPSHOT],
+            rows_omitted=max(0, len(rows) - EARNING_ROWS_IN_SNAPSHOT),
+            cards=[
+                CardEarningCardRow(
+                    device_index=card.device_index,
+                    wall_seconds=card.wall_seconds,
+                    attributed_seconds=card.attributed_seconds,
+                    unattributed_seconds=card.unattributed_seconds,
+                )
+                for card in window.cards
+            ],
+            window_started_at=window.started_at,
+            last_restart=(
+                CardEarningWindowRestart(
+                    at=last_restart.at,
+                    changed_settings=(
+                        list(last_restart.changed_settings) if last_restart.changed_settings is not None else None
+                    ),
+                )
+                if last_restart is not None
+                else None
+            ),
+        )
 
     def _apply_reloaded_bridge_data(self, bridge_data: reGenBridgeData) -> None:
         """Swap in freshly-loaded bridge data and re-derive dependent state."""

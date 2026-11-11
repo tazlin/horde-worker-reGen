@@ -313,6 +313,15 @@ is the card's other kudos over its wall less the model's seconds. Both are read 
 or workload setting changes (see [Persisted card earning](../reference/stats.md#persisted-card-earning)).
 Scheduling and the pop offer do not read them.
 
+The tick also tallies, per card and model, the seconds during which a whole-card pop claim for the model stood
+on the card. The scheduler reads the claim with `_standing_pop_claim`, under the same ledger key as the grant.
+This tally is apart from the three rules. A claim second can also be a second attributed to another model's job,
+because a job for another model can still be in flight while the claim narrows the offer. Time under a grant and
+time under a claim are separate figures. A grant can outlast its claim, when the maximum hold elapses or empty
+pops release it, and a multi-card host holds grants without a claim. The supervisor snapshot shows the tally
+beside each model's rates (see
+[Card earning on the supervisor snapshot](../reference/stats.md#card-earning-on-the-supervisor-snapshot)).
+
 ### The dashboard
 
 The [TUI dashboard](../how-to/use-the-dashboard.md) shows the same sampled figure live: the health

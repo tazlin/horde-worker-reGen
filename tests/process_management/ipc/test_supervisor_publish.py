@@ -15,6 +15,7 @@ import pytest
 from horde_worker_regen.process_management.config.worker_state import PopGate
 from horde_worker_regen.process_management.ipc.messages import HordeProcessState
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
+    EARNING_ROWS_IN_SNAPSHOT,
     RECENT_EVENTS_IN_SNAPSHOT,
     ModelPoolSeatReadiness,
     PopLivenessSnapshot,
@@ -26,7 +27,16 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
 from horde_worker_regen.process_management.jobs.pool_lanes import LaneDecision, PoolLaneState
 from horde_worker_regen.process_management.jobs.text_generation_coordinator import TextJobInFlight
 from horde_worker_regen.process_management.process_manager import HordeWorkerProcessManager
+from horde_worker_regen.process_management.scheduling.card_earning import (
+    CARD_EARNING_BUCKET_SECONDS,
+    CardEarningAccumulator,
+    CardTick,
+)
 from horde_worker_regen.process_management.scheduling.governance.preload_admission import AdmissionDecision
+from horde_worker_regen.process_management.scheduling.governance.whole_card import (
+    PopClaimValueVerdict,
+    two_sided_95_band_width,
+)
 from horde_worker_regen.process_management.scheduling.model_demand_poller import DemandSnapshot
 from horde_worker_regen.process_management.scheduling.model_pool import (
     ModelPool,
@@ -585,3 +595,144 @@ def test_suspended_lora_work_does_not_change_the_fingerprint() -> None:
     assert before.effective_allow_lora is True
     assert after.effective_allow_lora is False
     assert after.config_fingerprint == before.config_fingerprint
+
+
+EARNING_BUCKET_START = 1000.0 * CARD_EARNING_BUCKET_SECONDS
+"""A tick time at a bucket boundary, so each worked bucket stays inside one bucket."""
+
+
+def _earning_accumulator() -> CardEarningAccumulator:
+    return CardEarningAccumulator(max_tick_seconds=1000.0, clock=lambda: EARNING_BUCKET_START)
+
+
+def _two_bucket_earning_window() -> CardEarningAccumulator:
+    """Card 0 over two buckets, with model A at 1.75 kudos per second and a standard error of 0.375.
+
+    Bucket one: A and B share 20 s, A paid 10 and B paid 5. Bucket two: five lanes share 50 s, A has 30 s and B
+    20 s, A paid 60 and B paid 30. Card 0 then idles 10 s in bucket two, so its wall is 80 s and 70 s are
+    attributed. The rest of A's card has 10 s paid 5 and 30 s paid 30, a rate of 35 / 40 = 0.875, residuals of
+    -3.75 and 3.75, and a standard error of sqrt(2 x 28.125) / 40 = 0.1875. A whole-card pop claim for A stands
+    through bucket two's 50 s of jobs.
+    """
+    accumulator = _earning_accumulator()
+    second_bucket = EARNING_BUCKET_START + CARD_EARNING_BUCKET_SECONDS
+    accumulator.observe(EARNING_BUCKET_START, {})
+    accumulator.observe(EARNING_BUCKET_START + 20.0, {0: CardTick(in_flight_models=("A", "B"))})
+    accumulator.credit_finished_job(device_index=0, model="A", kudos=10.0)
+    accumulator.credit_finished_job(device_index=0, model="B", kudos=5.0)
+    accumulator.observe(second_bucket, {})
+    accumulator.observe(
+        second_bucket + 50.0,
+        {0: CardTick(in_flight_models=("A", "A", "A", "B", "B"), claimed_model="A")},
+    )
+    accumulator.credit_finished_job(device_index=0, model="A", kudos=60.0)
+    accumulator.credit_finished_job(device_index=0, model="B", kudos=30.0)
+    accumulator.observe(second_bucket + 60.0, {0: CardTick()})
+    return accumulator
+
+
+class TestCardEarningSnapshot:
+    """The snapshot includes the earning figures ready to show, computed on the worker."""
+
+    def test_an_empty_window_gives_empty_lists(self) -> None:
+        """With an empty window the rows and cards are empty, and the start and restart are None."""
+        manager = make_testable_process_manager()
+        manager._card_earning = _earning_accumulator()
+
+        earning = manager._build_worker_state_snapshot().card_earning
+
+        assert earning.rows == []
+        assert earning.rows_omitted == 0
+        assert earning.cards == []
+        assert earning.window_started_at is None
+        assert earning.last_restart is None
+
+    def test_the_worked_window_gives_its_rows_cards_and_start(self) -> None:
+        """Rows are ranked by attributed seconds, and the card row splits the wall."""
+        earning = HordeWorkerProcessManager._card_earning_snapshot(_two_bucket_earning_window())
+
+        assert [(row.device_index, row.model) for row in earning.rows] == [(0, "A"), (0, "B")]
+        row_a = earning.rows[0]
+        assert row_a.model_kudos_per_second == pytest.approx(1.75)
+        assert row_a.rest_kudos_per_second == pytest.approx(0.875)
+        assert row_a.jobs == 2
+        assert row_a.model_buckets == 2
+        assert row_a.rest_buckets == 2
+        assert row_a.attributed_card_seconds == pytest.approx(40.0)
+        assert row_a.claim_seconds == pytest.approx(50.0)
+        assert row_a.verdict == PopClaimValueVerdict.UNMEASURED.value
+        assert earning.rows[1].claim_seconds == 0.0
+        assert len(earning.cards) == 1
+        assert earning.cards[0].wall_seconds == pytest.approx(80.0)
+        assert earning.cards[0].attributed_seconds == pytest.approx(70.0)
+        assert earning.cards[0].unattributed_seconds == pytest.approx(10.0)
+        assert earning.window_started_at == EARNING_BUCKET_START
+
+    def test_band_ends_are_the_rate_plus_or_minus_the_width_in_standard_errors(self) -> None:
+        """Two buckets give Student's t for one degree of freedom as the width."""
+        row_a = HordeWorkerProcessManager._card_earning_snapshot(_two_bucket_earning_window()).rows[0]
+        width = two_sided_95_band_width(2)
+
+        assert row_a.model_band_low == pytest.approx(1.75 - width * 0.375)
+        assert row_a.model_band_high == pytest.approx(1.75 + width * 0.375)
+        assert row_a.rest_band_low == pytest.approx(0.875 - width * 0.1875)
+        assert row_a.rest_band_high == pytest.approx(0.875 + width * 0.1875)
+
+    def test_a_rate_without_a_standard_error_has_no_band(self) -> None:
+        """One bucket does not give a spread, so the band ends are None while the rate is present."""
+        accumulator = _earning_accumulator()
+        accumulator.observe(EARNING_BUCKET_START, {})
+        accumulator.observe(EARNING_BUCKET_START + 10.0, {0: CardTick(in_flight_models=("A",))})
+        accumulator.credit_finished_job(device_index=0, model="A", kudos=5.0)
+
+        row = HordeWorkerProcessManager._card_earning_snapshot(accumulator).rows[0]
+
+        assert row.model_kudos_per_second == pytest.approx(0.5)
+        assert row.model_band_low is None
+        assert row.model_band_high is None
+        assert row.rest_kudos_per_second is None
+        assert row.rest_band_low is None
+
+    def test_the_rows_are_bounded_keeping_the_most_attributed_seconds(self) -> None:
+        """Past the bound the snapshot keeps the pairs with the most card time and counts the rest."""
+        accumulator = _earning_accumulator()
+        pair_count = EARNING_ROWS_IN_SNAPSHOT + 5
+        now = EARNING_BUCKET_START
+        accumulator.observe(now, {})
+        for model_number in range(pair_count):
+            now += 1.0 + model_number
+            accumulator.observe(now, {0: CardTick(in_flight_models=(f"model-{model_number:02d}",))})
+
+        earning = HordeWorkerProcessManager._card_earning_snapshot(accumulator)
+
+        assert len(earning.rows) == EARNING_ROWS_IN_SNAPSHOT
+        assert earning.rows_omitted == 5
+        assert earning.rows[0].model == f"model-{pair_count - 1:02d}"
+        assert {row.model for row in earning.rows} == {f"model-{number:02d}" for number in range(5, pair_count)}
+
+    def test_a_restart_during_a_run_names_the_changed_setting(self) -> None:
+        """A supervisor concurrency command moves the live cap, and the next control-tick comparison names it."""
+        manager = make_testable_process_manager(max_threads=2)
+        manager._card_earning.restart_window_if_changed(manager._capacity_workload_settings())
+        assert manager._build_worker_state_snapshot().card_earning.last_restart is None
+
+        manager._apply_set_concurrency(target_threads=1, target_processes=None)
+        manager._restart_card_earning_window_if_changed()
+
+        restart = manager._build_worker_state_snapshot().card_earning.last_restart
+        assert restart is not None
+        assert restart.changed_settings == ["max_threads"]
+
+    def test_the_figures_are_reused_until_the_refresh_interval_passes(self) -> None:
+        """The window read is too slow for every snapshot, so a recent reading is reused and an old one is not."""
+        manager = make_testable_process_manager()
+        manager._card_earning = _two_bucket_earning_window()
+        first = manager._build_worker_state_snapshot().card_earning
+        manager._card_earning.credit_finished_job(device_index=0, model="A", kudos=5.0)
+
+        reused = manager._build_worker_state_snapshot().card_earning
+        manager._card_earning_snapshot_built_at -= manager._CARD_EARNING_SNAPSHOT_REFRESH_SECONDS
+        refreshed = manager._build_worker_state_snapshot().card_earning
+
+        assert reused.rows[0].jobs == first.rows[0].jobs
+        assert refreshed.rows[0].jobs == first.rows[0].jobs + 1

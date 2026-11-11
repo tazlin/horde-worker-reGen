@@ -8,14 +8,18 @@ from it for a (model, card) pair:
 - The rest rate is the card's kudos less the model's, over the card's wall seconds less the model's seconds.
 
 The scheduler feeds the time once per control tick (:meth:`CardEarningAccumulator.observe`) with each card's
-lanes that have a job in flight and the card's whole-card grant. The run metrics credit the kudos when a
-finished image record is folded into the rollups (:meth:`CardEarningAccumulator.credit_finished_job`). The
-process manager owns the instance, persists it beside ``perf_model.json`` and saves it at shutdown.
+lanes that have a job in flight, the card's whole-card grant and the card's standing pop claim. The run metrics
+credit the kudos when a finished image record is folded into the rollups
+(:meth:`CardEarningAccumulator.credit_finished_job`). The process manager owns the instance, persists it beside
+``perf_model.json`` and saves it at shutdown. :meth:`CardEarningAccumulator.read_window` returns every pair's
+figures, each card's time and the window's status in one read, for the supervisor snapshot.
 
 The buckets hold figures for one capacity and workload configuration, named by its fingerprint
 (:func:`~horde_worker_regen.process_management.ipc.supervisor_channel.capacity_workload_fingerprint`). A file
 written under another fingerprint loads empty, and :meth:`CardEarningAccumulator.restart_window_if_changed`
-drops the buckets when the fingerprint changes during a run.
+drops the buckets when the fingerprint changes during a run. The accumulator keeps the settings it last
+compared, so a restart during a run names the settings that changed. A restart found at load does not name
+them, since the file holds only the fingerprint.
 
 The module only measures. It does not hold a threshold or a verdict. The pop claim's value verdict in
 :mod:`~horde_worker_regen.process_management.scheduling.governance.whole_card` reads it for disclosure, and
@@ -35,6 +39,11 @@ from typing import Annotated
 from loguru import logger
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from horde_worker_regen.process_management.ipc.supervisor_channel import (
+    CapacityWorkloadSettings,
+    capacity_workload_fingerprint,
+    changed_capacity_workload_settings,
+)
 from horde_worker_regen.process_management.scheduling.performance_model import (
     _PERSIST_EVERY_N_OBSERVATIONS,
     _atomic_write_text,
@@ -78,10 +87,14 @@ class CardTick:
         in_flight_models: The model of each lane on the card with a job in flight, one entry per lane. A model
             appears twice when two of the card's lanes run its jobs.
         held_model: The model of the card's whole-card grant, of either rung, or None when the card holds none.
+        claimed_model: The model of the whole-card pop claim standing on the card, or None when none stands. A
+            grant can outlast its claim, and a multi-card host holds grants without a claim, so this is read
+            apart from ``held_model``.
     """
 
     in_flight_models: tuple[str, ...] = ()
     held_model: str | None = None
+    claimed_model: str | None = None
 
 
 @dataclass(frozen=True)
@@ -103,6 +116,8 @@ class CardEarningRate:
         model_buckets: How many retained buckets have attributed seconds for the model. The model's standard
             error is estimated from this many readings.
         rest_buckets: How many retained buckets have seconds left for the rest of the card.
+        claim_seconds: The card seconds during which a whole-card pop claim for the model stood on the card.
+            These seconds are not part of either rate.
     """
 
     model_kudos_per_second: float | None
@@ -114,6 +129,64 @@ class CardEarningRate:
     rest_standard_error: float | None = None
     model_buckets: int = 0
     rest_buckets: int = 0
+    claim_seconds: float = 0.0
+
+
+@dataclass(frozen=True)
+class CardTime:
+    """Represents one card's time over the retained window.
+
+    Attributes:
+        device_index: The card, by the lane's device index.
+        wall_seconds: The card's wall seconds.
+        attributed_seconds: The card seconds attributed to any model. At most ``wall_seconds``.
+    """
+
+    device_index: int
+    wall_seconds: float
+    attributed_seconds: float
+
+    @property
+    def unattributed_seconds(self) -> float:
+        """Return the card's wall seconds that did not go to any model.
+
+        Clamped at zero, because the wall and its shares are summed separately and can differ by a rounding
+        residue.
+        """
+        return max(0.0, self.wall_seconds - self.attributed_seconds)
+
+
+@dataclass(frozen=True)
+class CardEarningRestart:
+    """Represents the last time the window started over because the capacity or workload settings changed.
+
+    Attributes:
+        at: The wall-clock time of the restart.
+        changed_settings: The names of the settings that changed, in the order
+            :class:`~horde_worker_regen.process_management.ipc.supervisor_channel.CapacityWorkloadSettings`
+            declares them. None when they are unknown, which is the case for a restart found at load.
+    """
+
+    at: float
+    changed_settings: tuple[str, ...] | None
+
+
+@dataclass(frozen=True)
+class CardEarningWindow:
+    """Represents every figure of the retained window, read in one pass.
+
+    Attributes:
+        rates: Each (card, model) pair's figures, keyed by the lane's device index and the model. A pair is
+            present when it has attributed seconds, counted jobs or claim seconds in the window.
+        cards: Each card's time, by device index ascending.
+        started_at: The start of the oldest retained bucket, or None when the window is empty.
+        last_restart: The last restart during this run or at load, or None when there was none.
+    """
+
+    rates: dict[tuple[int, str], CardEarningRate]
+    cards: list[CardTime]
+    started_at: float | None
+    last_restart: CardEarningRestart | None
 
 
 @dataclass(frozen=True)
@@ -153,6 +226,67 @@ class _ModelTally:
     seconds: float = 0.0
     kudos: float = 0.0
     jobs: int = 0
+    claim_seconds: float = 0.0
+
+    def is_empty(self) -> bool:
+        """Return whether the tally's seconds, jobs and claim seconds are all zero."""
+        return self.seconds <= 0.0 and self.jobs == 0 and self.claim_seconds <= 0.0
+
+
+@dataclass(frozen=True)
+class _BucketSummary:
+    """Represents one bucket's figures with each card's kudos summed, which every pair's rate reads."""
+
+    wall_seconds_by_card: Mapping[int, float]
+    kudos_by_card: Mapping[int, float]
+    tallies: Mapping[tuple[int, str], _ModelTally]
+
+
+def _pair_rate(summaries: list[_BucketSummary], *, device_index: int, model: str) -> CardEarningRate:
+    """Return the earning figures of ``model`` on ``device_index`` over ``summaries``."""
+    card_wall = 0.0
+    card_kudos = 0.0
+    model_seconds = 0.0
+    model_kudos = 0.0
+    model_jobs = 0
+    claim_seconds = 0.0
+    model_by_bucket: list[_BucketFigures] = []
+    rest_by_bucket: list[_BucketFigures] = []
+    for summary in summaries:
+        bucket_wall = summary.wall_seconds_by_card.get(device_index, 0.0)
+        bucket_card_kudos = summary.kudos_by_card.get(device_index, 0.0)
+        tally = summary.tallies.get((device_index, model))
+        bucket_model_seconds = tally.seconds if tally is not None else 0.0
+        bucket_model_kudos = tally.kudos if tally is not None else 0.0
+        if tally is not None:
+            model_jobs += tally.jobs
+            claim_seconds += tally.claim_seconds
+        card_wall += bucket_wall
+        card_kudos += bucket_card_kudos
+        model_seconds += bucket_model_seconds
+        model_kudos += bucket_model_kudos
+        model_by_bucket.append(_BucketFigures(kudos=bucket_model_kudos, seconds=bucket_model_seconds))
+        rest_by_bucket.append(
+            _BucketFigures(
+                kudos=bucket_card_kudos - bucket_model_kudos,
+                seconds=bucket_wall - bucket_model_seconds,
+            ),
+        )
+    rest_seconds = card_wall - model_seconds
+    model_rate = model_kudos / model_seconds if model_seconds > _ZERO_SECONDS_TOLERANCE else None
+    rest_rate = (card_kudos - model_kudos) / rest_seconds if rest_seconds > _ZERO_SECONDS_TOLERANCE else None
+    return CardEarningRate(
+        model_kudos_per_second=model_rate,
+        rest_kudos_per_second=rest_rate,
+        jobs=model_jobs,
+        model_seconds=model_seconds,
+        card_wall_seconds=card_wall,
+        model_standard_error=_ratio_standard_error(model_by_bucket, model_rate),
+        rest_standard_error=_ratio_standard_error(rest_by_bucket, rest_rate),
+        model_buckets=len(_counted_buckets(model_by_bucket)),
+        rest_buckets=len(_counted_buckets(rest_by_bucket)),
+        claim_seconds=claim_seconds,
+    )
 
 
 @dataclass
@@ -169,6 +303,17 @@ class _EarningBucket:
             existing = _ModelTally()
             self.tallies[key] = existing
         return existing
+
+    def summary(self) -> _BucketSummary:
+        """Return the bucket's figures with each card's kudos summed over its tallies."""
+        kudos_by_card: dict[int, float] = {}
+        for (tally_card, _tally_model), tally in self.tallies.items():
+            kudos_by_card[tally_card] = kudos_by_card.get(tally_card, 0.0) + tally.kudos
+        return _BucketSummary(
+            wall_seconds_by_card=self.wall_seconds_by_card,
+            kudos_by_card=kudos_by_card,
+            tallies=self.tallies,
+        )
 
 
 class _PersistedCardWall(BaseModel):
@@ -190,6 +335,8 @@ class _PersistedModelTally(BaseModel):
     seconds: _FiniteNonNegative
     kudos: _FiniteNonNegative
     jobs: Annotated[int, Field(ge=0)]
+    claim_seconds: _FiniteNonNegative = 0.0
+    """Defaults to zero so a file written before the claim tally existed loads under the same schema version."""
 
 
 class _PersistedBucketStart(BaseModel):
@@ -209,6 +356,9 @@ class CardEarningAccumulator:
     model that caused them. Otherwise it counts only in the card's wall. The card's wall grows by the whole
     elapsed time in every case, so a card's attributed seconds never exceed its wall.
 
+    The time a whole-card pop claim stands on a card is tallied apart, to the claimed model. It does not change
+    the split above.
+
     Thread Safety:
         Fed by the control loop only. Not safe for concurrent mutation.
     """
@@ -217,7 +367,7 @@ class CardEarningAccumulator:
         self,
         *,
         max_tick_seconds: float,
-        config_fingerprint: str = "",
+        settings: CapacityWorkloadSettings | None = None,
         path: Path | None = None,
         clock: Callable[[], float] | None = None,
     ) -> None:
@@ -226,14 +376,15 @@ class CardEarningAccumulator:
         Args:
             max_tick_seconds: The most one tick may add. A larger gap means the control loop stalled, and the
                 stalled time is not evidence of what the card was doing.
-            config_fingerprint: The fingerprint of the capacity and workload settings the figures are measured
-                under. A persisted file written under another fingerprint loads empty.
+            settings: The capacity and workload settings the figures are measured under. A persisted file
+                written under another fingerprint loads empty. None stands for an empty fingerprint.
             path: Where the buckets persist. None keeps them in memory only.
-            clock: Wall-clock source, read to age the persisted buckets at load and to place a kudos credit
-                that arrives before the first tick. Defaults to ``time.time``.
+            clock: Wall-clock source, read to age the persisted buckets at load, to place a kudos credit that
+                arrives before the first tick and to time a restart. Defaults to ``time.time``.
         """
         self._max_tick_seconds = max_tick_seconds
-        self._config_fingerprint = config_fingerprint
+        self._settings = settings
+        self._config_fingerprint = capacity_workload_fingerprint(settings) if settings is not None else ""
         self._path = path
         self._clock: Callable[[], float] = clock if clock is not None else time.time
         self._buckets: dict[float, _EarningBucket] = {}
@@ -241,6 +392,7 @@ class CardEarningAccumulator:
         self._session_seconds_by_model: dict[str, float] = {}
         self._jobs_since_save = 0
         self._file_disabled = False
+        self._last_restart: CardEarningRestart | None = None
         self._load()
 
     # region feeding
@@ -270,6 +422,8 @@ class CardEarningAccumulator:
                     self._credit_seconds(bucket, device_index, model, share)
             elif card_tick.held_model is not None:
                 self._credit_seconds(bucket, device_index, card_tick.held_model, elapsed)
+            if card_tick.claimed_model is not None:
+                bucket.tally(device_index, card_tick.claimed_model).claim_seconds += elapsed
 
     def credit_finished_job(self, *, device_index: int, model: str, kudos: float | None) -> None:
         """Count one finished job for ``model`` on ``device_index`` and add its kudos.
@@ -293,19 +447,32 @@ class CardEarningAccumulator:
         if self._jobs_since_save >= _PERSIST_EVERY_N_OBSERVATIONS:
             self.save()
 
-    def restart_window_if_changed(self, config_fingerprint: str) -> None:
-        """Mutate the window to start over when ``config_fingerprint`` differs from the current one.
+    def restart_window_if_changed(self, settings: CapacityWorkloadSettings) -> None:
+        """Mutate the window to start over when the fingerprint of ``settings`` differs from the current one.
 
         The retained buckets are dropped and the new fingerprint is adopted. The session totals behind
         :meth:`session_seconds_by_model` are kept, since the rollups read them as session figures. The clock
-        anchor is kept too, so the next tick accrues into the new window as usual.
+        anchor is kept too, so the next tick accrues into the new window as usual. The restart is recorded with
+        the settings that changed since the previous call. It is recorded even when the window was empty,
+        because every figure from then on is measured under the new settings.
 
         Args:
-            config_fingerprint: The fingerprint of the current capacity and workload settings.
+            settings: The current capacity and workload settings.
         """
+        previous_settings = self._settings
+        self._settings = settings
+        config_fingerprint = capacity_workload_fingerprint(settings)
         if config_fingerprint == self._config_fingerprint:
             return
         self._config_fingerprint = config_fingerprint
+        self._last_restart = CardEarningRestart(
+            at=self._clock(),
+            changed_settings=(
+                changed_capacity_workload_settings(previous_settings, settings)
+                if previous_settings is not None
+                else None
+            ),
+        )
         if not self._buckets:
             return
         self._buckets.clear()
@@ -348,50 +515,54 @@ class CardEarningAccumulator:
             model: The model to read.
             device_index: The card to read, by the lane's device index.
         """
-        card_wall = 0.0
-        card_kudos = 0.0
-        model_seconds = 0.0
-        model_kudos = 0.0
-        model_jobs = 0
-        model_by_bucket: list[_BucketFigures] = []
-        rest_by_bucket: list[_BucketFigures] = []
+        summaries = [bucket.summary() for bucket in self._buckets.values()]
+        return _pair_rate(summaries, device_index=device_index, model=model)
+
+    @property
+    def last_restart(self) -> CardEarningRestart | None:
+        """The last window restart during this run or at load, or None when there was none.
+
+        A reader that keeps a copy of :meth:`read_window` compares this object by identity to find out that the
+        window restarted since the copy was taken, without paying for the read.
+        """
+        return self._last_restart
+
+    def read_window(self) -> CardEarningWindow:
+        """Return every pair's figures, each card's time and the window's status, from one pass over the buckets.
+
+        Each pair's figures equal what :meth:`rate` returns for it. The buckets are summarised once and every
+        pair reads the summaries, so the read does not walk each bucket's tallies once per pair.
+        """
+        summaries: list[_BucketSummary] = []
+        pairs: set[tuple[int, str]] = set()
+        wall_by_card: dict[int, float] = {}
+        attributed_by_card: dict[int, float] = {}
         for bucket in self._buckets.values():
-            bucket_wall = bucket.wall_seconds_by_card.get(device_index, 0.0)
-            bucket_card_kudos = 0.0
-            bucket_model_seconds = 0.0
-            bucket_model_kudos = 0.0
-            for (tally_card, tally_model), tally in bucket.tallies.items():
-                if tally_card != device_index:
+            summaries.append(bucket.summary())
+            for device_index, wall_seconds in bucket.wall_seconds_by_card.items():
+                wall_by_card[device_index] = wall_by_card.get(device_index, 0.0) + wall_seconds
+            for pair, tally in bucket.tallies.items():
+                if tally.is_empty():
                     continue
-                bucket_card_kudos += tally.kudos
-                if tally_model == model:
-                    bucket_model_seconds += tally.seconds
-                    bucket_model_kudos += tally.kudos
-                    model_jobs += tally.jobs
-            card_wall += bucket_wall
-            card_kudos += bucket_card_kudos
-            model_seconds += bucket_model_seconds
-            model_kudos += bucket_model_kudos
-            model_by_bucket.append(_BucketFigures(kudos=bucket_model_kudos, seconds=bucket_model_seconds))
-            rest_by_bucket.append(
-                _BucketFigures(
-                    kudos=bucket_card_kudos - bucket_model_kudos,
-                    seconds=bucket_wall - bucket_model_seconds,
-                ),
+                pairs.add(pair)
+                attributed_by_card[pair[0]] = attributed_by_card.get(pair[0], 0.0) + tally.seconds
+        rates = {
+            (device_index, model): _pair_rate(summaries, device_index=device_index, model=model)
+            for device_index, model in sorted(pairs)
+        }
+        cards = [
+            CardTime(
+                device_index=device_index,
+                wall_seconds=wall_by_card.get(device_index, 0.0),
+                attributed_seconds=attributed_by_card.get(device_index, 0.0),
             )
-        rest_seconds = card_wall - model_seconds
-        model_rate = model_kudos / model_seconds if model_seconds > _ZERO_SECONDS_TOLERANCE else None
-        rest_rate = (card_kudos - model_kudos) / rest_seconds if rest_seconds > _ZERO_SECONDS_TOLERANCE else None
-        return CardEarningRate(
-            model_kudos_per_second=model_rate,
-            rest_kudos_per_second=rest_rate,
-            jobs=model_jobs,
-            model_seconds=model_seconds,
-            card_wall_seconds=card_wall,
-            model_standard_error=_ratio_standard_error(model_by_bucket, model_rate),
-            rest_standard_error=_ratio_standard_error(rest_by_bucket, rest_rate),
-            model_buckets=len(_counted_buckets(model_by_bucket)),
-            rest_buckets=len(_counted_buckets(rest_by_bucket)),
+            for device_index in sorted(wall_by_card.keys() | attributed_by_card.keys())
+        ]
+        return CardEarningWindow(
+            rates=rates,
+            cards=cards,
+            started_at=min(self._buckets) if self._buckets else None,
+            last_restart=self._last_restart,
         )
 
     def session_seconds_by_model(self) -> dict[str, float]:
@@ -433,6 +604,7 @@ class CardEarningAccumulator:
                     seconds=tally.seconds,
                     kudos=tally.kudos,
                     jobs=tally.jobs,
+                    claim_seconds=tally.claim_seconds,
                 ).model_dump()
                 for (card, model), tally in sorted(bucket.tallies.items())
             ]
@@ -449,7 +621,8 @@ class CardEarningAccumulator:
 
         A file of another schema version or bucket width is discarded whole, since its buckets cannot be merged
         into this width. A file written under another configuration fingerprint is discarded whole too, and a
-        file without a fingerprint counts as another one.
+        file without a fingerprint counts as another one. Discarding buckets for another fingerprint is recorded
+        as a restart whose changed settings are unknown.
         """
         if self._path is None or not self._path.exists():
             return
@@ -469,6 +642,7 @@ class CardEarningAccumulator:
             return
         if raw.get("config_fingerprint") != self._config_fingerprint:
             if persisted_buckets:
+                self._last_restart = CardEarningRestart(at=self._clock(), changed_settings=None)
                 _log_window_restart()
             return
         now = self._clock()
@@ -511,6 +685,7 @@ class CardEarningAccumulator:
             tally.seconds += loaded.seconds
             tally.kudos += loaded.kudos
             tally.jobs += loaded.jobs
+            tally.claim_seconds += loaded.claim_seconds
         return dropped
 
     # endregion

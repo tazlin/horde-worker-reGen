@@ -288,6 +288,41 @@ the rate's denominator. Each bucket's deviation from the rate is therefore weigh
 error is `None` when its rate is `None` or fewer than two buckets count. The read also returns how many buckets each rate was read from. The pop claim's value verdict reads both
 rates and both standard errors (see [Logs](logs.md#lines-that-say-a-mechanism-acted)).
 
+Each bucket also holds a claim tally per card and model: the seconds during which a whole-card pop claim for the
+model stood on the card. It is fed by the same tick as the attributed seconds and does not change them. A grant
+can outlast its claim, and a multi-card host holds grants without a claim, so the claim seconds can be fewer than
+the seconds under a grant. A file written before the tally existed loads under the same schema version, with
+each tally's claim seconds at 0.
+
+### Card earning on the supervisor snapshot
+
+`WorkerStateSnapshot.card_earning` is a
+[`CardEarningSnapshot`][horde_worker_regen.process_management.ipc.supervisor_channel.CardEarningSnapshot], built
+by `HordeWorkerProcessManager._card_earning_snapshot` from one `CardEarningAccumulator.read_window` call. The
+worker computes every figure, so the dashboard does not redo the statistics or the verdict. The read walks every
+retained bucket and takes milliseconds to tens of milliseconds, so the worker reuses the figures for ten seconds
+(`_CARD_EARNING_SNAPSHOT_REFRESH_SECONDS`). A window restart is shown at the next snapshot.
+
+| Field | Meaning |
+| ----- | ------- |
+| `rows` | One [`CardEarningRow`][horde_worker_regen.process_management.ipc.supervisor_channel.CardEarningRow] per card and model with attributed seconds, counted jobs or claim seconds in the window, the most attributed seconds first. At most `EARNING_ROWS_IN_SNAPSHOT` (30). |
+| `rows_omitted` | How many pairs the bound left out. A row left out holds at most a thirty-first of the window's attributed seconds. |
+| `cards` | Per card: `wall_seconds`, `attributed_seconds` (to any model) and `unattributed_seconds` (the rest of the wall). |
+| `window_started_at` | The start of the oldest retained bucket, or `None` when the window is empty. |
+| `last_restart` | The last restart during this run or at load: `at` and `changed_settings`. `None` when there was none. |
+
+A row has the card, the model, `model_kudos_per_second` and `rest_kudos_per_second`, each with `_band_low` and
+`_band_high`, then `jobs`, `model_buckets`, `rest_buckets`, `attributed_card_seconds`, `claim_seconds` and
+`verdict`. A band end is the rate plus or minus `two_sided_95_band_width(buckets)` standard errors, from
+`whole_card.rate_95_band`, which the verdict reads too. A band end is `None` when the rate or its standard error
+is `None`. The verdict is `pop_claim_value_verdict` over the row's figures, as its string value.
+
+A restart during a run names the changed settings by their `CapacityWorkloadSettings` field names, in declaration
+order. The accumulator keeps the settings it last compared and names the fields with
+`changed_capacity_workload_settings`. A restart is recorded at every settings change, even when the window held
+no figures. A restart found at load has `changed_settings` set to `None`, because the file holds only the
+previous fingerprint. The restart record is not persisted.
+
 ## Stats tab: the Model pool section
 
 When the [fixed model pool](../explanation/model_pool.md) is enabled, the dashboard's **Stats** tab grows a

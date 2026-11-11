@@ -58,6 +58,14 @@ PENDING_JOBS_IN_SNAPSHOT = 8
 WORK_LEDGER_ENTRIES_IN_SNAPSHOT = 18
 """How many active/recent job rows to carry for the Overview work ledger (bounds payload size)."""
 
+EARNING_ROWS_IN_SNAPSHOT = 30
+"""How many (card, model) earning rows a snapshot holds (bounds payload size).
+
+A worker can offer hundreds of models, and a day's window can hold a row for each one served. The rows are
+ranked by attributed card seconds, so the rows left out are the ones with the least card time, whose rates rest
+on the fewest seconds. A row left out by a bound of thirty holds at most a thirty-first of the window's
+attributed seconds."""
+
 
 class SamplerSummary(BaseModel):
     """One job's sampler and what a step of it costs, for compact display.
@@ -294,6 +302,21 @@ def capacity_workload_fingerprint(settings: CapacityWorkloadSettings) -> str:
     """
     digest = hashlib.sha256(settings.model_dump_json().encode("utf-8")).hexdigest()
     return digest[:_CAPACITY_WORKLOAD_FINGERPRINT_HEX_DIGITS]
+
+
+def changed_capacity_workload_settings(
+    previous: CapacityWorkloadSettings,
+    current: CapacityWorkloadSettings,
+) -> tuple[str, ...]:
+    """Return the names of the fields that differ between ``previous`` and ``current``, in declaration order.
+
+    Args:
+        previous: The settings before the change.
+        current: The settings after the change.
+    """
+    previous_values = previous.model_dump()
+    current_values = current.model_dump()
+    return tuple(name for name, value in previous_values.items() if current_values[name] != value)
 
 
 class WorkerConfigSummary(BaseModel):
@@ -996,6 +1019,81 @@ class StatsRollupRow(BaseModel):
     A second of a card belongs to its lanes with a job in flight, split equally, or to the model of the card's
     whole-card grant while no job is in flight. Unlike ``sampling_seconds``, the shares on one card sum to at most
     the card's wall, so ``kudos`` over this figure is a card rate. It includes time of jobs not yet finalized."""
+
+
+class CardEarningRow(BaseModel):
+    """Represents one model's earning figures on one card over the trailing earning window.
+
+    A band end is None when its rate or the rate's standard error is None.
+    """
+
+    device_index: int
+    """The card, by the lane's device index (0 on a single-card host)."""
+    model: str
+    model_kudos_per_second: float | None = None
+    """The model's kudos over its attributed card seconds. None when the model has no attributed seconds."""
+    model_band_low: float | None = None
+    """The low end of the model rate's 95% band."""
+    model_band_high: float | None = None
+    """The high end of the model rate's 95% band."""
+    rest_kudos_per_second: float | None = None
+    """The card's other kudos over its wall less the model's seconds. None when the model took the whole wall."""
+    rest_band_low: float | None = None
+    """The low end of the rest rate's 95% band."""
+    rest_band_high: float | None = None
+    """The high end of the rest rate's 95% band."""
+    jobs: int = 0
+    """The model's finished jobs counted on the card, faulted jobs included."""
+    model_buckets: int = 0
+    """How many time buckets the model rate's standard error was read from."""
+    rest_buckets: int = 0
+    """How many time buckets the rest rate's standard error was read from."""
+    attributed_card_seconds: float = 0.0
+    """The card seconds attributed to the model, the model rate's denominator."""
+    claim_seconds: float = 0.0
+    """The card seconds during which a whole-card pop claim for the model stood on the card."""
+    verdict: str
+    """Whether the model earns as much per card second as the rest of its card (``unmeasured`` | ``pays`` |
+    ``below_the_rest``)."""
+
+
+class CardEarningCardRow(BaseModel):
+    """Represents one card's time over the trailing earning window."""
+
+    device_index: int
+    """The card, by the lane's device index (0 on a single-card host)."""
+    wall_seconds: float = 0.0
+    """The card's wall seconds in the window."""
+    attributed_seconds: float = 0.0
+    """The card seconds attributed to any model. At most ``wall_seconds``."""
+    unattributed_seconds: float = 0.0
+    """The wall seconds that did not go to any model."""
+
+
+class CardEarningWindowRestart(BaseModel):
+    """Represents the last restart of the earning window, during this run or found at load."""
+
+    at: float
+    """When the restart happened, as a wall-clock epoch."""
+    changed_settings: list[str] | None = None
+    """The capacity and workload settings that changed, by field name. None when they are unknown, as for a
+    restart found at load, where the file holds only the previous settings' fingerprint."""
+
+
+class CardEarningSnapshot(BaseModel):
+    """Represents the earning window's figures as the dashboard shows them, all computed on the worker."""
+
+    rows: list[CardEarningRow] = Field(default_factory=list)
+    """Each (card, model) pair with attributed seconds, counted jobs or claim seconds in the window, the most
+    attributed seconds first. Bounded by :data:`EARNING_ROWS_IN_SNAPSHOT`."""
+    rows_omitted: int = 0
+    """How many pairs the bound left out."""
+    cards: list[CardEarningCardRow] = Field(default_factory=list)
+    """Each card with time in the window, by device index ascending."""
+    window_started_at: float | None = None
+    """The start of the oldest retained time bucket, or None when the window is empty."""
+    last_restart: CardEarningWindowRestart | None = None
+    """The last restart during this run or at load, or None when there was none."""
 
 
 class StatsExportState(BaseModel):
@@ -1809,6 +1907,9 @@ class WorkerStateSnapshot(BaseModel):
     """Finalized image-job rollups by baseline."""
     stats_form_rollups: list[StatsRollupRow] = Field(default_factory=list)
     """Finalized alchemy-form rollups by form (``model`` includes the form name). Empty for a dreamer worker."""
+    card_earning: CardEarningSnapshot = Field(default_factory=CardEarningSnapshot)
+    """What each model earns per card second over the trailing earning window, with each card's time and the
+    window's status. Every figure is computed on the worker."""
     stats_export: StatsExportState = Field(default_factory=StatsExportState)
     """Worker-side stats JSONL export state."""
     stats_history_backfill: StatsHistoryBackfill | None = None

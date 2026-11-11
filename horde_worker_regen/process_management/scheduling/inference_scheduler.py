@@ -5275,12 +5275,14 @@ class InferenceScheduler:
         )
 
     def _observe_card_earning(self) -> None:
-        """Give the card earning accumulator each card's in-flight models and whole-card grant for this tick.
+        """Give the card earning accumulator each card's in-flight models, grant and standing claim for this tick.
 
         A lane counts while it owns a dispatched job, from dispatch to the job's result, whatever state it
         reports, so a job's load, encode and decode are charged to its model. The accumulator keys cards by the
-        lane's device index, while the whole-card ledger keys a single-card host by ``None``. The ledger read uses
-        the scheduler's card-to-key mapping (``device_index if self._multi_gpu_routing_active else None``).
+        lane's device index, while the whole-card ledger keys a single-card host by ``None``. The ledger reads use
+        the scheduler's card-to-key mapping (``device_index if self._multi_gpu_routing_active else None``). The
+        claim is read through :meth:`_standing_pop_claim`. It returns the same claim as
+        :meth:`whole_card_pop_claim` without the multi-GPU disclosure, so a tick does not repeat that disclosure.
         """
         if self._card_earning is None:
             return
@@ -5292,12 +5294,15 @@ class InferenceScheduler:
             job = process_info.current_inference_job()
             if job is not None and job.model is not None:
                 lane_models.append(str(job.model))
+        claim = self._standing_pop_claim()
         cards: dict[int, CardTick] = {}
         for device_index, models in in_flight_by_card.items():
-            held = self._whole_card_ledger.get(device_index if self._multi_gpu_routing_active else None)
+            ledger_key = device_index if self._multi_gpu_routing_active else None
+            held = self._whole_card_ledger.get(ledger_key)
             cards[device_index] = CardTick(
                 in_flight_models=tuple(models),
                 held_model=held.model if held is not None else None,
+                claimed_model=claim.model if claim is not None and claim.device_index == ledger_key else None,
             )
         self._card_earning.observe(self._clock(), cards)
 

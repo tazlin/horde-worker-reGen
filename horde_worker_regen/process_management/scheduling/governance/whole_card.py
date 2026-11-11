@@ -64,6 +64,7 @@ __all__ = [
     "GraceBudgetStatus",
     "PopClaimValue",
     "PopClaimValueVerdict",
+    "RateBand",
     "WholeCardGovernor",
     "WholeCardGovernorHold",
     "WholeCardPopClaimTracker",
@@ -78,6 +79,7 @@ __all__ = [
     "max_coresident_for_peak",
     "offer_under_pop_claim",
     "pop_claim_value_verdict",
+    "rate_95_band",
     "two_sided_95_band_width",
     "post_process_context_fits",
     "residency_has_holder",
@@ -244,6 +246,31 @@ def two_sided_95_band_width(readings: int) -> float:
         return _TWO_SIDED_95_T_BY_DEGREES_OF_FREEDOM[degrees_of_freedom - 1]
     correction = (_TWO_SIDED_95_NORMAL**3 + _TWO_SIDED_95_NORMAL) / (4 * degrees_of_freedom)
     return _TWO_SIDED_95_NORMAL + correction
+
+
+@dataclass(frozen=True)
+class RateBand:
+    """Represents the two ends of a rate's 95% band."""
+
+    low: float
+    high: float
+
+
+def rate_95_band(*, rate: float | None, standard_error: float | None, readings: int) -> RateBand | None:
+    """Return the 95% band of ``rate``, or None when the rate, its error or a second reading is missing.
+
+    Each end lies :func:`two_sided_95_band_width` standard errors from the rate. The pop claim's value verdict
+    and the supervisor snapshot both read their bands here, so the dashboard shows the band the verdict used.
+
+    Args:
+        rate: The rate, in kudos per card second.
+        standard_error: The rate's standard error.
+        readings: How many time buckets the standard error was read from.
+    """
+    if rate is None or standard_error is None or readings < 2:
+        return None
+    half_width = two_sided_95_band_width(readings) * standard_error
+    return RateBand(low=rate - half_width, high=rate + half_width)
 
 
 class WholeCardGovernor(StrEnum):
@@ -1384,17 +1411,19 @@ def pop_claim_value_verdict(rate: CardEarningRate) -> PopClaimValueVerdict:
     """
     if rate.jobs < POP_CLAIM_VALUE_MIN_JOBS:
         return PopClaimValueVerdict.UNMEASURED
-    model_rate = rate.model_kudos_per_second
-    rest_rate = rate.rest_kudos_per_second
-    model_error = rate.model_standard_error
-    rest_error = rate.rest_standard_error
-    if model_rate is None or rest_rate is None or model_error is None or rest_error is None:
+    model_band = rate_95_band(
+        rate=rate.model_kudos_per_second,
+        standard_error=rate.model_standard_error,
+        readings=rate.model_buckets,
+    )
+    rest_band = rate_95_band(
+        rate=rate.rest_kudos_per_second,
+        standard_error=rate.rest_standard_error,
+        readings=rate.rest_buckets,
+    )
+    if model_band is None or rest_band is None:
         return PopClaimValueVerdict.UNMEASURED
-    if min(rate.model_buckets, rate.rest_buckets) < 2:
-        return PopClaimValueVerdict.UNMEASURED
-    model_band_top = model_rate + two_sided_95_band_width(rate.model_buckets) * model_error
-    rest_band_bottom = rest_rate - two_sided_95_band_width(rate.rest_buckets) * rest_error
-    if model_band_top < rest_band_bottom:
+    if model_band.high < rest_band.low:
         return PopClaimValueVerdict.BELOW_THE_REST
     return PopClaimValueVerdict.PAYS
 

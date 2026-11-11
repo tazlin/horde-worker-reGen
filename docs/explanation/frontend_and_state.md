@@ -50,8 +50,10 @@ defines the structured protocol over it:
   `gpu_utilization_samples_per_card`, keyed by device index) and as the long-standing worker-wide
   scalars, which are reductions across the driven cards. The snapshot also carries
   worker-owned stats data: the latest one-second `StatsSample`, bounded stats-history backfill for
-  reconnecting frontends, model/baseline `StatsRollupRow` tables, and `StatsExportState` for the JSONL
-  export toggle and disk-size warning. A scribe worker's snapshot also includes its text flow: jobs in
+  reconnecting frontends, model/baseline `StatsRollupRow` tables, `StatsExportState` for the JSONL
+  export toggle and disk-size warning, and `card_earning`, the trailing earning window's per-model rates,
+  bands and verdicts, each card's time and the window's last restart (see
+  [Stats export](../reference/stats.md#card-earning-on-the-supervisor-snapshot)). A scribe worker's snapshot also includes its text flow: jobs in
   flight, the session's submitted and faulted totals, whether the backend's readiness gate has passed,
   and the model, context length and generation length being advertised, with `scribe`, `scribe_name` and
   `text_backend_managed` on the config summary. The summary carries all three role flags (`dreamer`,
@@ -100,7 +102,7 @@ defines the structured protocol over it:
   the config enables post-processing and the offer is withheld for a reason other than the fault breaker,
   which has its own row, and the headless status line appends the effective offer when it differs.
   The snapshot is versioned by `SUPERVISOR_PROTOCOL_VERSION`
-  (currently 34) so a frontend can detect a mismatch with a worker built from different code.
+  (currently 36) so a frontend can detect a mismatch with a worker built from different code.
 
 ### The event ring
 

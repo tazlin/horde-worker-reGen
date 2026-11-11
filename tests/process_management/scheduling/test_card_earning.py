@@ -15,6 +15,10 @@ from pathlib import Path
 import pytest
 from loguru import logger
 
+from horde_worker_regen.process_management.ipc.supervisor_channel import (
+    CapacityWorkloadSettings,
+    capacity_workload_fingerprint,
+)
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.scheduling.card_earning import (
@@ -38,8 +42,34 @@ BUCKET_START = 1000.0 * CARD_EARNING_BUCKET_SECONDS
 GENEROUS_TICK_SECONDS = 1000.0
 """A tick clamp above every step the worked examples take, so only the clamp test is clamped."""
 
-FINGERPRINT = "settings-a"
-OTHER_FINGERPRINT = "settings-b"
+
+def _settings(*, max_threads: int = 1, max_power: int = 8) -> CapacityWorkloadSettings:
+    return CapacityWorkloadSettings(
+        num_models=3,
+        max_power=max_power,
+        max_threads=max_threads,
+        queue_size=1,
+        max_batch=1,
+        safety_on_gpu=True,
+        allow_img2img=True,
+        allow_lora=False,
+        allow_controlnet=False,
+        allow_sdxl_controlnet=False,
+        allow_post_processing=False,
+        high_performance_mode=False,
+        moderate_performance_mode=False,
+        extra_slow_worker=False,
+        alchemist=False,
+        alchemy_concurrent=False,
+        alchemy_max_concurrency=1,
+        alchemy_vram_headroom_mb=0,
+        alchemy_forms=(),
+    )
+
+
+SETTINGS = _settings()
+OTHER_SETTINGS = _settings(max_threads=2)
+FINGERPRINT = capacity_workload_fingerprint(SETTINGS)
 
 
 @pytest.fixture
@@ -57,11 +87,11 @@ def _accumulator(
     *,
     max_tick_seconds: float = GENEROUS_TICK_SECONDS,
     path: Path | None = None,
-    config_fingerprint: str = FINGERPRINT,
+    settings: CapacityWorkloadSettings = SETTINGS,
 ) -> CardEarningAccumulator:
     return CardEarningAccumulator(
         max_tick_seconds=max_tick_seconds,
-        config_fingerprint=config_fingerprint,
+        settings=settings,
         path=path,
         clock=lambda: BUCKET_START,
     )
@@ -408,7 +438,7 @@ class TestConfigurationWindow:
         path = tmp_path / "card_earning.json"
         _accumulator_with_one_job(path=path).save()
 
-        rate = _accumulator(path=path, config_fingerprint=OTHER_FINGERPRINT).rate(model="A", device_index=0)
+        rate = _accumulator(path=path, settings=OTHER_SETTINGS).rate(model="A", device_index=0)
 
         assert rate.model_seconds == 0.0
         assert rate.card_wall_seconds == 0.0
@@ -431,7 +461,7 @@ class TestConfigurationWindow:
         """The rates read no seconds and no kudos, and the rollups' session totals are kept."""
         accumulator = _accumulator_with_one_job()
 
-        accumulator.restart_window_if_changed(OTHER_FINGERPRINT)
+        accumulator.restart_window_if_changed(OTHER_SETTINGS)
 
         rate = accumulator.rate(model="A", device_index=0)
         assert rate.model_seconds == 0.0
@@ -444,7 +474,7 @@ class TestConfigurationWindow:
     def test_ticks_after_a_restart_accrue_normally(self) -> None:
         """The clock anchor survives the restart, so the next tick's seconds land in the new window."""
         accumulator = _accumulator_with_one_job()
-        accumulator.restart_window_if_changed(OTHER_FINGERPRINT)
+        accumulator.restart_window_if_changed(OTHER_SETTINGS)
 
         accumulator.observe(BUCKET_START + 40.0, {0: CardTick(in_flight_models=("A",))})
         accumulator.credit_finished_job(device_index=0, model="A", kudos=5.0)
@@ -458,11 +488,11 @@ class TestConfigurationWindow:
         """After a restart the saved window belongs to the new settings."""
         path = tmp_path / "card_earning.json"
         accumulator = _accumulator_with_one_job(path=path)
-        accumulator.restart_window_if_changed(OTHER_FINGERPRINT)
+        accumulator.restart_window_if_changed(OTHER_SETTINGS)
         accumulator.observe(BUCKET_START + 40.0, {0: CardTick(in_flight_models=("A",))})
         accumulator.save()
 
-        reloaded = _accumulator(path=path, config_fingerprint=OTHER_FINGERPRINT)
+        reloaded = _accumulator(path=path, settings=OTHER_SETTINGS)
 
         assert reloaded.rate(model="A", device_index=0).model_seconds == pytest.approx(10.0)
 
@@ -470,7 +500,7 @@ class TestConfigurationWindow:
         """An unchanged fingerprint keeps the window and does not log."""
         accumulator = _accumulator_with_one_job()
 
-        accumulator.restart_window_if_changed(FINGERPRINT)
+        accumulator.restart_window_if_changed(SETTINGS)
 
         assert accumulator.rate(model="A", device_index=0).model_seconds == pytest.approx(30.0)
         assert not any("Card earning figures restart" in message for message in info_messages)
@@ -479,7 +509,7 @@ class TestConfigurationWindow:
         """No figures are dropped, so no restart line is written."""
         accumulator = _accumulator()
 
-        accumulator.restart_window_if_changed(OTHER_FINGERPRINT)
+        accumulator.restart_window_if_changed(OTHER_SETTINGS)
 
         assert not any("Card earning figures restart" in message for message in info_messages)
 
@@ -576,3 +606,230 @@ class TestStandardErrors:
 
         assert rate.model_standard_error == pytest.approx(0.0)
         assert rate.rest_standard_error == pytest.approx(0.0)
+
+
+def _two_bucket_two_card_window() -> CardEarningAccumulator:
+    """The standard-error worked example on card 0, plus a claimed Flux grant on card 1 in the second bucket."""
+    accumulator = _accumulator()
+    _fill_bucket(
+        accumulator,
+        start=BUCKET_START,
+        elapsed=20.0,
+        in_flight_models=("A", "B"),
+        kudos_by_model={"A": 10.0, "B": 5.0},
+    )
+    accumulator.observe(SECOND_BUCKET_START, {})
+    accumulator.observe(
+        SECOND_BUCKET_START + 50.0,
+        {
+            0: CardTick(in_flight_models=("A", "A", "A", "B", "B")),
+            1: CardTick(held_model="Flux", claimed_model="Flux"),
+        },
+    )
+    for model, kudos in (("A", 60.0), ("B", 30.0)):
+        accumulator.credit_finished_job(device_index=0, model=model, kudos=kudos)
+    accumulator.credit_finished_job(device_index=1, model="Flux", kudos=40.0)
+    return accumulator
+
+
+class TestReadWindow:
+    """One read returns every pair's figures, each card's time and the window's status."""
+
+    def test_every_pair_matches_its_own_rate_read(self) -> None:
+        """Each pair in the all-pairs read equals the single-pair read, standard errors included."""
+        accumulator = _two_bucket_two_card_window()
+
+        window = accumulator.read_window()
+
+        assert set(window.rates) == {(0, "A"), (0, "B"), (1, "Flux")}
+        for (device_index, model), rate in window.rates.items():
+            assert rate == accumulator.rate(model=model, device_index=device_index)
+        assert window.rates[(0, "A")].model_standard_error == pytest.approx(0.375)
+
+    def test_each_card_reports_its_wall_and_attributed_seconds(self) -> None:
+        """Card 0 idles 20 s of 120, so 20 s are unattributed. Card 1's grant takes its whole wall."""
+        accumulator = _accumulator()
+        accumulator.observe(BUCKET_START, {0: CardTick(), 1: CardTick()})
+        accumulator.observe(BUCKET_START + 60.0, {0: CardTick(in_flight_models=("A",)), 1: CardTick()})
+        accumulator.observe(BUCKET_START + 100.0, {0: CardTick(in_flight_models=("A", "B")), 1: CardTick()})
+        accumulator.observe(BUCKET_START + 120.0, {0: CardTick(), 1: CardTick(held_model="Flux")})
+
+        cards = accumulator.read_window().cards
+
+        assert [card.device_index for card in cards] == [0, 1]
+        assert cards[0].wall_seconds == pytest.approx(120.0)
+        assert cards[0].attributed_seconds == pytest.approx(100.0)
+        assert cards[0].unattributed_seconds == pytest.approx(20.0)
+        assert cards[1].wall_seconds == pytest.approx(120.0)
+        assert cards[1].attributed_seconds == pytest.approx(20.0)
+        assert cards[1].unattributed_seconds == pytest.approx(100.0)
+
+    def test_the_window_starts_at_the_oldest_retained_bucket(self) -> None:
+        """The start is the oldest bucket's start, and it moves on as the retention drops that bucket."""
+        accumulator = _two_bucket_two_card_window()
+        assert accumulator.read_window().started_at == BUCKET_START
+
+        later = BUCKET_START + CARD_EARNING_RETENTION_SECONDS + CARD_EARNING_BUCKET_SECONDS + 1.0
+        accumulator.observe(later, {0: CardTick()})
+
+        assert accumulator.read_window().started_at == SECOND_BUCKET_START
+
+    def test_an_empty_accumulator_reads_an_empty_window(self) -> None:
+        """The pairs and cards are empty, and the start and restart are None."""
+        window = _accumulator().read_window()
+
+        assert window.rates == {}
+        assert window.cards == []
+        assert window.started_at is None
+        assert window.last_restart is None
+
+
+class TestClaimSeconds:
+    """The time a whole-card pop claim stands is tallied to the claimed model, apart from the attribution."""
+
+    def test_claim_seconds_accrue_only_while_a_claim_stands_and_to_its_model(self) -> None:
+        """Claim seconds accrue to the claimed model only while its claim stands.
+
+        A grant that outlasts its claim adds held seconds and no claim seconds. A job beside a claim takes the
+        attributed seconds, and the claim seconds stay with the claimed model.
+        """
+        accumulator = _accumulator()
+        accumulator.observe(BUCKET_START, {0: CardTick()})
+        accumulator.observe(BUCKET_START + 10.0, {0: CardTick(held_model="Flux", claimed_model="Flux")})
+        accumulator.observe(BUCKET_START + 15.0, {0: CardTick(held_model="Flux")})
+        accumulator.observe(
+            BUCKET_START + 19.0,
+            {0: CardTick(in_flight_models=("A",), held_model="Flux", claimed_model="Flux")},
+        )
+        accumulator.observe(BUCKET_START + 21.0, {0: CardTick()})
+
+        flux = accumulator.rate(model="Flux", device_index=0)
+        assert flux.claim_seconds == pytest.approx(14.0)
+        assert flux.model_seconds == pytest.approx(15.0)
+        assert accumulator.rate(model="A", device_index=0).claim_seconds == 0.0
+        assert accumulator.rate(model="A", device_index=0).model_seconds == pytest.approx(4.0)
+        assert flux.card_wall_seconds == pytest.approx(21.0)
+
+    def test_claim_seconds_persist(self, tmp_path: Path) -> None:
+        """A saved claim tally loads back."""
+        path = tmp_path / "card_earning.json"
+        accumulator = _accumulator(path=path)
+        accumulator.observe(BUCKET_START, {0: CardTick()})
+        accumulator.observe(BUCKET_START + 10.0, {0: CardTick(held_model="Flux", claimed_model="Flux")})
+        accumulator.save()
+
+        assert _accumulator(path=path).rate(model="Flux", device_index=0).claim_seconds == pytest.approx(10.0)
+
+    def test_a_file_without_the_claim_tally_loads_with_it_at_zero(self, tmp_path: Path) -> None:
+        """A tally written before the claim tally existed keeps its seconds, kudos and jobs."""
+        path = tmp_path / "card_earning.json"
+        payload = {
+            "schema_version": CARD_EARNING_SCHEMA_VERSION,
+            "bucket_seconds": CARD_EARNING_BUCKET_SECONDS,
+            "config_fingerprint": FINGERPRINT,
+            "buckets": [
+                {
+                    "start": BUCKET_START,
+                    "walls": [{"card": 0, "seconds": 100.0}],
+                    "tallies": [{"card": 0, "model": "A", "seconds": 40.0, "kudos": 20.0, "jobs": 2}],
+                },
+            ],
+        }
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        rate = _accumulator(path=path).rate(model="A", device_index=0)
+
+        assert rate.claim_seconds == 0.0
+        assert rate.model_seconds == pytest.approx(40.0)
+        assert rate.model_kudos_per_second == pytest.approx(0.5)
+        assert rate.jobs == 2
+        assert rate.card_wall_seconds == pytest.approx(100.0)
+
+    @pytest.mark.parametrize("card_index", [0, 1])
+    def test_a_single_card_claim_is_credited_on_the_lane_card(self, card_index: int) -> None:
+        """The ledger keys the claim by None on a single-card host, and the tally lands on the lane's card."""
+        clock = _Clock(BUCKET_START)
+        scheduler, accumulator = _scheduler(
+            [_lane(1, device_index=card_index)],
+            clock=clock,
+            device_indices=(card_index,),
+        )
+        scheduler._whole_card_ledger.record_grant(
+            None,
+            model="Flux",
+            forecast=None,
+            cooldown_until=clock.now + 300.0,
+            now=clock.now,
+        )
+        assert scheduler.whole_card_pop_claim() is not None
+
+        _tick_twice(scheduler, clock, 6.0)
+
+        rate = accumulator.rate(model="Flux", device_index=card_index)
+        assert rate.claim_seconds == pytest.approx(6.0)
+        assert rate.model_seconds == pytest.approx(6.0)
+
+    def test_a_grant_whose_claim_was_released_adds_no_claim_seconds(self) -> None:
+        """A grant can outlast its claim. The grant keeps the card's time and the claim tally stays at zero."""
+        clock = _Clock(BUCKET_START)
+        scheduler, accumulator = _scheduler([_lane(1)], clock=clock)
+        scheduler._whole_card_ledger.record_grant(
+            None,
+            model="Flux",
+            forecast=None,
+            cooldown_until=clock.now + 300.0,
+            now=clock.now,
+        )
+        state = scheduler._whole_card_ledger.state_for(None)
+        state.pop_claim_released_at = clock.now
+        assert scheduler.whole_card_pop_claim() is None
+
+        _tick_twice(scheduler, clock, 6.0)
+
+        rate = accumulator.rate(model="Flux", device_index=0)
+        assert rate.claim_seconds == 0.0
+        assert rate.model_seconds == pytest.approx(6.0)
+
+
+class TestWindowRestartStatus:
+    """The window reports its last restart, naming the changed settings when the run saw them change."""
+
+    def test_a_restart_during_a_run_names_the_changed_setting(self) -> None:
+        """Only the live concurrency cap differs between the two settings."""
+        accumulator = _accumulator_with_one_job()
+
+        accumulator.restart_window_if_changed(OTHER_SETTINGS)
+
+        restart = accumulator.read_window().last_restart
+        assert restart is not None
+        assert restart.at == BUCKET_START
+        assert restart.changed_settings == ("max_threads",)
+
+    def test_settings_changed_in_two_fields_are_named_in_declaration_order(self) -> None:
+        """Both changed fields are named, in the order the settings model declares them."""
+        accumulator = _accumulator()
+
+        accumulator.restart_window_if_changed(_settings(max_threads=3, max_power=16))
+
+        restart = accumulator.read_window().last_restart
+        assert restart is not None
+        assert restart.changed_settings == ("max_power", "max_threads")
+
+    def test_unchanged_settings_do_not_report_a_restart(self) -> None:
+        """An unchanged fingerprint does not record a restart."""
+        accumulator = _accumulator_with_one_job()
+
+        accumulator.restart_window_if_changed(SETTINGS)
+
+        assert accumulator.read_window().last_restart is None
+
+    def test_a_restart_found_at_load_does_not_name_the_settings(self, tmp_path: Path) -> None:
+        """The file holds only the previous fingerprint, so the changed settings are unknown."""
+        path = tmp_path / "card_earning.json"
+        _accumulator_with_one_job(path=path).save()
+
+        restart = _accumulator(path=path, settings=OTHER_SETTINGS).read_window().last_restart
+
+        assert restart is not None
+        assert restart.at == BUCKET_START
+        assert restart.changed_settings is None
