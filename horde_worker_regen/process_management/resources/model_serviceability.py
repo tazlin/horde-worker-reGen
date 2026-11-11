@@ -581,6 +581,18 @@ def serviceability_arithmetic(verdicts: list[tuple[CardRuntime, ModelServiceabil
     return "; ".join(f"device {card.device_index}: {verdict.reason()}" for card, verdict in verdicts)
 
 
+def held_back_from_offer(verdicts: list[tuple[CardRuntime, ModelServiceabilityVerdict]]) -> bool:
+    """Return whether the offer leaves a model out because no card can serve its smallest legal job.
+
+    The offer's hold-back and the pop claim both read this test, so a claim does not stand for a model that is
+    not in the offer.
+
+    Args:
+        verdicts: The model's serviceability verdicts per card, read without a size cap.
+    """
+    return bool(verdicts) and not any(verdict.serviceable for _, verdict in verdicts)
+
+
 def constrained_max_power(verdicts: list[tuple[CardRuntime, ModelServiceabilityVerdict]]) -> int | None:
     """Return the largest ``max_power`` some card fits a constrained model at, or None when it is not constrained.
 

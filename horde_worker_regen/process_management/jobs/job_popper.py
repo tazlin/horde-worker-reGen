@@ -79,6 +79,7 @@ from horde_worker_regen.process_management.resources.model_serviceability import
     WholeCardSeat,
     constrained_max_power,
     decide_constrained_offer,
+    held_back_from_offer,
     max_power_to_pixels,
     model_serviceability_verdicts,
     serviceability_arithmetic,
@@ -428,7 +429,7 @@ def _serviceability_held_back_models(
             max_pixels=None,
             whole_card_seat_provider=whole_card_seat_provider,
         )
-        if not verdicts or any(verdict.serviceable for _, verdict in verdicts):
+        if not held_back_from_offer(verdicts):
             continue
         held_back.add(model)
         if serviceability_logged is None:

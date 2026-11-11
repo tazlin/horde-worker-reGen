@@ -1169,11 +1169,16 @@ class OverviewView(Vertical):
                 if residency.pop_claim_verdict is not None
                 else "below the rest"
             )
+            because = (
+                "the worker is not asking the horde for it now, so a hold would leave nothing to ask for"
+                if residency.pop_claim_hold_reason == PopClaimHoldReason.WITHHELD_NOT_OFFERED
+                else f"it earns {verdict_text}, so the worker asks the horde for the other models"
+            )
             add_pair(
                 "Not holding the card for",
                 Text(residency.pop_claim_withheld_model, style="#f0beff"),
                 "Because",
-                Text(f"it earns {verdict_text}, so the worker asks the horde for the other models"),
+                Text(because),
             )
         elif residency.pop_claim_release is not None:
             add_pair(

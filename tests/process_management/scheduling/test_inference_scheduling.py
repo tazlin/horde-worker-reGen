@@ -344,6 +344,30 @@ class TestPreloadGateChecksTheSeatWithoutTheFloor:
         assert seat.fits is False
         assert scheduler._unserviceable_job_reason(make_job_pop_response(_MOSS)) is None
 
+    def test_the_model_that_holds_the_card_stays_in_the_offer_under_paging(self) -> None:
+        """A partial load pages a little by itself, so the model that holds the card is not withheld for it.
+
+        Before the grant the model's seat cannot be priced on a paging card, and the offer leaves the model out.
+        Once the model holds the card its seat is taken. The offer then keeps it under the other rules, so the
+        card is not held for a model that is not in the offer.
+        """
+        scheduler = _small_card_scheduler({_MOSS: KNOWN_IMAGE_GENERATION_BASELINE.moss_image})
+        scheduler.note_wddm_paging({100001: 512.0}, active=True)
+        unpriced = scheduler.whole_card_seat(_MOSS, 0)
+        assert unpriced is not None and unpriced.priced is False
+        assert scheduler._claimed_model_held_back_from_offer(_MOSS) is True
+
+        scheduler._whole_card_ledger.record_grant(
+            None,
+            model=_MOSS,
+            forecast=None,
+            cooldown_until=scheduler._clock() + 300.0,
+            now=scheduler._clock(),
+        )
+
+        assert scheduler.whole_card_seat(_MOSS, 0) is None
+        assert scheduler._claimed_model_held_back_from_offer(_MOSS) is False
+
     def test_a_whole_card_model_off_rung_two_faults_by_the_recommended_minimum_card(self) -> None:
         """A measured peak that seats the model beside a context puts it under the recommended-minimum rule.
 

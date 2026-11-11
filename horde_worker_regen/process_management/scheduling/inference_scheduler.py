@@ -71,6 +71,7 @@ from horde_worker_regen.process_management.resources.foreign_vram_floor import (
 from horde_worker_regen.process_management.resources.model_serviceability import (
     WholeCardSeat,
     constrained_max_power,
+    held_back_from_offer,
     max_power_to_pixels,
     model_serviceability_verdicts,
     serviceability_arithmetic,
@@ -254,6 +255,7 @@ from horde_worker_regen.process_management.scheduling.governance.whole_card impo
     PopClaimExemption,
     PopClaimHold,
     PopClaimHoldDecision,
+    PopClaimHoldReason,
     PopClaimValue,
     PopClaimValueVerdict,
     WholeCardClaimPolicy,
@@ -4275,7 +4277,9 @@ class InferenceScheduler:
         card, so jobs for other models taken meanwhile are not left waiting behind a stream of its jobs.
         """
         hold = self._pop_claim_hold()
-        if hold is None or not hold.decision.withheld:
+        # Only a model that earns below the rest is paced. A model left out of the offer returns under the
+        # offer's own rule.
+        if hold is None or hold.decision.reason is not PopClaimHoldReason.WITHHELD_BELOW_THE_REST:
             return None
         return hold.claim.model
 
@@ -4331,7 +4335,26 @@ class InferenceScheduler:
             policy=self._whole_card_claim_policy(),
             verdict=verdict,
             exemption=lambda: self._pop_claim_exemption(claim.model),
+            held_back_from_offer=self._claimed_model_held_back_from_offer(claim.model),
         )
+
+    def _claimed_model_held_back_from_offer(self, model: str) -> bool:
+        """Return whether the offer leaves ``model`` out because no card can serve its smallest legal job.
+
+        It is the offer's own test (``held_back_from_offer`` over ``model_serviceability_verdicts``, with the
+        providers the popper is given), read without a size cap as the offer's hold-back reads it.
+        """
+        if not self._card_runtimes:
+            return False
+        verdicts = model_serviceability_verdicts(
+            model,
+            card_runtimes=self._card_runtimes,
+            model_metadata=self._model_metadata,
+            admission_baseline_provider=self.serviceability_baseline_mb,
+            max_pixels=None,
+            whole_card_seat_provider=self.whole_card_seat,
+        )
+        return held_back_from_offer(verdicts)
 
     def _disclose_pop_claim_edge(self) -> None:
         """Log the claim's engage, release or withheld line when the claim changed since the last call."""
@@ -6870,6 +6893,8 @@ class InferenceScheduler:
         None when the model is neither (a model outside the extra-large tier does not have a seat) or when the card
         is not yet sized, so the serviceability verdict keeps its other rules. A rung-2 or pinned model whose seat
         cannot be priced (a paging card) is returned unpriced, so the offer withholds it and the gate passes it.
+        The model that holds the card's whole-card grant is the exception. Its seat is taken, so it is returned
+        as None and stays in the offer under the other rules.
         The offer reads this with the foreign floor in the ceiling. The preload gate reads it without the floor
         (:meth:`_preload_gate_whole_card_seat`), so a job accepted before the floor rose is never faulted by it.
         """
@@ -6883,6 +6908,15 @@ class InferenceScheduler:
         # the model from the offer and lets the preload gate recognise a job popped before paging began.
         if seat_mb is None and not (
             self._retention.wddm_paging_active and self._model_size_tier(model) >= ModelSizeTier.EXTRA_LARGE
+        ):
+            return None
+        # The model that holds the card's whole-card grant already has its seat. A partial load of an extra-large
+        # checkpoint leaves some of its allocations in shared memory, so the paging reading is in part that
+        # model's own load. Withholding it would leave the card held for a model that is not in the offer. A job
+        # for it is priced at dispatch, at its activation above the seated weights.
+        if seat_mb is None and self._whole_card_ledger.holds_model_on_card(
+            model,
+            device_index if self._multi_gpu_routing_active else None,
         ):
             return None
         ceiling_mb = self.achievable_ceiling_mb(device_index, include_foreign_floor=include_foreign_floor)

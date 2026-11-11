@@ -447,6 +447,43 @@ class TestSchedulerExemptions:
         assert scheduler._pop_claim_exemption(CLAIMED_MODEL) is PopClaimExemption.CONSTRAINED_LANE
 
 
+class TestClaimForAModelLeftOutOfTheOffer:
+    """A claim narrows the offer to its model, so it does not stand for a model that is not in the offer."""
+
+    @pytest.mark.parametrize("policy", list(WholeCardClaimPolicy))
+    @pytest.mark.parametrize("verdict", list(PopClaimValueVerdict))
+    def test_the_claim_is_withheld_whatever_the_policy_and_the_verdict(
+        self,
+        policy: WholeCardClaimPolicy,
+        verdict: PopClaimValueVerdict,
+    ) -> None:
+        """Neither the always policy, a paying verdict nor an exemption keeps a claim that would empty the offer."""
+        decision = pop_claim_hold_decision(
+            policy=policy,
+            verdict=verdict,
+            exemption=lambda: PopClaimExemption.LISTED,
+            held_back_from_offer=True,
+        )
+
+        assert decision.reason is PopClaimHoldReason.WITHHELD_NOT_OFFERED
+        assert decision.withheld
+
+    def test_the_scheduler_withholds_the_claim_and_does_not_pace_the_model(self, info_messages: list[str]) -> None:
+        """Every reader sees no claim. The model is not paced, since pacing is for a model that earns less."""
+        scheduler = _scheduler(card_index=0, accumulator=None)
+        _hold_the_card(scheduler)
+        assert scheduler.whole_card_pop_claim() is not None
+        scheduler._claimed_model_held_back_from_offer = lambda _model: True  # type: ignore[method-assign]
+
+        scheduler._disclose_pop_claim_edge()
+
+        assert scheduler.whole_card_pop_claim() is None
+        assert scheduler.withheld_pop_claim_model() is None
+        (line,) = [message for message in info_messages if message.startswith("Not holding the card for")]
+        assert "the worker is not asking the horde for it now" in line
+        assert "The worker asks the horde for its other models." in line
+
+
 class TestReadersFollowTheWithheldClaim:
     """The offer, the resident bypass and the run copy's retention all read the claim at one point."""
 

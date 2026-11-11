@@ -438,6 +438,8 @@ class PopClaimHoldReason(StrEnum):
     """The model's verdict is not below the rest, so the claim stands."""
     WITHHELD_BELOW_THE_REST = "withheld_below_the_rest"
     """The model earns below the rest of its card, so the worker asks the horde for the other models."""
+    WITHHELD_NOT_OFFERED = "withheld_not_offered"
+    """The offer leaves the model out, so a claim for it would leave nothing to ask the horde for."""
     KEPT_BY_POLICY = "kept_by_policy"
     """The model earns below the rest, and the policy is ``always``."""
     KEPT_BY_EXEMPTION = "kept_by_exemption"
@@ -459,7 +461,10 @@ class PopClaimHoldDecision:
     @property
     def withheld(self) -> bool:
         """Return whether the claim is withheld."""
-        return self.reason is PopClaimHoldReason.WITHHELD_BELOW_THE_REST
+        return self.reason in (
+            PopClaimHoldReason.WITHHELD_BELOW_THE_REST,
+            PopClaimHoldReason.WITHHELD_NOT_OFFERED,
+        )
 
 
 @dataclass(frozen=True)
@@ -1510,11 +1515,15 @@ def pop_claim_hold_decision(
     policy: WholeCardClaimPolicy,
     verdict: PopClaimValueVerdict,
     exemption: Callable[[], PopClaimExemption | None],
+    held_back_from_offer: bool = False,
 ) -> PopClaimHoldDecision:
     """Return whether the claim is withheld for a model on its card, and why.
 
-    Only a verdict of below the rest withholds a claim. An unmeasured model keeps its claim, so its first readings
-    are taken with the claim. The policy ``always`` keeps every claim, and otherwise an exemption keeps it.
+    A claim for a model left out of the offer is withheld, whatever the policy, the verdict and the exemptions
+    are. The claim narrows the offer to its model, so it would leave nothing to ask the horde for until its
+    maximum hold ended. Otherwise only a verdict of below the rest withholds a claim. An unmeasured
+    model keeps its claim, so its first readings are taken with the claim. The policy ``always`` keeps every
+    such claim, and otherwise an exemption keeps it.
 
     Args:
         policy: The operator's ``whole_card_claim_policy``.
@@ -1522,7 +1531,10 @@ def pop_claim_hold_decision(
         exemption: Return the exemption that keeps the model's claim, or None. It is called only when the
             verdict is below the rest and the policy is ``when_it_pays``, since some exemptions take a
             serviceability reading.
+        held_back_from_offer: Whether the model is left out of the offer because no card can serve it now.
     """
+    if held_back_from_offer:
+        return PopClaimHoldDecision(reason=PopClaimHoldReason.WITHHELD_NOT_OFFERED)
     if verdict is not PopClaimValueVerdict.BELOW_THE_REST:
         return PopClaimHoldDecision(reason=PopClaimHoldReason.NOT_WITHHELD)
     if policy is WholeCardClaimPolicy.ALWAYS:
@@ -1581,8 +1593,18 @@ def _kept_sentence(decision: PopClaimHoldDecision) -> str:
 
 
 def _withheld_line(hold: PopClaimHold, *, low_earning_return_seconds: float) -> str:
-    """Return the line that states a claim is withheld, with both rates and the settings that change it."""
+    """Return the line that states a claim is withheld and why.
+
+    A model that earns below the rest gets both rates and the settings that change it. A model left out of the
+    offer gets the reason that a hold would not help.
+    """
     model = hold.claim.model
+    if hold.decision.reason is PopClaimHoldReason.WITHHELD_NOT_OFFERED:
+        return (
+            f"Not holding the card for {model}, since the worker is not asking the horde for it now. Asking "
+            "the horde only for that model would leave nothing to ask for. The worker asks the horde for its "
+            "other models."
+        )
     rate = hold.value.rate
     model_rate = _format_kudos_rate(rate.model_kudos_per_second if rate is not None else None)
     rest_rate = _format_kudos_rate(rate.rest_kudos_per_second if rate is not None else None)

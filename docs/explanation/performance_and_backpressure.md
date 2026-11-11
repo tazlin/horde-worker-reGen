@@ -328,8 +328,12 @@ and returns when the tenant goes. The preload gate checks the same seat against 
 margin only, so a job accepted before the floor rose is not faulted for it. Where an extra-large model's seat cannot
 be priced (a card under WDDM demand paging), the offer withholds the model, since it advertises only what it can
 price, and the preload gate lets a job already popped through, since the offer priced the seat before paging began
-and the popped job is owed its load. Core weights over the card's weight budget still fault at the gate in every
-case.
+and the popped job is owed its load. The model that holds the card's whole-card grant is not withheld this way.
+Its seat is already taken, and a partial load of an extra-large checkpoint leaves some allocations in shared
+memory, so the paging reading is in part that model's own load. It stays in the offer under the
+recommended-minimum rule, and a job for it is priced at dispatch. Without this the card would be held for a
+model that is not in the offer, and the pop claim for it would leave nothing to ask the horde for. Core
+weights over the card's weight budget still fault at the gate in every case.
 
 ### Dominance verdict
 
