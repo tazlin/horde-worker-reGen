@@ -401,6 +401,9 @@ the settings that changed at the last restart. A restart found at startup says o
 differed from the last run's. "And 3 more models with less card time" counts the models the section left
 out. With nothing measured yet, the section says so and that it waits for finished jobs.
 
+The [Insights](#insights) tab turns a below-the-rest verdict and a restart of the figures into findings, with
+what an operator can do about each.
+
 At Advanced and above, the same three parts are tables with the figures behind them.
 
 | Column | Meaning |
@@ -530,7 +533,11 @@ idle time, configuration mismatches, and model-pool guidance, plus a recent-acti
 is the same card the Diagnostics tab uses: a badge saying what to do with it, a one-line headline, a
 "Do this" line, and a collapsed "Details" section. The catalogue in
 [Findings](../reference/log_findings.md#live-dashboard) lists them. When nothing is worth saying the
-panel says the worker looks healthy.
+panel shows that the worker looks healthy. The earning findings come from the [Card earning](#card-earning)
+figures: a model that earns below the rest of its card while the worker asked the horde only for it, a model
+that earns below the rest and took more than half of its card's time, and a note that the figures started
+again after a settings change. A card's details update in place when only its figures move, so an open
+"Details" section stays open.
 
 The **Model pool** panel is always present. With the pool off it reads `Model pool: off` and notes the
 throughput-versus-variety trade, and a finding appears only after measured `model_swap` churn.

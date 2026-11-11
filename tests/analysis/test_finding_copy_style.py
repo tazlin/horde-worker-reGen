@@ -128,8 +128,13 @@ _QUOTED = re.compile(r'"[^"]*"')
 it is exempt from the identifier, banned-word and punctuation rules. It still counts toward sentence length."""
 _SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
 
-_CONFIG_KEYS: frozenset[str] = frozenset(reGenBridgeData.model_fields)
-"""The only identifiers copy may name: the keys of the operator's config file, as written there."""
+_CONFIG_KEYS: frozenset[str] = frozenset(reGenBridgeData.model_fields) | frozenset(
+    field.alias for field in reGenBridgeData.model_fields.values() if field.alias is not None
+)
+"""The only identifiers copy may name: the keys of the operator's config file.
+
+A field with an alias is written under the alias in the file (``models_to_load``, ``models_to_skip``), and
+the loader takes the field name too, so both spellings are config keys."""
 
 
 def _sentences(text: str) -> list[str]:

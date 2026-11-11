@@ -6,9 +6,15 @@ import asyncio
 
 import pytest
 from textual.app import App, ComposeResult
-from textual.widgets import Static
+from textual.widgets import Collapsible, Static
 
-from horde_worker_regen.process_management.ipc.supervisor_channel import WorkerConfigSummary, WorkerStateSnapshot
+from horde_worker_regen.process_management.ipc.supervisor_channel import (
+    CardEarningCardRow,
+    CardEarningRow,
+    CardEarningSnapshot,
+    WorkerConfigSummary,
+    WorkerStateSnapshot,
+)
 from horde_worker_regen.tui.widgets.finding_card import FindingCard
 from horde_worker_regen.tui.widgets.insights import InsightsView
 
@@ -63,3 +69,56 @@ async def test_findings_become_cards_and_a_healthy_snapshot_clears_them() -> Non
         await _wait_for_cards(pilot, view, count=0)
         assert _message(view).display
         assert "looks healthy" in str(_message(view).render())
+
+
+def _earning_snapshot(*, window_hours: float) -> WorkerStateSnapshot:
+    """Two models below the rest of one card, each with claim time, measured over ``window_hours``."""
+    now = 1_800_000_000.0
+
+    def below_rest(model: str, claim_seconds: float) -> CardEarningRow:
+        return CardEarningRow(
+            device_index=0,
+            model=model,
+            model_kudos_per_second=0.42,
+            model_band_low=0.36,
+            model_band_high=0.48,
+            rest_kudos_per_second=0.61,
+            rest_band_low=0.55,
+            rest_band_high=0.67,
+            jobs=412,
+            attributed_card_seconds=9000.0,
+            claim_seconds=claim_seconds,
+            verdict="below_the_rest",
+        )
+
+    earning = CardEarningSnapshot(
+        rows=[below_rest("Less claimed", 3600.0), below_rest("More claimed", 12240.0)],
+        cards=[CardEarningCardRow(device_index=0, wall_seconds=36000.0, attributed_seconds=30000.0)],
+        window_started_at=now - window_hours * 3600,
+        verdict_min_jobs=20,
+    )
+    return _snapshot(timestamp=now, card_earning=earning)
+
+
+@pytest.mark.asyncio
+async def test_earning_cards_mount_in_order_and_new_figures_keep_details_open() -> None:
+    """Two below-the-rest models give two cards, most claim time first, and new evidence updates them in place."""
+    app = _Host()
+    async with app.run_test(size=(120, 60)) as pilot:
+        view = app.query_one(InsightsView)
+        view.update_snapshot(_earning_snapshot(window_hours=9))
+        cards = await _wait_for_cards(pilot, view, count=2)
+        assert [card.finding.headline.split('"')[1] for card in cards] == ["More claimed", "Less claimed"]
+
+        section = cards[0].query_one(Collapsible)
+        section.collapsed = False
+        await pilot.pause()
+
+        view.update_snapshot(_earning_snapshot(window_hours=10))
+        await pilot.pause()
+
+        assert [id(card) for card in view.query(FindingCard)] == [id(card) for card in cards]
+        assert not section.collapsed
+        detail = str(cards[0].query_one(".finding-detail", Static).render())
+        assert "Measured over the last 10 hours." in detail
+        assert cards[0].finding.evidence[-1] == "Measured over the last 10 hours."

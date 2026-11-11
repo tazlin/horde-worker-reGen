@@ -100,6 +100,27 @@ class FindingCard(Vertical):
         """Colour the border by severity once the widget has styles to set."""
         self.styles.border = ("round", _SEVERITY_BORDER.get(self.finding.severity, "grey50"))
 
+    def update_detail(self, finding: Finding) -> bool:
+        """Mutate the card to show ``finding``'s detail layer in place, keeping the section open or closed.
+
+        Only the detail layer is updated. The caller rebuilds the card when the plain layer changes.
+
+        Args:
+            finding: The finding of the same kind and plain layer, with new evidence.
+
+        Returns:
+            True when the card now shows ``finding``. False when the card has no detail section to update, so the
+            caller has to rebuild it.
+        """
+        detail = self._detail_text(finding)
+        sections = self.query(".finding-detail").results(Static)
+        section = next(sections, None)
+        if detail is None or section is None:
+            return False
+        self.finding = finding
+        section.update(detail)
+        return True
+
     @staticmethod
     def _detail_text(finding: Finding) -> Text | None:
         """The detail layer as one block: the prose, the evidence, the cross-reference and the docs page."""

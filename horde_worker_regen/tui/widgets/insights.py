@@ -2,8 +2,9 @@
 
 The findings come from :func:`horde_worker_regen.tui.recommendations.analyze` over the latest worker
 snapshot and are shown with the same card the Diagnostics tab uses for a log finding, so the two tabs
-read alike. Snapshots arrive every few seconds; the cards are rebuilt only when the findings change, so
-an open "Details" section stays open while the numbers behind it stand.
+read alike. Snapshots arrive every few seconds. The cards are rebuilt only when a finding's headline, "Do
+this" line or severity changes, and new evidence updates a card's details in place, so an open "Details"
+section stays open.
 """
 
 from __future__ import annotations
@@ -80,9 +81,13 @@ class InsightsView(VerticalScroll):
         self._update_model_pool(snapshot.model_pool)
 
     def _update_findings(self, findings: list[Finding]) -> None:
-        """Show the findings as cards, rebuilding them only when what they say has changed."""
+        """Show the findings as cards, rebuilding them only when their plain layer has changed.
+
+        New evidence under an unchanged plain layer updates the card in place, so a reader's open "Details" section
+        stays open while the figures in it move.
+        """
         shown = [(finding.id, finding.severity.value, finding.headline, finding.action) for finding in findings]
-        if shown == self._shown_findings:
+        if shown == self._shown_findings and self._update_card_details(findings):
             return
         self._shown_findings = shown
         message = self.query_one("#insights-findings-message", Static)
@@ -93,6 +98,23 @@ class InsightsView(VerticalScroll):
         # queue and awaits the removal first; a render superseded by a newer snapshot mounts nothing.
         self._cards_generation += 1
         self.call_next(self._mount_cards, findings, self._cards_generation)
+
+    def _update_card_details(self, findings: list[Finding]) -> bool:
+        """Update each mounted card whose evidence changed, and return whether every card now shows its finding.
+
+        While a rebuild is still mounting, the mounted cards differ from the findings. They are compared again at
+        the next snapshot.
+        """
+        cards = list(self.query_one("#insights-findings-cards", Vertical).query_children(FindingCard))
+        mounted = [(card.finding.id, card.finding.headline) for card in cards]
+        if mounted != [(finding.id, finding.headline) for finding in findings]:
+            return True
+        for card, finding in zip(cards, findings, strict=True):
+            if card.finding.evidence == finding.evidence:
+                continue
+            if not card.update_detail(finding):
+                return False
+        return True
 
     async def _mount_cards(self, findings: list[Finding], generation: int) -> None:
         """Replace the cards container's children with one card per finding, in order."""

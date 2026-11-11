@@ -2,19 +2,37 @@
 
 A light, dependency-free analysis (no benchmark or hordelib import) that encodes the operational
 levers learned from the duty-cycle and memory work: low GPU duty cycle, VRAM pressure, fault rate,
-idle time, and configuration mismatches. The benchmark remains the authoritative capability sweep;
-these are the at-a-glance, in-the-moment hints.
+idle time, configuration mismatches, and what each model earns on its card. The benchmark remains the
+authoritative capability sweep; these are the at-a-glance, in-the-moment hints.
 
 Each hint is a :class:`~horde_worker_regen.analysis.finding_kinds.Finding` of a declared kind, so the
 dashboard shows it with the same card, badge words and copy rules as a log diagnosis, and the catalogue
 documents it beside them. A healthy snapshot yields no findings at all; the view says so itself.
+
+The earning findings read the worker's figures and verdicts from ``WorkerStateSnapshot.card_earning`` and do
+not compute any statistic. A share is one snapshot figure over another.
 """
 
 from __future__ import annotations
 
 from horde_worker_regen.analysis.finding_kinds import SEVERITY_ORDER, Finding, FindingKind, Severity
-from horde_worker_regen.process_management.ipc.supervisor_channel import ModelPoolSnapshot, WorkerStateSnapshot
+from horde_worker_regen.process_management.ipc.supervisor_channel import (
+    CardEarningRow,
+    CardEarningSnapshot,
+    CardEarningWindowRestart,
+    ModelPoolSnapshot,
+    WorkerStateSnapshot,
+)
+from horde_worker_regen.process_management.scheduling.governance.whole_card import PopClaimValueVerdict
 from horde_worker_regen.tui.formatters import human_duration
+from horde_worker_regen.tui.widgets.earning import (
+    join_words,
+    plain_span,
+    rate_text,
+    setting_words,
+    share_text,
+    verdict_phrase,
+)
 
 _LOW_DUTY_CYCLE = 50.0
 _HIGH_VRAM_FRACTION = 0.92
@@ -52,6 +70,7 @@ def analyze(snapshot: WorkerStateSnapshot) -> list[Finding]:
     _check_duty_cycle(snapshot, findings)
     _check_idle(snapshot, findings)
     _check_model_pool(snapshot, findings)
+    _check_card_earning(snapshot, findings)
 
     if config.extra_slow_worker and config.max_batch > 1:
         findings.append(
@@ -239,3 +258,145 @@ def _note_pool_resident_matches(pool: ModelPoolSnapshot, out: list[Finding]) -> 
                 ),
             ),
         )
+
+
+def _check_card_earning(snapshot: WorkerStateSnapshot, out: list[Finding]) -> None:
+    """Flag each model that earns below the rest of its card, then note a restart of the earning window.
+
+    A model with claim time gets a card whatever its share, because the worker asked the horde only for it during
+    that time. A model without a claim gets one only when it took more than half of the card's wall. That is more
+    seconds than the rest's rate is read over, which is the wall less the model's seconds.
+    """
+    earning = snapshot.card_earning
+    walls = {card.device_index: card.wall_seconds for card in earning.cards}
+    several_cards = len(set(walls) | {row.device_index for row in earning.rows}) > 1
+    below_rest = [
+        row
+        for row in earning.rows
+        if row.verdict == PopClaimValueVerdict.BELOW_THE_REST and walls.get(row.device_index, 0.0) > 0
+    ]
+    claimed = sorted(
+        (row for row in below_rest if row.claim_seconds > 0),
+        key=lambda row: (-row.claim_seconds, row.device_index),
+    )
+    for row in claimed:
+        out.append(
+            _below_rest_finding(
+                snapshot,
+                row,
+                wall_seconds=walls[row.device_index],
+                several_cards=several_cards,
+                had_claim=True,
+            ),
+        )
+    unclaimed = sorted(
+        (
+            row
+            for row in below_rest
+            if row.claim_seconds <= 0
+            and row.attributed_card_seconds > walls[row.device_index] - row.attributed_card_seconds
+        ),
+        key=lambda row: (-row.attributed_card_seconds, row.device_index),
+    )
+    for row in unclaimed:
+        out.append(
+            _below_rest_finding(
+                snapshot,
+                row,
+                wall_seconds=walls[row.device_index],
+                several_cards=several_cards,
+                had_claim=False,
+            ),
+        )
+    _check_earning_restart(snapshot, out)
+
+
+def _below_rest_finding(
+    snapshot: WorkerStateSnapshot,
+    row: CardEarningRow,
+    *,
+    wall_seconds: float,
+    several_cards: bool,
+    had_claim: bool,
+) -> Finding:
+    """Return the finding for one model that earns below the rest of its card.
+
+    Args:
+        snapshot: The snapshot the row comes from.
+        row: The model's earning row.
+        wall_seconds: The card's wall seconds in the window, above 0.
+        several_cards: Whether the window has more than one card, so the headline names the card.
+        had_claim: Whether a whole-card pop claim for the model stood on the card in the window.
+    """
+    earning = snapshot.card_earning
+    phrase = verdict_phrase(row.verdict, row=row, min_jobs=earning.verdict_min_jobs)
+    card_words = f"card {row.device_index}" if several_cards else "its card"
+    card_share = share_text(row.attributed_card_seconds / wall_seconds)
+    evidence = _earning_evidence(earning, row, now=snapshot.timestamp)
+    if had_claim:
+        claim_share = share_text(row.claim_seconds / wall_seconds)
+        evidence.insert(1, f"It took {card_share} of the card's time.")
+        return Finding(
+            kind=FindingKind.CLAIMED_MODEL_EARNS_BELOW_REST,
+            severity=Severity.SUGGESTION,
+            headline=(
+                f'"{row.model}" earns {phrase} of {card_words}, and the worker asked the horde only for it for '
+                f"{claim_share} of the card's time."
+            ),
+            evidence=evidence,
+        )
+    return Finding(
+        kind=FindingKind.MODEL_EARNS_BELOW_REST,
+        severity=Severity.INFO,
+        headline=f'"{row.model}" earns {phrase} of {card_words} and took {card_share} of the card\'s time.',
+        evidence=evidence,
+    )
+
+
+def _earning_evidence(earning: CardEarningSnapshot, row: CardEarningRow, *, now: float) -> list[str]:
+    """Return the figures behind a below-the-rest finding: the two rates, their bands, the jobs and the window."""
+    lines = [
+        f"It earns {rate_text(row.model_kudos_per_second)} kudos per second of card time. The rest of the card "
+        f"earns {rate_text(row.rest_kudos_per_second)}.",
+    ]
+    bands = (row.model_band_low, row.model_band_high, row.rest_band_low, row.rest_band_high)
+    if all(band is not None for band in bands):
+        lines.append(
+            f"Its 95% band is {rate_text(row.model_band_low)} to {rate_text(row.model_band_high)}. The rest's band "
+            f"is {rate_text(row.rest_band_low)} to {rate_text(row.rest_band_high)}.",
+        )
+    lines.append(f"Counted from {row.jobs:,} of its jobs on the card.")
+    if earning.window_started_at is not None:
+        lines.append(f"Measured over the last {plain_span(now - earning.window_started_at)}.")
+    return lines
+
+
+def _check_earning_restart(snapshot: WorkerStateSnapshot, out: list[Finding]) -> None:
+    """Note that the earning window restarted, until a model's verdict is measured again.
+
+    A worker that does not serve image jobs gets the note only once it has figures, as with the Stats tab's earning
+    section.
+    """
+    earning = snapshot.card_earning
+    restart = earning.last_restart
+    if restart is None:
+        return
+    if not (snapshot.config.dreamer or earning.rows):
+        return
+    if any(row.verdict != PopClaimValueVerdict.UNMEASURED for row in earning.rows):
+        return
+    out.append(
+        Finding(
+            kind=FindingKind.CARD_EARNING_RESTARTED,
+            severity=Severity.INFO,
+            headline=_restart_headline(restart),
+        ),
+    )
+
+
+def _restart_headline(restart: CardEarningWindowRestart) -> str:
+    """Return the restart note's headline, naming the changed settings when the worker reported them."""
+    if not restart.changed_settings:
+        return "The earning figures started again because the settings differed from the last run's."
+    names = [setting_words(field_name) for field_name in restart.changed_settings]
+    return f"The earning figures started again when {join_words(names)} changed."

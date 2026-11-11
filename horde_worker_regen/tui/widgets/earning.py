@@ -10,6 +10,11 @@ module turns them into words and bars and does not compute any statistic of its 
   model on its card.
 - [`CardEarningView`][horde_worker_regen.tui.widgets.earning.CardEarningView]: the Stats tab section, with a
   plain form at Simple and a detailed form at Advanced and above.
+- [`share_text`][horde_worker_regen.tui.widgets.earning.share_text],
+  [`plain_span`][horde_worker_regen.tui.widgets.earning.plain_span],
+  [`rate_text`][horde_worker_regen.tui.widgets.earning.rate_text] and
+  [`join_words`][horde_worker_regen.tui.widgets.earning.join_words]: the wording of a share, a window's span, a
+  rate and a list, which the Insights tab's earning findings read too.
 """
 
 from __future__ import annotations
@@ -22,6 +27,7 @@ from textual.app import ComposeResult
 from textual.containers import Vertical
 from textual.widgets import Static
 
+from horde_worker_regen.bridge_data.data_model import reGenBridgeData
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
     CardEarningCardRow,
     CardEarningRow,
@@ -32,11 +38,17 @@ from horde_worker_regen.process_management.scheduling.governance.whole_card impo
 from horde_worker_regen.tui.formatters import human_duration, is_low_fidelity, shorten
 
 __all__ = [
+    "CAPACITY_SETTING_WORDS",
     "VERDICT_TEXT",
     "CardEarningView",
     "claim_earning_row",
+    "join_words",
+    "plain_span",
+    "rate_text",
     "render_earning_detail",
     "render_earning_simple",
+    "share_text",
+    "setting_words",
     "verdict_phrase",
 ]
 
@@ -115,14 +127,14 @@ def _bar(fraction: float, *, width: int = _BAR_WIDTH) -> str:
     return ("#" if is_low_fidelity() else "█") * filled
 
 
-def _share_text(fraction: float) -> str:
+def share_text(fraction: float) -> str:
     """Return a share of the wall as a whole percentage, with tiny non-zero shares shown as under one."""
     if 0 < fraction < 0.005:
         return "<1%"
     return f"{fraction * 100:.0f}%"
 
 
-def _plain_span(seconds: float) -> str:
+def plain_span(seconds: float) -> str:
     """Return a duration in words an operator reads at a glance, such as "9 hours" or "40 minutes"."""
     minutes = max(1, round(seconds / 60))
     if minutes < 90:
@@ -131,17 +143,49 @@ def _plain_span(seconds: float) -> str:
     return f"{hours} hour{'s' if hours != 1 else ''}"
 
 
-def _join_words(words: list[str]) -> str:
+def join_words(words: list[str]) -> str:
     """Return ``words`` joined as "a", "a and b" or "a, b and c"."""
     if len(words) <= 1:
         return "".join(words)
     return ", ".join(words[:-1]) + " and " + words[-1]
 
 
+CAPACITY_SETTING_WORDS: dict[str, str] = {
+    "num_models": "the number of models in `models_to_load`",
+    "alchemy_concurrent": "`alchemy_allow_concurrent`",
+    "alchemy_forms": "`forms`",
+}
+"""How the dashboard names each ``CapacityWorkloadSettings`` field that is not a key of the config file. Every
+other field is named as its config key."""
+
+_CONFIG_FILE_KEYS: dict[str, str] = {
+    field_name: field.alias or field_name for field_name, field in reGenBridgeData.model_fields.items()
+}
+"""Each config field's key as the config file writes it. A field with an alias is written under the alias."""
+
+
+def setting_words(field_name: str) -> str:
+    """Return how the dashboard names a capacity or workload setting, with a config key in backticks.
+
+    A config key is named as the config file writes it. A field from a newer worker that is neither a config
+    key nor in :data:`CAPACITY_SETTING_WORDS` is quoted as it arrives.
+
+    Args:
+        field_name: The ``CapacityWorkloadSettings`` field name reported by the worker.
+    """
+    if field_name in CAPACITY_SETTING_WORDS:
+        return CAPACITY_SETTING_WORDS[field_name]
+    if field_name in _CONFIG_FILE_KEYS:
+        return f"`{_CONFIG_FILE_KEYS[field_name]}`"
+    return f'"{field_name}"'
+
+
 def _restart_sentence(restart: CardEarningWindowRestart) -> str:
     """Return the sentence that says why the window last restarted."""
     if restart.changed_settings:
-        return f"Restarted when {_join_words(restart.changed_settings)} changed."
+        # The section is plain text, so the marks that a finding shows around a config key are dropped.
+        names = [setting_words(field_name).replace("`", "") for field_name in restart.changed_settings]
+        return f"Restarted when {join_words(names)} changed."
     return "Restarted because the settings differed from the last run's."
 
 
@@ -149,7 +193,7 @@ def _footer(earning: CardEarningSnapshot, *, now: float) -> Text:
     """Return the lines under the section: the window's span, the last restart and the rows left out."""
     sentences: list[str] = []
     if earning.window_started_at is not None:
-        sentences.append(f"Measured over the last {_plain_span(now - earning.window_started_at)}.")
+        sentences.append(f"Measured over the last {plain_span(now - earning.window_started_at)}.")
     if earning.last_restart is not None:
         sentences.append(_restart_sentence(earning.last_restart))
     if earning.rows_omitted > 0:
@@ -272,7 +316,7 @@ def _simple_time_grid(earning: CardEarningSnapshot, device_index: int) -> Render
     for label, fraction, _seconds in shares:
         style = "grey62" if label == "idle" else "green"
         bar = _bar(fraction, width=_SHARE_BAR_WIDTH)
-        grid.add_row(shorten(label, _MODEL_NAME_WIDTH), Text(bar, style=style), _share_text(fraction))
+        grid.add_row(shorten(label, _MODEL_NAME_WIDTH), Text(bar, style=style), share_text(fraction))
     return grid
 
 
@@ -290,7 +334,7 @@ def _simple_claim_lines(earning: CardEarningSnapshot, device_index: int) -> list
     if wall <= 0:
         return lines
     for row in _claim_rows(earning, device_index):
-        share = _share_text(row.claim_seconds / wall)
+        share = share_text(row.claim_seconds / wall)
         phrase = verdict_phrase(row.verdict, row=row, min_jobs=earning.verdict_min_jobs)
         lines.append(
             Text(f"Asked the horde only for {row.model} for {share} of the card's time. It is {phrase}."),
@@ -325,7 +369,7 @@ def render_earning_simple(earning: CardEarningSnapshot, *, now: float) -> Render
     return Group(*blocks)
 
 
-def _rate_text(rate: float | None) -> str:
+def rate_text(rate: float | None) -> str:
     """Return a kudos-per-second figure, or a dash when there is none."""
     return "-" if rate is None else f"{rate:.2f}"
 
@@ -360,9 +404,9 @@ def _detail_card_block(earning: CardEarningSnapshot, device_index: int, *, sever
     for row in rows:
         table.add_row(
             row.model,
-            _rate_text(row.model_kudos_per_second),
+            rate_text(row.model_kudos_per_second),
             _band_text(row.model_band_low, row.model_band_high),
-            _rate_text(row.rest_kudos_per_second),
+            rate_text(row.rest_kudos_per_second),
             _band_text(row.rest_band_low, row.rest_band_high),
             f"{row.jobs:,}",
             f"{row.model_buckets}/{row.rest_buckets}",
@@ -395,7 +439,7 @@ def _detail_time_table(earning: CardEarningSnapshot, device_index: int) -> Rende
     table.add_column("Card time", justify="right", no_wrap=True)
     shares = _time_shares(earning, device_index)
     for label, fraction, seconds in shares:
-        table.add_row(label, _share_text(fraction), human_duration(seconds))
+        table.add_row(label, share_text(fraction), human_duration(seconds))
     if not shares:
         table.add_row("no card time measured yet", "", "")
     return Group(heading, table)
@@ -415,7 +459,7 @@ def _detail_claim_table(earning: CardEarningSnapshot, device_index: int) -> Rend
     for row in rows:
         table.add_row(
             row.model,
-            _share_text(row.claim_seconds / wall),
+            share_text(row.claim_seconds / wall),
             human_duration(row.claim_seconds),
             verdict_phrase(row.verdict, row=row, min_jobs=earning.verdict_min_jobs),
         )

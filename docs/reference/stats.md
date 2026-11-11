@@ -320,7 +320,7 @@ is `None`. The verdict is `pop_claim_value_verdict` over the row's figures, as i
 
 The dashboard shows the figures on the Stats tab (see
 [Card earning](../how-to/use-the-dashboard.md#card-earning)). Its words for a verdict come from
-`tui/widgets/earning.py` `verdict_phrase`, which the Overview's residency panel reads too. A `pays` verdict reads
+`tui/widgets/earning.py` `verdict_phrase`, which the Overview's residency panel and the Insights earning findings read too. A `pays` verdict reads
 "earning well" when the model rate is at or above the rest rate and "about the same as the rest" when it is
 under. An unknown verdict string is shown as it arrives.
 

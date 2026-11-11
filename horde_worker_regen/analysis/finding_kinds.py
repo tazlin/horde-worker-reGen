@@ -141,6 +141,9 @@ class FindingKind(enum.StrEnum):
     MODEL_POOL_STALE_DEMAND = "model_pool_stale_demand"
     MODEL_POOL_UNPRODUCTIVE_SEATS = "model_pool_unproductive_seats"
     MODEL_POOL_RESIDENT_MATCHES = "model_pool_resident_matches"
+    CLAIMED_MODEL_EARNS_BELOW_REST = "claimed_model_earns_below_rest"
+    MODEL_EARNS_BELOW_REST = "model_earns_below_rest"
+    CARD_EARNING_RESTARTED = "card_earning_restarted"
 
 
 @dataclass(frozen=True)
@@ -1125,6 +1128,51 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
             "A match counted here was accepted while its model was already loaded, so no cold load was "
             "paid. Job completion is tracked separately."
         ),
+    ),
+    FindingSpec(
+        kind=FindingKind.CLAIMED_MODEL_EARNS_BELOW_REST,
+        title="A model that earns less had the card to itself",
+        action=(
+            "Remove the model from your model list, or add it to `models_to_skip`, to stop serving it. "
+            "Or set `whole_card_residency_max_hold_seconds` to 0 so the worker never asks the horde for one "
+            "model only. That also applies to models that earn well, and jobs for other models can then push "
+            "their loaded weights off the card."
+        ),
+        detail=(
+            "The worker compares what a model earns per second of card time with the rest of the card's work. "
+            "The model's 95% band lies wholly under the rest's band, so the gap is larger than the readings vary. "
+            "While the worker asks the horde only for this model, the card does not take better-paid work for "
+            "other models. The worker keeps asking for one model only whatever the model earns. "
+            "The Stats tab shows the figures for every model."
+        ),
+        reference_page="docs/how-to/use-the-dashboard.md",
+    ),
+    FindingSpec(
+        kind=FindingKind.MODEL_EARNS_BELOW_REST,
+        title="A model that earns less took most of the card's time",
+        action=(
+            "No action needed if you serve this model on purpose. Otherwise remove it from your model list, or "
+            "add it to `models_to_skip`, to stop serving it."
+        ),
+        detail=(
+            "The worker compares what a model earns per second of card time with the rest of the card's work. "
+            "The model's 95% band lies wholly under the rest's band, so the gap is larger than the readings vary. "
+            "This note appears only when the model took more than half of the card's time, idle time included. "
+            "The worker did not ask the horde for this model alone. "
+            "The horde sets what each job pays."
+        ),
+        reference_page="docs/how-to/use-the-dashboard.md",
+    ),
+    FindingSpec(
+        kind=FindingKind.CARD_EARNING_RESTARTED,
+        title="The earning figures started again",
+        action="No action needed. This note clears once a model's earning is measured again.",
+        detail=(
+            "The worker keeps a day of figures on what each model earns per second of card time. "
+            "A change to a capacity or workload setting drops them, because figures measured under one set of "
+            "settings do not describe another. No model has a verdict until enough of its new jobs finish."
+        ),
+        reference_page="docs/how-to/use-the-dashboard.md",
     ),
 )
 
