@@ -1851,8 +1851,19 @@ close to 2 from thirty. A wide gap is therefore ruled after a few buckets, and a
 The claim earns below the rest when the two bands do not overlap and the model's band is the lower one.
 Otherwise it pays, which means only that the model is not shown to earn below the rest. A model near the
 rest is not ruled below on noise. The residency status and every stats sample report the same verdict beside the
-standing claim (see [Stats export](../reference/stats.md#standing-pop-claim-on-stats_sample)). The verdict is
-disclosed only. The claim narrows the offer, and dispatch and retention read the claim, whatever the verdict is.
+standing claim (see [Stats export](../reference/stats.md#standing-pop-claim-on-stats_sample)).
+
+A model that earns below the rest does not get the claim under the default `whole_card_claim_policy`
+(`when_it_pays`). The grant still holds the card for the model, and the worker keeps asking the horde for every
+model while it does. The cost is that a foreign job can arrive while the model holds the card. Such a job can
+wait until the model's jobs drain, or the model's weights leave the card for it. An unmeasured model keeps the claim, so a
+model's first readings are taken with the card held for it. Setting the policy to `always` keeps every claim.
+Listing a model in `whole_card_claim_always_models` keeps its claim alone. A model pinned to a seat of the enabled
+model pool, and a model the card fits only at a reduced size, keep it too. The second is offered on its own
+reduced-size pop, one in several, so without the claim its jobs rarely arrive while it holds the card. The
+scheduler reads the claim at one point (`InferenceScheduler._standing_pop_claim`), so the offer, the resident
+bypass and the retention of a run's copy drop a withheld claim together. The worker logs the decision once per
+model, and the Overview's residency panel names the model the card is not held for and why.
 
 ### Governor observability
 

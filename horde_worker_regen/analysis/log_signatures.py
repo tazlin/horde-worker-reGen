@@ -1143,6 +1143,21 @@ _SIGNATURE_LIST: list[LogSignature] = [
         ),
         dry_run_reason=_WHOLE_CARD_NOT_EXERCISED,
     ),
+    _signature(
+        "pop_claim_withheld",
+        r"Not holding the card for (?P<model>.+?), since it earns below the rest of the card\. On card "
+        r"(?P<card>\d+) it earns (?P<model_rate>\S+) kudos per card second, and the rest of the card's work "
+        r"earns (?P<rest_rate>[^.\s]+(?:\.\d+)?)\.",
+        emitter="process_management.scheduling.governance.whole_card:_withheld_line",
+        sample=(
+            "Not holding the card for Qwen-Image_fp8, since it earns below the rest of the card. On card 0 it earns "
+            "5.060 kudos per card second, and the rest of the card's work earns 10.700. The worker keeps asking the "
+            "horde for every model while Qwen-Image_fp8 holds the card. To ask the horde only for Qwen-Image_fp8 "
+            "while it holds the card, set whole_card_claim_policy to always, or add the model to "
+            "whole_card_claim_always_models."
+        ),
+        dry_run_reason=_WHOLE_CARD_NOT_EXERCISED,
+    ),
     # The stall summary for a residency hold whose latest pass left no remedy on its card: the remedy phrase is
     # HoldRemedy.NONE's, so a detector can tell a hold that frees nothing from swap churn.
     _signature(

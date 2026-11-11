@@ -131,6 +131,7 @@ from horde_worker_regen.process_management.resources.vram_footprints import (
     learned_post_process_vram_mb,
 )
 from horde_worker_regen.process_management.scheduling.admission.pricing import staging_charge_mb
+from horde_worker_regen.process_management.scheduling.card_earning import CardEarningAccumulator
 from horde_worker_regen.process_management.scheduling.clearance_lease import (
     CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS,
     ClearanceController,
@@ -885,6 +886,7 @@ class _DispatchWorld:
         tail_overlap: bool = False,
         gpu_sampling_lease_slots: int | None = None,
         performance_model: bool = False,
+        card_earning: CardEarningAccumulator | None = None,
         legacy_comfy_vram_unload: bool = False,
         child_free_view_lie_mb: float = 0.0,
         parent_device_reading: bool = True,
@@ -1039,6 +1041,10 @@ class _DispatchWorld:
                 the manager feeds it: each finished closed-loop job's sampling rate as job metrics, and each
                 finalized job through the tracker's finalize observer. With it the scheduler stamps a dispatched
                 slot's expected sampling seconds once a signature has enough samples; off, that figure is None.
+            card_earning: A card earning accumulator the scheduler reads and feeds, as the manager's. A row seeds
+                it with figures so a pop claim's earning verdict is measured. The world does not credit kudos to
+                it. None, the default, gives the scheduler none, so every verdict is unmeasured and every claim
+                stands.
             legacy_comfy_vram_unload: Whether the escape hatch that restores the old flag-based child regime
                 is configured. Under it the child's executor returns the card at the end of every prompt below
                 anything a grant can suppress, so a closed-loop run evicts on every completion whatever the
@@ -1784,6 +1790,7 @@ class _DispatchWorld:
             resource_state_sink=self._record_resource_state,
             clock=lambda: self.now,
             performance_model=self.performance_model,
+            card_earning=card_earning,
         )
         if disaggregated:
             # Class-eligibility is the scheduler's own seam for "this job will run as a UNet-only sampler".

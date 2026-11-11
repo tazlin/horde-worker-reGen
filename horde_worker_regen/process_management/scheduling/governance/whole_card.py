@@ -16,7 +16,8 @@ A held residency also claims the worker's intake: while the claim stands the off
 model, so the horde stops sending work that would force the resident weights back out of the card. The claim
 is a residency fact, so its state and its early ends (the operator-configured maximum hold, the run of empty
 pops that says the resident model's demand has dried up, and a terminal fault of the claimed model) are
-answered here too.
+answered here too. So is whether a claim is withheld because its model earns below the rest of its card
+(:func:`pop_claim_hold_decision`).
 
 Each grant includes the dominance rung it was made on (:class:`DominanceRung`). Rung 2 includes the teardown. The
 readers that stop siblings, move safety or pause lanes read :meth:`WholeCardResidencyLedger.teardown_held`, so a rung-1
@@ -62,8 +63,13 @@ __all__ = [
     "WHOLE_CARD_RESTORE_GRACE_SECONDS",
     "DominanceRung",
     "GraceBudgetStatus",
+    "PopClaimExemption",
+    "PopClaimHold",
+    "PopClaimHoldDecision",
+    "PopClaimHoldReason",
     "PopClaimValue",
     "PopClaimValueVerdict",
+    "WholeCardClaimPolicy",
     "RateBand",
     "WholeCardGovernor",
     "WholeCardGovernorHold",
@@ -78,6 +84,7 @@ __all__ = [
     "convergence_blockers",
     "max_coresident_for_peak",
     "offer_under_pop_claim",
+    "pop_claim_hold_decision",
     "pop_claim_value_verdict",
     "rate_95_band",
     "two_sided_95_band_width",
@@ -369,10 +376,10 @@ class WholeCardPopClaimRelease(StrEnum):
 
 
 class PopClaimValueVerdict(StrEnum):
-    """Whether a standing pop claim's model earns as much per card second as the rest of its card's work.
+    """Whether a pop claim's model earns as much per card second as the rest of its card's work.
 
-    The verdict is disclosed in the log and the stats stream. The claim, the offer, dispatch and retention do not
-    read it.
+    The verdict is disclosed in the log and the stats stream. A verdict of below the rest withholds the claim
+    unless the operator's policy or an exemption keeps it (:func:`pop_claim_hold_decision`).
     """
 
     UNMEASURED = auto()
@@ -398,6 +405,76 @@ class PopClaimValue:
     card_index: int
     rate: CardEarningRate | None
     verdict: PopClaimValueVerdict
+
+
+class WholeCardClaimPolicy(StrEnum):
+    """When the worker asks the horde only for a whole-card model that earns below the rest of its card.
+
+    The setting ``whole_card_claim_policy`` takes these values.
+    """
+
+    ALWAYS = "always"
+    """Every held grant claims the offer, whatever its model earns."""
+    WHEN_IT_PAYS = "when_it_pays"
+    """A model whose earning verdict is below the rest of its card does not get a claim, unless it is exempt."""
+
+
+class PopClaimExemption(StrEnum):
+    """Why a model keeps its claim whatever it earns."""
+
+    LISTED = "listed"
+    """The operator lists the model in ``whole_card_claim_always_models``."""
+    POOL_PIN = "pool_pin"
+    """The model is pinned to a seat of the enabled model pool."""
+    CONSTRAINED_LANE = "constrained_lane"
+    """The card fits the model only at a reduced size, so it is offered on a pop of its own. Without the claim
+    the model is asked for on one pop in several, so its jobs rarely arrive while it holds the card."""
+
+
+class PopClaimHoldReason(StrEnum):
+    """Whether a held grant's claim over the pop offer stands, and why."""
+
+    NOT_WITHHELD = "not_withheld"
+    """The model's verdict is not below the rest, so the claim stands."""
+    WITHHELD_BELOW_THE_REST = "withheld_below_the_rest"
+    """The model earns below the rest of its card, so the worker keeps asking the horde for every model."""
+    KEPT_BY_POLICY = "kept_by_policy"
+    """The model earns below the rest, and the policy is ``always``."""
+    KEPT_BY_EXEMPTION = "kept_by_exemption"
+    """The model earns below the rest, and an exemption keeps its claim."""
+
+
+@dataclass(frozen=True)
+class PopClaimHoldDecision:
+    """Represents whether a claim is withheld for a model on its card, and why.
+
+    Attributes:
+        reason: Whether the claim stands, and why.
+        exemption: The exemption that kept the claim, when ``reason`` is ``KEPT_BY_EXEMPTION``. None otherwise.
+    """
+
+    reason: PopClaimHoldReason
+    exemption: PopClaimExemption | None = None
+
+    @property
+    def withheld(self) -> bool:
+        """Return whether the claim is withheld."""
+        return self.reason is PopClaimHoldReason.WITHHELD_BELOW_THE_REST
+
+
+@dataclass(frozen=True)
+class PopClaimHold:
+    """Represents a held grant's claim over the pop offer, with its measured value and whether it stands.
+
+    Attributes:
+        claim: The claim the grant holds, or would hold when it is withheld.
+        value: The claim's measured value on its card.
+        decision: Whether the claim is withheld, and why.
+    """
+
+    claim: WholeCardPopClaim
+    value: PopClaimValue
+    decision: PopClaimHoldDecision
 
 
 class DominanceRung(StrEnum):
@@ -1428,6 +1505,34 @@ def pop_claim_value_verdict(rate: CardEarningRate) -> PopClaimValueVerdict:
     return PopClaimValueVerdict.PAYS
 
 
+def pop_claim_hold_decision(
+    *,
+    policy: WholeCardClaimPolicy,
+    verdict: PopClaimValueVerdict,
+    exemption: Callable[[], PopClaimExemption | None],
+) -> PopClaimHoldDecision:
+    """Return whether the claim is withheld for a model on its card, and why.
+
+    Only a verdict of below the rest withholds a claim. An unmeasured model keeps its claim, so its first readings
+    are taken with the claim. The policy ``always`` keeps every claim, and otherwise an exemption keeps it.
+
+    Args:
+        policy: The operator's ``whole_card_claim_policy``.
+        verdict: The model's earning verdict on the claim's card.
+        exemption: Return the exemption that keeps the model's claim, or None. It is called only when the
+            verdict is below the rest and the policy is ``when_it_pays``, since some exemptions take a
+            serviceability reading.
+    """
+    if verdict is not PopClaimValueVerdict.BELOW_THE_REST:
+        return PopClaimHoldDecision(reason=PopClaimHoldReason.NOT_WITHHELD)
+    if policy is WholeCardClaimPolicy.ALWAYS:
+        return PopClaimHoldDecision(reason=PopClaimHoldReason.KEPT_BY_POLICY)
+    kept_by = exemption()
+    if kept_by is not None:
+        return PopClaimHoldDecision(reason=PopClaimHoldReason.KEPT_BY_EXEMPTION, exemption=kept_by)
+    return PopClaimHoldDecision(reason=PopClaimHoldReason.WITHHELD_BELOW_THE_REST)
+
+
 def _format_kudos_rate(kudos_per_second: float | None) -> str:
     return "unmeasured" if kudos_per_second is None else f"{kudos_per_second:.3f}"
 
@@ -1453,6 +1558,41 @@ def _pop_claim_value_sentence(value: PopClaimValue) -> str:
     if rate.jobs < POP_CLAIM_VALUE_MIN_JOBS:
         return f"{figures} The claim's value is unmeasured until {POP_CLAIM_VALUE_MIN_JOBS} jobs are counted."
     return f"{figures} The claim's value is unmeasured until both rates have readings from two time buckets."
+
+
+_KEPT_BY_EXEMPTION_SENTENCES: dict[PopClaimExemption, str] = {
+    PopClaimExemption.LISTED: "The card is held for it because it is listed in whole_card_claim_always_models.",
+    PopClaimExemption.POOL_PIN: "The card is held for it because it is pinned to a model pool seat.",
+    PopClaimExemption.CONSTRAINED_LANE: (
+        "The card is held for it because the card fits it only at a reduced size, and without the hold it is "
+        "asked for on one pop in several."
+    ),
+}
+"""The engage line's statement of why a model that earns below the rest keeps its claim, per exemption."""
+
+
+def _kept_sentence(decision: PopClaimHoldDecision) -> str:
+    """Return the engage line's statement of why a below-the-rest claim stands, or an empty string."""
+    if decision.reason is PopClaimHoldReason.KEPT_BY_POLICY:
+        return " The card is held for it because whole_card_claim_policy is always."
+    if decision.reason is PopClaimHoldReason.KEPT_BY_EXEMPTION and decision.exemption is not None:
+        return f" {_KEPT_BY_EXEMPTION_SENTENCES[decision.exemption]}"
+    return ""
+
+
+def _withheld_line(hold: PopClaimHold) -> str:
+    """Return the line that states a claim is withheld, with both rates and the settings that change it."""
+    model = hold.claim.model
+    rate = hold.value.rate
+    model_rate = _format_kudos_rate(rate.model_kudos_per_second if rate is not None else None)
+    rest_rate = _format_kudos_rate(rate.rest_kudos_per_second if rate is not None else None)
+    return (
+        f"Not holding the card for {model}, since it earns below the rest of the card. On card "
+        f"{hold.value.card_index} it earns {model_rate} kudos per card second, and the rest of the card's work "
+        f"earns {rest_rate}. The worker keeps asking the horde for every model while {model} holds the card. To "
+        f"ask the horde only for {model} while it holds the card, set whole_card_claim_policy to always, or add "
+        "the model to whole_card_claim_always_models."
+    )
 
 
 def _establishing(state: WholeCardResidency, *, now: float, establish_grace_seconds: float) -> bool:
@@ -1542,6 +1682,7 @@ class WholeCardPopClaimTracker:
     def __init__(self) -> None:
         """Start with no claim disclosed and no release remembered."""
         self._disclosed: WholeCardPopClaim | None = None
+        self._withheld_disclosed: str | None = None
         self._early_release_pending: WholeCardPopClaimRelease | None = None
         self._release: tuple[WholeCardPopClaimRelease, float] | None = None
         self._multi_gpu_disclosed = False
@@ -1574,15 +1715,24 @@ class WholeCardPopClaimTracker:
         *,
         now: float,
         value_of: Callable[[WholeCardPopClaim], PopClaimValue] | None = None,
+        decision_of: Callable[[WholeCardPopClaim], PopClaimHoldDecision] | None = None,
+        withheld: PopClaimHold | None = None,
     ) -> None:
-        """Log the engage or release line when the standing claim actually changes.
+        """Log the engage, release or withheld line when the claim actually changes.
 
         Args:
             claim: The standing claim, or None when the pool is unclaimed.
             now: The scheduler's clock.
             value_of: Reads a claim's measured value. It is called only at an engage edge, and the engage line
                 then states the value. None leaves the value out of the line.
+            decision_of: Reads whether a claim is withheld and why. It is called only at an engage edge, and the
+                engage line then states why a claim whose model earns below the rest stands. None leaves the
+                reason out of the line.
+            withheld: The claim a held grant would hold, when it is withheld because its model earns below the
+                rest. The withheld line is logged once per model. A claim that was standing and is then
+                withheld for the same model is not also logged as released.
         """
+        self._disclose_withheld(withheld)
         previous = self._disclosed
         if claim is not None:
             if previous is not None and previous.model == claim.model:
@@ -1591,14 +1741,18 @@ class WholeCardPopClaimTracker:
             self._early_release_pending = None
             self._release = None
             value_sentence = f" {_pop_claim_value_sentence(value_of(claim))}" if value_of is not None else ""
+            kept_sentence = _kept_sentence(decision_of(claim)) if decision_of is not None else ""
             logger.info(
                 f"Whole-card pop claim engaged for {claim.model}: advertising that model alone while it holds "
-                f"the card, for at most {claim.expires_at - claim.held_since:.0f}s.{value_sentence}",
+                f"the card, for at most {claim.expires_at - claim.held_since:.0f}s.{value_sentence}{kept_sentence}",
             )
             return
         if previous is None:
             return
         self._disclosed = None
+        if withheld is not None and withheld.claim.model == previous.model:
+            self._early_release_pending = None
+            return
         if self._early_release_pending is WholeCardPopClaimRelease.NO_FURTHER_WORK:
             release = WholeCardPopClaimRelease.NO_FURTHER_WORK
             reason = "the horde had no further work for it"
@@ -1614,6 +1768,16 @@ class WholeCardPopClaimTracker:
         self._early_release_pending = None
         self._release = (release, now)
         logger.info(f"Whole-card pop claim released for {previous.model}: {reason}; advertising the full pool again.")
+
+    def _disclose_withheld(self, withheld: PopClaimHold | None) -> None:
+        """Log the withheld line when a claim is first withheld for a model, and forget it once none is."""
+        if withheld is None:
+            self._withheld_disclosed = None
+            return
+        if self._withheld_disclosed == withheld.claim.model:
+            return
+        self._withheld_disclosed = withheld.claim.model
+        logger.info(_withheld_line(withheld))
 
     def recent_release(self, now: float) -> WholeCardPopClaimRelease | None:
         """Why the last claim ended, while that still explains the widened offer; else None."""

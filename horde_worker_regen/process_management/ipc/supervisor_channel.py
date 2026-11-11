@@ -285,6 +285,10 @@ class CapacityWorkloadSettings(BaseModel):
     alchemy_max_concurrency: int
     alchemy_vram_headroom_mb: int
     alchemy_forms: tuple[str, ...]
+    whole_card_claim_always: bool = False
+    """Whether ``whole_card_claim_policy`` is ``always``. The policy decides whether a model that earns below the
+    rest of its card is measured with the card held for it, so figures taken under one policy do not describe the
+    other. Defaults to False, the default policy, so a snapshot from a worker without the field still validates."""
 
 
 _CAPACITY_WORKLOAD_FINGERPRINT_HEX_DIGITS = 16
@@ -1383,11 +1387,20 @@ class WholeCardResidencyStatus(BaseModel):
     """Why the last claim ended (``maximum_hold`` | ``no_further_work`` | ``residency_released``), while that
     is still recent; None otherwise."""
     pop_claim_card_index: int | None = None
-    """The standing claim's card, by the lane's device index, or None when no claim stands."""
+    """The card of the standing or withheld claim, by the lane's device index, or None when a held grant does
+    not claim the offer."""
     pop_claim_verdict: str | None = None
-    """Whether the claimed model earns as much per card second as the rest of its card (``unmeasured`` |
-    ``pays`` | ``below_the_rest``), or None when no claim stands. It is disclosed only, and the claim does not
-    read it."""
+    """Whether the model of the standing or withheld claim earns as much per card second as the rest of its card
+    (``unmeasured`` | ``pays`` | ``below_the_rest``), or None when a held grant does not claim the offer."""
+    pop_claim_withheld_model: str | None = None
+    """The model a held grant would claim the offer for, when the claim is withheld because the model earns below
+    the rest of its card. None otherwise. While it is set the worker keeps asking the horde for every model."""
+    pop_claim_hold_reason: str | None = None
+    """Whether the held grant's claim stands and why (``not_withheld`` | ``withheld_below_the_rest`` |
+    ``kept_by_policy`` | ``kept_by_exemption``), or None when a held grant does not claim the offer."""
+    pop_claim_exemption: str | None = None
+    """The exemption that keeps the claim of a model that earns below the rest (``listed`` | ``pool_pin`` |
+    ``constrained_lane``), or None."""
 
     weights_mb: int | None = None
     """Resident weight footprint of the residency model (detail view)."""

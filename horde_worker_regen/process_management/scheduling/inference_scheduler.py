@@ -70,6 +70,8 @@ from horde_worker_regen.process_management.resources.foreign_vram_floor import (
 )
 from horde_worker_regen.process_management.resources.model_serviceability import (
     WholeCardSeat,
+    constrained_max_power,
+    max_power_to_pixels,
     model_serviceability_verdicts,
     serviceability_arithmetic,
 )
@@ -191,7 +193,12 @@ from horde_worker_regen.process_management.scheduling.admission.snapshot import 
     build_scheduling_snapshot,
     snapshot_ledgers,
 )
-from horde_worker_regen.process_management.scheduling.card_earning import CardEarningAccumulator, CardTick
+from horde_worker_regen.process_management.scheduling.card_earning import (
+    CARD_EARNING_READ_REUSE_SECONDS,
+    CardEarningAccumulator,
+    CardEarningRestart,
+    CardTick,
+)
 from horde_worker_regen.process_management.scheduling.clearance_lease import (
     CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS,
     TAIL_OVERLAP_MIN_PROGRESS_FOR_ESTIMATE,
@@ -244,10 +251,15 @@ from horde_worker_regen.process_management.scheduling.governance.whole_card impo
     WHOLE_CARD_RESTORE_GRACE_SECONDS,
     DominanceRung,
     DominantRunEndCause,
+    PopClaimExemption,
+    PopClaimHold,
+    PopClaimHoldDecision,
     PopClaimValue,
     PopClaimValueVerdict,
+    WholeCardClaimPolicy,
     WholeCardGrantKind,
     convergence_blockers,
+    pop_claim_hold_decision,
     pop_claim_value_verdict,
     post_process_context_fits,
     residency_has_holder,
@@ -452,6 +464,21 @@ class _WholeCardDemandOutcome(enum.Enum):
     DEFER_GOVERNOR = enum.auto()
     """The establish-rate limiter holds the card's next residency off. The head stands down this cycle and keeps
     asking, and the card is free for other work meanwhile."""
+
+
+@dataclass(frozen=True)
+class _ReusedPopClaimValue:
+    """Represents a claim's measured value with when it was read and the earning window it was read from.
+
+    Attributes:
+        value: The measured value and its verdict.
+        read_at: The scheduler's clock at the read.
+        restart: The earning window's last restart at the read. A later restart makes the value stale at once.
+    """
+
+    value: PopClaimValue
+    read_at: float
+    restart: CardEarningRestart | None
 
 
 @dataclass(frozen=True)
@@ -769,6 +796,9 @@ class InferenceScheduler:
         self._lru = lru
         self._performance_model = performance_model
         self._card_earning = card_earning
+        # A claim's measured value, reused for a few seconds per (model, card). The claim is read several
+        # times per tick while a card is held, and each fresh read walks a day of buckets.
+        self._pop_claim_value_reuse: dict[tuple[str, int], _ReusedPopClaimValue] = {}
         # Optional sink for between-jobs reload/respawn events, set by the manager to
         # WorkerRunMetrics.record_churn. None in unit tests that drive the scheduler directly.
         self._churn_observer: Callable[[ChurnKind], None] | None = None
@@ -3297,11 +3327,7 @@ class InferenceScheduler:
         if not self._whole_card_ledger.note_terminal_fault(model, now=self._clock()):
             return
         self._pop_claim_tracker.note_terminal_fault_release()
-        self._pop_claim_tracker.disclose_edge(
-            self.whole_card_pop_claim(),
-            now=self._clock(),
-            value_of=self._pop_claim_value,
-        )
+        self._disclose_pop_claim_edge()
 
     def _converge_whole_card_residency(self) -> None:
         """Collapse each held residency to sole VRAM residency once its model has a holder.
@@ -3869,11 +3895,7 @@ class InferenceScheduler:
                 model,
             )
         self._release_exclusive_admits_without_residency()
-        self._pop_claim_tracker.disclose_edge(
-            self.whole_card_pop_claim(),
-            now=self._clock(),
-            value_of=self._pop_claim_value,
-        )
+        self._disclose_pop_claim_edge()
 
     def _release_exclusive_admits_without_residency(self) -> None:
         """Release the pending exclusive admits whose card does not hold a residency for the admit's model.
@@ -4223,7 +4245,9 @@ class InferenceScheduler:
         Two conditions keep the claim off hosts it would harm. It is skipped entirely on a host with more than
         one card runtime, whatever each card serves, because a residency is per-card and holding the whole
         worker's intake to one card's model would starve the others. It is also skipped when the operator has
-        set the maximum hold to zero, which disables the claim along with the cap that bounds it.
+        set the maximum hold to zero, which disables the claim along with the cap that bounds it. A claim whose
+        model earns below the rest of its card is withheld under the operator's policy (see
+        :meth:`_standing_pop_claim`).
         """
         if self._multi_gpu_routing_active:
             self._pop_claim_tracker.disclose_skipped_on_multi_gpu(any_held=self._whole_card_ledger.any_held())
@@ -4231,7 +4255,21 @@ class InferenceScheduler:
         return self._standing_pop_claim()
 
     def _standing_pop_claim(self) -> WholeCardPopClaim | None:
-        """The claim :meth:`whole_card_pop_claim` reports, read without its multi-GPU disclosure."""
+        """The claim :meth:`whole_card_pop_claim` reports, read without its multi-GPU disclosure.
+
+        This is the one read point of the claim. The offer (through :meth:`whole_card_pop_claim`), the resident
+        bypass in :meth:`get_next_job_and_process`, the admission snapshot's ``pop_claim_model`` (which
+        ``pricing.copy_belongs_to_dominant_run`` reads for retention) and the card earning tally all read the
+        claim here. A claim withheld by :func:`pop_claim_hold_decision` is therefore withheld from every one of
+        them together.
+        """
+        hold = self._pop_claim_hold()
+        if hold is None or hold.decision.withheld:
+            return None
+        return hold.claim
+
+    def _held_grant_pop_claim(self) -> WholeCardPopClaim | None:
+        """Return the claim a held grant has over the pop offer before the earning policy is applied."""
         if self._multi_gpu_routing_active:
             return None
         max_hold_seconds = self._whole_card_max_hold_seconds()
@@ -4248,6 +4286,79 @@ class InferenceScheduler:
                 return claim
         return None
 
+    def _pop_claim_hold(self) -> PopClaimHold | None:
+        """Return a held grant's claim with its measured value and whether it is withheld, or None without one.
+
+        A scheduler without a card earning accumulator reads every verdict as unmeasured, so its claims stand.
+        """
+        claim = self._held_grant_pop_claim()
+        if claim is None:
+            return None
+        value = self._pop_claim_value(claim)
+        return PopClaimHold(claim=claim, value=value, decision=self._pop_claim_decision(claim, value))
+
+    def _pop_claim_decision(
+        self, claim: WholeCardPopClaim, value: PopClaimValue | None = None
+    ) -> PopClaimHoldDecision:
+        """Return whether ``claim`` is withheld and why, reading its value when ``value`` is not given."""
+        verdict = (value if value is not None else self._pop_claim_value(claim)).verdict
+        return pop_claim_hold_decision(
+            policy=self._whole_card_claim_policy(),
+            verdict=verdict,
+            exemption=lambda: self._pop_claim_exemption(claim.model),
+        )
+
+    def _disclose_pop_claim_edge(self) -> None:
+        """Log the claim's engage, release or withheld line when the claim changed since the last call."""
+        claim = self.whole_card_pop_claim()
+        hold = self._pop_claim_hold() if claim is None else None
+        self._pop_claim_tracker.disclose_edge(
+            claim,
+            now=self._clock(),
+            value_of=self._pop_claim_value,
+            decision_of=self._pop_claim_decision,
+            withheld=hold if hold is not None and hold.decision.withheld else None,
+        )
+
+    def _whole_card_claim_policy(self) -> WholeCardClaimPolicy:
+        """Return the operator's ``whole_card_claim_policy``.
+
+        A value that is not a policy member reads as the default.
+        """
+        configured = self._runtime_config.bridge_data.whole_card_claim_policy
+        return configured if isinstance(configured, WholeCardClaimPolicy) else WholeCardClaimPolicy.WHEN_IT_PAYS
+
+    def _pop_claim_exemption(self, model: str) -> PopClaimExemption | None:
+        """Return the exemption that keeps ``model``'s claim whatever it earns, or None.
+
+        The listed models come from ``whole_card_claim_always_models``. A pin counts while the model pool is
+        enabled, since a pin seats a model only then. The constrained lane is the offer's own test
+        (``constrained_max_power`` over ``model_serviceability_verdicts``, with the providers the popper is
+        given), read at the card's configured ``max_power``.
+        """
+        bridge_data = self._runtime_config.bridge_data
+        listed = bridge_data.whole_card_claim_always_models
+        if isinstance(listed, list) and model in listed:
+            return PopClaimExemption.LISTED
+        pool = bridge_data.model_pool
+        if pool.enabled is True and any(entry.name == model for entry in pool.pinned):
+            return PopClaimExemption.POOL_PIN
+        # Without a card runtime the offer's constrained-lane test does not mark any model constrained either.
+        card_runtime = next(iter(self._card_runtimes.values()), None)
+        if card_runtime is None:
+            return None
+        verdicts = model_serviceability_verdicts(
+            model,
+            card_runtimes=self._card_runtimes,
+            model_metadata=self._model_metadata,
+            admission_baseline_provider=self.serviceability_baseline_mb,
+            max_pixels=max_power_to_pixels(card_runtime.config.max_power),
+            whole_card_seat_provider=self.whole_card_seat,
+        )
+        if constrained_max_power(verdicts) is not None:
+            return PopClaimExemption.CONSTRAINED_LANE
+        return None
+
     def _pop_claim_value(self, claim: WholeCardPopClaim) -> PopClaimValue:
         """Return the measured value of ``claim`` on its card, read from the card earning accumulator.
 
@@ -4258,8 +4369,20 @@ class InferenceScheduler:
         card_index = claim.device_index if claim.device_index is not None else next(iter(self._card_runtimes), 0)
         if self._card_earning is None:
             return PopClaimValue(card_index=card_index, rate=None, verdict=PopClaimValueVerdict.UNMEASURED)
+        now = self._clock()
+        last_restart = self._card_earning.last_restart
+        key = (claim.model, card_index)
+        reused = self._pop_claim_value_reuse.get(key)
+        if (
+            reused is not None
+            and reused.restart is last_restart
+            and 0.0 <= now - reused.read_at < CARD_EARNING_READ_REUSE_SECONDS
+        ):
+            return reused.value
         rate = self._card_earning.rate(model=claim.model, device_index=card_index)
-        return PopClaimValue(card_index=card_index, rate=rate, verdict=pop_claim_value_verdict(rate))
+        value = PopClaimValue(card_index=card_index, rate=rate, verdict=pop_claim_value_verdict(rate))
+        self._pop_claim_value_reuse[key] = _ReusedPopClaimValue(value=value, read_at=now, restart=last_restart)
+        return value
 
     def note_whole_card_pop_outcome(self, *, served: bool) -> None:
         """Record what a pop taken under the standing claim came back with (the empty-pop evidence).
@@ -4384,8 +4507,13 @@ class InferenceScheduler:
         # The claim is a separate fact from the residency: a card can hold a model without narrowing the
         # offer to it, and the offer is what an operator watching models come and go actually sees change.
         pop_claim = self.whole_card_pop_claim()
-        pop_claim_release = self._pop_claim_tracker.recent_release(now) if pop_claim is None else None
-        pop_claim_value = self._pop_claim_value(pop_claim) if pop_claim is not None else None
+        # The held grant's claim with its value and policy decision, whether it stands or is withheld.
+        hold = self._pop_claim_hold()
+        withheld = hold if hold is not None and hold.decision.withheld else None
+        pop_claim_release = (
+            self._pop_claim_tracker.recent_release(now) if pop_claim is None and withheld is None else None
+        )
+        pop_claim_value = hold.value if hold is not None else None
 
         return WholeCardResidencyState(
             possible=possible,
@@ -4407,6 +4535,11 @@ class InferenceScheduler:
             pop_claim_release=pop_claim_release.value if pop_claim_release is not None else None,
             pop_claim_card_index=pop_claim_value.card_index if pop_claim_value is not None else None,
             pop_claim_verdict=pop_claim_value.verdict.value if pop_claim_value is not None else None,
+            pop_claim_withheld_model=withheld.claim.model if withheld is not None else None,
+            pop_claim_hold_reason=hold.decision.reason.value if hold is not None else None,
+            pop_claim_exemption=(
+                hold.decision.exemption.value if hold is not None and hold.decision.exemption is not None else None
+            ),
             weights_mb=weights_mb,
             reserve_mb=reserve_mb,
             free_now_mb=free_now_mb,

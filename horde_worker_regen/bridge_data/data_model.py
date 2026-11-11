@@ -26,6 +26,7 @@ from horde_worker_regen.compute_mode import TextBackendAccelerator
 from horde_worker_regen.consts import TOTAL_LORA_DOWNLOAD_TIMEOUT, WORKER_KNOWN_EXTRA_ALCHEMY_FORMS
 from horde_worker_regen.locale_info.regen_bridge_data_fields import BRIDGE_DATA_FIELD_DESCRIPTIONS
 from horde_worker_regen.process_management.models.download_scheduler import DownloadPriorityPolicy
+from horde_worker_regen.process_management.scheduling.governance.whole_card import WholeCardClaimPolicy
 
 
 @dataclass(frozen=True)
@@ -1584,6 +1585,30 @@ class reGenBridgeData(CombinedHordeBridgeData):
     while a job queued for another model just before the residency began still drains inside its deadline. 0
     disables both the cap and the pop claim, leaving residency duration governed by the cooldown alone. Only
     used when `enable_vram_budget` is true."""
+
+    whole_card_claim_policy: WholeCardClaimPolicy = Field(default=WholeCardClaimPolicy.WHEN_IT_PAYS)
+    """Whether the worker asks the horde only for a whole-card model that earns less than the rest of the card.
+
+    While a model holds the card to itself, the worker normally asks the horde only for that model, so jobs for
+    other models do not push its weights off the card. The worker measures what each model earns per second of
+    the card's time. With `when_it_pays` (the default), a model that earns clearly less than the rest of the
+    card's work does not get this. The worker keeps asking for every model while it holds the card, and this is
+    written to the log and shown on the dashboard. A model with too few jobs measured is asked for alone as usual.
+    `always` asks only for the model that holds the card, whatever it earns.
+
+    The cost of `when_it_pays` is that a job for another model can arrive while the low-earning model holds the
+    card, and it waits for that model's jobs to finish, or the model's weights have to leave the card. The cost
+    of `always` is the kudos given up while the card serves the low-earning model alone. Changing it restarts the
+    measured earning figures. Only used on a host with one card, and only while
+    `whole_card_residency_max_hold_seconds` is above 0."""
+
+    whole_card_claim_always_models: list[str] = Field(default_factory=list)
+    """Models, by reference name, for which the worker asks the horde only for that model while it holds the
+    card, whatever it earns.
+
+    Use it for a model you serve on purpose even though it pays less than your other models. It has the effect of
+    `whole_card_claim_policy: always` for the listed models alone. A model pinned to a seat of the enabled model
+    pool, and a model the card fits only at a reduced size, are treated as listed. Empty by default."""
 
     large_model_switch_min_seconds: int = Field(default=0, ge=0, le=600)
     """Minimum seconds between accepting jobs for *different* very-large models (the switch throttle).

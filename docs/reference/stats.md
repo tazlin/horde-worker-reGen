@@ -95,9 +95,12 @@ entry. Each entry is a
 | `verdict` | `unmeasured`, `pays` or `below_the_rest`, read from the card earning figures as the engage line reads them (see [Logs](logs.md#lines-that-say-a-mechanism-acted)). |
 
 The entries come from the residency status (`WholeCardResidencyStatus.pop_claim_card_index` and
-`pop_claim_verdict`), so the stream and the dashboard read the same claim. The verdict is disclosed only, and the
-claim does not read it. A span inside a claim can be split from the rest of a session with this field instead of
-the engage and release lines. Samples written before the field existed omit it.
+`pop_claim_verdict`), so the stream and the dashboard read the same claim. A claim withheld because its model
+earns below the rest does not stand, so it is not listed. The residency status names it in
+`pop_claim_withheld_model`, with `pop_claim_hold_reason` and `pop_claim_exemption` saying whether a claim stands
+and why. A standing entry's verdict is `below_the_rest` only when the policy or an exemption kept the claim. A
+span inside a claim can be split from the rest of a session with this field instead of the engage and release
+lines. Samples written before the field existed omit it.
 
 ### Sampling window on `job_completed`
 

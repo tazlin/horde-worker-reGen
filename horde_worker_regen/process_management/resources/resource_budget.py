@@ -765,11 +765,20 @@ class WholeCardResidencyState:
     from every other surface by the time it is asked about; None once the release is old enough that it no
     longer explains what the worker is doing now."""
     pop_claim_card_index: int | None = None
-    """The standing claim's card, by the lane's device index, or None when no claim stands."""
+    """The card of the standing or withheld claim, by the lane's device index, or None when a held grant does
+    not claim the offer."""
     pop_claim_verdict: str | None = None
-    """The standing claim's value verdict (a :class:`PopClaimValueVerdict` value), or None when no claim stands.
-
-    It is disclosed only. The claim, the offer, dispatch and retention do not read it."""
+    """The value verdict (a :class:`PopClaimValueVerdict` value) of the standing or withheld claim, or None when a
+    held grant does not claim the offer."""
+    pop_claim_withheld_model: str | None = None
+    """The model a held grant would claim the offer for, when the claim is withheld because the model earns below
+    the rest of its card. None otherwise. While it is set the worker keeps asking the horde for every model."""
+    pop_claim_hold_reason: str | None = None
+    """Whether the held grant's claim stands and why (a :class:`PopClaimHoldReason` value), or None when a held
+    grant does not claim the offer."""
+    pop_claim_exemption: str | None = None
+    """The exemption (a :class:`PopClaimExemption` value) that keeps the claim of a model that earns below the
+    rest, or None."""
 
     weights_mb: float | None = None
     """Resident weight footprint of the residency model (the establishing forecast), for the detail view."""

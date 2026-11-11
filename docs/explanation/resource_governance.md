@@ -646,6 +646,17 @@ others. The maximum hold still caps retention there. A residency held through lu
 once it has passed the hold and its work has drained, and a terminal fault of the resident model also ends its
 retention. Setting the maximum hold to zero disables the claim along with the cap that bounds it.
 
+The claim is also withheld when its model earns below the rest of its card. Holding the whole offer for a model
+pays only when the model earns at least what the card's other work earns per card second, and the worker
+measures both
+(see [The whole-card pop claim](performance_and_backpressure.md#the-whole-card-pop-claim)). Under the default
+`whole_card_claim_policy` a grant whose model reads below the rest holds the card without a claim. The residency
+keeps its own clocks: its cooldown, its maximum hold and its retention end work as above. Only what the worker
+asks for changes. The worker keeps asking for every model, and a foreign job that arrives can wait for the
+resident model's jobs to drain. A run's copy is spared only while a job for its model is queued. The operator keeps the
+claim for every model with `whole_card_claim_policy: always`, or for chosen models with
+`whole_card_claim_always_models`.
+
 The large-model re-entry cooldown sits beneath all of this, and it does not pace the return of the model that
 just held the card. It arms only once no card holds a grant and no very-large model is loaded or queued. A
 restore does not unload the resident model's weights, so after a release whose model stays on a lane the

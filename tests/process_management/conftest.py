@@ -50,6 +50,7 @@ from horde_worker_regen.process_management.resources.model_serviceability import
 )
 from horde_worker_regen.process_management.resources.reclaim_ladder import LadderCandidates
 from horde_worker_regen.process_management.resources.resource_budget import CommittedReserveLedger
+from horde_worker_regen.process_management.scheduling.governance.whole_card import WholeCardClaimPolicy
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 
 
@@ -293,6 +294,8 @@ def make_mock_bridge_data(**overrides: object) -> Mock:
     bd.whole_card_residency_safety_off_gpu = True
     bd.whole_card_residency_cooldown_seconds = 0
     bd.whole_card_residency_max_hold_seconds = 180
+    bd.whole_card_claim_policy = WholeCardClaimPolicy.WHEN_IT_PAYS
+    bd.whole_card_claim_always_models = []
     bd.large_model_switch_min_seconds = 0
     bd.large_model_reentry_cooldown_seconds = -1
     bd.unservable_model_fault_threshold = 3

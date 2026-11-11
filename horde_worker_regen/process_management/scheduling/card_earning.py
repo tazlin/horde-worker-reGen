@@ -22,8 +22,8 @@ compared, so a restart during a run names the settings that changed. A restart f
 them, since the file holds only the fingerprint.
 
 The module only measures. It does not hold a threshold or a verdict. The pop claim's value verdict in
-:mod:`~horde_worker_regen.process_management.scheduling.governance.whole_card` reads it for disclosure, and
-scheduling decisions do not read it.
+:mod:`~horde_worker_regen.process_management.scheduling.governance.whole_card` reads it, and under the default
+``whole_card_claim_policy`` a verdict of below the rest withholds the claim.
 """
 
 from __future__ import annotations
@@ -61,6 +61,14 @@ CARD_EARNING_BUCKET_SECONDS = 15 * 60
 Old time leaves the window one bucket at a time, so the width is the step in which a rate changes as time
 expires. One bucket is about 1% of the retention below, so a bucket leaving does not move a rate by much. A day
 is 96 buckets, which keeps the persisted file small."""
+
+CARD_EARNING_READ_REUSE_SECONDS = 10.0
+"""How long a reader may reuse figures it read from the window before it reads them again.
+
+A read walks every retained bucket. It takes about a millisecond for one model and tens of milliseconds for
+every model on a worker that served many. The control loop asks several times per tick while a card is held,
+and a snapshot is built up to twice a second. The figures are sums over a day in 15-minute buckets, so a
+reading that is ten seconds old gives the same rates and the same verdict."""
 
 CARD_EARNING_RETENTION_SECONDS = 24 * 60 * 60
 """How long a bucket counts toward the rates after it closes.

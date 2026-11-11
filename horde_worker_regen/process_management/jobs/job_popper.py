@@ -73,8 +73,8 @@ from horde_worker_regen.process_management.resources.hysteresis import Hysteresi
 from horde_worker_regen.process_management.resources.model_serviceability import (
     _CONSTRAINED_LANE_FULL_CYCLES,
     ConstrainedLaneState,
-    ModelServiceabilityTier,
     WholeCardSeat,
+    constrained_max_power,
     decide_constrained_offer,
     max_power_to_pixels,
     model_serviceability_verdicts,
@@ -891,16 +891,9 @@ class JobPopper:
                 max_pixels=max_power_to_pixels(pop_max_power),
                 whole_card_seat_provider=self._whole_card_seat_provider,
             )
-            if not verdicts or any(v.tier is ModelServiceabilityTier.SERVICEABLE for _, v in verdicts):
+            model_cap = constrained_max_power(verdicts)
+            if model_cap is None:
                 continue
-            fitting = [
-                v.largest_fitting_max_power
-                for _, v in verdicts
-                if v.tier is ModelServiceabilityTier.CONSTRAINED and v.largest_fitting_max_power is not None
-            ]
-            if not fitting:
-                continue
-            model_cap = max(fitting)
             if self._serviceability_cap_logged.get(model) != model_cap:
                 self._serviceability_cap_logged[model] = model_cap
                 logger.warning(

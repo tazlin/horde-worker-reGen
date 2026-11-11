@@ -41,6 +41,10 @@ from horde_worker_regen.process_management.lifecycle.process_temperature import 
     temperature_phrase,
 )
 from horde_worker_regen.process_management.models.feature_readiness import FeatureReadinessState
+from horde_worker_regen.process_management.scheduling.governance.whole_card import (
+    PopClaimExemption,
+    PopClaimHoldReason,
+)
 from horde_worker_regen.process_management.scheduling.workload_flow import WorkloadKind
 from horde_worker_regen.tui.formatters import (
     format_its,
@@ -125,6 +129,15 @@ _POP_CLAIM_RELEASE_TEXT: dict[str, str] = {
 }
 """How each ``WholeCardPopClaimRelease`` reads to an operator watching the offer widen back out. An unknown
 value is shown as it arrives, so a worker newer than the dashboard still says something true."""
+
+_POP_CLAIM_KEPT_TEXT: dict[str, str] = {
+    PopClaimHoldReason.KEPT_BY_POLICY: "whole_card_claim_policy is always",
+    PopClaimExemption.LISTED: "it is in whole_card_claim_always_models",
+    PopClaimExemption.POOL_PIN: "it is pinned to a model pool seat",
+    PopClaimExemption.CONSTRAINED_LANE: "the card fits it only at a reduced size",
+}
+"""Why the card is held for a model that earns below the rest, by ``PopClaimHoldReason`` or ``PopClaimExemption``
+value. An unknown value is shown as it arrives."""
 
 
 def _join_styled(parts: list[tuple[str, str]], separator: str) -> list[tuple[str, str] | str]:
@@ -1060,10 +1073,11 @@ class OverviewView(Vertical):
         """
         claim_row: CardEarningRow | None = None
         claim_min_jobs: int | None = None
-        if earning is not None and residency.pop_claim_model is not None:
+        claim_model = residency.pop_claim_model or residency.pop_claim_withheld_model
+        if earning is not None and claim_model is not None:
             claim_row = claim_earning_row(
                 earning,
-                model=residency.pop_claim_model,
+                model=claim_model,
                 device_index=residency.pop_claim_card_index,
             )
             claim_min_jobs = earning.verdict_min_jobs
@@ -1144,6 +1158,23 @@ class OverviewView(Vertical):
             if residency.pop_claim_verdict is not None:
                 verdict_text = verdict_phrase(residency.pop_claim_verdict, row=claim_row, min_jobs=claim_min_jobs)
                 add_pair("Claim value", Text(verdict_text), "", "")
+            kept_key = residency.pop_claim_exemption or residency.pop_claim_hold_reason
+            kept = (PopClaimHoldReason.KEPT_BY_POLICY, PopClaimHoldReason.KEPT_BY_EXEMPTION)
+            if residency.pop_claim_hold_reason in kept and kept_key is not None:
+                add_pair("Held because", Text(_POP_CLAIM_KEPT_TEXT.get(kept_key, kept_key)), "", "")
+        elif residency.pop_claim_withheld_model is not None:
+            # A withheld claim changes what the worker asks the horde for, so it is shown with its reason.
+            verdict_text = (
+                verdict_phrase(residency.pop_claim_verdict, row=claim_row, min_jobs=claim_min_jobs)
+                if residency.pop_claim_verdict is not None
+                else "below the rest"
+            )
+            add_pair(
+                "Not holding the card for",
+                Text(residency.pop_claim_withheld_model, style="#f0beff"),
+                "Because",
+                Text(f"it earns {verdict_text}, so the worker asks the horde for every model"),
+            )
         elif residency.pop_claim_release is not None:
             add_pair(
                 "Offering only",

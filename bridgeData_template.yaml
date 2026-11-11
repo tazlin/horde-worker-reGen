@@ -875,6 +875,21 @@ whole_card_residency_cooldown_seconds: 45
 # single-model offer. Only used with enable_vram_budget.
 whole_card_residency_max_hold_seconds: 180
 
+# Whether the worker asks the horde only for a whole-card model that earns less than the rest of the card.
+# The worker measures what each model earns per second of the card's time. when_it_pays (the default) does
+# not ask for such a model alone. The worker keeps asking for every model while it holds the card, and this
+# is written to the log and shown on the dashboard. A model with too few jobs measured is asked for alone.
+# always asks only for the model that holds the card, whatever it earns. Changing this restarts the
+# measured earning figures.
+whole_card_claim_policy: when_it_pays
+
+# Models, by reference name, that the worker asks for alone while they hold the card, whatever they earn.
+# Use it for a model you serve on purpose even though it pays less than your other models. A model pinned
+# to a seat of the enabled model pool, and a model the card fits only at a reduced size, are treated as
+# listed.
+# whole_card_claim_always_models:
+#   - "Qwen-Image_fp8"
+
 # Minimum seconds between accepting jobs for *different* very-large models (Flux/Cascade/Qwen/Z-Image and
 # the named VRAM-heavy checkpoints). A queue that alternates distinct very-large models forces a fresh
 # whole-card teardown and a multi-GB checkpoint reload on every switch. Above 0, once a very-large model is

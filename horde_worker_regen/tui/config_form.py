@@ -46,6 +46,11 @@ ALCHEMY_FORMS = (
 
 DEDICATED_POST_PROCESSING_CHOICES = ("auto", "on", "off")
 
+# The values of ``WholeCardClaimPolicy``. Kept as literals so this module does not import the enum's module,
+# which loads the scheduler. A drift test (tests/tui/test_config_fields.py) pins them to the enum.
+WHOLE_CARD_CLAIM_POLICY_CHOICES = ("always", "when_it_pays")
+WHOLE_CARD_CLAIM_POLICY_LABELS = ("Always", "Only when it pays")
+
 # Derived from the scheduler's own enum (a stdlib/loguru-only module, so the TUI stays import-light)
 # rather than retyped, so a new policy cannot go missing from the editor.
 DOWNLOAD_PRIORITY_POLICY_CHOICES = tuple(policy.value for policy in DownloadPriorityPolicy)
@@ -131,6 +136,9 @@ class ConfigField:
     maximum: float | None = None
     unit: str = ""
     choices: tuple[str, ...] = ()
+    choice_labels: tuple[str, ...] = ()
+    """The words a SELECT field shows for each of ``choices``, in the same order. Empty shows each choice as the
+    config file writes it."""
     optional: bool = False
     """Whether a blank value is meaningful (the field is nullable: blank/None means 'unset').
 
@@ -261,8 +269,9 @@ SECTION_GUIDANCE: dict[str, str] = {
     "its prerequisite has no effect.",
     "Models": "Edit the load/skip rules below. The panel previews which models will load and "
     "their disk cost. Press Resolve to expand 'top N' / 'bottom N' commands (needs usage stats).",
-    "Workload policy": "These switches shape the model set produced by the load/skip rules. Presets may replace "
-    "the model list. Review the preset diff before saving.",
+    "Workload policy": "These settings shape the model set produced by the load/skip rules, and whether a very "
+    "large model that earns less than your other models is asked for alone while it holds the card. Presets may "
+    "replace the model list. Review the preset diff before saving.",
     "Model pool": "The fixed model pool biases work toward a small set of logical seats. A seat is an advertising "
     "commitment, and the runtime panels separately show whether its model is resident. This can reduce model "
     "swaps when the horde has demand for resident seats. Leave it off (the default) to advertise "
@@ -666,6 +675,29 @@ CONFIG_FIELDS: list[ConfigField] = [
         requires_restart=True,
         risk_level="advanced",
         explicit_default=[],
+    ),
+    ConfigField(
+        "whole_card_claim_policy",
+        "Hold the card for low-earning models",
+        FieldKind.SELECT,
+        "Workload policy",
+        "While a very large model has the card to itself, the worker can ask the horde for that model only, so "
+        "jobs for other models do not push it off the card. The worker measures what each model earns. With "
+        "Only when it pays, the default, a model that earns clearly less than your other models does not get "
+        "this. The worker then keeps asking for every model while that model holds the card. With Always, the "
+        "worker asks only for the model that holds the card, whatever it earns. Changing this restarts the "
+        "earning figures on the Stats tab.",
+        choices=WHOLE_CARD_CLAIM_POLICY_CHOICES,
+        choice_labels=WHOLE_CARD_CLAIM_POLICY_LABELS,
+        explicit_default="when_it_pays",
+    ),
+    ConfigField(
+        "whole_card_claim_always_models",
+        "Always hold the card for these models",
+        FieldKind.STR_LIST,
+        "Workload policy",
+        "Models, by name, that the worker asks for alone while they hold the card, whatever they earn. Use it "
+        "for a model you serve on purpose even though it pays less than your other models.",
     ),
     # Model pool
     ConfigField(

@@ -5,7 +5,9 @@ from __future__ import annotations
 import pytest
 
 from horde_worker_regen.alchemy_forms import DEFAULT_ALCHEMY_FORMS, normalise_alchemy_form_name
+from horde_worker_regen.bridge_data.data_model import reGenBridgeData
 from horde_worker_regen.process_management.models.download_scheduler import DownloadPriorityPolicy
+from horde_worker_regen.process_management.scheduling.governance.whole_card import WholeCardClaimPolicy
 from horde_worker_regen.tui.config_form import CONFIG_FIELDS, FieldKind, coerce_value
 
 _BY_KEY = {field.key: field for field in CONFIG_FIELDS}
@@ -134,6 +136,22 @@ def test_download_priority_policy_offers_every_queue_order() -> None:
     assert coerce_value(field, DownloadPriorityPolicy.PARALLEL.value) == DownloadPriorityPolicy.PARALLEL
     with pytest.raises(ValueError, match="serve_first, parallel"):
         coerce_value(field, "whenever")
+
+
+def test_whole_card_claim_policy_offers_every_policy_with_plain_labels() -> None:
+    """The card-holding choice is a select over the worker's policies, shown at Simple with a label per choice."""
+    field = _BY_KEY["whole_card_claim_policy"]
+
+    assert field.kind is FieldKind.SELECT
+    assert field.risk_level == "normal"
+    assert field.section == "Workload policy"
+    assert set(field.choices) == {policy.value for policy in WholeCardClaimPolicy}
+    assert dict(zip(field.choices, field.choice_labels, strict=True)) == {
+        WholeCardClaimPolicy.ALWAYS.value: "Always",
+        WholeCardClaimPolicy.WHEN_IT_PAYS.value: "Only when it pays",
+    }
+    assert field.default() == reGenBridgeData.model_fields["whole_card_claim_policy"].default
+    assert _BY_KEY["whole_card_claim_always_models"].kind is FieldKind.STR_LIST
 
 
 def test_secret_fields_flagged() -> None:

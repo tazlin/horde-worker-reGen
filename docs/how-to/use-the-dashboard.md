@@ -262,7 +262,9 @@ claim stands, the worker asks the horde only for one model, so the card stays wi
 |-----|---------|
 | **Offering only** | The model the worker asks the horde for while the claim stands. |
 | **Ends in** | Time left before the claim's maximum hold ends it. |
-| **Claim value** | Whether that model earns as much per card second as the rest of the card's work, in the words of the Stats tab's [Card earning](#card-earning) section. It reads "not below the rest" until the Stats figures for the model reach the dashboard. The claim does not read this verdict. |
+| **Claim value** | Whether that model earns as much per card second as the rest of the card's work, in the words of the Stats tab's [Card earning](#card-earning) section. It reads "not below the rest" until the Stats figures for the model reach the dashboard. |
+| **Held because** | Shown when the model earns below the rest and the worker still asks only for it: `whole_card_claim_policy` is always, the model is in `whole_card_claim_always_models`, it is pinned to a model pool seat, or the card fits it only at a reduced size. |
+| **Not holding the card for** and **Because** | A model holds the card, but it earns below the rest of the card's work, so the worker asks the horde for every model. To change this, set **Hold the card for low-earning models** to Always, or add the model to **Always hold the card for these models**, on the Config tab's Models page. |
 | **Offering only: no longer** and **Because** | Shown for a while after a claim ends: the maximum hold elapsed, the horde had no further work for the model, or the residency ended. |
 
 #### Reading a work-ledger row
@@ -337,6 +339,8 @@ A change to any of these settings marks the trends as stabilizing:
 - `high_performance_mode`, `moderate_performance_mode` and `extra_slow_worker`.
 - `alchemist`, `alchemy_allow_concurrent`, `alchemy_max_concurrency`, `alchemy_vram_headroom_mb` and the
   configured alchemy forms, in their configured order.
+- `whole_card_claim_policy`, since it decides whether a low-earning model is measured with the card held for
+  it. `whole_card_claim_always_models` is not in the list, so listing a model does not restart the figures.
 
 The worker reduces these settings to one fingerprint (`WorkerConfigSummary.config_fingerprint`, built by
 `capacity_workload_fingerprint`). The same fingerprint restarts the
@@ -507,6 +511,11 @@ field. A value that was already invalid on disk and that you did not touch never
 change. The same holds for conflicting settings: a conflict already in the saved file (LoRA on without a
 Civitai token, say) is listed beside the warnings, and only a conflict your edit introduces blocks the
 save.
+
+The **Models** page also holds **Hold the card for low-earning models** (Always or Only when it pays, the
+default) and **Always hold the card for these models**, at every experience level. They decide whether the
+worker asks the horde only for a very large model while it holds the card when that model earns less than your
+other models. See [Bridge Configuration](../explanation/bridge_config.md) for what each choice costs.
 
 The tab also holds a models editor and a searchable model picker: search across name, description,
 tags, and triggers, filter by baseline, by SFW/NSFW/inpainting, and by on-disk status, sort by any

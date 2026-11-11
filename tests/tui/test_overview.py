@@ -1078,6 +1078,43 @@ def test_residency_panel_explains_a_recently_released_claim() -> None:
     assert "no further work" in text
 
 
+def test_residency_panel_says_the_card_is_not_held_for_a_low_earning_model() -> None:
+    """A withheld claim is named with its reason in the verdict's words, and no claim row is shown."""
+    text = _render(
+        OverviewView._render_residency_panel(
+            _active_residency(
+                pop_claim_withheld_model="Qwen-Image",
+                pop_claim_hold_reason="withheld_below_the_rest",
+                pop_claim_card_index=0,
+                pop_claim_verdict="below_the_rest",
+            ),
+        ),
+    )
+
+    assert "Not holding the card for" in text
+    assert "Qwen-Image" in text
+    assert "it earns below the rest, so the worker asks the horde for every model" in " ".join(text.split())
+    assert "Offering only" not in text
+
+
+def test_residency_panel_says_why_a_low_earning_claim_is_kept() -> None:
+    """A claim kept by an exemption says which one held the card."""
+    text = _render(
+        OverviewView._render_residency_panel(
+            _active_residency(
+                pop_claim_model="Qwen-Image",
+                pop_claim_remaining_seconds=95.0,
+                pop_claim_verdict="below_the_rest",
+                pop_claim_hold_reason="kept_by_exemption",
+                pop_claim_exemption="listed",
+            ),
+        ),
+    )
+
+    assert "Held because" in text
+    assert "whole_card_claim_always_models" in text
+
+
 def test_hero_banner_names_the_model_the_claim_advertises() -> None:
     """The hero line explains the narrowed offer alongside the paused processes it already explains."""
     snapshot = WorkerStateSnapshot(

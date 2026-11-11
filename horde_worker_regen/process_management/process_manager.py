@@ -279,6 +279,7 @@ from horde_worker_regen.process_management.resources.vram_footprints import (
 from horde_worker_regen.process_management.scheduling import pool_ranker
 from horde_worker_regen.process_management.scheduling.card_earning import (
     CARD_EARNING_FILENAME,
+    CARD_EARNING_READ_REUSE_SECONDS,
     CardEarningAccumulator,
     CardEarningRestart,
 )
@@ -290,6 +291,7 @@ from horde_worker_regen.process_management.scheduling.clearance_lease import (
 )
 from horde_worker_regen.process_management.scheduling.governance.whole_card import (
     POP_CLAIM_VALUE_MIN_JOBS,
+    WholeCardClaimPolicy,
     pop_claim_value_verdict,
     rate_95_band,
 )
@@ -1301,7 +1303,7 @@ class HordeWorkerProcessManager:
     primed, cleared). The interval is the floor on that hop latency; the loop's own work is small beside it.
     """
 
-    _CARD_EARNING_SNAPSHOT_REFRESH_SECONDS: float = 10.0
+    _CARD_EARNING_SNAPSHOT_REFRESH_SECONDS: float = CARD_EARNING_READ_REUSE_SECONDS
     """How long the snapshot's card earning figures are reused before they are read again.
 
     The read walks every retained bucket for every card and model, which takes several milliseconds on a full
@@ -8250,6 +8252,9 @@ class HordeWorkerProcessManager:
             pop_claim_release=state.pop_claim_release,
             pop_claim_card_index=state.pop_claim_card_index,
             pop_claim_verdict=state.pop_claim_verdict,
+            pop_claim_withheld_model=state.pop_claim_withheld_model,
+            pop_claim_hold_reason=state.pop_claim_hold_reason,
+            pop_claim_exemption=state.pop_claim_exemption,
             weights_mb=self._to_int_mb(state.weights_mb),
             reserve_mb=self._to_int_mb(state.reserve_mb),
             free_now_mb=self._to_int_mb(state.free_now_mb),
@@ -9377,6 +9382,7 @@ class HordeWorkerProcessManager:
             alchemy_max_concurrency=bridge_data.alchemy_max_concurrency,
             alchemy_vram_headroom_mb=bridge_data.alchemy_vram_headroom_mb,
             alchemy_forms=tuple(bridge_data.forms) if bridge_data.forms else tuple(DEFAULT_ALCHEMY_FORMS),
+            whole_card_claim_always=bridge_data.whole_card_claim_policy is WholeCardClaimPolicy.ALWAYS,
         )
 
     def _capacity_workload_fingerprint(self) -> str:

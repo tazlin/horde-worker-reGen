@@ -154,6 +154,7 @@ CAPACITY_SETTING_WORDS: dict[str, str] = {
     "num_models": "the number of models in `models_to_load`",
     "alchemy_concurrent": "`alchemy_allow_concurrent`",
     "alchemy_forms": "`forms`",
+    "whole_card_claim_always": "`whole_card_claim_policy`",
 }
 """How the dashboard names each ``CapacityWorkloadSettings`` field that is not a key of the config file. Every
 other field is named as its config key."""

@@ -581,6 +581,25 @@ def serviceability_arithmetic(verdicts: list[tuple[CardRuntime, ModelServiceabil
     return "; ".join(f"device {card.device_index}: {verdict.reason()}" for card, verdict in verdicts)
 
 
+def constrained_max_power(verdicts: list[tuple[CardRuntime, ModelServiceabilityVerdict]]) -> int | None:
+    """Return the largest ``max_power`` some card fits a constrained model at, or None when it is not constrained.
+
+    A model is constrained when no card in ``verdicts`` fits it at the pop's full size and at least one fits it
+    at a reduced size. The offer's constrained lane and the pop claim's exemption both read this test.
+
+    Args:
+        verdicts: The model's serviceability verdicts per card, read at the pop's ``max_power``.
+    """
+    if not verdicts or any(verdict.tier is ModelServiceabilityTier.SERVICEABLE for _, verdict in verdicts):
+        return None
+    fitting = [
+        verdict.largest_fitting_max_power
+        for _, verdict in verdicts
+        if verdict.tier is ModelServiceabilityTier.CONSTRAINED and verdict.largest_fitting_max_power is not None
+    ]
+    return max(fitting) if fitting else None
+
+
 _CONSTRAINED_LANE_FULL_CYCLES = 3
 """Full-size pops advertised between two constrained pops while the offer holds a constrained model.
 

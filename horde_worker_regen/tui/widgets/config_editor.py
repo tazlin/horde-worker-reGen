@@ -722,7 +722,11 @@ class ConfigEditorView(Vertical):
             control = Vertical(
                 Horizontal(
                     Label(label_text),
-                    Select([(choice, choice) for choice in field.choices], value=selected, id=widget_id),
+                    Select(
+                        list(zip(field.choice_labels or field.choices, field.choices, strict=True)),
+                        value=selected,
+                        id=widget_id,
+                    ),
                     classes="config-row",
                 ),
                 Static(field.help, classes="config-help"),
