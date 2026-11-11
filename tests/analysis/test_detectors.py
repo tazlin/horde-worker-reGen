@@ -12,6 +12,8 @@ import json
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 from horde_worker_regen.analysis.bundle import LogBundle
 from horde_worker_regen.analysis.correlate import build_session_context
 from horde_worker_regen.analysis.detectors import (
@@ -4257,12 +4259,24 @@ def _lane_job_started(ts: str, job_id: str) -> str:
     )
 
 
-def _sampling_beside_residents(ts: str, *, resident_mb: int = 9420) -> str:
+_RESIDENT_LINE_ENDINGS = (
+    "no forced eviction",
+    "load not forced, ComfyUI may still unload residents for room",
+)
+"""The endings of hordelib's resident-models line, which differ between hordelib versions."""
+
+
+def _sampling_beside_residents(
+    ts: str,
+    *,
+    resident_mb: int = 9420,
+    ending: str = _RESIDENT_LINE_ENDINGS[0],
+) -> str:
     """The comfy_patches._log_sampling_beside_resident_models line in hordelib: a load left beside residents."""
     return (
         f"2026-06-24 {ts} | INFO     | hordelib.execution.comfy_patches:_log_sampling_beside_resident_models:620 - "
         f"Sampling beside resident models: reason=overflow Flux loading 11350 MB with {resident_mb} MB of other "
-        "models resident (FluxClipModel_), free 8120 MB; no forced eviction"
+        f"models resident (FluxClipModel_), free 8120 MB; {ending}"
     )
 
 
@@ -4290,6 +4304,18 @@ class TestOutOfMemoryBesideResidentModels:
         assert "stayed loaded on the card" in finding.action
         assert "`horde-log bundle`" in finding.action
         assert "favours" not in finding.action
+
+    @pytest.mark.parametrize("ending", _RESIDENT_LINE_ENDINGS)
+    def test_each_ending_of_the_line_is_counted(self, tmp_path: Path, ending: str) -> None:
+        """The resident-models line is matched with the ending of either hordelib version."""
+        finding = self._findings(
+            tmp_path,
+            _lane_job_started("18:09:50.000", _OOM_FAULT_JOB),
+            _sampling_beside_residents("18:09:55.000", ending=ending),
+        )["oom"]
+        assert finding.evidence[-1].startswith(
+            "job c0d7c4c8 on process 2, 9420 MB resident (FluxClipModel_): 18:09:55"
+        )
 
     def test_a_job_without_the_line_keeps_the_full_card_advice(self, tmp_path: Path) -> None:
         """A lane log with the job's start and no resident-models line adds nothing."""

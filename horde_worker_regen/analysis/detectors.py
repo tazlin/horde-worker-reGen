@@ -434,7 +434,7 @@ _OOM_CONCENTRATION_MIN_FAULTS = 3
 # The out-of-memory headline names this many models and counts the rest, so a session failing every model it
 # serves still reads as one sentence.
 _OOM_HEADLINE_MODELS = 3
-# hordelib's line for a load that proceeded beside other resident models with no forced eviction, and the
+# hordelib's line for a load that went ahead beside other resident models without being forced, and the
 # inference process's job start that bounds the lookback to the faulting job. The finding names this many such
 # faults in its evidence and counts the rest.
 _SAMPLING_BESIDE_RESIDENTS_RE = pattern_for("sampling_beside_resident_models")
@@ -1765,8 +1765,8 @@ def detect_oom(context: SessionContext) -> list[Finding]:
     finding names that process instead of advising less work on the card. A CUDA runtime error
     (``torch.AcceleratorError``) is named as a failed CUDA call.
 
-    hordelib forces no eviction before a load it does not force-load in full, and logs the models it left
-    resident. A fault whose own job logged that line is counted and named in the evidence, so a fault caused
+    hordelib does not evict other models before a load that is not forced in full, and it logs the models that
+    were resident. A fault with that line in its job's log is counted and listed in the evidence, so a fault caused
     by the models left in place is attributable from a bundle.
     """
     oom = _matching(context.session.records, _OOM_RE)

@@ -1480,16 +1480,17 @@ _SIGNATURE_LIST: list[LogSignature] = [
     ),
     _signature(
         # Logged once per load that skipped hordelib's force-full load while other models kept weights on the
-        # device. hordelib forces no eviction for such a load, so an OOM after it is attributable to these
-        # residents. The sample is built from the emitter's format string; no released hordelib wrote it yet.
+        # device. hordelib does not force that load, and ComfyUI may still unload residents for room, so an OOM
+        # after it is attributable to the residents that stayed. The line's ending differs between hordelib
+        # versions, and the pattern matches both endings. The sample is built from the emitter's format string.
         "sampling_beside_resident_models",
         r"Sampling beside resident models: reason=(?P<reason>\w+) (?P<loading>.+?) loading (?P<loading_mb>\d+) MB "
         r"with (?P<resident_mb>\d+) MB of other models resident \((?P<resident>.*)\), free (?P<free_mb>-?\d+) MB; "
-        r"no forced eviction",
+        r"(?:no forced eviction|load not forced, ComfyUI may still unload residents for room)",
         emitter="hordelib.execution.comfy_patches:_log_sampling_beside_resident_models",
         sample=(
             "Sampling beside resident models: reason=overflow Flux loading 11350 MB with 9420 MB of other models "
-            "resident (FluxClipModel_), free 8120 MB; no forced eviction"
+            "resident (FluxClipModel_), free 8120 MB; load not forced, ComfyUI may still unload residents for room"
         ),
         dry_run_reason=_CHILD_LOG_NOT_READ,
     ),
