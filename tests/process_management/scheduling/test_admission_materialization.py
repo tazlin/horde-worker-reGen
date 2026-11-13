@@ -117,6 +117,34 @@ async def test_request_carries_the_snapshot_pricing(
         assert request.idle_contexts_teardownable is False
 
 
+async def test_a_job_standing_in_for_the_head_is_timed_by_the_heads_clock() -> None:
+    """A job that is not the timed head has zero starved seconds, and the head's figure when it stands in for it.
+
+    The measured-load probe and the lane rungs wait on this figure, so a job given the head's standing without the
+    head's clock would never reach either.
+    """
+    clock_value = [5_000.0]
+    scheduler, head, _target = await _worker(clock_value)
+    follower = make_job_pop_response(model="stable_diffusion")
+    await track_popped_job_async(scheduler._job_tracker, follower)  # type: ignore[attr-defined]
+    arbiter = scheduler._ensure_preload_arbiter()  # type: ignore[attr-defined]
+    snapshot = scheduler.snapshot()
+
+    def starved_seconds(starvation_clock_job_id: str | None) -> float:
+        return build_materialization_request(
+            snapshot,
+            str(follower.id_),
+            0,
+            arbiter=arbiter,
+            is_head_of_queue=True,
+            head_outstanding_mb=None,
+            starvation_clock_job_id=starvation_clock_job_id,
+        ).request.starved_seconds
+
+    assert starved_seconds(None) == pytest.approx(0.0)
+    assert starved_seconds(str(head.id_)) == pytest.approx(30.0)
+
+
 async def test_core_evaluates_the_built_request_against_one_freeze() -> None:
     """The scheduler hands the arbiter the snapshot-built request and freezes a private arbiter once per call."""
     clock_value = [5_000.0]

@@ -294,6 +294,7 @@ from horde_worker_regen.process_management.scheduling.ledgers.safety_placement i
     SAFETY_BACKLOG_PRIORITY_DEPTH,
     SAFETY_PLACEMENT_RESTORE_DWELL_FACTOR,
 )
+from horde_worker_regen.process_management.scheduling.performance_model import signature_from_job
 from horde_worker_regen.process_management.scheduling.workload_flow import POST_PROCESS_RESERVE_FLOW
 from horde_worker_regen.process_management.workers import post_process_orchestrator
 from tests.process_management.conftest import (
@@ -9922,4 +9923,421 @@ async def test_after_a_give_up_the_next_head_of_the_model_is_placed_by_preload()
     assert not late_wedges, (
         f"{context}: the queue wedged past the structural horizon on tick(s) {late_wedges} after the second head "
         f"was queued. {world.state_dump()}"
+    )
+
+
+# --------------------------------------------------------------------------------------------------------
+# Mixed cards: jobs of a residency's model queued behind a cold head that the residency bars
+# --------------------------------------------------------------------------------------------------------
+
+_RESIDENCY_JOB_CARD_PIXELS = {0: 4_194_304, 1: 262_144}
+"""Per-card resolution ceilings. The small card takes only the 512 px filler, so only the large card can serve the
+1024 px Flux and Krea2 jobs, and both models compete for the one inference lane on that card."""
+
+_RESIDENCY_JOB_FOREIGN_MB = 3350.0
+"""Device memory held by another program on the large card from the rise tick on.
+
+It puts the Flux candidate about 245 MB above the measured available room. That is less than the post-processing
+lane's context, so pausing that lane closes the shortfall."""
+
+_RESIDENCY_JOB_FOREIGN_RISE_TICK = 8
+"""The tick on which the foreign memory appears. The first Flux job is already sampling by then, since it fit."""
+
+_RESIDENCY_JOB_FOLLOWERS = 2
+"""The number of Flux jobs queued behind the Krea2 head. Only Flux jobs can drain the Flux residency."""
+
+_RESIDENCY_JOB_DISPATCH_BOUND_TICKS = 20
+"""How many ticks the first Flux job behind the Krea2 head may wait between its first hold and sampling.
+
+A Flux head held on the same shortfall samples once its measured-attempt wait of ten ticks has passed and the
+post-processing lane is paused. In the teardown row the wait starts again when the placement order stops promoting
+the follower, a few ticks into the hold. The bound is far below a job's deadline."""
+
+_RESIDENCY_JOB_HEAD_BOUND_TICKS = 20
+"""How many ticks the Krea2 head may take to reach sampling once every Flux job has left the queue. This covers the
+residency's release, Krea2's load and its first step, and is far below the head's deadline."""
+
+_RESIDENCY_JOB_ROW_TICKS = 150
+"""How many ticks the row runs after the first Flux job is queued. This leaves time for that job, both followers
+and the Krea2 head to run, with a margin."""
+
+_RUNG_TWO_FLUX_STORE_MB = {
+    FootprintStage.RESIDENT: 19815.0,
+    FootprintStage.SAMPLE: 22074.0,
+    FootprintStage.SAMPLE_ACTIVATION: 1842.0,
+}
+"""Flux figures for the teardown row, at the size of a whole-card model on a 24 GB card with its encoder resident.
+
+The sampling figure beside one sibling context exceeds the card, so the dominance verdict puts Flux on rung 2."""
+
+_RUNG_TWO_KREA2_TYPICAL_SAMPLE_MB = 17500.0
+"""Krea2's usual sampling figure in the pooled key, which the dominance verdict prices. It leaves Krea2 off rung 2,
+so Krea2 does not claim the card for itself."""
+
+_RUNG_TWO_KREA2_PEAK_SAMPLE_MB = 21000.0
+"""Krea2's highest sampling figure. It is the pooled key's watermark and the value of every job-class observation.
+
+The preload candidate is the job-class estimate capped at the pooled watermark (``learned_sampling_peak_mb``), so
+the Krea2 head's preload is priced at this figure. That is about 175 MB above the room left by the foreign
+memory, so the measured budget defers the preload while Krea2 is still co-resident under the dominance verdict."""
+
+_RUNG_TWO_FOREIGN_MB = 400.0
+"""Foreign memory on the large card in the teardown row from the rise tick on.
+
+It leaves each Flux job's candidate about 377 MB above the measured room, which pausing the post-processing lane
+closes, and the Krea2 candidate about 175 MB above it."""
+
+_RUNG_TWO_FLUX_SAMPLING_ITS = 1.0
+"""The Flux sampling rate seeded into the scheduler's performance model, as on a worker that has already run Flux.
+
+The placement order promotes a residency's queued job ahead of the head only when the job has an expected sampling
+time, so without a rate the follower never reaches the resident whole-card path, where the exclusive mark is taken."""
+
+_RUNG_TWO_HEAD_TTL_SECONDS = 70
+"""The Krea2 head's ttl in the teardown row.
+
+The placement order stops promoting jobs past a head once the head is older than ``ANTI_STARVATION_TTL_FRACTION``
+of its ttl, 21 seconds here. The head pops on the first Flux job's dispatch, so the promotion ends a few ticks into
+the follower's hold. The follower keeps the exclusive mark that it took while it was promoted. From then on it is
+selected only through the teardown bypass, which is a line skip."""
+
+
+def _rung_two_residency_store() -> LearnedFootprintStore:
+    """Return a store with the teardown row's Flux and Krea2 figures under the keys used to price a 1024 px job."""
+    store = LearnedFootprintStore()
+    large_card_gb = card_total_gb(max(_MIXED_CARD_TOTALS.values()))
+    assert large_card_gb is not None
+    observations = _MIN_OBSERVATIONS_FOR_MEASURED * 4
+    models = (
+        (_FLUX, _RUNG_TWO_FLUX_STORE_MB, _RUNG_TWO_FLUX_STORE_MB[FootprintStage.SAMPLE]),
+        (
+            _KREA2,
+            {
+                FootprintStage.RESIDENT: 18017.0,
+                FootprintStage.SAMPLE: _RUNG_TWO_KREA2_PEAK_SAMPLE_MB,
+                FootprintStage.SAMPLE_ACTIVATION: 1842.0,
+            },
+            _RUNG_TWO_KREA2_TYPICAL_SAMPLE_MB,
+        ),
+    )
+    for model, figures_mb, typical_pooled_sample_mb in models:
+        baseline = model.baseline.value
+        resident_key = FootprintKey(
+            model_baseline=baseline,
+            resolution_bucket=None,
+            platform="win32",
+            card_total_gb=large_card_gb,
+            stage=FootprintStage.RESIDENT,
+            checkpoint=model.name,
+        )
+        for _ in range(observations):
+            store.observe_peak(resident_key, figures_mb[FootprintStage.RESIDENT])
+        for stage in (FootprintStage.SAMPLE, FootprintStage.SAMPLE_ACTIVATION):
+            pooled = FootprintKey(
+                model_baseline=baseline,
+                resolution_bucket=ResolutionBucket.LE_1024,
+                platform="win32",
+                card_total_gb=large_card_gb,
+                stage=stage,
+            )
+            typical_mb = typical_pooled_sample_mb if stage is FootprintStage.SAMPLE else figures_mb[stage]
+            for _ in range(observations):
+                store.observe_peak(pooled, typical_mb)
+                store.observe_peak(pooled.for_job_class(batch=1, hires_fix=False), figures_mb[stage])
+            store.observe_peak(pooled, figures_mb[stage])
+    return store
+
+
+@dataclass
+class ResidencyJobRow:
+    """Represents the finished world after Flux jobs queue behind a Krea2 head barred from the card by a residency."""
+
+    world: _DispatchWorld
+    first_flux: ImageGenerateJobPopResponse
+    head: ImageGenerateJobPopResponse
+    followers: list[ImageGenerateJobPopResponse]
+    first_hold_tick: int | None
+    """The tick on which the first follower's dispatch was first held."""
+    head_at_first_hold: str | None
+    """The queue head's job id on that tick."""
+    residency_rung_at_first_hold: DominanceRung | None
+    """The rung of the large card's Flux residency on that tick, or None when the card did not hold one for Flux."""
+    flux_drained_tick: int | None
+    """The first tick on which every Flux job had left the pending-inference list."""
+    recovery_wedge_ticks: list[int]
+    """Ticks on which the recovery coordinator reported a structural queue wedge. A soft reset acts on that report."""
+    follower_marked_ticks: list[int]
+    """Ticks on which the first follower held an exclusive mark. Preloads of other models are refused on that card."""
+
+
+async def _keep_small_card_busy(world: _DispatchWorld) -> None:
+    """Queue another SD 1.5 job for the small card when one is not already queued or running."""
+    if not any(job.model == _SD15.name for job in world._job_tracker.jobs_pending_inference):
+        await world.pop(make_job_pop_response(_SD15.name, width=512, height=512, ddim_steps=20))
+
+
+async def drive_residency_jobs_behind_a_cold_head(
+    *,
+    footprint_store: LearnedFootprintStore,
+    foreign_mb: float,
+    job_end_vram_unload: bool = False,
+    flux_sampling_its: float | None = None,
+    head_ttl_seconds: int | None = None,
+) -> ResidencyJobRow:
+    """Run a Flux job under a whole-card residency, then queue a Krea2 head and more Flux jobs behind it.
+
+    Two cards with one inference lane each. The large card also holds the post-processing and utilities lanes,
+    and safety sits on the small card. Flux is held in RAM on the large card's lane. The small card runs SD 1.5
+    jobs for the whole row. Once the first Flux job samples, a Krea2 job and the Flux followers are queued. Foreign
+    memory then appears on the large card and puts each follower's candidate just above the measured room.
+
+    Args:
+        footprint_store: The learned figures used to price both models. They set the Flux residency's rung and
+            whether the Krea2 head's preload fits.
+        foreign_mb: Device memory held by another program on the large card from the rise tick on.
+        job_end_vram_unload: Whether the large card's lane returns Flux to RAM at the end of every job, retention
+            grant or not.
+        flux_sampling_its: A Flux sampling rate to seed the scheduler's performance model with, or None to run the
+            scheduler without a performance model.
+        head_ttl_seconds: The Krea2 head's ttl, or None for a head without one.
+    """
+    world = _DispatchWorld(
+        card=_CARD_24GB,
+        lane_count=2,
+        max_threads=1,
+        queue_depth=_RESIDENCY_JOB_FOLLOWERS + 3,
+        whole_card_enabled=True,
+        closed_loop=True,
+        tick_seconds=1.0,
+        card_max_pixels=_RESIDENCY_JOB_CARD_PIXELS,
+        card_total_mb=_MIXED_CARD_TOTALS,
+        service_contexts=True,
+        service_lane_exit_seconds=2.0,
+        safety_card_index=1,
+        post_process_card_index=0,
+        extra_model_classes=(_KREA2,),
+        footprint_store=footprint_store,
+        foreign_vram_mb_by_card={0: {1: 0.0, _RESIDENCY_JOB_FOREIGN_RISE_TICK: foreign_mb}},
+        lane_reports_carry_context=True,
+        job_end_vram_unload_cards=frozenset({0}) if job_end_vram_unload else frozenset(),
+        performance_model=flux_sampling_its is not None,
+    )
+    assert [world.card_of_lane(lane) for lane in world.inference_lane_ids()] == [0, 1], (
+        "precondition: one inference lane per card"
+    )
+    world.scheduler._foreign_floor_clock = lambda: world.now
+    if flux_sampling_its is not None:
+        assert world.performance_model is not None
+        signature = signature_from_job(
+            make_job_pop_response(_FLUX.name, width=1024, height=1024, ddim_steps=4), _FLUX.baseline.value
+        )
+        assert signature is not None
+        while world.performance_model.expected_sampling_seconds(signature) is None:
+            assert world.performance_model.sample_count(signature) < 100, "the seeded Flux rate never gives a time"
+            world.performance_model.observe(signature, flux_sampling_its)
+    world.seed_resident(0, _FLUX, in_vram=False)
+    world.seed_resident(1, _SD15, in_vram=True)
+    coordinator = _recovery_coordinator_over(world)
+    for _ in range(2):
+        await _keep_small_card_busy(world)
+        await world.step()
+
+    first_flux = make_job_pop_response(_FLUX.name, width=1024, height=1024, ddim_steps=4)
+    head = make_job_pop_response(_KREA2.name, width=1024, height=1024, ddim_steps=4)
+    if head_ttl_seconds is not None:
+        head = head.model_copy(update={"ttl": head_ttl_seconds})
+    followers = [
+        make_job_pop_response(_FLUX.name, width=1024, height=1024, ddim_steps=4)
+        for _ in range(_RESIDENCY_JOB_FOLLOWERS)
+    ]
+    flux_jobs = [first_flux, *followers]
+    await world.pop(first_flux)
+    rest_queued = False
+    first_follower_id = str(followers[0].id_)
+    first_hold_tick: int | None = None
+    head_at_first_hold: str | None = None
+    residency_rung_at_first_hold: DominanceRung | None = None
+    flux_drained_tick: int | None = None
+    recovery_wedge_ticks: list[int] = []
+    follower_marked_ticks: list[int] = []
+    for _ in range(_RESIDENCY_JOB_ROW_TICKS):
+        if not rest_queued and world.dispatch_tick(first_flux) is not None:
+            rest_queued = True
+            await world.pop(head)
+            for job in followers:
+                await world.pop(job)
+        await _keep_small_card_busy(world)
+        await world.step()
+        pending = world._job_tracker.jobs_pending_inference
+        if first_hold_tick is None and world.scheduler.dispatch_holds.held_seconds(first_follower_id) is not None:
+            first_hold_tick = world.tick
+            head_at_first_hold = str(pending[0].id_) if pending else None
+            residency_rung_at_first_hold = next(
+                (
+                    state.rung
+                    for device_index, state in world.scheduler._whole_card_ledger.held()
+                    if device_index == 0 and state.model == _FLUX.name
+                ),
+                None,
+            )
+        if rest_queued and flux_drained_tick is None and not any(job in pending for job in flux_jobs):
+            flux_drained_tick = world.tick
+        if coordinator.structural_queue_wedge_active():
+            recovery_wedge_ticks.append(world.tick)
+        if world._job_tracker.is_admitted_exclusive(followers[0]):
+            follower_marked_ticks.append(world.tick)
+    return ResidencyJobRow(
+        world=world,
+        first_flux=first_flux,
+        head=head,
+        followers=followers,
+        first_hold_tick=first_hold_tick,
+        head_at_first_hold=head_at_first_hold,
+        residency_rung_at_first_hold=residency_rung_at_first_hold,
+        flux_drained_tick=flux_drained_tick,
+        recovery_wedge_ticks=recovery_wedge_ticks,
+        follower_marked_ticks=follower_marked_ticks,
+    )
+
+
+async def test_mixed_cards_a_residency_job_behind_a_cold_head_drains_the_residency() -> None:
+    """A Flux job queued behind a Krea2 head samples under the Flux residency, and the Krea2 head runs after it.
+
+    A whole-card residency for Flux holds the large card, and Krea2 can only be seated there. The Krea2 head
+    cannot load until the residency ends, and only the Flux jobs behind it can drain the residency. Each of those
+    jobs needs a few hundred MB more than the measured room, and pausing the post-processing lane closes the gap.
+    The jobs must get that remedy for the residency to end. The small card keeps working the whole time, so the
+    worker-wide wedge detector does not fire and does not recover the large card.
+
+    If the first follower is held for the whole row, the large card stays idle while the small card works, and the
+    Krea2 head stays queued until its deadline.
+    """
+    row = await drive_residency_jobs_behind_a_cold_head(
+        footprint_store=_large_card_flux_store(), foreign_mb=_RESIDENCY_JOB_FOREIGN_MB
+    )
+    await _assert_residency_jobs_drain(row, "Flux residency jobs behind a cold Krea2 head")
+
+
+async def test_mixed_cards_a_teardown_residency_job_behind_a_cold_head_drains_the_residency() -> None:
+    """A Flux job behind a Krea2 head samples under a teardown residency for Flux, and the Krea2 head runs after.
+
+    The rung-2 form of the residency-job row. Flux's sampling figure beside one sibling context exceeds the large
+    card, so its residency is a teardown. The lane returns Flux to RAM at the end of each job, so every Flux job
+    pays its whole candidate at the dispatch gate. Krea2's candidate is also about 175 MB above the measured
+    room, so the measured budget defers the Krea2 head's preload when the lane goes idle. The placement order then
+    promotes the first follower ahead of the head. The follower takes the card's exclusive mark, and the Krea2
+    preload is refused while the mark is held. Once the head is old enough to end the promotion, the follower is
+    selected only through the teardown bypass, which is a line skip. The follower must still get the head's
+    remedies at the dispatch gate.
+    """
+    row = await drive_residency_jobs_behind_a_cold_head(
+        footprint_store=_rung_two_residency_store(),
+        foreign_mb=_RUNG_TWO_FOREIGN_MB,
+        job_end_vram_unload=True,
+        flux_sampling_its=_RUNG_TWO_FLUX_SAMPLING_ITS,
+        head_ttl_seconds=_RUNG_TWO_HEAD_TTL_SECONDS,
+    )
+    world = row.world
+    context = "Flux teardown residency jobs behind a cold Krea2 head"
+    assert row.first_hold_tick is not None and row.residency_rung_at_first_hold is DominanceRung.CANNOT_CO_RESIDE, (
+        f"{context}: precondition: the large card's Flux residency must be a teardown when the first follower is "
+        f"first held (first hold tick {row.first_hold_tick}, rung {row.residency_rung_at_first_hold}). "
+        f"{world.state_dump()}"
+    )
+    head_id = str(row.head.id_)
+    refused_exclusive_ticks = [
+        record.tick
+        for record in world.decision_records
+        if record.decision_kind is DecisionKind.VRAM_ADMISSION
+        and record.subject == head_id
+        and record.inputs.get("decision") == AdmissionDecision.EXCLUSIVE_IN_PROGRESS
+        and record.tick in row.follower_marked_ticks
+    ]
+    assert refused_exclusive_ticks, (
+        f"{context}: precondition: the Krea2 head's preload must be refused as exclusive_in_progress while the "
+        f"first follower holds the card's exclusive mark (follower marked on ticks {row.follower_marked_ticks[:6]}). "
+        f"{world.state_dump()}"
+    )
+    await _assert_residency_jobs_drain(row, context)
+
+
+async def _assert_residency_jobs_drain(row: ResidencyJobRow, context: str) -> None:
+    """Assert the first follower is held on a closable shortfall, samples within its bound, and the head follows.
+
+    The bounds are ``_RESIDENCY_JOB_DISPATCH_BOUND_TICKS`` from the follower's first hold and
+    ``_RESIDENCY_JOB_HEAD_BOUND_TICKS`` from the tick on which the Flux jobs drained.
+    """
+    world = row.world
+    follower = row.followers[0]
+    follower_id = str(follower.id_)
+
+    first_flux_tick = world.dispatch_tick(row.first_flux)
+    assert first_flux_tick is not None and first_flux_tick < _RESIDENCY_JOB_FOREIGN_RISE_TICK, (
+        f"{context}: precondition: the first Flux job must sample before the foreign memory appears. "
+        f"{world.state_dump()}"
+    )
+    assert row.first_hold_tick is not None, (
+        f"{context}: precondition: the dispatch gate must hold the first follower. {world.state_dump()}"
+    )
+    assert row.head_at_first_hold == str(row.head.id_) and row.residency_rung_at_first_hold is not None, (
+        f"{context}: precondition: the Krea2 job must head the queue under a Flux residency on the large card when "
+        f"the follower is first held (head {row.head_at_first_hold}, residency rung "
+        f"{row.residency_rung_at_first_hold}). {world.state_dump()}"
+    )
+    holds = [
+        record
+        for record in world.decision_records
+        if record.decision_kind is DecisionKind.INFERENCE_DISPATCH
+        and record.subject == follower_id
+        and record.verdict is DecisionVerdict.DEFER
+    ]
+    assert holds, f"{context}: precondition: the follower's hold must be recorded. {world.state_dump()}"
+    first_hold = holds[0].inputs
+    deficit_mb = first_hold.get("room_deficit_mb")
+    lane_rung_mb = first_hold.get("rung_post_process_lane_mb")
+    assert (
+        isinstance(deficit_mb, float)
+        and isinstance(lane_rung_mb, float)
+        and 0.0 < deficit_mb <= lane_rung_mb
+        and first_hold.get("room_closable") is True
+    ), (
+        f"{context}: precondition: the follower must be held on a shortfall that is closed by pausing the "
+        f"post-processing lane. First hold inputs: {first_hold}. {world.state_dump()}"
+    )
+
+    last_hold = holds[-1].inputs
+    selection = await world.scheduler.get_next_job_and_process(information_only=True)
+    line_skip = selection.line_skip if selection is not None else None
+    hold_description = (
+        f"residency rung {row.residency_rung_at_first_hold}, is_head_of_queue={first_hold.get('is_head_of_queue')}, "
+        f"short {deficit_mb:.0f} MB, closable {first_hold.get('room_closable')}, post-processing lane rung "
+        f"{lane_rung_mb:.0f} MB permitted {first_hold.get('rung_post_process_lane_permitted')}; last hold on tick "
+        f"{holds[-1].tick} with is_head_of_queue={last_hold.get('is_head_of_queue')}, probe "
+        f"{last_hold.get('probe_state')} and remedy "
+        f"{world.scheduler.dispatch_holds.remedies.get(follower_id)}; selection line skip "
+        f"{line_skip.reason if line_skip is not None else None}"
+    )
+    dispatch_tick = world.dispatch_tick(follower)
+    assert dispatch_tick is not None and dispatch_tick <= row.first_hold_tick + _RESIDENCY_JOB_DISPATCH_BOUND_TICKS, (
+        f"{context}: the first follower was first held on tick {row.first_hold_tick} and reached sampling on tick "
+        f"{dispatch_tick}. The bound is {_RESIDENCY_JOB_DISPATCH_BOUND_TICKS} ticks ({hold_description}). "
+        f"{world.state_dump()}"
+    )
+    flux_lanes = [lane for model, lane in world.dispatch_lanes if model == _FLUX.name]
+    assert flux_lanes and all(world.card_of_lane(lane) == 0 for lane in flux_lanes), (
+        f"{context}: Flux must run only on the large card. It was dispatched to lane(s) {flux_lanes}. "
+        f"{world.state_dump()}"
+    )
+
+    assert row.flux_drained_tick is not None, f"{context}: the Flux jobs never drained. {world.state_dump()}"
+    head_tick = world.dispatch_tick(row.head)
+    assert head_tick is not None and head_tick <= row.flux_drained_tick + _RESIDENCY_JOB_HEAD_BOUND_TICKS, (
+        f"{context}: the Flux jobs drained on tick {row.flux_drained_tick} and the Krea2 head reached sampling on "
+        f"tick {head_tick}. The bound is {_RESIDENCY_JOB_HEAD_BOUND_TICKS} ticks. {world.state_dump()}"
+    )
+
+    assert not world.structural_queue_wedges and not row.recovery_wedge_ticks, (
+        f"{context}: the queue-deadlock detector reported a wedge on tick(s) {world.structural_queue_wedges[:6]}, and "
+        f"the recovery coordinator reported one on tick(s) {row.recovery_wedge_ticks[:6]}. A soft reset acts on it. "
+        f"{world.state_dump()}"
     )

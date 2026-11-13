@@ -14737,6 +14737,7 @@ class InferenceScheduler:
         *,
         is_head_of_queue: bool = True,
         head_outstanding_mb: float | None = None,
+        starvation_clock_job: ImageGenerateJobPopResponse | None = None,
     ) -> bool:
         """Return whether ``next_job``'s dispatch must be held because its VRAM would over-commit the card now.
 
@@ -14772,6 +14773,11 @@ class InferenceScheduler:
         the head keeps first claim on the physical space rather than being starved behind the skipper. A
         line-skip likewise routes its reclaim through the non-head eviction path, which respects the residency
         and queued-lookahead guards the head escalation would override.
+
+        ``starvation_clock_job`` is the displaced head when a job of the residency's model stands in for it
+        (:meth:`_residency_job_stands_in_for_head`), and this dispatch is timed by that head's starvation clock.
+        The measured-load probe and the lane rungs wait on that clock, and it runs only for the timed head.
+        Without this argument a job with the head's standing would not reach either remedy.
         """
         self._prune_abandoned_dispatch_holds()
 
@@ -14794,6 +14800,7 @@ class InferenceScheduler:
             is_head_of_queue=is_head_of_queue,
             head_outstanding_mb=head_outstanding_mb,
             candidate_delta_override_mb=staging_charge_override,
+            starvation_clock_job=starvation_clock_job,
         )
         verdict = outcome.verdict
         device_index = outcome.device_index
@@ -14806,7 +14813,11 @@ class InferenceScheduler:
                 # hold's own records show why the job waited, and this one shows what the arbiter measured when
                 # it let the job through.
                 admit_room_inputs: FlatScalarMap = dict(
-                    self._dispatch_hold_context_inputs(next_job, device_index=device_index),
+                    self._dispatch_hold_context_inputs(
+                        next_job,
+                        device_index=device_index,
+                        starvation_clock_job=starvation_clock_job,
+                    ),
                 )
                 if room is not None:
                     admit_room_inputs.update(room.as_inputs())
@@ -14825,7 +14836,11 @@ class InferenceScheduler:
             )
             return False
 
-        hold_context = self._dispatch_hold_context_inputs(next_job, device_index=device_index)
+        hold_context = self._dispatch_hold_context_inputs(
+            next_job,
+            device_index=device_index,
+            starvation_clock_job=starvation_clock_job,
+        )
         room_inputs: FlatScalarMap = dict(hold_context)
         if room is not None:
             room_inputs.update(room.as_inputs())
@@ -15030,11 +15045,33 @@ class InferenceScheduler:
         self.unload_from_ram(process_info.process_id)
         return True
 
+    def _residency_job_stands_in_for_head(
+        self,
+        job: ImageGenerateJobPopResponse,
+        process_with_model: HordeProcessInfo,
+        line_skip: LineSkip,
+    ) -> bool:
+        """Return whether a job selected past the head drains the residency that blocks the head on this card.
+
+        True when the card's whole-card residency or dominant run is held for the job's model and the displaced
+        head is for a different model. That head cannot take the card until the residency drains, and only jobs
+        of the residency's model drain it. A non-head job does not get the lane rungs, the measured-load probe or
+        the tenancy reclaim. If only those remedies can close the job's shortfall, the job stays held, the
+        residency does not drain and the head waits as well.
+        """
+        if job.model is None or line_skip.displaced_job.model == job.model:
+            return False
+        return self._whole_card_ledger.holds_model_on_card(
+            job.model,
+            self._routing_device_index(process_with_model),
+        )
+
     def _dispatch_hold_context_inputs(
         self,
         job: ImageGenerateJobPopResponse,
         *,
         device_index: int | None,
+        starvation_clock_job: ImageGenerateJobPopResponse | None = None,
     ) -> FlatScalarMap:
         """The head's standing with the escape hatches, so a hold record says what it is waiting on.
 
@@ -15042,11 +15079,12 @@ class InferenceScheduler:
         measured-load probe is gated on, reported beside its threshold so a reader can see how far the probe
         is; ``probe_state`` names whether that one-shot is still waiting, in progress, or already spent on this
         card; and the whole-card intent fields say whether the forecast is claiming the card for this model or
-        has retired that claim on measurement.
+        has retired that claim on measurement. ``starvation_clock_job`` is the displaced head when a job of the
+        residency's model stands in for it. The record then reports that head's clock, which gates the probe.
         """
         held = self._dispatch_holds.held_seconds(str(job.id_)) if job.id_ is not None else None
         hold_seconds = held if held is not None else 0.0
-        starved_seconds = self._head_starved_seconds(job)
+        starved_seconds = self._head_starved_seconds(starvation_clock_job or job)
         if self._job_tracker.is_measured_attempt_on_device(job, device_index):
             probe_state = "in_progress"
         elif self._job_tracker.has_spent_measured_attempt_on_device(job, device_index):
@@ -15094,6 +15132,7 @@ class InferenceScheduler:
         head_outstanding_mb: float | None,
         candidate_delta_override_mb: float | None = None,
         nets_own_dispatch_reservation: bool = False,
+        starvation_clock_job: ImageGenerateJobPopResponse | None = None,
     ) -> _MaterializationOutcome:
         """Price a job's VRAM materialisation through the single MONOLITHIC_DISPATCH arbiter identity.
 
@@ -15121,6 +15160,11 @@ class InferenceScheduler:
             head_outstanding_mb=head_outstanding_mb,
             candidate_delta_override_mb=candidate_delta_override_mb,
             nets_own_dispatch_reservation=nets_own_dispatch_reservation,
+            starvation_clock_job_id=(
+                str(starvation_clock_job.id_)
+                if starvation_clock_job is not None and starvation_clock_job.id_ is not None
+                else None
+            ),
         )
         verdict = arbiter.evaluate(priced.request)
         if verdict.admits:
@@ -15440,21 +15484,31 @@ class InferenceScheduler:
             )
 
         line_skip = next_job_and_process.line_skip
+        stood_in_head = (
+            line_skip.displaced_job
+            if line_skip is not None
+            and self._residency_job_stands_in_for_head(next_job, process_with_model, line_skip)
+            else None
+        )
+        has_head_standing = line_skip is None or stood_in_head is not None
         if self._budget_active() and self._dispatch_residency_reconciliation_holds(
             next_job,
             process_with_model,
             # A line-skip dispatch is not the true head of queue, so it presents is_head_of_queue=False and the
             # head it jumped priced as head_outstanding_mb. Head protection reserves the card's physical room
             # for a head that could use it now; a head whose lanes are all running a job prices as no demand.
-            is_head_of_queue=line_skip is None,
+            # A job of the model that holds the card's residency is the exception. The head waits for that
+            # residency to drain, so the job takes the head's standing and is timed by the head's clock.
+            is_head_of_queue=has_head_standing,
             head_outstanding_mb=(
                 None
-                if line_skip is None
+                if has_head_standing or line_skip is None
                 else self._displaced_head_outstanding_mb(
                     line_skip.displaced_job,
                     device_index=self._routing_device_index(process_with_model),
                 )
             ),
+            starvation_clock_job=stood_in_head,
         ):
             # The staged job's VRAM materialisation would over-commit the card. The job keeps its head-of-queue
             # position and re-asks next pass. The decline reports the remedy the gate recorded for the hold, since a

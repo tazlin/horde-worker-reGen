@@ -3,7 +3,7 @@
 Each knob is off by default, so every other row runs on the classes, predictors and rates the world carries. A
 row here sets one knob on a one-lane card and reads back from the world's own records that the card was charged,
 or the job was timed, as the knob stated. The lane start latency is read on a two-lane pool, since it applies to a
-lane the pool regrows.
+lane that the pool regrows. The job-end unload is read from whether the successor of a granted job pays a load.
 """
 
 from __future__ import annotations
@@ -218,6 +218,52 @@ async def test_a_seeded_store_is_the_parents_prior_and_keeps_learning() -> None:
 
     assert store.observation_count(seed_key) == 1, "the seeded observation did not survive the run"
     assert len(store) > 1, "the children's reports never reached the seeded store"
+
+
+@pytest.mark.parametrize("job_end_unload", [False, True], ids=["grant_kept", "job_end_unload"])
+async def test_a_granted_copy_returns_to_ram_on_a_job_end_unload_card(job_end_unload: bool) -> None:
+    """A granted job's weights stay on the card, unless the card is listed in ``job_end_vram_unload_cards``.
+
+    On a listed card the lane holds the model in RAM after the job, so the successor pays the whole load. The
+    slot's retained-resident record is cleared at the job's end, so the parent does not price a copy that is not
+    on the card.
+    """
+    world = _DispatchWorld(
+        card=_CARD_24GB,
+        lane_count=1,
+        max_threads=1,
+        queue_depth=2,
+        closed_loop=True,
+        tick_seconds=_TICK_SECONDS,
+        job_end_vram_unload_cards=frozenset({_CARD_INDEX}) if job_end_unload else frozenset(),
+    )
+    (lane_id,) = world.inference_lane_ids()
+    granted = make_job_pop_response(_SD15.name, width=512, height=512, ddim_steps=30)
+    successor = make_job_pop_response(_SD15.name, width=512, height=512, ddim_steps=30)
+    await world.pop(granted)
+    await world.pop(successor)
+    retained_at_end: list[str | None] = []
+    for _ in range(_MAX_TICKS):
+        await world.step()
+        if str(granted.id_) in world.completed_job_ids and not retained_at_end:
+            retained_at_end.append(world._process_map[lane_id].retained_resident_model)
+        if world.dispatch_tick(successor) is not None:
+            break
+    assert world.job_windows[str(granted.id_)].retention_granted is True, (
+        f"precondition: the job with a queued successor must be granted retention. {world.state_dump()}"
+    )
+    successor_window = world.job_windows.get(str(successor.id_))
+    assert successor_window is not None, f"the successor was never dispatched. {world.state_dump()}"
+    if job_end_unload:
+        assert successor_window.loaded_now and retained_at_end == [None], (
+            f"after a job on a job-end unload card the successor loaded weights {successor_window.loaded_now} and "
+            f"the slot's retained record read {retained_at_end}. {world.state_dump()}"
+        )
+        return
+    assert not successor_window.loaded_now and retained_at_end == [_SD15.name], (
+        f"after a granted job the successor loaded weights {successor_window.loaded_now} and the slot's retained "
+        f"record read {retained_at_end}. {world.state_dump()}"
+    )
 
 
 def _lane_state(world: _DispatchWorld, lane_id: int) -> HordeProcessState:

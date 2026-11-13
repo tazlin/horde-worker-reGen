@@ -589,7 +589,12 @@ These fail as interactions, not as units, so component tests stay green through 
   replay learns from does not climb; the fixture's truth hook charges the store's figures without their margin,
   which the parent adds once.
   `seed_ram_held_checkpoint` makes a lane report its seated checkpoint as a held component sized by its RAM
-  pages with nothing of it on the device, the report of a pooled monolithic lane. `post_process_chain_peak_mb`
+  pages with nothing of it on the device, the report of a pooled monolithic lane. `job_end_vram_unload_cards`
+  (empty by default) makes every inference lane on the listed cards return the model to RAM at the end of each
+  job, with or without a retention grant, and report it out of VRAM. The next job of the model then pays the whole
+  candidate at the dispatch gate. Without it a whole-card residency's lane keeps the model on the card between
+  jobs, because production grants retention to jobs of a held residency while the static fit passes.
+  `post_process_chain_peak_mb`
   gives the post-processing lane modelled chains that go through production's sampling co-residency check
   against the lanes cleared to sample, where a lane holding only a stage grant does not hold the card. With
   `post_process_chain_measured_admission=True`, which is off by default, a real `PostProcessOrchestrator` prices

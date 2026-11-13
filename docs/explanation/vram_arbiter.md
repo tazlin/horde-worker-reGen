@@ -607,7 +607,11 @@ authorized, so its bounded skipper omits `head_outstanding_mb` and both jobs tak
 measured admission. If the candidate does not physically fit (or
 the requester is not the head), the disposition is `DEFER` and the `admission_foreign_pressure_defers` counter
 advances. The dispatch-reconciliation gate plumbs the same truth, presenting `is_head_of_queue=False` for a
-line-skip dispatch and retaining head protection except for that preparation-only pending state.
+line-skip dispatch and retaining head protection except for that preparation-only pending state. One kind of
+line skip is priced as the head. It is a job selected past a head for a different model, where the job's model
+holds the whole-card residency or the dominant run on the card of the job's lane. That job takes the head's
+standing and is timed by the head's starvation clock. The head cannot use the card until the residency drains,
+so the lane rungs, the measured-load probe and the tenancy reclaim are offered to the job that drains it.
 
 Head protection is bounded. Reserving physical room for a head is only worth its cost while the head is
 converging on a dispatch; a head whose own admission keeps declining otherwise holds an idle card against

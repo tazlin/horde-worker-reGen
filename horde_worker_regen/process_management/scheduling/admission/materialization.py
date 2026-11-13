@@ -114,6 +114,7 @@ def build_materialization_request(
     context_reduction: ContextReduction | None = None,
     forecast: StreamForecast | None = None,
     prepared_head_reprices_activation: bool = True,
+    starvation_clock_job_id: str | None = None,
 ) -> MaterializationRequest:
     """Price the job's landing on the slot as the arbiter will see it.
 
@@ -126,8 +127,11 @@ def build_materialization_request(
     by the caller (the preload's, from the predictive peak); without it the depth is sized from the candidate
     delta and the live-context reduction is never offered. ``prepared_head_reprices_activation`` is the dispatch
     rule that an aux-prepared job beside live work on the card re-prices its activation even where its weights
-    are resident; a preload never does. The idle-context teardown is widened in the measured frame through the
-    arbiter's deficit, the one thing here that is not read from the snapshot.
+    are resident. A preload does not re-price it. ``starvation_clock_job_id`` is the id of the displaced queue head
+    when the dispatch gate gives this job the head's standing, and the request is then timed by that head's
+    starvation clock. Without it the job's clock is read, and that clock runs only for the timed head. The
+    idle-context teardown is widened in the measured frame through the arbiter's deficit, the one thing here that
+    is not read from the snapshot.
 
     A staged waiter's dispatch also includes its partial-load seat and the non-weight reserve its grant hands the
     child, since only clearance hands the child a grant whose free figure its partial load is sized against.
@@ -248,7 +252,7 @@ def build_materialization_request(
         starved_seconds=(
             staged_waiter.starved_seconds
             if staged_waiter is not None
-            else head_starved_seconds(snapshot, job_id, device_index=device_index)
+            else head_starved_seconds(snapshot, starvation_clock_job_id or job_id, device_index=device_index)
         ),
         probe_after_seconds=float(config.measured_load_probe_seconds),
         attempt_deadline_seconds=staged_waiter.attempt_deadline_seconds if staged_waiter is not None else None,

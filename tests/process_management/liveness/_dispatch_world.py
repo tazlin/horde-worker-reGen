@@ -901,6 +901,7 @@ class _DispatchWorld:
         safety_load_transient_mb: float = 0.0,
         unload_release_delay_seconds: float = 0.0,
         child_evicts_granted_resident: bool = False,
+        job_end_vram_unload_cards: frozenset[int] = frozenset(),
         child_unload_leaks_mb: float = 0.0,
         preload_report_latency_seconds: float = 0.0,
         preload_latency_seconds: float = 0.0,
@@ -1124,6 +1125,14 @@ class _DispatchWorld:
                 never ComfyUI's; the parent's record of what the slot holds is a prediction made at dispatch
                 and nothing in the parent can measure the difference. Off, every lane's device copy survives
                 exactly as the record says.
+            job_end_vram_unload_cards: Device indices whose inference lanes return the model's weights to host
+                RAM at the end of every job, with or without a retention grant. The card then holds only the
+                lane's context between jobs, and the next job of the model pays the whole load at the dispatch
+                gate. The child reports the model out of VRAM and production clears the slot's retained-resident
+                record, so the parent does not price a copy that is not on the card. Without it a whole-card
+                residency's lane keeps the model in VRAM between jobs, because production grants retention to
+                jobs of a held residency's model while the static fit passes. The default is an empty set, which
+                leaves every card to the retention grant.
             child_unload_leaks_mb: How much of a lane's committed weights an unload leaves on the card. A full
                 free is a request the child's backend answers by dropping what it can, and a model a live
                 reference still pins is skipped: the command returns, the card keeps the weights, and the lane
@@ -1321,6 +1330,9 @@ class _DispatchWorld:
         self.learned_footprints = learned_footprints
         self.unload_release_delay_seconds = unload_release_delay_seconds
         self.child_evicts_granted_resident = child_evicts_granted_resident
+        if job_end_vram_unload_cards and not closed_loop:
+            raise ValueError("a job-end unload acts on finished job phases, so it needs closed_loop")
+        self.job_end_vram_unload_cards = job_end_vram_unload_cards
         if partial_loads and not closed_loop:
             raise ValueError("a partial load carried across jobs is a claim about job phases, so it needs closed_loop")
         self.partial_loads = partial_loads
@@ -4835,7 +4847,9 @@ class _DispatchWorld:
         model's weights stay committed to the device for the next job to reuse, and an ungranted one is
         returned by the child's explicit end-of-job evictor, leaving the checkpoint in the child's RAM cache
         for a reload. Under the legacy unload regime the child returns the card regardless of what was asked,
-        so the device loses the weights whatever the record says.
+        so the device loses the weights whatever the record says. On a card in ``job_end_vram_unload_cards`` the
+        weights of a granted job also leave the card. The child then reports the model out of VRAM, as it does
+        when it frees a granted copy without a command from the parent.
         """
         job_id = occupancy.job_id
         self._occupancy.pop(job_id, None)
@@ -4899,14 +4913,17 @@ class _DispatchWorld:
         lane.last_process_state = HordeProcessState.WAITING_FOR_JOB
         lane.last_control_flag = None
         retained = lane.retained_resident_model == occupancy.model and not self._legacy_unload_regime()
-        child_evicted = occupancy.lane_id in self._granted_resident_evicted
+        child_evicted = (
+            occupancy.lane_id in self._granted_resident_evicted
+            or self._card_of(occupancy.lane_id) in self.job_end_vram_unload_cards
+        )
         self._granted_resident_evicted.discard(occupancy.lane_id)
         if retained and child_evicted:
-            # The grant was settled onto the slot for weights the child had already freed. The child is what
-            # closes that gap: it sees the device empty at the end of a run it was told to keep resident and
-            # reports the model out of VRAM, which is the same state change a parent-commanded unload sends
-            # and is handled by the same production reconciliation. Without it the record stands over an
-            # empty device and the rest of the session is priced, held and routed against a phantom.
+            # The grant was settled onto the slot for weights that the child already freed or frees at the end of
+            # this job. The child closes that gap. The device is empty at the end of a run that was meant to stay
+            # resident, so the child reports the model out of VRAM. A parent-commanded unload sends the same state
+            # change, and the same production reconciliation handles it. Without that report the record lists
+            # weights that are not on the device, and the rest of the session is priced and routed against it.
             self._resident_mb.pop(occupancy.lane_id, None)
             self._resident_model.pop(occupancy.lane_id, None)
             self._staged_mb[occupancy.lane_id] = self._copy_to_ram_mb(occupancy)
